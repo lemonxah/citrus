@@ -1,0 +1,16 @@
+[package]
+name = "citrus-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+citrus-render.workspace = true
+gltf.workspace = true
+ufbx.workspace = true
+image.workspace = true
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "citrus-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
+winit.workspace = true
+gpu-allocator.workspace = true
+bytemuck.workspace = true
+egui.workspace = true
+egui-ash-renderer.workspace = true
+glam.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
