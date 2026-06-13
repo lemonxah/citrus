@@ -6,13 +6,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
-use glam::{Mat4, Quat, Vec3};
-use citrus_editor::{AlphaModeModel, MaterialModel};
-use citrus_render::{
-    AlphaMode, DrawCmd, MaterialDesc, MaterialFeatures, MaterialHandle, MaterialParams,
-    MeshHandle, Renderer, TextureHandle,
-};
 use citrus_assets::{MaterialRef, ObjectSource, SceneEntry, SceneFile};
+use citrus_editor::{AlphaModeModel, Component, ComponentCtx, ComponentRegistry, MaterialModel};
+use citrus_render::{
+    AlphaMode, DrawCmd, MaterialDesc, MaterialFeatures, MaterialHandle, MaterialParams, MeshHandle,
+    Renderer, TextureHandle,
+};
+use glam::{Mat4, Quat, Vec3};
+
+use crate::shaders::ShaderLibrary;
 
 /// Render data for mesh objects; empties and cameras have none.
 #[derive(Clone, Copy)]
@@ -27,11 +29,19 @@ pub struct SceneObject {
     pub name: String,
     pub render: Option<RenderInfo>,
     pub source: ObjectSource,
+    /// When false the object is skipped at draw time (and its light, if any,
+    /// stops contributing) but it stays in the scene.
+    pub enabled: bool,
+    /// Marks the object as non-moving so its geometry is included in the
+    /// lighting bake (lightmaps + as a ray-trace occluder). Dynamic objects
+    /// instead sample baked light probes.
+    pub static_geometry: bool,
     /// Parent object index; transform is local to it.
     pub parent: Option<usize>,
     pub translation: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
+    pub components: Vec<Box<dyn Component>>,
 }
 
 impl SceneObject {
@@ -39,10 +49,27 @@ impl SceneObject {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
 
+    /// Serialize all components (undo snapshots, play-mode restore).
+    pub fn save_components(&self) -> Vec<(String, String)> {
+        self.components
+            .iter()
+            .map(|c| (c.type_name().to_owned(), c.save()))
+            .collect()
+    }
+
+    /// Rebuild the component list from serialized state.
+    pub fn load_components(&mut self, saved: &[(String, String)], registry: &ComponentRegistry) {
+        self.components = saved
+            .iter()
+            .filter_map(|(kind, data)| registry.load(kind, data))
+            .collect();
+    }
+
     pub fn kind_label(&self) -> &'static str {
         match self.source {
             ObjectSource::Empty => "Empty",
             ObjectSource::Camera => "Camera",
+            ObjectSource::Light => "Light",
             ObjectSource::Primitive { .. } => "Primitive",
             _ => "Mesh",
         }
@@ -55,6 +82,10 @@ pub struct MaterialEntry {
     pub handle: MaterialHandle,
     /// Set when this material came from (or was saved to) a `.material` file.
     pub file: Option<PathBuf>,
+    /// True for imported-model materials whose textures came embedded in the
+    /// model file: they can't be expressed in a `.material` file (no paths),
+    /// so scene saves keep them inline instead of materializing a file.
+    pub embedded_textures: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -78,6 +109,10 @@ pub struct LoadedScene {
     model_mesh_base: HashMap<PathBuf, usize>,
     material_file_cache: HashMap<PathBuf, usize>,
     texture_file_cache: HashMap<(PathBuf, bool), TextureHandle>,
+    /// Project-relative equirectangular skybox image (None = procedural sky).
+    pub skybox: Option<String>,
+    /// World lighting / environment (ambient + sun + skybox toggle).
+    pub environment: citrus_assets::WorldEnvironment,
 }
 
 impl LoadedScene {
@@ -94,6 +129,8 @@ impl LoadedScene {
             model_mesh_base: HashMap::new(),
             material_file_cache: HashMap::new(),
             texture_file_cache: HashMap::new(),
+            skybox: None,
+            environment: citrus_assets::WorldEnvironment::default(),
         }
     }
 
@@ -174,6 +211,105 @@ impl LoadedScene {
         o.scale = scale;
     }
 
+    /// Move `child` (and its subtree) under `new_parent`, inserted in the
+    /// objects Vec immediately before `before` (None = append at the end of
+    /// the new parent's children). Preserves world transform and remaps every
+    /// positional parent index. Returns the old→new index map (empty if the
+    /// move was rejected), so callers can fix up selection indices.
+    pub fn reorder_object(
+        &mut self,
+        child: usize,
+        new_parent: Option<usize>,
+        before: Option<usize>,
+    ) -> Vec<usize> {
+        let len = self.objects.len();
+        if child >= len {
+            return Vec::new();
+        }
+        // Reject cycles: new_parent must not be `child` or a descendant of it.
+        if let Some(p) = new_parent {
+            if p >= len || p == child {
+                return Vec::new();
+            }
+            let mut i = p;
+            let mut guard = 0;
+            while let Some(pp) = self.objects[i].parent {
+                if pp == child {
+                    return Vec::new();
+                }
+                i = pp;
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+            }
+        }
+
+        // Re-parent, preserving the world transform.
+        let world = self.world_transform(child);
+        self.objects[child].parent = new_parent;
+        let parent_world = new_parent.map_or(Mat4::IDENTITY, |p| self.world_transform(p));
+        let local = parent_world.inverse() * world;
+        let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        {
+            let o = &mut self.objects[child];
+            o.translation = translation;
+            o.rotation = rotation;
+            o.scale = scale;
+        }
+
+        // The moving block = child's subtree in display (DFS pre-order).
+        let moving = self.subtree_preorder(child);
+        let mut in_moving = vec![false; len];
+        for &m in &moving {
+            in_moving[m] = true;
+        }
+        let rest: Vec<usize> = (0..len).filter(|i| !in_moving[*i]).collect();
+        let insert_at = match before {
+            Some(b) if b < len && !in_moving[b] => {
+                rest.iter().position(|&i| i == b).unwrap_or(rest.len())
+            }
+            _ => rest.len(),
+        };
+        let mut new_order = Vec::with_capacity(len);
+        new_order.extend_from_slice(&rest[..insert_at]);
+        new_order.extend_from_slice(&moving);
+        new_order.extend_from_slice(&rest[insert_at..]);
+
+        let mut map = vec![0usize; len];
+        for (ni, &oi) in new_order.iter().enumerate() {
+            map[oi] = ni;
+        }
+        // Rebuild the Vec in the new order, then remap every parent index.
+        let mut slots: Vec<Option<SceneObject>> = self.objects.drain(..).map(Some).collect();
+        let mut rebuilt = Vec::with_capacity(len);
+        for &oi in &new_order {
+            rebuilt.push(slots[oi].take().unwrap());
+        }
+        self.objects = rebuilt;
+        for o in &mut self.objects {
+            o.parent = o.parent.map(|p| map[p]);
+        }
+        map
+    }
+
+    /// Indices of `root` and its descendants, in DFS pre-order (== display
+    /// order, since children iterate in ascending index).
+    fn subtree_preorder(&self, root: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.collect_subtree(root, &mut out);
+        out
+    }
+
+    fn collect_subtree(&self, root: usize, out: &mut Vec<usize>) {
+        out.push(root);
+        for i in 0..self.objects.len() {
+            if self.objects[i].parent == Some(root) {
+                self.collect_subtree(i, out);
+            }
+        }
+    }
+
     fn ensure_default_material(&mut self, renderer: &mut Renderer) -> Result<usize> {
         if let Some(i) = self.default_material {
             return Ok(i);
@@ -200,6 +336,7 @@ impl LoadedScene {
             model,
             handle,
             file: None,
+            embedded_textures: false,
         });
         let index = self.materials.len() - 1;
         self.default_material = Some(index);
@@ -252,10 +389,13 @@ impl LoadedScene {
             name,
             render,
             source,
+            enabled: true,
+            static_geometry: false,
             parent: None,
             translation: position,
             rotation: Quat::IDENTITY,
             scale: Vec3::ONE,
+            components: Vec::new(),
         });
         Ok(self.objects.len() - 1)
     }
@@ -317,12 +457,15 @@ impl LoadedScene {
                 model,
                 handle,
                 file: None,
+                embedded_textures: material.albedo.is_some()
+                    || material.normal.is_some()
+                    || material.orm.is_some()
+                    || material.emission.is_some(),
             });
         }
 
         for instance in &scene.instances {
-            let (scale, rotation, translation) =
-                instance.transform.to_scale_rotation_translation();
+            let (scale, rotation, translation) = instance.transform.to_scale_rotation_translation();
             let mesh = mesh_base + instance.mesh;
             let material = material_base + instance.material;
             let source = match source_path {
@@ -338,10 +481,13 @@ impl LoadedScene {
                 name: instance.name.clone(),
                 render: Some(RenderInfo { mesh, material }),
                 source,
+                enabled: true,
+                static_geometry: false,
                 parent: None,
                 translation,
                 rotation,
                 scale,
+                components: Vec::new(),
             });
         }
         Ok(())
@@ -353,13 +499,14 @@ impl LoadedScene {
     pub fn material_from_file(
         &mut self,
         renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
         path: &Path,
         project_root: &Path,
     ) -> usize {
         if let Some(&index) = self.material_file_cache.get(path) {
             return index;
         }
-        let index = match self.try_load_material_file(renderer, path, project_root) {
+        let index = match self.try_load_material_file(renderer, shaders, path, project_root) {
             Ok(index) => index,
             Err(e) => {
                 tracing::error!("loading material {}: {e:#}", path.display());
@@ -389,6 +536,7 @@ impl LoadedScene {
                     model,
                     handle,
                     file: Some(path.to_owned()),
+                    embedded_textures: false,
                 });
                 self.materials.len() - 1
             }
@@ -400,6 +548,7 @@ impl LoadedScene {
     fn try_load_material_file(
         &mut self,
         renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
         path: &Path,
         project_root: &Path,
     ) -> Result<usize> {
@@ -434,34 +583,55 @@ impl LoadedScene {
         let mut model =
             model_from_material(&file.name, &file.params, &file.features, normal.is_some());
         model.shader = file.shader.clone();
+        if let Some(q) = file.render_queue {
+            model.render_queue = q;
+        }
+        if file.shader != "standard" {
+            let entry = shaders.resolve(renderer, project_root, &file.shader);
+            if let Some(source) = &entry.source {
+                model.custom_values = source.pack(&file.custom).to_vec();
+            }
+        }
         self.materials.push(MaterialEntry {
             default: model.clone(),
             model,
             handle,
             file: Some(path.to_owned()),
+            embedded_textures: false,
         });
-        Ok(self.materials.len() - 1)
+        let index = self.materials.len() - 1;
+        self.apply_material(renderer, shaders, project_root, index);
+        Ok(index)
     }
 
     /// Assign a `.material` file to an object's slot.
     pub fn assign_material(
         &mut self,
         renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
         object: usize,
         path: &Path,
         project_root: &Path,
     ) {
-        let material = self.material_from_file(renderer, path, project_root);
+        let material = self.material_from_file(renderer, shaders, path, project_root);
         if let Some(render) = &mut self.objects[object].render {
             render.material = material;
         }
     }
 
-    /// Push one material's inspector model into the renderer.
-    pub fn apply_material(&mut self, renderer: &mut Renderer, index: usize) {
+    /// Push one material's inspector model into the renderer, resolving its
+    /// shader (compiling custom shaders on first use).
+    pub fn apply_material(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        index: usize,
+    ) {
         let entry = &self.materials[index];
+        let handle = entry.handle;
         let m = &entry.model;
-        let params = renderer.material_params_mut(entry.handle);
+        let params = renderer.material_params_mut(handle);
         params.base_color = m.base_color;
         params.metallic = m.metallic;
         params.roughness = m.roughness;
@@ -472,12 +642,254 @@ impl LoadedScene {
         params.emission_intensity = m.emission_intensity;
         params.alpha_cutoff = m.alpha_cutoff;
         params.normal_strength = m.normal_strength;
-        renderer.set_material_features(entry.handle, features_from_model(m));
-        // Unknown shader → error swirl until custom shaders exist.
-        renderer.set_material_error(
-            entry.handle,
-            !citrus_editor::SHADER_REGISTRY.contains(&m.shader.as_str()),
-        );
+        renderer.set_material_features(handle, features_from_model(m));
+        renderer.set_material_render_queue(handle, m.render_queue);
+
+        if m.shader == "standard" {
+            renderer.set_material_shader(handle, None);
+            renderer.set_material_error(handle, false);
+            return;
+        }
+        let shader = m.shader.clone();
+        let shader_entry = shaders.resolve(renderer, project_root, &shader);
+        match shader_entry.id {
+            Some(id) => {
+                let defaults = shader_entry.defaults();
+                let model = &mut self.materials[index].model;
+                if model.custom_values.len() != defaults.len() {
+                    model.custom_values = defaults;
+                }
+                let mut data = [0.0f32; 16];
+                data.copy_from_slice(&model.custom_values);
+                renderer.set_material_shader(handle, Some(id));
+                renderer.set_material_custom_data(handle, data);
+                renderer.set_material_error(handle, false);
+            }
+            // Broken/missing shader → error swirl.
+            None => renderer.set_material_error(handle, true),
+        }
+    }
+
+    /// Link a material to a `.material` file it was saved to (auto-save of
+    /// previously file-less materials).
+    pub fn set_material_file(&mut self, index: usize, path: PathBuf) {
+        self.material_file_cache.insert(path.clone(), index);
+        self.materials[index].file = Some(path);
+    }
+
+    /// Re-apply every material that uses one of `changed` shaders (hot
+    /// reload).
+    pub fn reapply_materials_using(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        changed: &[String],
+    ) {
+        for index in 0..self.materials.len() {
+            if changed.contains(&self.materials[index].model.shader) {
+                self.apply_material(renderer, shaders, project_root, index);
+            }
+        }
+    }
+
+    /// Make sure every camera object carries a Camera component (spawned
+    /// and legacy-scene cameras alike).
+    pub fn ensure_camera_components(&mut self, registry: &ComponentRegistry) {
+        for object in &mut self.objects {
+            if matches!(object.source, ObjectSource::Camera)
+                && !object.components.iter().any(|c| c.type_name() == "Camera")
+                && let Some(camera) = registry.create("Camera")
+            {
+                object.components.push(camera);
+            }
+        }
+    }
+
+    /// Make sure every light object carries a Light component (a default
+    /// directional one for legacy/edited scenes that lost it).
+    pub fn ensure_light_components(&mut self, registry: &ComponentRegistry) {
+        for object in &mut self.objects {
+            if matches!(object.source, ObjectSource::Light)
+                && !object.components.iter().any(|c| c.type_name() == "Light")
+                && let Some(light) = registry.create("Light")
+            {
+                object.components.push(light);
+            }
+        }
+    }
+
+    /// Assign a stable, unique id to every camera that doesn't have one yet
+    /// (id 0 = unassigned). New ids continue past the current maximum, so the
+    /// oldest camera keeps the smallest id (and stays "main") across spawns
+    /// and reloads. Returns true if any id was assigned (so the caller can
+    /// persist the change).
+    pub fn ensure_camera_ids(&mut self) -> bool {
+        use citrus_editor::CameraComponent;
+        let mut max_id = 0u32;
+        for object in &self.objects {
+            for c in &object.components {
+                if let Some(cam) = c.as_any().downcast_ref::<CameraComponent>() {
+                    max_id = max_id.max(cam.id);
+                }
+            }
+        }
+        let mut changed = false;
+        for object in &mut self.objects {
+            for c in &mut object.components {
+                if let Some(cam) = c.as_any_mut().downcast_mut::<CameraComponent>()
+                    && cam.id == 0
+                {
+                    max_id += 1;
+                    cam.id = max_id;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Object index of the "main" camera: the one with the smallest camera id.
+    /// Run [`ensure_camera_ids`](Self::ensure_camera_ids) first so every camera
+    /// has an id.
+    pub fn main_camera(&self) -> Option<usize> {
+        use citrus_editor::CameraComponent;
+        let mut best: Option<(usize, u32)> = None;
+        for (i, object) in self.objects.iter().enumerate() {
+            if let Some(cam) = object
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+                && best.is_none_or(|(_, id)| cam.id < id)
+            {
+                best = Some((i, cam.id));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// View, projection, and world position of the main camera for the given
+    /// aspect ratio (cameras look down -Z, glTF convention).
+    pub fn main_camera_view_proj(&self, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
+        use citrus_editor::CameraComponent;
+        let i = self.main_camera()?;
+        let cam = self.objects[i]
+            .components
+            .iter()
+            .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())?;
+        let world = self.world_transform(i);
+        let (_, rotation, position) = world.to_scale_rotation_translation();
+        let forward = rotation * Vec3::NEG_Z;
+        let up = rotation * Vec3::Y;
+        let view = Mat4::look_to_rh(position, forward, up);
+        let near = cam.near.max(0.001);
+        let far = cam.far.max(near + 0.001);
+        let proj = Mat4::perspective_rh(cam.fov_deg.to_radians(), aspect.max(0.01), near, far);
+        Some((view, proj, position))
+    }
+
+    /// Call one lifecycle hook on every component.
+    fn each_component(
+        &mut self,
+        dt: f32,
+        time: f32,
+        mut call: impl FnMut(&mut Box<dyn citrus_editor::Component>, &mut ComponentCtx),
+    ) {
+        for object in &mut self.objects {
+            let SceneObject {
+                components,
+                translation,
+                rotation,
+                scale,
+                ..
+            } = object;
+            for component in components.iter_mut() {
+                call(
+                    component,
+                    &mut ComponentCtx {
+                        dt,
+                        time,
+                        translation,
+                        rotation,
+                        scale,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Play started: every component's `start` hook.
+    pub fn start_components(&mut self, time: f32) {
+        self.each_component(0.0, time, |c, ctx| c.start(ctx));
+    }
+
+    /// Run all components for one frame (Play mode): all `update`s, then
+    /// all `late_update`s.
+    pub fn update_components(&mut self, dt: f32, time: f32) {
+        self.each_component(dt, time, |c, ctx| c.update(ctx));
+        self.each_component(dt, time, |c, ctx| c.late_update(ctx));
+    }
+
+    /// True if the object and all of its ancestors are enabled (a disabled
+    /// parent hides its whole subtree).
+    pub fn is_active(&self, index: usize) -> bool {
+        let mut i = index;
+        let mut guard = 0;
+        loop {
+            if !self.objects[i].enabled {
+                return false;
+            }
+            match self.objects[i].parent {
+                Some(p) if p < self.objects.len() && guard < 64 => {
+                    i = p;
+                    guard += 1;
+                }
+                _ => return true,
+            }
+        }
+    }
+
+    /// Collect every `Light` component into renderer light instances, reading
+    /// world position/orientation from each object's transform. Baked lights
+    /// are included for now (the bake path isn't built yet), so scenes don't
+    /// go dark.
+    pub fn gather_lights(&self) -> Vec<citrus_render::LightInstance> {
+        use citrus_editor::{LightComponent, LightKind};
+        let mut lights = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(light) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
+            else {
+                continue;
+            };
+            let world = self.world_transform(i);
+            let (_, rotation, position) = world.to_scale_rotation_translation();
+            // Forward (-Z) is the light's travel direction.
+            let direction = rotation * Vec3::NEG_Z;
+            let kind = match light.kind {
+                LightKind::Directional => citrus_render::LightKind::Directional,
+                LightKind::Point => citrus_render::LightKind::Point,
+                LightKind::Spot => citrus_render::LightKind::Spot,
+            };
+            lights.push(citrus_render::LightInstance {
+                kind,
+                position,
+                direction,
+                color: light.color,
+                intensity: light.intensity,
+                range: light.range,
+                spot_inner_deg: light.spot_angle * (1.0 - light.spot_blend),
+                spot_outer_deg: light.spot_angle,
+                cast_shadows: light.cast_shadows,
+                shadow_bias: light.shadow_bias,
+            });
+        }
+        lights
     }
 
     /// Sync all draw transforms from object TRS (cheap; runs every frame).
@@ -487,12 +899,64 @@ impl LoadedScene {
             let Some(render) = self.objects[i].render else {
                 continue;
             };
+            if !self.is_active(i) {
+                continue;
+            }
             self.draws.push(DrawCmd {
                 mesh: self.mesh_handles[render.mesh],
                 material: self.materials[render.material].handle,
                 transform: self.world_transform(i),
                 highlight: if selected == Some(i) { highlight } else { 0.0 },
+                mesh_center: self.mesh_center_local(render.mesh),
             });
+        }
+    }
+
+    /// Delete an object and its whole subtree, remapping the surviving
+    /// objects' parent indices (objects are a positional Vec). Meshes and
+    /// materials are left in place (slot GC is a separate concern).
+    pub fn remove_object(&mut self, index: usize) {
+        if index >= self.objects.len() {
+            return;
+        }
+        // Mark the object and every descendant for removal.
+        let mut remove = vec![false; self.objects.len()];
+        remove[index] = true;
+        // Children always have a higher index than... not guaranteed, so
+        // iterate to a fixpoint over the parent links.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in 0..self.objects.len() {
+                if remove[i] {
+                    continue;
+                }
+                if let Some(p) = self.objects[i].parent
+                    && p < remove.len()
+                    && remove[p]
+                {
+                    remove[i] = true;
+                    changed = true;
+                }
+            }
+        }
+        // old index -> new index for survivors.
+        let mut remap = vec![None; self.objects.len()];
+        let mut next = 0usize;
+        for (i, slot) in remap.iter_mut().enumerate() {
+            if !remove[i] {
+                *slot = Some(next);
+                next += 1;
+            }
+        }
+        let mut i = 0;
+        self.objects.retain(|_| {
+            let keep = !remove[i];
+            i += 1;
+            keep
+        });
+        for object in &mut self.objects {
+            object.parent = object.parent.and_then(|p| remap.get(p).copied().flatten());
         }
     }
 
@@ -520,7 +984,7 @@ impl LoadedScene {
     }
 
     /// Serialize the current scene to a SceneFile.
-    pub fn to_scene_file(&self, project_root: &Path) -> SceneFile {
+    pub fn to_scene_file(&self, project_root: &Path, shaders: &ShaderLibrary) -> SceneFile {
         let entries = self
             .objects
             .iter()
@@ -532,27 +996,55 @@ impl LoadedScene {
                             Some(path) => MaterialRef::File(relative_to(path, project_root)),
                             None => {
                                 let (params, features) = material_from_model(&entry.model);
-                                MaterialRef::Inline { params, features }
+                                let custom = shaders
+                                    .get(&entry.model.shader)
+                                    .and_then(|e| e.source.as_ref())
+                                    .map(|s| s.unpack(&entry.model.custom_values))
+                                    .unwrap_or_default();
+                                MaterialRef::Inline {
+                                    params,
+                                    features,
+                                    shader: entry.model.shader.clone(),
+                                    custom,
+                                    render_queue: Some(entry.model.render_queue),
+                                }
                             }
                         }
                     }
                     None => MaterialRef::Inline {
                         params: MaterialParams::default(),
                         features: MaterialFeatures::default(),
+                        shader: "standard".into(),
+                        custom: Default::default(),
+                        render_queue: None,
                     },
                 };
                 SceneEntry {
                     name: object.name.clone(),
                     source: object.source.clone(),
+                    enabled: object.enabled,
+                    static_geometry: object.static_geometry,
                     material,
                     parent: object.parent,
+                    components: object
+                        .components
+                        .iter()
+                        .map(|c| citrus_assets::ComponentData {
+                            kind: c.type_name().to_owned(),
+                            data: c.save(),
+                        })
+                        .collect(),
                     translation: object.translation.to_array(),
                     rotation: object.rotation.to_array(),
                     scale: object.scale.to_array(),
                 }
             })
             .collect();
-        SceneFile { entries }
+        SceneFile {
+            entries,
+            skybox: self.skybox.clone(),
+            environment: self.environment.clone(),
+        }
     }
 
     /// Rebuild the whole scene from a SceneFile. The renderer's scene
@@ -561,8 +1053,12 @@ impl LoadedScene {
         renderer: &mut Renderer,
         file: &SceneFile,
         project_root: &Path,
+        registry: &ComponentRegistry,
+        shaders: &mut ShaderLibrary,
     ) -> Result<Self> {
         let mut scene = Self::empty();
+        scene.skybox = file.skybox.clone();
+        scene.environment = file.environment.clone();
 
         // Import each referenced model (and the builtin set) once.
         let mut model_object_template: HashMap<String, Vec<usize>> = HashMap::new();
@@ -573,7 +1069,10 @@ impl LoadedScene {
                     model_object_template.entry(path.clone()).or_default();
                 }
                 ObjectSource::Builtin { .. } => needs_builtin = true,
-                ObjectSource::Primitive { .. } | ObjectSource::Empty | ObjectSource::Camera => {}
+                ObjectSource::Primitive { .. }
+                | ObjectSource::Empty
+                | ObjectSource::Camera
+                | ObjectSource::Light => {}
             }
         }
 
@@ -585,8 +1084,11 @@ impl LoadedScene {
             let mesh_base = scene.mesh_handles.len();
             scene.add_asset_scene(renderer, &test, None)?;
             // Remove the template objects; entries recreate placements.
-            let template_materials: Vec<usize> =
-                scene.objects.iter().filter_map(|o| o.render.map(|r| r.material)).collect();
+            let template_materials: Vec<usize> = scene
+                .objects
+                .iter()
+                .filter_map(|o| o.render.map(|r| r.material))
+                .collect();
             scene.objects.clear();
             scene.draws.clear();
             builtin_template = Some((mesh_base, template_materials));
@@ -637,7 +1139,7 @@ impl LoadedScene {
                     let material = scene.ensure_default_material(renderer)?;
                     Some((mesh, material))
                 }
-                ObjectSource::Empty | ObjectSource::Camera => None,
+                ObjectSource::Empty | ObjectSource::Camera | ObjectSource::Light => None,
             };
 
             let render = match mesh_material {
@@ -645,16 +1147,33 @@ impl LoadedScene {
                     let material = match &entry.material {
                         MaterialRef::File(path) => {
                             let abs = project_root.join(path);
-                            scene.material_from_file(renderer, &abs, project_root)
+                            scene.material_from_file(renderer, shaders, &abs, project_root)
                         }
-                        MaterialRef::Inline { params, features } => {
+                        MaterialRef::Inline {
+                            params,
+                            features,
+                            shader,
+                            custom,
+                            render_queue,
+                        } => {
                             // Apply the stored params over the imported
                             // material's textures by editing its model.
                             let entry_ref = &mut scene.materials[default_material];
                             let has_normal = entry_ref.model.has_normal_texture;
                             let name = entry_ref.model.name.clone();
-                            entry_ref.model =
+                            let mut model =
                                 model_from_material(&name, params, features, has_normal);
+                            model.shader = shader.clone();
+                            if let Some(q) = render_queue {
+                                model.render_queue = *q;
+                            }
+                            if shader != "standard" {
+                                let shader_entry = shaders.resolve(renderer, project_root, shader);
+                                if let Some(source) = &shader_entry.source {
+                                    model.custom_values = source.pack(custom).to_vec();
+                                }
+                            }
+                            scene.materials[default_material].model = model;
                             default_material
                         }
                     };
@@ -667,25 +1186,33 @@ impl LoadedScene {
                 name: entry.name.clone(),
                 render,
                 source: entry.source.clone(),
+                enabled: entry.enabled,
+                static_geometry: entry.static_geometry,
                 parent: None, // applied below once all objects exist
                 translation: Vec3::from(entry.translation),
                 rotation: Quat::from_array(entry.rotation),
                 scale: Vec3::from(entry.scale),
+                components: entry
+                    .components
+                    .iter()
+                    .filter_map(|c| registry.load(&c.kind, &c.data))
+                    .collect(),
             });
         }
 
         // Parent links (entry order == object order in a fresh scene).
         for (i, entry) in file.entries.iter().enumerate() {
-            if let Some(parent) = entry.parent {
-                if parent < scene.objects.len() && parent != i {
-                    scene.objects[i].parent = Some(parent);
-                }
+            if let Some(parent) = entry.parent
+                && parent < scene.objects.len()
+                && parent != i
+            {
+                scene.objects[i].parent = Some(parent);
             }
         }
 
         // Push all material models (incl. inline overrides) to the renderer.
         for i in 0..scene.materials.len() {
-            scene.apply_material(renderer, i);
+            scene.apply_material(renderer, shaders, project_root, i);
         }
         Ok(scene)
     }
@@ -700,6 +1227,7 @@ pub fn model_from_material(
     MaterialModel {
         name: name.to_owned(),
         shader: "standard".into(),
+        custom_values: Vec::new(),
         base_color: p.base_color,
         metallic: p.metallic,
         roughness: p.roughness,
@@ -720,6 +1248,12 @@ pub fn model_from_material(
         normal_map_enabled: f.normal_map,
         normal_strength: p.normal_strength,
         double_sided: f.double_sided,
+        render_queue: (match f.alpha_mode {
+            AlphaMode::Opaque => AlphaModeModel::Opaque,
+            AlphaMode::Cutout => AlphaModeModel::Cutout,
+            AlphaMode::Blend => AlphaModeModel::Blend,
+        })
+        .default_render_queue(),
     }
 }
 

@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 egui.workspace = true
+egui_extras.workspace = true
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+tracing.workspace = true

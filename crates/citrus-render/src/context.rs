@@ -21,6 +21,19 @@ pub struct GpuContext {
     pub device: ash::Device,
     pub queue_family: u32,
     pub queue: vk::Queue,
+    /// Acceleration-structure loader, present only when the device supports
+    /// ray query (the lighting bake's ray tracing). `None` disables baking.
+    // Consumed by the bake's BLAS/TLAS builders (next phase).
+    #[allow(dead_code)]
+    pub accel: Option<khr::acceleration_structure::Device>,
+}
+
+impl GpuContext {
+    /// Whether the device can ray-trace (acceleration structures + ray query),
+    /// which the lighting bake requires.
+    pub fn ray_tracing(&self) -> bool {
+        self.accel.is_some()
+    }
 }
 
 impl GpuContext {
@@ -89,17 +102,54 @@ impl GpuContext {
         let queue_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&queue_priorities)];
-        let device_extensions = [khr::swapchain::NAME.as_ptr()];
+
+        // Ray query (for the lighting bake) needs acceleration structures +
+        // ray query + deferred host ops + buffer device address. Enable them
+        // only when the device advertises all of it; otherwise the engine runs
+        // fine without baking.
+        let rt_exts = [
+            khr::acceleration_structure::NAME,
+            khr::ray_query::NAME,
+            khr::deferred_host_operations::NAME,
+        ];
+        let has_rt = device_supports(&instance, physical_device, &rt_exts)?;
+
+        let mut device_extensions = vec![khr::swapchain::NAME.as_ptr()];
+        if has_rt {
+            for e in rt_exts {
+                device_extensions.push(e.as_ptr());
+            }
+        }
+
         let mut vk13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut vk12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+        let mut as_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            .acceleration_structure(true);
+        let mut rq_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_extensions)
             .push_next(&mut vk13);
+        if has_rt {
+            device_info = device_info
+                .push_next(&mut vk12)
+                .push_next(&mut as_features)
+                .push_next(&mut rq_features);
+        }
         let device = unsafe { instance.create_device(physical_device, &device_info, None) }
             .context("creating logical device")?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+
+        let accel = if has_rt {
+            tracing::info!("ray query supported; lighting bake enabled");
+            Some(khr::acceleration_structure::Device::new(&instance, &device))
+        } else {
+            tracing::warn!("ray query unsupported on this device; lighting bake disabled");
+            None
+        };
 
         Ok(Self {
             entry,
@@ -111,6 +161,7 @@ impl GpuContext {
             device,
             queue_family,
             queue,
+            accel,
         })
     }
 }
@@ -127,6 +178,20 @@ impl Drop for GpuContext {
             self.instance.destroy_instance(None);
         }
     }
+}
+
+/// Whether `pd` advertises every extension in `wanted`.
+fn device_supports(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    wanted: &[&CStr],
+) -> Result<bool> {
+    let exts = unsafe { instance.enumerate_device_extension_properties(pd)? };
+    let available: Vec<&CStr> = exts
+        .iter()
+        .map(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) })
+        .collect();
+    Ok(wanted.iter().all(|w| available.contains(w)))
 }
 
 fn has_validation_layer(entry: &ash::Entry) -> bool {

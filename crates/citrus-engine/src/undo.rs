@@ -11,8 +11,8 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use glam::{Quat, Vec3};
 use citrus_editor::MaterialModel;
+use glam::{Quat, Vec3};
 
 /// How long after the last merge a gesture stays "open" for coalescing.
 const MERGE_WINDOW: Duration = Duration::from_millis(700);
@@ -23,6 +23,8 @@ pub struct ObjectState {
     pub translation: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
+    /// Components as (registry name, RON) — diffable and restorable.
+    pub components: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -102,7 +104,10 @@ impl UndoStack {
             .is_some_and(|t| now.duration_since(t) < MERGE_WINDOW);
         let coalesce = !matches!(entry, UndoEntry::Assign { .. })
             && in_window
-            && self.undo.last().is_some_and(|last| last.same_target(&entry));
+            && self
+                .undo
+                .last()
+                .is_some_and(|last| last.same_target(&entry));
         if coalesce {
             self.undo.last_mut().unwrap().absorb(entry);
         } else {

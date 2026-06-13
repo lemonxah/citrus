@@ -8,7 +8,9 @@ mod fbx_loader;
 mod gltf_loader;
 mod material_file;
 mod procedural;
+mod project_file;
 mod scene_file;
+mod shader_file;
 
 pub use fbx_loader::load_fbx;
 pub use gltf_loader::load_gltf;
@@ -17,16 +19,23 @@ pub use material_file::{
     save_material_file,
 };
 pub use procedural::{primitive_mesh, test_scene};
+pub use project_file::{
+    PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
+};
 pub use scene_file::{
-    MaterialRef, ObjectSource, PrimitiveShape, SCENE_EXTENSION, SceneEntry, SceneFile,
-    load_scene_file, save_scene_file,
+    ComponentData, MaterialRef, ObjectSource, PrimitiveShape, SCENE_EXTENSION, SceneEntry,
+    SceneFile, WorldEnvironment, load_scene_file, save_scene_file,
+};
+pub use shader_file::{
+    SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,
+    ShaderSource, compile_shader, load_shader_file, parse_shader_source,
 };
 
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use glam::Mat4;
 use citrus_render::{MaterialFeatures, MaterialParams, MeshData, TextureData};
+use glam::Mat4;
 
 /// One renderable placement of a mesh with a material.
 pub struct Instance {
@@ -58,7 +67,10 @@ pub struct Scene {
 /// True if the extension is an importable model format.
 pub fn is_model_file(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .as_deref(),
         Some("gltf" | "glb" | "fbx")
     )
 }

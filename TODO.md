@@ -13,6 +13,92 @@ Living document — update whenever a feature is added, finished, or discovered.
       could be true spuriously; now the look starts from the viewport tab's own
       widget (`button_pressed(Secondary) && hovered`), so egui's hit-testing decides
 
+## Done (2026-06-12 second batch)
+
+- [x] **Log console tab** — dockable `Tab::Log` (next to Files) mirroring every
+      `tracing` event into a 5000-entry ring (custom subscriber layer). Filter by
+      level (Error/Warn/Info/Debug/Trace toggles) + substring search; Follow
+      (stick-to-bottom) + Clear. Plugin `cargo build` errors/warnings and `glslc`
+      shader compile errors route in via `tracing` (multi-line output flattened to
+      indented rows). Reachable from Windows menu.
+- [x] **First-class code editor + LSP** — code/text files open in dockable
+      `Tab::Code` tabs (multiple at once, close/rearrange/split), not the
+      Inspector; full **syntect** syntax highlighting (Rust, GLSL, …); per-tab
+      dirty + debounced auto-save (saving `.frag` still hot-reloads shaders).
+      **rust-analyzer** spawned on demand (JSON-RPC over stdio on a reader
+      thread) surfaces live diagnostics, **completion** (Ctrl+Space popup with
+      insert), and **hover** (Ctrl+hover tooltip) on `.rs` files. Follow-ups:
+      go-to-def, inline gutter markers, signature help, a shader (GLSL) server.
+- [x] **Component system (Unity-style)** — `TypedComponent` trait (serde +
+      Default + inspector UI + per-frame `update`) with a `ComponentRegistry`;
+      Inspector shows components with ➕ Add Component / ✕ remove; components
+      serialize into `.scene` files and participate in undo (snapshot-diff).
+      Built-ins: Spin, Bob.
+- [x] **Play mode** — ▶ Play / ⏹ Stop in the menu bar: components run while
+      playing; Stop restores transforms + component state from the play
+      snapshot; play-time motion never lands in undo or saves.
+- [x] **Custom shaders v1 (GLSL)** — user `.frag` files compiled at runtime
+      via `glslc` against an engine preamble (frame UBO, 4 texture slots,
+      varyings, 16 push-constant floats). Properties declared as
+      `//! prop name float|toggle|color|color3 range(…) default(…)` pragmas
+      and reflected into the Inspector; values stored by name in `.material`
+      and `.scene` files. Hot reload on file change (~2s poll); failed
+      compiles render the error swirl + show compiler output in the
+      Inspector. Files → Create → New Shader writes a starter. (Slang still
+      a candidate frontend later; see below.)
+- [x] **Rust component plugins** — crates under `plugins/` (workspace members
+      so dependency versions match the editor exactly) are cargo-built and
+      dylib-loaded by the editor: at startup and via Tools → Build & Reload
+      Components. Plugins export `citrus_register(&mut ComponentRegistry)`.
+      Old libraries stay mapped forever (instances may reference them);
+      reload re-instantiates scene components from serialized state. Build
+      errors show in a window. Starter crate: `plugins/components` (Orbit).
+- [x] Selection outline always on top: depth buffer cleared before the
+      outline prepass, so only the selected object can mask its own outline
+- [x] Outline corner gaps fixed: hull inflates radially from the mesh center
+      (pure function of position → duplicated hard-edge vertices stay
+      welded), normal fallback in concave regions
+- [x] Material auto-save: edits persist 0.8s after the gesture settles —
+      file-backed materials to their `.material`, others to a new
+      `materials/<name>.material` (texture paths in existing files preserved)
+- [x] Files/Scene panels: right-click works on empty space and full-width
+      rows; Scene tree context menu adds objects (Empty/Camera/primitives)
+- [x] File explorer: inline Rename, Cut/Copy/Paste (recursive folder copy),
+      drag a file onto a folder (or empty space = root) to move; selection
+      follows renames
+- [x] Files panel is now a Unity-style Project view: resizable folder tree
+      on the left (full-width rows, collapse arrows, click = show contents),
+      icon grid on the right (big type icons, names wrapped to 2 lines and
+      cropped with …, vertical scroll only). Double-click folders to enter,
+      ⬆ + breadcrumb at the top; all rename/clipboard/drag-move/context-menu
+      ops work on tiles and tree rows.
+- [x] `project.citrus` (RON, created on first run): project name (window
+      title), last-opened scene (restored on startup; broken files fall back
+      to the test scene), per-project engine settings (vsync, stats toggles,
+      snap + grid size). Saved on scene save/load/new and on window close.
+- [x] File menu: New Scene (empty scene) and Open Scene (submenu listing all
+      project .scene files) alongside Save / Save As
+- [x] Editing a `.material` file updates all scene objects using it live
+      (not just on save); rename pre-selects the filename stem so the
+      extension survives typing
+- [x] Scene panel rebuilt as a real tree: root "Scene" node (drop = unparent,
+      right-click = Add Object), left-aligned full-width rows with collapse
+      arrows per parent, hover highlight; reparent drag & drop and context
+      menus preserved.
+- [x] App icon: procedural citrus-slice icon; winit window icon (X11) +
+      `app_id` "citrus" and a best-effort `~/.local/share` desktop-entry +
+      icon install for Wayland compositors
+- [x] Scene save materializes materials: every material referenced by the
+      scene gets a real `.material` file (created in materials/ if missing,
+      refreshed otherwise) and the scene references it by path. Exception:
+      imported materials with embedded textures stay inline until a texture
+      export pipeline exists (.material can't carry embedded textures).
+- [x] Camera component (FOV / near / far), auto-attached to every camera
+      object; viewport always draws each camera's frustum wireframe
+      (near/far rects, edges, up-marker; purple when selected) so the
+      orientation and framing are visible. Post-process settings join the
+      component once a post pipeline exists.
+
 ## Done (2026-06-12 editor batch)
 
 - [x] Clickable section headers (collapse/expand by clicking the title, not just the arrow)
@@ -65,6 +151,66 @@ Living document — update whenever a feature is added, finished, or discovered.
 
 ## Next up (designed, not started)
 
+- [x] **Lightmap UVs (second UV set)** — `Vertex` carries `uv1` (lightmap coords). FBX uses
+      its 2nd UV set when present, else generates a per-triangle grid atlas (non-overlapping,
+      seam-heavy — a real chart unwrap via **xatlas** is the quality follow-up). glTF uses
+      `TEXCOORD_1` or falls back to the primary set. Built-in primitives reuse their clean
+      primary UVs. Stored on the mesh ready for the bake; not yet sampled by any shader.
+
+- [ ] **Baked / static lighting** (IN PROGRESS) — GPU bake via **Vulkan ray query**
+      (VK_KHR_ray_query on the existing device; RTX/RDNA2+ hardware RT). Full v1 target:
+      lightmaps (direct + soft shadows + multi-bounce indirect GI) for static surfaces,
+      plus **light-probe volumes** for dynamic objects. Phased build:
+      - [x] **Phase 0 — authoring data**: `static_geometry` flag on objects (inspector
+            "Static" checkbox, serialized); new `LightProbeVolume` component (box `size`
+            + `density` /m → grid of probes; live count readout; box + probe-point gizmo
+            when selected); `LightMode` already authored.
+      - [x] **Phase 1 — RT device infra**: enable VK_KHR_acceleration_structure +
+            ray_query + deferred_host_operations + bufferDeviceAddress when the device
+            supports them (graceful fallback disables baking); allocator BDA follows.
+            `GpuContext::ray_tracing()` / `accel` loader.
+      - [ ] **Phase 2 — accel structures**: BLAS per static mesh, TLAS over static
+            instances; geometry/material SSBOs for the trace (mesh buffers need AS-build
+            + device-address usage flags).
+      - [ ] **Phase 3 — lightmap bake**: raster a pos+normal gbuffer into uv1 space per
+            static object, then a ray-query compute pass per texel (direct + soft shadow
+            from Baked/Mixed lights + hemisphere-sampled indirect); HDR lightmap → disk.
+      - [ ] **Phase 4 — probe bake**: per `LightProbeVolume`, trace the sphere at each
+            grid probe → SH-L1 irradiance, stored per scene.
+      - [ ] **Phase 5 — runtime sampling**: set 2 — static objects sample the lightmap
+            (uv1), dynamic objects trilinearly interpolate probe SH; Baked lights drop
+            out of the realtime loop (Mixed keeps direct).
+      - [ ] **Phase 6 — editor UX**: "Bake Lighting" action + progress.
+      Ties into the skybox/HDR IBL work (environment is another bake input). Until the
+      bake runs, Baked lights still render realtime so scenes aren't dark.
+
+- [x] **Lights (directional / point / spot)** — `LightComponent` (Type, Mode, Color,
+      Intensity, Range, Spot Angle/Blend) attached to `ObjectSource::Light` objects;
+      Scene tree → Light submenu spawns each kind; gizmo-movable like any object. The
+      renderer evaluates up to `MAX_LIGHTS` (16) per frame with distance attenuation and
+      spot cones (multi-light frag loop). Light/camera billboards + selectable in the
+      viewport; widgets hidden for disabled objects.
+- [x] **Shadow-casting lights** — `LightComponent` Cast Shadows + bias; shadow-map array
+      (8×1024 D32, `sampler2DArrayShadow`), depth pass from each caster's POV (directional
+      = camera-following ortho, spot = perspective cone, point = 6 cube faces), light
+      view-projs in the frame UBO, PCF sampling in standard.frag. Shared by the main view
+      and the Camera preview. **Needs GPU validation** (acne/bias tuning, cascades, and a
+      shadow-caster budget UI are follow-ups).
+- [x] **Camera preview tab** — Game-view-style tab rendering the scene from the "main"
+      camera (smallest stable camera id, saved in `.scene`) to an offscreen target shown
+      as an egui user texture. View menu → Camera preview.
+- [x] **Skybox (procedural + equirect)** — fullscreen skybox pass behind the scene:
+      procedural gradient by default, or an equirectangular image (Files → right-click
+      → Set as Skybox), saved per-scene. HDR + IBL still TODO (see below).
+
+- [ ] **HDR skybox + IBL** — the normal skybox ships (procedural + equirect LDR image,
+      per-scene). Still to come: load **HDR** equirect (`.hdr`/`.exr`), convert to a
+      cubemap, and drive image-based lighting (irradiance + prefiltered specular + BRDF
+      LUT) so materials pick up ambient/specular from the environment. Scene-level
+      environment settings (rotation, intensity, tint); the ambient term feeds from the
+      skybox once IBL exists. Pairs with the light components for full environment
+      lighting.
+
 - [ ] **VR editing** — build worlds and avatars from inside the headset, not just at
       the desk. Builds on M4 (VR rendering) + M5 (editor): editor panels rendered as
       quad layers / in-world surfaces with laser-pointer interaction (egui can be fed
@@ -83,22 +229,32 @@ Living document — update whenever a feature is added, finished, or discovered.
       shader becomes just another entry in the shader registry. Failed compiles render
       with the error swirl shader.
 
-- [ ] **Plugin system (Rust)** — `citrus_plugin::Plugin` trait (init, update, editor_ui,
-      events); registration first via static linking (a `plugins/` workspace crate the
-      app links), later dynamic loading (`libloading` + stable ABI layer or an IPC/wasm
-      boundary — dylib Rust ABI is unstable, needs care). Plugins should be able to:
-      register components, register systems, add menu entries/panels.
-- [ ] **Component system (Unity-style)** — objects are hecs entities; components are
-      Rust structs registered in a component registry (name, default value, inspector
-      UI via reflection-lite trait, serde for `.scene` files). Inspector gets an
-      "Add Component" button; components can drive behaviour each frame via systems
-      (e.g. Spin, light components, colliders later). Transform becomes the first
-      built-in component; plugin system registers custom ones.
+- [ ] **Plugin system — beyond components** — plugins can register components today
+      (see Done: Rust component plugins). Still to come: register systems, add menu
+      entries/panels, and a stable ABI / wasm boundary instead of the
+      same-workspace-dylib assumption. Plugin build currently blocks the UI thread;
+      move to a background task with a progress toast.
+- [ ] **Components phase 2** — components on hecs entities (objects are still a Vec),
+      component-driven lights/colliders, multi-component duplicates UX, copy/paste
+      component values, Reset per component. Bob/Orbit restore-on-stop relies on the
+      play snapshot; keep that invariant when adding new built-ins.
+- [ ] **Custom shaders phase 2** — Slang frontend (compiled to SPIR-V), custom vertex
+      stage, texture-slot properties, spec-constant feature toggles in user shaders,
+      shader graph later. Hot reload currently leaks superseded shader modules +
+      pipeline variants until app exit (small, by design).
 - [x] Undo/redo (Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y + Edit menu): object move/rotate/
       scale/rename, material property edits (scene + .material files), material
       assignments. Snapshot-diff based with gesture coalescing (one drag = one
       entry). **By design: object deletion will NOT be undoable** (user decision —
       keep it that way when delete is implemented).
+- [ ] Gizmo rotation snap: holding Ctrl locks rotation to 15° steps (easy
+      90° turns and anything between); translation already grid-snaps
+- [ ] **Audio components** — `AudioSource` (clip, play-on-start, loop, volume,
+      pitch) with a **Spatial** toggle: spatial = 3D settings (min/max
+      distance, rolloff linear/log/custom, doppler, spread/cone); non-spatial
+      = constant-volume 2D ignoring listener position. Needs an `AudioListener`
+      (default on the main camera) and an audio backend (kira/rodio); spatial
+      pan + attenuation from listener↔source transforms each frame.
 - [ ] Multi-select + multi-object gizmo
 - [ ] Stencil/JFA-based outline (upgrade from inverted hull; perfect concave silhouettes)
 - [ ] Material texture-slot assignment UI (thumbnails, drag textures from Files panel)

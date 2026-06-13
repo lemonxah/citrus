@@ -1,15 +1,17 @@
 //! `.material` asset files (RON).
 //!
-//! A material file stores standard-shader parameters, feature toggles, and
+//! A material file stores shader parameters, feature toggles, and
 //! project-relative texture paths. The `shader` field selects which shader
-//! the material targets — only "standard" exists today; custom shaders with
-//! reflected inspector sections are on the roadmap (TODO.md).
+//! the material targets: "standard", or the project-relative path of a
+//! custom `.frag` shader (see shader_file.rs); custom property values are
+//! stored by name in `custom`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context as _, Result};
 use citrus_render::{MaterialFeatures, MaterialParams, TextureData};
+use serde::{Deserialize, Serialize};
 
 pub const MATERIAL_EXTENSION: &str = "material";
 
@@ -29,28 +31,28 @@ pub struct MaterialTextures {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MaterialFile {
     pub name: String,
-    /// Shader this material targets. Currently always "standard".
+    /// "standard" or a project-relative custom `.frag` shader path.
     #[serde(default = "default_shader")]
     pub shader: String,
     pub params: MaterialParams,
     pub features: MaterialFeatures,
+    /// Draw-order priority (Unity render queue). `None` = derive from the
+    /// alpha mode on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_queue: Option<i32>,
     #[serde(default)]
     pub textures: MaterialTextures,
+    /// Custom-shader property values by property name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom: BTreeMap<String, Vec<f32>>,
 }
 
 pub fn load_material_file(path: impl AsRef<Path>) -> Result<MaterialFile> {
     let path = path.as_ref();
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let material: MaterialFile = ron::from_str(&text)
         .with_context(|| format!("parsing material file {}", path.display()))?;
-    if material.shader != "standard" {
-        bail!(
-            "material {} uses shader {:?}; only \"standard\" is supported (custom shaders are on the roadmap)",
-            path.display(),
-            material.shader
-        );
-    }
     Ok(material)
 }
 

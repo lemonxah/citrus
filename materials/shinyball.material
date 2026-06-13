@@ -1,0 +1,30 @@
+(
+    name: "new_material",
+    shader: "standard",
+    params: (
+        base_color: (0.038780928, 0.022637427, 0.9091133, 1.0),
+        emission_color: (0.083155915, 0.00777106, 0.08269116),
+        emission_intensity: 0.5,
+        metallic: 0.0,
+        roughness: 0.7,
+        toon_steps: 6.0,
+        pbr_toon_blend: 1.0,
+        alpha_cutoff: 0.5,
+        normal_strength: 1.0,
+        occlusion_strength: 1.0,
+    ),
+    features: (
+        toon: true,
+        normal_map: false,
+        emission: true,
+        alpha_mode: Opaque,
+        double_sided: false,
+    ),
+    render_queue: Some(2000),
+    textures: (
+        albedo: None,
+        normal: None,
+        orm: None,
+        emission: None,
+    ),
+)

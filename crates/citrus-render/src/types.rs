@@ -14,6 +14,10 @@ pub struct Vertex {
     pub color: [f32; 4],
     /// xyz tangent, w handedness (+1/-1), glTF convention.
     pub tangent: [f32; 4],
+    /// Second UV set: lightmap / baked-lighting coordinates. Read from the
+    /// model's second UV channel, or generated when absent. Kept at the end of
+    /// the struct so existing vertex attributes keep their offsets.
+    pub uv1: [f32; 2],
 }
 
 impl Default for Vertex {
@@ -24,6 +28,7 @@ impl Default for Vertex {
             uv: [0.0; 2],
             color: [1.0; 4],
             tangent: [1.0, 0.0, 0.0, 1.0],
+            uv1: [0.0; 2],
         }
     }
 }
@@ -101,6 +106,9 @@ pub struct MeshHandle(pub(crate) usize);
 pub struct TextureHandle(pub(crate) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaterialHandle(pub(crate) usize);
+/// A registered custom fragment shader (compiled SPIR-V).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShaderId(pub(crate) usize);
 
 pub struct MaterialDesc {
     pub name: String,
@@ -120,8 +128,12 @@ pub struct CameraData {
     pub position: Vec3,
 }
 
+/// Scene-wide lighting that isn't tied to a single light object: the ambient
+/// fill and the "key" directional light exposed to custom shaders through the
+/// `u_light_dir` / `u_light_color` macros. The full per-object light set is
+/// passed separately as [`LightInstance`]s.
 pub struct LightData {
-    /// Direction the light travels (from the light toward the scene).
+    /// Direction the key light travels (from the light toward the scene).
     pub direction: Vec3,
     pub color: [f32; 3],
     pub intensity: f32,
@@ -139,12 +151,47 @@ impl Default for LightData {
     }
 }
 
+/// What shape of light a [`LightInstance`] emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightKind {
+    Directional,
+    Point,
+    Spot,
+}
+
+/// One light gathered from the scene for a frame. Directional lights use only
+/// `direction`; point lights only `position`; spot lights both.
+#[derive(Clone, Copy, Debug)]
+pub struct LightInstance {
+    pub kind: LightKind,
+    /// World-space position (point/spot).
+    pub position: Vec3,
+    /// World-space travel direction, normalized (directional/spot).
+    pub direction: Vec3,
+    /// Linear RGB color (not yet scaled by intensity).
+    pub color: [f32; 3],
+    pub intensity: f32,
+    /// Distance at which point/spot reach zero.
+    pub range: f32,
+    /// Spot inner cone full angle (degrees) — full brightness inside it.
+    pub spot_inner_deg: f32,
+    /// Spot outer cone full angle (degrees) — zero brightness outside it.
+    pub spot_outer_deg: f32,
+    /// Render shadows for this light (depth map from its POV).
+    pub cast_shadows: bool,
+    /// Light-clip-space depth-compare bias.
+    pub shadow_bias: f32,
+}
+
 pub struct DrawCmd {
     pub mesh: MeshHandle,
     pub material: MaterialHandle,
     pub transform: Mat4,
     /// Editor selection glow, 0.0 = off. Per-draw, not part of the material.
     pub highlight: f32,
+    /// Mesh AABB center in object space; the outline pass inflates radially
+    /// from it so hard-edged meshes stay watertight (no corner gaps).
+    pub mesh_center: Vec3,
 }
 
 pub struct EguiDraw {
@@ -178,7 +225,21 @@ pub struct RenderStats {
 pub struct FrameInput<'a> {
     pub clear_color: [f32; 4],
     pub camera: CameraData,
+    /// Ambient + key-light fallback (the latter feeds custom-shader macros).
     pub light: LightData,
+    /// Every light gathered from the scene this frame. When empty, the
+    /// standard shader falls back to the single key directional in `light`.
+    pub lights: &'a [LightInstance],
+    /// When set, the scene is also rendered from this camera into the offscreen
+    /// preview target (the editor's Camera tab). `None` skips that pass.
+    pub camera_preview: Option<CameraData>,
+    /// Draw the skybox behind the scene. When false the clear color shows.
+    pub draw_skybox: bool,
+    /// PCF tap spacing in shadow-UV units (softness / shadow_resolution).
+    pub shadow_pcf_texel: f32,
+    /// Directional shadow coverage in world units (ortho box fit ahead of the
+    /// camera). Smaller = sharper.
+    pub shadow_distance: f32,
     /// Seconds since app start; drives animated shader effects.
     pub time: f32,
     pub draws: &'a [DrawCmd],

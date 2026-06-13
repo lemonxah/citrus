@@ -82,8 +82,8 @@ impl Swapchain {
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(present_mode)
             .clipped(true);
-        let handle = unsafe { loader.create_swapchain(&info, None) }
-            .context("creating swapchain")?;
+        let handle =
+            unsafe { loader.create_swapchain(&info, None) }.context("creating swapchain")?;
 
         let images = unsafe { loader.get_swapchain_images(handle)? };
         let views = images
@@ -130,10 +130,7 @@ impl Swapchain {
         })
     }
 
-    pub fn acquire(
-        &self,
-        signal: vk::Semaphore,
-    ) -> ash::prelude::VkResult<(u32, bool)> {
+    pub fn acquire(&self, signal: vk::Semaphore) -> ash::prelude::VkResult<(u32, bool)> {
         unsafe {
             self.loader
                 .acquire_next_image(self.handle, u64::MAX, signal, vk::Fence::null())

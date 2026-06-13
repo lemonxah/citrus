@@ -41,14 +41,9 @@ impl GizmoTool {
                     | GizmoMode::TranslateXZ
                     | GizmoMode::TranslateYZ
             ),
-            Self::Rotate => enum_set!(
-                GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ
-            ),
+            Self::Rotate => enum_set!(GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ),
             Self::Scale => enum_set!(
-                GizmoMode::ScaleX
-                    | GizmoMode::ScaleY
-                    | GizmoMode::ScaleZ
-                    | GizmoMode::ScaleUniform
+                GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ | GizmoMode::ScaleUniform
             ),
         }
     }
@@ -167,26 +162,22 @@ impl GizmoState {
             ui.painter().add(mesh);
         }
 
-        if let Some((_, transforms)) = result {
-            if let Some(t) = transforms.first() {
-                let new_pivot = DVec3::from(t.translation).as_vec3();
-                let new_rotation = DQuat::from(t.rotation).as_quat();
-                let new_scale = DVec3::from(t.scale).as_vec3();
+        if let Some((_, transforms)) = result
+            && let Some(t) = transforms.first()
+        {
+            let new_pivot = DVec3::from(t.translation).as_vec3();
+            let new_rotation = DQuat::from(t.rotation).as_quat();
+            let new_scale = DVec3::from(t.scale).as_vec3();
 
-                // Re-derive the object origin from the edited pivot frame:
-                // origin = pivot + R_new * (ratio * (R_old⁻¹ * offset)).
-                let offset = *translation - pivot_world;
-                let ratio = Vec3::select(
-                    scale.cmpne(Vec3::ZERO),
-                    new_scale / *scale,
-                    Vec3::ONE,
-                );
-                let local_offset = rotation.inverse() * offset;
-                *translation = new_pivot + new_rotation * (local_offset * ratio);
-                *rotation = new_rotation;
-                *scale = new_scale;
-                return true;
-            }
+            // Re-derive the object origin from the edited pivot frame:
+            // origin = pivot + R_new * (ratio * (R_old⁻¹ * offset)).
+            let offset = *translation - pivot_world;
+            let ratio = Vec3::select(scale.cmpne(Vec3::ZERO), new_scale / *scale, Vec3::ONE);
+            let local_offset = rotation.inverse() * offset;
+            *translation = new_pivot + new_rotation * (local_offset * ratio);
+            *rotation = new_rotation;
+            *scale = new_scale;
+            return true;
         }
         false
     }

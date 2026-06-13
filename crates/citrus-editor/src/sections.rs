@@ -8,13 +8,60 @@ use egui::{ComboBox, DragValue, Label, RichText, Sense, Slider, Ui};
 
 use crate::inspector::{AlphaModeModel, MaterialModel};
 
+/// Reflected custom-shader property kinds (mirrors the pragma metadata
+/// parsed by citrus-assets; the engine converts between the two).
+#[derive(Clone, Copy, Debug)]
+pub enum ShaderPropKindUi {
+    Float { min: f32, max: f32 },
+    Toggle,
+    Color,
+    Color3,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderPropUi {
+    pub label: String,
+    pub kind: ShaderPropKindUi,
+    /// Flat float offset into `MaterialModel::custom_values`.
+    pub offset: usize,
+}
+
+/// Everything the inspector needs to draw a custom shader's material UI.
+#[derive(Clone, Debug, Default)]
+pub struct ShaderUiInfo {
+    pub display_name: String,
+    pub props: Vec<ShaderPropUi>,
+    /// Compile/parse error; shown instead of properties (error swirl in the
+    /// viewport).
+    pub error: Option<String>,
+}
+
 /// Section metadata for search: (title, keywords).
 const SECTIONS: [(&str, &[&str]); 5] = [
-    ("Base", &["color", "albedo", "metallic", "roughness", "occlusion", "ao"]),
-    ("Toon Shading", &["toon", "steps", "bands", "blend", "ramp", "cel"]),
+    (
+        "Base",
+        &[
+            "color",
+            "albedo",
+            "metallic",
+            "roughness",
+            "occlusion",
+            "ao",
+        ],
+    ),
+    (
+        "Toon Shading",
+        &["toon", "steps", "bands", "blend", "ramp", "cel"],
+    ),
     ("Emission", &["emission", "glow", "emissive", "intensity"]),
-    ("Transparency", &["alpha", "cutout", "blend", "opacity", "cutoff"]),
-    ("Geometry", &["normal", "double", "sided", "culling", "bump"]),
+    (
+        "Transparency",
+        &["alpha", "cutout", "blend", "opacity", "cutoff"],
+    ),
+    (
+        "Geometry",
+        &["normal", "double", "sided", "culling", "bump"],
+    ),
 ];
 
 fn section_matches(search: &str, index: usize) -> bool {
@@ -31,6 +78,7 @@ pub fn material_editor_ui(
     search: &mut String,
     m: &mut MaterialModel,
     shaders: &[&str],
+    shader_info: Option<&ShaderUiInfo>,
 ) -> bool {
     let mut changed = false;
 
@@ -52,6 +100,8 @@ pub fn material_editor_ui(
                         .selectable_value(&mut m.shader, shader.to_owned(), shader)
                         .changed()
                     {
+                        // New shader = new property layout; defaults refill.
+                        m.custom_values.clear();
                         changed = true;
                     }
                 }
@@ -60,6 +110,20 @@ pub fn material_editor_ui(
             ui.label(RichText::new("unknown shader").color(ui.visuals().error_fg_color));
         }
     });
+
+    if m.shader != "standard" {
+        changed |= custom_shader_ui(ui, m, shader_info);
+        // Pipeline state still comes from the standard feature set.
+        section(ui, "Transparency", None, &mut changed, |ui, changed| {
+            alpha_mode_ui(ui, m, changed);
+        });
+        section(ui, "Geometry", None, &mut changed, |ui, changed| {
+            property_row(ui, "Double Sided", changed, |ui| {
+                ui.checkbox(&mut m.double_sided, "")
+            });
+        });
+        return changed;
+    }
 
     ui.horizontal(|ui| {
         ui.label("🔍");
@@ -126,36 +190,7 @@ pub fn material_editor_ui(
 
     if section_matches(&search_lower, 3) {
         section(ui, "Transparency", None, &mut changed, |ui, changed| {
-            let before = m.alpha_mode;
-            ui.horizontal(|ui| {
-                ui.label("Mode");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ComboBox::from_id_salt("alpha-mode")
-                        .selected_text(m.alpha_mode.label())
-                        .show_ui(ui, |ui| {
-                            for mode in [
-                                AlphaModeModel::Opaque,
-                                AlphaModeModel::Cutout,
-                                AlphaModeModel::Blend,
-                            ] {
-                                ui.selectable_value(&mut m.alpha_mode, mode, mode.label());
-                            }
-                        });
-                });
-            });
-            if m.alpha_mode != before {
-                *changed = true;
-            }
-            if m.alpha_mode == AlphaModeModel::Cutout {
-                property_row(ui, "Cutoff", changed, |ui| {
-                    ui.add(Slider::new(&mut m.alpha_cutoff, 0.0..=1.0))
-                });
-            }
-            if m.alpha_mode == AlphaModeModel::Blend {
-                property_row(ui, "Opacity", changed, |ui| {
-                    ui.add(Slider::new(&mut m.base_color[3], 0.0..=1.0))
-                });
-            }
+            alpha_mode_ui(ui, m, changed);
         });
     }
 
@@ -178,6 +213,139 @@ pub fn material_editor_ui(
         });
     }
 
+    changed
+}
+
+fn alpha_mode_ui(ui: &mut Ui, m: &mut MaterialModel, changed: &mut bool) {
+    let before = m.alpha_mode;
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ComboBox::from_id_salt("alpha-mode")
+                .selected_text(m.alpha_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        AlphaModeModel::Opaque,
+                        AlphaModeModel::Cutout,
+                        AlphaModeModel::Blend,
+                    ] {
+                        ui.selectable_value(&mut m.alpha_mode, mode, mode.label());
+                    }
+                });
+        });
+    });
+    if m.alpha_mode != before {
+        *changed = true;
+        // Follow the new mode's default queue, unless the user had customized
+        // it away from the old mode's default.
+        if m.render_queue == before.default_render_queue() {
+            m.render_queue = m.alpha_mode.default_render_queue();
+        }
+    }
+    if m.alpha_mode == AlphaModeModel::Cutout {
+        property_row(ui, "Cutoff", changed, |ui| {
+            ui.add(Slider::new(&mut m.alpha_cutoff, 0.0..=1.0))
+        });
+    }
+    if m.alpha_mode == AlphaModeModel::Blend {
+        property_row(ui, "Opacity", changed, |ui| {
+            ui.add(Slider::new(&mut m.base_color[3], 0.0..=1.0))
+        });
+    }
+    render_queue_ui(ui, m, changed);
+}
+
+/// Render-queue (draw-order priority) control: a value plus Unity-style
+/// preset buttons. Higher = drawn later; transparent (≥3000) sorts
+/// back-to-front. The gaps let you fine-tune layered transparency ordering.
+fn render_queue_ui(ui: &mut Ui, m: &mut MaterialModel, changed: &mut bool) {
+    property_row(ui, "Render Queue", changed, |ui| {
+        ui.add(
+            DragValue::new(&mut m.render_queue)
+                .range(0..=5000)
+                .speed(1.0),
+        )
+    });
+    ui.horizontal(|ui| {
+        for (label, q) in [
+            ("Geometry", 2000),
+            ("AlphaTest", 2450),
+            ("Transparent", 3000),
+            ("Overlay", 4000),
+        ] {
+            if ui.selectable_label(m.render_queue == q, label).clicked() {
+                m.render_queue = q;
+                *changed = true;
+            }
+        }
+    });
+}
+
+/// Reflected property editor for a custom shader. Returns true on change.
+fn custom_shader_ui(ui: &mut Ui, m: &mut MaterialModel, info: Option<&ShaderUiInfo>) -> bool {
+    let mut changed = false;
+    ui.separator();
+    let Some(info) = info else {
+        ui.label(RichText::new("Loading shader…").weak());
+        return false;
+    };
+    if let Some(error) = &info.error {
+        ui.label(
+            RichText::new("Shader failed to compile")
+                .color(ui.visuals().error_fg_color)
+                .strong(),
+        );
+        ui.label(RichText::new(error).small().monospace());
+        return false;
+    }
+    if m.custom_values.len() < 16 {
+        // Engine fills defaults on resolve; guard against a stale frame.
+        ui.label(RichText::new("Initializing properties…").weak());
+        return false;
+    }
+    section(ui, "Properties", None, &mut changed, |ui, changed| {
+        if info.props.is_empty() {
+            ui.label(
+                RichText::new("This shader declares no properties")
+                    .small()
+                    .weak(),
+            );
+        }
+        for prop in &info.props {
+            let at = prop.offset;
+            match prop.kind {
+                ShaderPropKindUi::Float { min, max } => {
+                    property_row(ui, &prop.label, changed, |ui| {
+                        ui.add(Slider::new(&mut m.custom_values[at], min..=max))
+                    });
+                }
+                ShaderPropKindUi::Toggle => {
+                    let mut on = m.custom_values[at] != 0.0;
+                    property_row(ui, &prop.label, changed, |ui| {
+                        let response = ui.checkbox(&mut on, "");
+                        if response.changed() {
+                            m.custom_values[at] = on as u32 as f32;
+                        }
+                        response
+                    });
+                }
+                ShaderPropKindUi::Color => {
+                    property_row(ui, &prop.label, changed, |ui| {
+                        let slice: &mut [f32; 4] =
+                            (&mut m.custom_values[at..at + 4]).try_into().unwrap();
+                        ui.color_edit_button_rgba_unmultiplied(slice)
+                    });
+                }
+                ShaderPropKindUi::Color3 => {
+                    property_row(ui, &prop.label, changed, |ui| {
+                        let slice: &mut [f32; 3] =
+                            (&mut m.custom_values[at..at + 3]).try_into().unwrap();
+                        ui.color_edit_button_rgb(slice)
+                    });
+                }
+            }
+        }
+    });
     changed
 }
 

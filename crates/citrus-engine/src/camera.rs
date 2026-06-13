@@ -85,8 +85,7 @@ impl FlyCamera {
     /// `local` is (right, up, forward) movement intent, e.g. from WASD.
     pub fn fly(&mut self, local: Vec3, dt: f32, fast: bool) {
         let speed = if fast { 10.0 } else { 3.0 };
-        let movement =
-            self.right() * local.x + Vec3::Y * local.y + self.forward() * local.z;
+        let movement = self.right() * local.x + Vec3::Y * local.y + self.forward() * local.z;
         self.position += movement.normalize_or(Vec3::ZERO) * speed * dt;
     }
 

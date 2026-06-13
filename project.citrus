@@ -1,0 +1,11 @@
+(
+    name: "citrus",
+    last_scene: Some("scenes/world.scene"),
+    settings: (
+        vsync: true,
+        show_stats: true,
+        show_stats_overlay: false,
+        snap: false,
+        grid_size: 0.5,
+    ),
+)

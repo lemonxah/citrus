@@ -17,6 +17,9 @@ const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.
 const ERROR_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/error.frag.spv"));
 const OUTLINE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/outline.vert.spv"));
 const OUTLINE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/outline.frag.spv"));
+const SKYBOX_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.vert.spv"));
+const SKYBOX_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.frag.spv"));
+const SHADOW_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 
 pub(crate) const PUSH_CONSTANT_SIZE: u32 = 128;
 
@@ -34,6 +37,13 @@ pub(crate) struct PipelineKey {
     /// Depth-only prepass (no color writes); masks outline interiors for
     /// transparent objects, which never write depth in the main pass.
     pub depth_only: bool,
+    /// Fullscreen skybox background (no vertex buffer, depth-test only).
+    pub skybox: bool,
+    /// Shadow depth pass: vertex-only, depth into a shadow map (no color).
+    pub shadow: bool,
+    /// 0 = standard shader; otherwise a custom fragment shader
+    /// (`ShaderId` + 1). Custom variants skip specialization constants.
+    pub shader: u32,
 }
 
 impl PipelineKey {
@@ -51,6 +61,9 @@ impl PipelineKey {
             error: false,
             outline: false,
             depth_only: false,
+            skybox: false,
+            shadow: false,
+            shader: 0,
         }
     }
 
@@ -64,6 +77,9 @@ impl PipelineKey {
             error: true,
             outline: false,
             depth_only: false,
+            skybox: false,
+            shadow: false,
+            shader: 0,
         }
     }
 
@@ -77,6 +93,9 @@ impl PipelineKey {
             error: false,
             outline: true,
             depth_only: false,
+            skybox: false,
+            shadow: false,
+            shader: 0,
         }
     }
 
@@ -90,6 +109,41 @@ impl PipelineKey {
             error: false,
             outline: false,
             depth_only: true,
+            skybox: false,
+            shadow: false,
+            shader: 0,
+        }
+    }
+
+    pub fn skybox() -> Self {
+        Self {
+            toon: false,
+            normal_map: false,
+            emission: false,
+            alpha_mode: 0,
+            double_sided: false,
+            error: false,
+            outline: false,
+            depth_only: false,
+            skybox: true,
+            shadow: false,
+            shader: 0,
+        }
+    }
+
+    pub fn shadow() -> Self {
+        Self {
+            toon: false,
+            normal_map: false,
+            emission: false,
+            alpha_mode: 0,
+            double_sided: false,
+            error: false,
+            outline: false,
+            depth_only: false,
+            skybox: false,
+            shadow: true,
+            shader: 0,
         }
     }
 }
@@ -100,6 +154,11 @@ pub(crate) struct PipelineCache {
     error_frag: vk::ShaderModule,
     outline_vert: vk::ShaderModule,
     outline_frag: vk::ShaderModule,
+    skybox_vert: vk::ShaderModule,
+    skybox_frag: vk::ShaderModule,
+    shadow_vert: vk::ShaderModule,
+    /// Runtime-registered custom fragment shaders, indexed by `ShaderId`.
+    custom_frags: Vec<vk::ShaderModule>,
     pub set0_layout: vk::DescriptorSetLayout,
     pub set1_layout: vk::DescriptorSetLayout,
     pub layout: vk::PipelineLayout,
@@ -149,13 +208,41 @@ impl PipelineCache {
                 None,
             )?
         };
+        let skybox_vert_code = ash::util::read_spv(&mut Cursor::new(SKYBOX_VERT_SPV))?;
+        let skybox_frag_code = ash::util::read_spv(&mut Cursor::new(SKYBOX_FRAG_SPV))?;
+        let skybox_vert = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&skybox_vert_code),
+                None,
+            )?
+        };
+        let skybox_frag = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&skybox_frag_code),
+                None,
+            )?
+        };
+        let shadow_vert_code = ash::util::read_spv(&mut Cursor::new(SHADOW_VERT_SPV))?;
+        let shadow_vert = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&shadow_vert_code),
+                None,
+            )?
+        };
 
-        // set 0: per-frame UBO
-        let frame_bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)];
+        // set 0: per-frame UBO (binding 0) + shadow-map array (binding 1).
+        let frame_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
         let set0_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&frame_bindings),
@@ -199,6 +286,10 @@ impl PipelineCache {
             error_frag,
             outline_vert,
             outline_frag,
+            skybox_vert,
+            skybox_frag,
+            shadow_vert,
+            custom_frags: Vec::new(),
             set0_layout,
             set1_layout,
             layout,
@@ -210,6 +301,19 @@ impl PipelineCache {
 
     pub fn variant_count(&self) -> u32 {
         self.pipelines.len() as u32
+    }
+
+    /// Register a runtime-compiled custom fragment shader; returns its
+    /// index. Modules live until the cache is destroyed (hot reload
+    /// registers a replacement rather than destroying in-flight modules).
+    pub fn register_custom(&mut self, device: &ash::Device, spirv: &[u8]) -> Result<usize> {
+        let code =
+            ash::util::read_spv(&mut Cursor::new(spirv)).context("reading custom shader SPIR-V")?;
+        let module = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)?
+        };
+        self.custom_frags.push(module);
+        Ok(self.custom_frags.len() - 1)
     }
 
     pub fn get(&mut self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
@@ -240,12 +344,21 @@ impl PipelineCache {
             .map_entries(&spec_entries)
             .data(bytemuck::cast_slice(&spec_data));
 
-        let vert_module = if key.outline {
+        let vert_module = if key.shadow {
+            self.shadow_vert
+        } else if key.skybox {
+            self.skybox_vert
+        } else if key.outline {
             self.outline_vert
         } else {
             self.vert
         };
-        let frag_stage = if key.depth_only {
+        let frag_stage = if key.skybox {
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(self.skybox_frag)
+                .name(c"main")
+        } else if key.depth_only {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.error_frag)
@@ -260,6 +373,12 @@ impl PipelineCache {
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.error_frag)
                 .name(c"main")
+        } else if key.shader > 0 {
+            // Custom shaders define no specialization constants.
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(self.custom_frags[key.shader as usize - 1])
+                .name(c"main")
         } else {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -267,13 +386,16 @@ impl PipelineCache {
                 .name(c"main")
                 .specialization_info(&spec)
         };
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vert_module)
-                .name(c"main"),
-            frag_stage,
-        ];
+        let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_module)
+            .name(c"main");
+        // The shadow pass is depth-only: vertex stage alone, no fragment.
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = if key.shadow {
+            vec![vertex_stage]
+        } else {
+            vec![vertex_stage, frag_stage]
+        };
 
         let bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -311,9 +433,14 @@ impl PipelineCache {
                 offset: 48,
             },
         ];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_binding_descriptions(&bindings)
-            .vertex_attribute_descriptions(&attributes);
+        // The skybox is a vertex-buffer-less fullscreen triangle.
+        let vertex_input = if key.skybox {
+            vk::PipelineVertexInputStateCreateInfo::default()
+        } else {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes)
+        };
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
@@ -325,9 +452,13 @@ impl PipelineCache {
         let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(if key.outline {
-                // Inverted hull: keep only back faces of the inflated mesh.
+                // Inverted-hull outline keeps back faces only.
                 vk::CullModeFlags::FRONT
-            } else if key.double_sided {
+            } else if key.shadow || key.double_sided || key.skybox {
+                // Shadow pass renders both faces so the closest (light-facing)
+                // surface lays the depth. Culling front faces (second-depth)
+                // instead leaks a lit line along a caster's light terminator;
+                // a slope-scaled bias in the sampler handles the acne.
                 vk::CullModeFlags::NONE
             } else {
                 vk::CullModeFlags::BACK
@@ -343,7 +474,9 @@ impl PipelineCache {
         let transparent = key.alpha_mode == 2;
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable((!transparent && !key.outline) || key.depth_only)
+            // Skybox tests against the cleared far depth but never writes, so
+            // geometry drawn afterwards always wins.
+            .depth_write_enable(!key.skybox && ((!transparent && !key.outline) || key.depth_only))
             .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
 
         let blend_attachment = if key.depth_only {
@@ -364,18 +497,26 @@ impl PipelineCache {
             vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
         };
+        // The shadow pass has no color attachment.
         let blend_attachments = [blend_attachment];
-        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
-            .attachments(&blend_attachments);
+        let color_blend = if key.shadow {
+            vk::PipelineColorBlendStateCreateInfo::default()
+        } else {
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments)
+        };
 
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let dynamic =
-            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         let color_formats = [self.color_format];
-        let mut rendering = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(&color_formats)
-            .depth_attachment_format(self.depth_format);
+        let mut rendering = if key.shadow {
+            // Depth-only target: no color attachments.
+            vk::PipelineRenderingCreateInfo::default().depth_attachment_format(self.depth_format)
+        } else {
+            vk::PipelineRenderingCreateInfo::default()
+                .color_attachment_formats(&color_formats)
+                .depth_attachment_format(self.depth_format)
+        };
 
         let info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
@@ -412,6 +553,12 @@ impl PipelineCache {
             device.destroy_shader_module(self.error_frag, None);
             device.destroy_shader_module(self.outline_vert, None);
             device.destroy_shader_module(self.outline_frag, None);
+            device.destroy_shader_module(self.skybox_vert, None);
+            device.destroy_shader_module(self.skybox_frag, None);
+            device.destroy_shader_module(self.shadow_vert, None);
+            for module in self.custom_frags.drain(..) {
+                device.destroy_shader_module(module, None);
+            }
         }
     }
 }

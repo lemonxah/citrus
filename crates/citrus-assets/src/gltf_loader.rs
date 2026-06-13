@@ -4,15 +4,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use glam::Mat4;
 use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, Vertex};
+use glam::Mat4;
 
 use crate::{Instance, Scene, SceneMaterial};
 
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
     let path = path.as_ref();
-    let (doc, buffers, images) = gltf::import(path)
-        .with_context(|| format!("importing glTF file {}", path.display()))?;
+    let (doc, buffers, images) =
+        gltf::import(path).with_context(|| format!("importing glTF file {}", path.display()))?;
 
     let mut scene = Scene {
         meshes: Vec::new(),
@@ -72,8 +72,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
 
         let emissive_factor = material.emissive_factor();
         let emissive_strength = material.emissive_strength().unwrap_or(1.0);
-        let has_emission =
-            emission_tex.is_some() || emissive_factor.iter().any(|&c| c > 0.0);
+        let has_emission = emission_tex.is_some() || emissive_factor.iter().any(|&c| c > 0.0);
 
         let (alpha_mode, alpha_cutoff) = match material.alpha_mode() {
             gltf::material::AlphaMode::Opaque => (AlphaMode::Opaque, 0.5),
@@ -150,6 +149,12 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 .read_tex_coords(0)
                 .map(|t| t.into_f32().collect())
                 .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+            // Second UV set = lightmap UVs; fall back to the primary set when
+            // the model has no TEXCOORD_1.
+            let uvs1: Vec<[f32; 2]> = reader
+                .read_tex_coords(1)
+                .map(|t| t.into_f32().collect())
+                .unwrap_or_else(|| uvs.clone());
             let colors: Vec<[f32; 4]> = reader
                 .read_colors(0)
                 .map(|c| c.into_rgba_f32().collect())
@@ -166,6 +171,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                     uv: uvs[i],
                     color: colors[i],
                     tangent: tangents[i],
+                    uv1: uvs1[i],
                 })
                 .collect();
             let indices: Vec<u32> = reader
@@ -174,10 +180,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 .unwrap_or_else(|| (0..vertices.len() as u32).collect());
 
             scene.meshes.push(MeshData { vertices, indices });
-            let material = primitive
-                .material()
-                .index()
-                .unwrap_or(default_material);
+            let material = primitive.material().index().unwrap_or(default_material);
             primitive_map.insert(
                 (mesh.index(), primitive.index()),
                 (scene.meshes.len() - 1, material),

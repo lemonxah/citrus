@@ -6,7 +6,8 @@ use std::path::PathBuf;
 
 use egui::{DragValue, Frame, RichText, Ui};
 
-use crate::sections::material_editor_ui;
+use crate::components::{Component, ComponentRegistry, components_ui};
+use crate::sections::{ShaderUiInfo, material_editor_ui};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AlphaModeModel {
@@ -23,13 +24,26 @@ impl AlphaModeModel {
             Self::Blend => "Transparent",
         }
     }
+
+    /// Default render queue for this alpha mode (Unity-style breakpoints).
+    pub fn default_render_queue(self) -> i32 {
+        match self {
+            Self::Opaque => 2000, // Geometry
+            Self::Cutout => 2450, // AlphaTest
+            Self::Blend => 3000,  // Transparent
+        }
+    }
 }
 
-/// Editor-side view of one standard-shader material.
+/// Editor-side view of one material (standard or custom shader).
 #[derive(Clone, PartialEq)]
 pub struct MaterialModel {
     pub name: String,
+    /// "standard" or a project-relative `.frag` custom shader path.
     pub shader: String,
+    /// Custom-shader property values, packed by property offset (16 floats
+    /// once initialized; empty = take the shader's defaults).
+    pub custom_values: Vec<f32>,
     pub base_color: [f32; 4],
     pub metallic: f32,
     pub roughness: f32,
@@ -46,6 +60,9 @@ pub struct MaterialModel {
     pub normal_map_enabled: bool,
     pub normal_strength: f32,
     pub double_sided: bool,
+    /// Draw-order priority (Unity render queue): Geometry 2000, AlphaTest
+    /// 2450, Transparent 3000, Overlay 4000.
+    pub render_queue: i32,
 }
 
 #[derive(Clone, PartialEq)]
@@ -58,6 +75,10 @@ pub struct TransformModel {
 
 pub struct ObjectInfoModel {
     pub name: String,
+    /// Whether the object renders / contributes light.
+    pub enabled: bool,
+    /// Non-moving: included in the lighting bake (lightmaps + occluder).
+    pub static_geometry: bool,
     /// "Mesh" / "Empty" / "Camera" / "Primitive".
     pub kind: &'static str,
     pub transform: TransformModel,
@@ -70,10 +91,15 @@ pub enum InspectorContent<'a> {
     Object {
         info: &'a mut ObjectInfoModel,
         material: Option<&'a mut MaterialModel>,
+        /// Reflected info for the material's custom shader, if it uses one.
+        shader_info: Option<&'a ShaderUiInfo>,
+        components: &'a mut Vec<Box<dyn Component>>,
+        registry: &'a ComponentRegistry,
     },
     MaterialFile {
         path: String,
         material: &'a mut MaterialModel,
+        shader_info: Option<&'a ShaderUiInfo>,
         dirty: bool,
     },
     SceneFile {
@@ -94,10 +120,33 @@ pub struct InspectorResponse {
     pub load_scene: bool,
     /// A `.material` file was dropped on the material slot.
     pub material_dropped: Option<PathBuf>,
+    /// Component picked from the Add Component menu.
+    pub add_component: Option<&'static str>,
+    /// Component index whose remove button was clicked.
+    pub remove_component: Option<usize>,
+    /// The code editor's text changed / its save button was clicked.
+    pub code_changed: bool,
+    pub save_code: bool,
+    /// Run cargo clippy over the plugin crates.
+    pub run_check: bool,
+}
+
+/// One cargo clippy / rustc message, simplified for display.
+#[derive(Clone, Debug)]
+pub struct CodeDiagnostic {
+    /// "error" or "warning".
+    pub level: String,
+    /// Project-relative file.
+    pub file: String,
+    pub line: u32,
+    pub message: String,
 }
 
 pub struct InspectorPanel {
     search: String,
+    /// When set, the inspector keeps showing the locked selection even as the
+    /// scene selection changes. The engine reads this to freeze its content.
+    pub locked: bool,
 }
 
 impl Default for InspectorPanel {
@@ -110,7 +159,29 @@ impl InspectorPanel {
     pub fn new() -> Self {
         Self {
             search: String::new(),
+            locked: false,
         }
+    }
+
+    /// Draw the lock toggle header (a 🔒 button). Returns true if the lock
+    /// state changed this frame (the engine snapshots the selection then).
+    pub fn lock_header(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            let icon = if self.locked { "🔒" } else { "🔓" };
+            if ui
+                .selectable_label(self.locked, icon)
+                .on_hover_text("Lock the Inspector to the current selection")
+                .clicked()
+            {
+                self.locked = !self.locked;
+                changed = true;
+            }
+            if self.locked {
+                ui.label(RichText::new("Locked").small().weak());
+            }
+        });
+        changed
     }
 
     pub fn ui(
@@ -129,12 +200,28 @@ impl InspectorPanel {
                         .weak(),
                 );
             }
-            InspectorContent::Object { info, material } => {
-                self.object_ui(ui, info, material, shaders, &mut response);
+            InspectorContent::Object {
+                info,
+                material,
+                shader_info,
+                components,
+                registry,
+            } => {
+                self.object_ui(
+                    ui,
+                    info,
+                    material,
+                    shader_info,
+                    components,
+                    registry,
+                    shaders,
+                    &mut response,
+                );
             }
             InspectorContent::MaterialFile {
                 path,
                 material,
+                shader_info,
                 dirty,
             } => {
                 ui.heading(RichText::new(&material.name).strong());
@@ -152,7 +239,7 @@ impl InspectorPanel {
                 });
                 ui.separator();
                 response.material_changed |=
-                    material_editor_ui(ui, &mut self.search, material, shaders);
+                    material_editor_ui(ui, &mut self.search, material, shaders, shader_info);
             }
             InspectorContent::SceneFile { path } => {
                 ui.heading("Scene");
@@ -177,19 +264,39 @@ impl InspectorPanel {
         response
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn object_ui(
         &mut self,
         ui: &mut Ui,
         info: &mut ObjectInfoModel,
         material: Option<&mut MaterialModel>,
+        shader_info: Option<&ShaderUiInfo>,
+        components: &mut Vec<Box<dyn Component>>,
+        registry: &ComponentRegistry,
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
         ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut info.enabled, "")
+                .on_hover_text("Enable / disable (skips rendering and lighting)")
+                .changed()
+            {
+                response.object_changed = true;
+            }
             if ui.text_edit_singleline(&mut info.name).changed() {
                 response.object_changed = true;
             }
             ui.label(RichText::new(info.kind).small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .checkbox(&mut info.static_geometry, "Static")
+                    .on_hover_text("Non-moving: included in the lighting bake")
+                    .changed()
+                {
+                    response.object_changed = true;
+                }
+            });
         });
         ui.separator();
 
@@ -199,16 +306,33 @@ impl InspectorPanel {
             .num_columns(4)
             .spacing([10.0, 4.0])
             .show(ui, |ui| {
-                response.object_changed |=
-                    transform_row(ui, "Location", &mut t.translation, 0.02);
-                response.object_changed |=
-                    transform_row(ui, "Rotation", &mut t.rotation_deg, 0.5);
+                response.object_changed |= transform_row(ui, "Location", &mut t.translation, 0.02);
+                response.object_changed |= transform_row(ui, "Rotation", &mut t.rotation_deg, 0.5);
                 response.object_changed |= transform_row(ui, "Scale", &mut t.scale, 0.01);
             });
 
-        let Some(material) = material else {
-            return; // empties / cameras: transform only
-        };
+        if let Some(material) = material {
+            self.material_ui(ui, info, material, shader_info, shaders, response);
+        }
+
+        // Components (Unity-style: list + Add Component at the bottom).
+        ui.separator();
+        ui.label(RichText::new("Components").strong());
+        let comp = components_ui(ui, components, registry);
+        response.object_changed |= comp.changed;
+        response.add_component = comp.add;
+        response.remove_component = comp.remove;
+    }
+
+    fn material_ui(
+        &mut self,
+        ui: &mut Ui,
+        info: &ObjectInfoModel,
+        material: &mut MaterialModel,
+        shader_info: Option<&ShaderUiInfo>,
+        shaders: &[&str],
+        response: &mut InspectorResponse,
+    ) {
         ui.separator();
         if let Some((vertices, triangles)) = info.mesh {
             ui.label(RichText::new("Mesh").strong());
@@ -226,27 +350,23 @@ impl InspectorPanel {
                         ui.label(RichText::new(&material.name).strong());
                     });
                 });
-                ui.label(
-                    RichText::new("drop a .material file here")
-                        .small()
-                        .weak(),
-                );
+                ui.label(RichText::new("drop a .material file here").small().weak());
             })
             .response;
-        if let Some(hover) = slot.dnd_hover_payload::<PathBuf>() {
-            if hover.extension().is_some_and(|e| e == "material") {
-                ui.painter().rect_stroke(
-                    slot.rect,
-                    4.0,
-                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
-                    egui::StrokeKind::Outside,
-                );
-            }
+        if let Some(hover) = slot.dnd_hover_payload::<PathBuf>()
+            && hover.extension().is_some_and(|e| e == "material")
+        {
+            ui.painter().rect_stroke(
+                slot.rect,
+                4.0,
+                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                egui::StrokeKind::Outside,
+            );
         }
-        if let Some(dropped) = slot.dnd_release_payload::<PathBuf>() {
-            if dropped.extension().is_some_and(|e| e == "material") {
-                response.material_dropped = Some((*dropped).clone());
-            }
+        if let Some(dropped) = slot.dnd_release_payload::<PathBuf>()
+            && dropped.extension().is_some_and(|e| e == "material")
+        {
+            response.material_dropped = Some((*dropped).clone());
         }
 
         ui.separator();
@@ -262,7 +382,8 @@ impl InspectorPanel {
                 }
             });
         });
-        response.material_changed |= material_editor_ui(ui, &mut self.search, material, shaders);
+        response.material_changed |=
+            material_editor_ui(ui, &mut self.search, material, shaders, shader_info);
     }
 }
 

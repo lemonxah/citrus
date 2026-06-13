@@ -10,10 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, TextureData, Vertex};
 use glam::Mat4;
-use citrus_render::{
-    AlphaMode, MaterialFeatures, MaterialParams, MeshData, TextureData, Vertex,
-};
 
 use crate::{Instance, Scene, SceneMaterial};
 
@@ -28,11 +26,8 @@ pub fn load_fbx(path: impl AsRef<Path>) -> Result<Scene> {
         ignore_missing_external_files: true,
         ..Default::default()
     };
-    let fbx = ufbx::load_file(
-        path.to_str().context("non-UTF8 path")?,
-        opts,
-    )
-    .map_err(|e| anyhow!("loading FBX {}: {}", path.display(), e.description.as_ref()))?;
+    let fbx = ufbx::load_file(path.to_str().context("non-UTF8 path")?, opts)
+        .map_err(|e| anyhow!("loading FBX {}: {}", path.display(), e.description.as_ref()))?;
 
     let base_dir = path.parent().unwrap_or(Path::new("."));
     let mut scene = Scene {
@@ -134,6 +129,8 @@ pub fn load_fbx(path: impl AsRef<Path>) -> Result<Scene> {
 fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>> {
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut tri_indices = vec![0u32; mesh.max_face_triangles.max(1) * 3];
+    // Second UV set = lightmap UVs, if the mesh has one.
+    let uv_set1 = mesh.uv_sets.get(1).filter(|s| s.vertex_uv.exists);
 
     let face_indices: Vec<u32> = match mesh.material_parts.get(part_index) {
         Some(part) => part.face_indices.as_ref().to_vec(),
@@ -171,12 +168,20 @@ fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>
             } else {
                 [1.0, 0.0, 0.0, 1.0]
             };
+            let uv1 = match uv_set1 {
+                Some(set) => {
+                    let uv = set.vertex_uv[i];
+                    [uv.x as f32, 1.0 - uv.y as f32]
+                }
+                None => [0.0, 0.0],
+            };
             vertices.push(Vertex {
                 position: [p.x as f32, p.y as f32, p.z as f32],
                 normal: n,
                 uv,
                 color,
                 tangent,
+                uv1,
             });
         }
     }
@@ -184,8 +189,36 @@ fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>
     if vertices.is_empty() {
         return Ok(None);
     }
+    // No authored lightmap UVs: generate a simple per-triangle atlas (the mesh
+    // is already un-indexed, so each triangle is 3 consecutive vertices).
+    if uv_set1.is_none() {
+        generate_lightmap_grid(&mut vertices);
+    }
     let indices = (0..vertices.len() as u32).collect();
     Ok(Some(MeshData { vertices, indices }))
+}
+
+/// Pack each triangle into its own cell of a square grid in the [0,1] UV
+/// square, writing the result to `uv1`. Non-overlapping (valid for lightmap
+/// baking) but seam-heavy — a real chart-based unwrap (xatlas) is a follow-up.
+fn generate_lightmap_grid(vertices: &mut [Vertex]) {
+    let tri_count = vertices.len() / 3;
+    if tri_count == 0 {
+        return;
+    }
+    let cols = (tri_count as f32).sqrt().ceil().max(1.0) as usize;
+    let cell = 1.0 / cols as f32;
+    let margin = cell * 0.08;
+    let lo = cell - 2.0 * margin;
+    for t in 0..tri_count {
+        let cx = (t % cols) as f32 * cell + margin;
+        let cy = (t / cols) as f32 * cell + margin;
+        // A right triangle filling the cell (with a small margin gutter).
+        let corners = [[cx, cy], [cx + lo, cy], [cx, cy + lo]];
+        for (k, corner) in corners.iter().enumerate() {
+            vertices[t * 3 + k].uv1 = *corner;
+        }
+    }
 }
 
 fn material_for(

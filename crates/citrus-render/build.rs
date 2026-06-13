@@ -12,6 +12,9 @@ fn main() {
         "error.frag",
         "outline.vert",
         "outline.frag",
+        "skybox.vert",
+        "skybox.frag",
+        "shadow.vert",
     ] {
         let src = format!("shaders/{name}");
         let dst = Path::new(&out_dir).join(format!("{name}.spv"));

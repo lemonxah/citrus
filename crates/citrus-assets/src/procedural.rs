@@ -1,13 +1,11 @@
 //! Built-in test scene: generated meshes + materials exercising the
 //! standard shader's phase-1 feature set. Used when no glTF path is given.
 
+use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, TextureData, Vertex};
 use glam::{Mat4, Quat, Vec3};
-use citrus_render::{
-    AlphaMode, MaterialFeatures, MaterialParams, MeshData, TextureData, Vertex,
-};
 
-use crate::{Instance, Scene, SceneMaterial};
 use crate::scene_file::PrimitiveShape;
+use crate::{Instance, Scene, SceneMaterial};
 
 /// Generate the mesh for a creatable primitive shape.
 pub fn primitive_mesh(shape: PrimitiveShape) -> MeshData {
@@ -17,6 +15,15 @@ pub fn primitive_mesh(shape: PrimitiveShape) -> MeshData {
         PrimitiveShape::Capsule => capsule(0.25, 1.0, 32, 8),
         PrimitiveShape::Plane => plane(2.0, 1.0),
     }
+}
+
+/// Build a `MeshData`, using the primary (clean, non-overlapping) UVs as the
+/// lightmap UV set too — primitives need no separate unwrap.
+fn mesh_with_lightmap(mut vertices: Vec<Vertex>, indices: Vec<u32>) -> MeshData {
+    for v in &mut vertices {
+        v.uv1 = v.uv;
+    }
+    MeshData { vertices, indices }
 }
 
 /// Capsule: cylinder of height `height` between two hemispheres of `radius`,
@@ -70,7 +77,7 @@ fn capsule(radius: f32, height: f32, segments: u32, rings: u32) -> MeshData {
             indices.extend_from_slice(&[a, a + 1, b, b, a + 1, b + 1]);
         }
     }
-    MeshData { vertices, indices }
+    mesh_with_lightmap(vertices, indices)
 }
 
 pub fn test_scene() -> Scene {
@@ -220,7 +227,7 @@ fn checker_texture(size: u32, cell: u32) -> TextureData {
     let mut pixels = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
-            let even = ((x / cell) + (y / cell)) % 2 == 0;
+            let even = ((x / cell) + (y / cell)).is_multiple_of(2);
             let v = if even { 200 } else { 90 };
             pixels.extend_from_slice(&[v, v, v, 255]);
         }
@@ -257,16 +264,14 @@ fn plane(size: f32, uv_tiles: f32) -> MeshData {
             ..Default::default()
         },
     ];
-    MeshData {
-        vertices,
-        indices: vec![0, 2, 1, 0, 3, 2],
-    }
+    mesh_with_lightmap(vertices, vec![0, 2, 1, 0, 3, 2])
 }
 
 fn cube(size: f32) -> MeshData {
     let h = size * 0.5;
     // (normal, tangent, four corners)
-    let faces: [([f32; 3], [f32; 4], [[f32; 3]; 4]); 6] = [
+    type CubeFace = ([f32; 3], [f32; 4], [[f32; 3]; 4]);
+    let faces: [CubeFace; 6] = [
         (
             [0.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 1.0],
@@ -314,7 +319,7 @@ fn cube(size: f32) -> MeshData {
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    MeshData { vertices, indices }
+    mesh_with_lightmap(vertices, indices)
 }
 
 fn uv_sphere(radius: f32, segments: u32, rings: u32) -> MeshData {
@@ -347,5 +352,5 @@ fn uv_sphere(radius: f32, segments: u32, rings: u32) -> MeshData {
             indices.extend_from_slice(&[a, a + 1, b, b, a + 1, b + 1]);
         }
     }
-    MeshData { vertices, indices }
+    mesh_with_lightmap(vertices, indices)
 }

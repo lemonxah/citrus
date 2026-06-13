@@ -23,15 +23,24 @@ layout(push_constant) uniform Push {
     mat4 model;
     vec4 base_color;
     vec4 emission;
-    vec4 params0;
+    vec4 params0; // xyz = mesh AABB center (object space)
     vec4 params1; // w = highlight strength (scales outline width)
 } pc;
 
 void main() {
-    vec3 world_normal = normalize(mat3(pc.model) * a_normal);
+    // Inflate radially from the mesh center: the direction depends only on
+    // position, so vertices duplicated across hard edges (per-face normals)
+    // move together and the hull stays watertight — no gaps at cube corners.
+    // Concave regions, where the radial direction leaves the surface, fall
+    // back to the vertex normal.
+    vec3 radial = a_position - pc.params0.xyz;
+    vec3 dir = (length(radial) > 1e-5 && dot(normalize(radial), a_normal) > 0.05)
+        ? normalize(radial)
+        : a_normal;
+    vec3 world_dir = normalize(mat3(pc.model) * dir);
     vec4 world = pc.model * vec4(a_position, 1.0);
     // Roughly constant screen-space width: scale with view distance.
     float dist = length(frame.camera_pos.xyz - world.xyz);
-    world.xyz += world_normal * 0.005 * dist * pc.params1.w;
+    world.xyz += world_dir * 0.005 * dist * pc.params1.w;
     gl_Position = frame.view_proj * world;
 }

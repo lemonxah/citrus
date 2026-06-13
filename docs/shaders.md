@@ -99,3 +99,41 @@ inspector and the shader are one deliverable, not two.
 - Material parameters serialize into the glTF material `extras` /
   a `VRSH_materials_standard` extension so worlds and VRM avatars carry vrsh
   materials portably while staying valid glTF for other tools.
+
+## Custom shaders (v1, implemented)
+
+User-authored GLSL fragment shaders: any `.frag` file in the project appears
+in the material Shader picker. The engine prepends a fixed preamble and
+compiles via `glslc` at runtime, with hot reload (~2s file polling) and the
+error swirl + compiler output in the Inspector on failure.
+Files → Create → New Shader writes a commented starter.
+
+The shader body is the fragment stage only (standard vertex stage). Do not
+write a `#version` line. Provided by the preamble:
+
+| | |
+|---|---|
+| Textures | `t_albedo`, `t_normal`, `t_orm`, `t_emission` (material slots) |
+| Varyings | `v_world_pos`, `v_normal`, `v_uv`, `v_color`, `v_tangent` |
+| Uniforms | `u_time`, `u_camera_pos`, `u_light_dir`, `u_light_color`, `u_ambient` |
+| Output | `o_color` |
+
+Properties are pragma comments, reflected into Inspector widgets and packed
+into 16 push-constant floats (vec-valued properties auto-align to vec4):
+
+```glsl
+//! shader "Wobble"
+//! prop tint color default(1, 0.5, 0.1, 1)
+//! prop speed float range(0, 10) default(2)
+//! prop flat_shaded toggle
+//! prop glow_color color3 default(1, 1, 0.5)
+```
+
+Kinds: `float` (Slider, optional `range(min,max)`), `toggle` (checkbox,
+0/1), `color` (RGBA), `color3` (RGB). Values are saved by property name in
+`.material` files and inline scene materials, so reordering declarations is
+safe. Alpha mode and double-sided still come from the material's
+Transparency/Geometry sections (they drive pipeline state).
+
+Phase 2 (designed): Slang frontend, custom vertex stage, texture-slot
+properties, specialization-constant feature toggles in user shaders.
