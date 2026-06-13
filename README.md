@@ -12,6 +12,8 @@ plugins, custom shaders, lighting, audio, colliders, and a growing editor.
 - **[TODO.md](TODO.md)** — working list, changelog, and design notes for
   upcoming work.
 - **[BUGS.md](BUGS.md)** — open bugs, verify-after-rebuild items, crash/stability.
+- **[docs/components.md](docs/components.md)** — the component model, the in-game
+  API (`ComponentCtx`), object references, and writing a Rust plugin.
 - **[docs/shaders.md](docs/shaders.md)** — the citrus standard shader.
 
 ## Stack
@@ -33,6 +35,7 @@ plugins, custom shaders, lighting, audio, colliders, and a growing editor.
 ```
 crates/
   citrus          binary entry point (desktop now, +VR at M4)
+  citrus-core     egui-free runtime API: components, ComponentCtx, ObjectId/Ref
   citrus-engine   app loop, scene, timing, input, editor host
   citrus-render   ash Vulkan renderer (context, swapchain, frames, bake)
   citrus-xr       OpenXR session/swapchains/input          (stub)
@@ -41,6 +44,10 @@ crates/
 plugins/
   components      example Rust component plugin (Orbit)
 ```
+
+A shipped game links `citrus-core` (through the engine) and never the editor:
+behaviour lives in core, inspector/gizmo code is gated behind an `editor` cargo
+feature. See [docs/components.md](docs/components.md).
 
 ## Features
 
@@ -67,8 +74,12 @@ go-to-definition, references); a **vim mode** (motions, operators, visual,
 
 **Components & scripting** — `TypedComponent` system with built-ins
 (Light, Camera, Audio, Colliders, Spin, Bob, Light Probe Volume); cargo-built,
-hot-reloadable **Rust plugins**; runtime custom **GLSL shaders**; runtime scene
-switching from gameplay code (first slice of the in-game API).
+hot-reloadable **Rust plugins** (runtime behaviour in `citrus-core`, editor
+inspector/gizmo behind an `editor` feature); stable **object identity**
+(`ObjectId` UUID) with `ObjectRef` cross-object references set by dragging from
+the Scene tree; an in-game API (`ComponentCtx`) for transforms (incl.
+parent-aware world writes), object lookups, and runtime scene switching; runtime
+custom **GLSL shaders**. Full reference in [docs/components.md](docs/components.md).
 
 **Audio** — spatial / non-spatial `AudioSource` + `AudioListener` with distance
 attenuation, driven in play mode.
@@ -79,9 +90,11 @@ widgets (authoring only; the physics engine is planned).
 **Lighting bake — IN TESTING, NOT YET VERIFIED.** A GPU lightmap + light-probe
 bake (Vulkan ray query: BLAS/TLAS, path-traced direct + soft shadows +
 multi-bounce indirect, SH-L1 probes) with a "Baker's Man" editor tab and
-`.lightmap`/`.lightdata` sidecars. It compiles and runs on RT-capable hardware,
-but the GPU output has not been visually validated and runtime sampling
-(Phase 5) is not done, so it does not light the scene yet.
+`.lightmap`/`.lightdata` sidecars. Runtime sampling has started (Phase 5a:
+baked probe SH feeds the frame's ambient term, and baked-mode lights drop out of
+the realtime pass), but per-fragment probe sampling and lightmap application in
+the standard shader are not done, and the GPU bake output has not been visually
+validated — so it does not fully light the scene yet.
 
 ## Planned
 
