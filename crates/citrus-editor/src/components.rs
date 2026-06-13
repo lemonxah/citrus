@@ -13,6 +13,17 @@ use glam::{Quat, Vec3};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+/// Deferred engine request a component can make from a lifecycle hook. The
+/// engine applies these after the update pass finishes (so the scene isn't
+/// mutated mid-iteration). This is the first slice of the in-game API
+/// (Features.md 2D); grow the enum as more world control is exposed.
+#[derive(Debug, Clone)]
+pub enum ComponentCommand {
+    /// Switch to another scene (level change, menu -> game). Path is
+    /// project-relative, e.g. "scenes/level2.scene". Replaces the current scene.
+    LoadScene(String),
+}
+
 /// Per-frame update context handed to components in Play mode. Transform
 /// fields are the owning object's local TRS.
 pub struct ComponentCtx<'a> {
@@ -22,6 +33,16 @@ pub struct ComponentCtx<'a> {
     pub translation: &'a mut Vec3,
     pub rotation: &'a mut Quat,
     pub scale: &'a mut Vec3,
+    /// Deferred engine requests; drained and applied after the update pass.
+    pub commands: &'a mut Vec<ComponentCommand>,
+}
+
+impl ComponentCtx<'_> {
+    /// Queue a scene switch (level change, menu -> game). Project-relative
+    /// path. Applied after the current update pass.
+    pub fn load_scene(&mut self, path: impl Into<String>) {
+        self.commands.push(ComponentCommand::LoadScene(path.into()));
+    }
 }
 
 /// Object-safe component, as stored on scene objects. Implement
@@ -104,6 +125,11 @@ impl ComponentRegistry {
         registry.register::<CameraComponent>();
         registry.register::<LightComponent>();
         registry.register::<LightProbeVolume>();
+        registry.register::<AudioSource>();
+        registry.register::<AudioListener>();
+        registry.register::<BoxCollider>();
+        registry.register::<SphereCollider>();
+        registry.register::<MeshCollider>();
         registry.register::<Spin>();
         registry.register::<Bob>();
         registry
@@ -200,39 +226,97 @@ pub fn components_ui(
 
     ui.add_space(4.0);
     ui.vertical_centered_justified(|ui| {
-        ui.menu_button("➕ Add Component", |ui| {
-            // Search box + scrollable list: the registry grows large once
-            // plugins and built-ins (lights, etc.) pile up.
-            let search_id = ui.make_persistent_id("citrus-add-component-search");
-            let mut search: String = ui.data(|d| d.get_temp(search_id).unwrap_or_default());
-            let edit = ui.add(
-                egui::TextEdit::singleline(&mut search)
-                    .hint_text("🔍 Search…")
-                    .desired_width(180.0),
-            );
-            if edit.changed() {
-                ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
-            }
-            let needle = search.to_lowercase();
-            ui.separator();
-            ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                let mut any = false;
-                for name in registry.names() {
-                    if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    any = true;
-                    if ui.button(name).clicked() {
-                        response.add = Some(name);
-                        ui.data_mut(|d| d.remove::<String>(search_id));
-                        ui.close();
-                    }
+        // CloseOnClickOutside so clicking/typing in the search box doesn't
+        // dismiss the menu (only a click outside, or picking a component,
+        // closes it).
+        egui::containers::menu::MenuButton::new("➕ Add Component")
+            .config(
+                egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, |ui| {
+                // Search box + scrollable list: the registry grows large once
+                // plugins and built-ins (lights, etc.) pile up.
+                let search_id = ui.make_persistent_id("citrus-add-component-search");
+                let mut search: String = ui.data(|d| d.get_temp(search_id).unwrap_or_default());
+
+                // Fixed, user-resizable popup size (persisted): the list area
+                // keeps a constant height and width so typing in the search box
+                // never shrinks the window as matches drop. The grip below
+                // adjusts this.
+                let size_id = ui.make_persistent_id("citrus-add-component-size");
+                let mut size: egui::Vec2 =
+                    ui.data(|d| d.get_temp(size_id).unwrap_or(egui::vec2(240.0, 240.0)));
+                ui.set_min_width(size.x);
+                ui.set_max_width(size.x);
+
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut search)
+                        .hint_text("🔍 Search…")
+                        .desired_width(f32::INFINITY),
+                );
+                if edit.changed() {
+                    ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
                 }
-                if !any {
-                    ui.label(RichText::new("No matches").weak());
+                let needle = search.to_lowercase();
+                ui.separator();
+                // auto_shrink off + max_height = size.y -> the viewport stays a
+                // constant height regardless of how many rows match.
+                ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .max_height(size.y)
+                    .show(ui, |ui| {
+                        let mut any = false;
+                        for name in registry.names() {
+                            // Camera is intrinsic to camera objects — not
+                            // something you add to arbitrary objects.
+                            if name == "Camera" {
+                                continue;
+                            }
+                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            any = true;
+                            // Full-width rows: easy hit target.
+                            if ui
+                                .add(egui::Button::new(name).min_size(egui::vec2(
+                                    ui.available_width(),
+                                    0.0,
+                                )))
+                                .clicked()
+                            {
+                                response.add = Some(name);
+                                ui.data_mut(|d| d.remove::<String>(search_id));
+                                ui.close();
+                            }
+                        }
+                        if !any {
+                            ui.label(RichText::new("No matches").weak());
+                        }
+                    });
+
+                // Bottom-right resize grip: drag to change the popup size.
+                let (grip_rect, grip) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 12.0),
+                    Sense::drag(),
+                );
+                let corner = grip_rect.right_bottom();
+                let col = ui.visuals().weak_text_color();
+                for i in 1..=3 {
+                    let o = i as f32 * 3.0;
+                    ui.painter().line_segment(
+                        [corner - egui::vec2(o, 1.0), corner - egui::vec2(1.0, o)],
+                        egui::Stroke::new(1.0, col),
+                    );
                 }
+                if grip.dragged() {
+                    let d = grip.drag_delta();
+                    size.x = (size.x + d.x).clamp(180.0, 600.0);
+                    size.y = (size.y + d.y).clamp(120.0, 600.0);
+                    ui.data_mut(|d| d.insert_temp(size_id, size));
+                }
+                grip.on_hover_cursor(egui::CursorIcon::ResizeNwSe);
             });
-        });
     });
     response
 }
@@ -695,6 +779,277 @@ impl TypedComponent for LightProbeVolume {
                 ui.label(RichText::new(format!("{x} × {y} × {z} = {}", x * y * z)).weak());
             });
         });
+        changed
+    }
+}
+
+/// How a spatial audio source quietens with distance between min and max.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum AudioRolloff {
+    /// Volume falls off linearly from min_distance (1.0) to max_distance (0.0).
+    Linear,
+    /// Inverse-distance falloff (more natural; quiet tail).
+    Logarithmic,
+}
+
+impl AudioRolloff {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Logarithmic => "Logarithmic",
+        }
+    }
+    pub const ALL: [AudioRolloff; 2] = [Self::Linear, Self::Logarithmic];
+}
+
+/// A sound emitter. `spatial` sources attenuate with distance to the
+/// AudioListener (min/max + rolloff); non-spatial (2D) sources play at a
+/// constant volume regardless of position. Clips are project-relative
+/// `.wav` / `.flac` / `.mp3` files. Playback is driven by the engine's audio
+/// system in Play mode.
+#[derive(Serialize, Deserialize)]
+pub struct AudioSource {
+    /// Project-relative path to a .wav / .flac / .mp3 clip.
+    pub clip: String,
+    pub play_on_start: bool,
+    pub looping: bool,
+    /// Base volume (0..=1, but higher is allowed for boosting).
+    pub volume: f32,
+    /// Playback speed / pitch multiplier (1.0 = original).
+    pub pitch: f32,
+    /// 3D (distance-attenuated) vs 2D (constant volume).
+    pub spatial: bool,
+    /// Within this distance the source is at full volume.
+    pub min_distance: f32,
+    /// Beyond this distance the source is silent.
+    pub max_distance: f32,
+    pub rolloff: AudioRolloff,
+}
+
+impl Default for AudioSource {
+    fn default() -> Self {
+        Self {
+            clip: String::new(),
+            play_on_start: true,
+            looping: false,
+            volume: 1.0,
+            pitch: 1.0,
+            spatial: true,
+            min_distance: 1.0,
+            max_distance: 20.0,
+            rolloff: AudioRolloff::Logarithmic,
+        }
+    }
+}
+
+impl TypedComponent for AudioSource {
+    const NAME: &'static str = "Audio Source";
+
+    fn inspector_ui(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Clip");
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.clip)
+                        .hint_text("audio/foo.wav")
+                        .desired_width(f32::INFINITY),
+                )
+                .changed();
+        });
+        ui.label(
+            RichText::new(".wav · .flac · .mp3 (project-relative)")
+                .small()
+                .weak(),
+        );
+        property_row(ui, "Play on Start", &mut changed, |ui| {
+            ui.checkbox(&mut self.play_on_start, "")
+        });
+        property_row(ui, "Loop", &mut changed, |ui| {
+            ui.checkbox(&mut self.looping, "")
+        });
+        property_row(ui, "Volume", &mut changed, |ui| {
+            ui.add(egui::Slider::new(&mut self.volume, 0.0..=2.0))
+        });
+        property_row(ui, "Pitch", &mut changed, |ui| {
+            ui.add(egui::Slider::new(&mut self.pitch, 0.25..=4.0))
+        });
+        property_row(ui, "Spatial (3D)", &mut changed, |ui| {
+            ui.checkbox(&mut self.spatial, "")
+        });
+        if self.spatial {
+            property_row(ui, "Min Distance", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.min_distance).speed(0.1).range(0.0..=10000.0))
+            });
+            property_row(ui, "Max Distance", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.max_distance).speed(0.5).range(0.0..=10000.0))
+            });
+            if self.max_distance < self.min_distance + 0.01 {
+                self.max_distance = self.min_distance + 0.01;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Rolloff");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("citrus-audio-rolloff")
+                        .selected_text(self.rolloff.label())
+                        .show_ui(ui, |ui| {
+                            for r in AudioRolloff::ALL {
+                                changed |= ui
+                                    .selectable_value(&mut self.rolloff, r, r.label())
+                                    .changed();
+                            }
+                        });
+                });
+            });
+        }
+        changed
+    }
+}
+
+/// Marks the object whose transform is the "ears" for spatial audio (usually
+/// the main camera). The first active listener wins; if none exists the
+/// engine falls back to the editor camera.
+#[derive(Serialize, Deserialize, Default)]
+pub struct AudioListener {}
+
+impl TypedComponent for AudioListener {
+    const NAME: &'static str = "Audio Listener";
+
+    fn inspector_ui(&mut self, ui: &mut Ui) -> bool {
+        ui.label(
+            RichText::new("Ears for spatial audio (put this on the main camera).")
+                .small()
+                .weak(),
+        );
+        false
+    }
+}
+
+// ----------------------------------------------------------- colliders
+
+/// Number of collision layers (mirrors the layer-collision matrix that the
+/// physics engine consults; see the physics TODO).
+pub const COLLISION_LAYERS: u32 = 32;
+
+/// Shared collider inspector rows: trigger flag + collision layer.
+fn collider_common_ui(ui: &mut Ui, is_trigger: &mut bool, layer: &mut u32, changed: &mut bool) {
+    property_row(ui, "Is Trigger", changed, |ui| {
+        ui.checkbox(is_trigger, "")
+            .on_hover_text("Detect overlaps without blocking (no collision response)")
+    });
+    property_row(ui, "Layer", changed, |ui| {
+        let r = ui.add(egui::DragValue::new(layer).range(0..=COLLISION_LAYERS - 1));
+        *layer = (*layer).min(COLLISION_LAYERS - 1);
+        r
+    });
+}
+
+/// Axis-aligned (in object space) box collision zone. `center` offsets it from
+/// the object origin; `size` is the full extent. No physics solver yet — this
+/// is authoring data the physics engine (TODO) will consume.
+#[derive(Serialize, Deserialize)]
+pub struct BoxCollider {
+    pub center: [f32; 3],
+    pub size: [f32; 3],
+    pub is_trigger: bool,
+    pub layer: u32,
+}
+
+impl Default for BoxCollider {
+    fn default() -> Self {
+        Self {
+            center: [0.0; 3],
+            size: [1.0; 3],
+            is_trigger: false,
+            layer: 0,
+        }
+    }
+}
+
+impl TypedComponent for BoxCollider {
+    const NAME: &'static str = "Box Collider";
+
+    fn inspector_ui(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        axis_row(ui, "Center", &mut self.center, &mut changed);
+        axis_row(ui, "Size", &mut self.size, &mut changed);
+        for s in &mut self.size {
+            *s = s.max(0.01);
+        }
+        collider_common_ui(ui, &mut self.is_trigger, &mut self.layer, &mut changed);
+        changed
+    }
+}
+
+/// Sphere collision zone (center offset + radius).
+#[derive(Serialize, Deserialize)]
+pub struct SphereCollider {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub is_trigger: bool,
+    pub layer: u32,
+}
+
+impl Default for SphereCollider {
+    fn default() -> Self {
+        Self {
+            center: [0.0; 3],
+            radius: 0.5,
+            is_trigger: false,
+            layer: 0,
+        }
+    }
+}
+
+impl TypedComponent for SphereCollider {
+    const NAME: &'static str = "Sphere Collider";
+
+    fn inspector_ui(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        axis_row(ui, "Center", &mut self.center, &mut changed);
+        property_row(ui, "Radius", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.radius).speed(0.05).range(0.01..=10000.0))
+        });
+        collider_common_ui(ui, &mut self.is_trigger, &mut self.layer, &mut changed);
+        changed
+    }
+}
+
+/// Collision from the object's own mesh. `convex` builds a convex hull (needed
+/// for dynamic bodies); otherwise the exact triangle mesh is used (static
+/// only). Follows the mesh, so there's no editable size.
+#[derive(Serialize, Deserialize)]
+pub struct MeshCollider {
+    pub convex: bool,
+    pub is_trigger: bool,
+    pub layer: u32,
+}
+
+impl Default for MeshCollider {
+    fn default() -> Self {
+        Self {
+            convex: false,
+            is_trigger: false,
+            layer: 0,
+        }
+    }
+}
+
+impl TypedComponent for MeshCollider {
+    const NAME: &'static str = "Mesh Collider";
+
+    fn inspector_ui(&mut self, ui: &mut Ui) -> bool {
+        let mut changed = false;
+        property_row(ui, "Convex", &mut changed, |ui| {
+            ui.checkbox(&mut self.convex, "")
+                .on_hover_text("Convex hull (required for dynamic bodies); off = exact triangles (static only)")
+        });
+        collider_common_ui(ui, &mut self.is_trigger, &mut self.layer, &mut changed);
+        ui.label(
+            RichText::new("Uses this object's mesh as the collision shape.")
+                .small()
+                .weak(),
+        );
         changed
     }
 }

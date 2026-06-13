@@ -136,6 +136,36 @@ pub struct WorldEnvironment {
     /// this size ahead of the camera. Smaller = sharper, less coverage.
     #[serde(default = "default_shadow_distance")]
     pub shadow_distance: f32,
+    /// Lighting-bake settings (Bakery-style: texels-per-meter density).
+    #[serde(default)]
+    pub bake: BakeSettings,
+}
+
+/// Lighting-bake parameters, authored per scene. Resolution is a texel
+/// density (Bakery / Unity style); each static object's lightmap size is
+/// `density × world-AABB size`, clamped to `max_lightmap`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BakeSettings {
+    /// Lightmap texels per world meter.
+    pub texel_density: f32,
+    /// Indirect bounces per path (0 = direct + sky only).
+    pub bounces: u32,
+    /// Paths traced per texel / per probe.
+    pub samples: u32,
+    /// Upper clamp on a single object's lightmap resolution.
+    pub max_lightmap: u32,
+}
+
+impl Default for BakeSettings {
+    fn default() -> Self {
+        Self {
+            texel_density: 16.0,
+            bounces: 2,
+            samples: 128,
+            max_lightmap: 512,
+        }
+    }
 }
 
 fn default_shadow_resolution() -> u32 {
@@ -163,6 +193,7 @@ impl Default for WorldEnvironment {
             shadow_resolution: default_shadow_resolution(),
             shadow_softness: default_shadow_softness(),
             shadow_distance: default_shadow_distance(),
+            bake: BakeSettings::default(),
         }
     }
 }

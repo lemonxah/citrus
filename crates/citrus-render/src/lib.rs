@@ -5,6 +5,7 @@
 //! system, and an egui overlay pass for the in-engine inspector.
 
 mod alloc;
+mod bake;
 mod context;
 mod frame;
 mod pipeline;
@@ -297,6 +298,7 @@ struct GpuMesh {
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     index_count: u32,
+    vertex_count: u32,
 }
 
 /// Unity-style render queue: draws are ordered by this number, with named
@@ -753,7 +755,6 @@ impl ShadowAtlas {
 }
 
 pub struct Renderer {
-    window: Arc<Window>,
     ctx: GpuContext,
     allocator: Option<Arc<Mutex<Allocator>>>,
     swapchain: Swapchain,
@@ -790,6 +791,14 @@ pub struct Renderer {
     camera_preview: Option<CameraPreview>,
     last_stats: RenderStats,
     vsync: bool,
+
+    /// Declared last so it drops last: `GpuContext::drop` destroys the Vulkan
+    /// surface, which must happen while the underlying winit window still
+    /// exists. EngineApp drops its own `Arc<Window>` clone before the renderer,
+    /// so this field can be the final strong reference — keeping it last means
+    /// the window outlives `ctx`/`surface` teardown (NVIDIA/Wayland segfaults
+    /// on exit otherwise).
+    window: Arc<Window>,
 }
 
 impl Renderer {
@@ -1059,6 +1068,16 @@ impl Renderer {
     }
 
     pub fn upload_mesh(&mut self, data: &MeshData) -> Result<MeshHandle> {
+        // When ray tracing is available the bake reads these buffers as
+        // acceleration-structure inputs and as SSBOs (via device address),
+        // so they need the extra usage flags + device-address storage.
+        let rt = if self.ctx.ray_tracing() {
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+        } else {
+            vk::BufferUsageFlags::empty()
+        };
         let allocator = self.allocator();
         let mut alloc = allocator.lock().unwrap();
         let vertex_buffer = alloc::upload_buffer(
@@ -1067,7 +1086,7 @@ impl Renderer {
             self.command_pool,
             self.ctx.queue,
             bytemuck::cast_slice(&data.vertices),
-            vk::BufferUsageFlags::VERTEX_BUFFER,
+            vk::BufferUsageFlags::VERTEX_BUFFER | rt,
             "vertices",
         )?;
         let index_buffer = alloc::upload_buffer(
@@ -1076,15 +1095,34 @@ impl Renderer {
             self.command_pool,
             self.ctx.queue,
             bytemuck::cast_slice(&data.indices),
-            vk::BufferUsageFlags::INDEX_BUFFER,
+            vk::BufferUsageFlags::INDEX_BUFFER | rt,
             "indices",
         )?;
         self.meshes.push(GpuMesh {
             vertex_buffer,
             index_buffer,
             index_count: data.indices.len() as u32,
+            vertex_count: data.vertices.len() as u32,
         });
         Ok(MeshHandle(self.meshes.len() - 1))
+    }
+
+    /// Whether the GPU lighting bake can run (ray query support).
+    pub fn supports_baking(&self) -> bool {
+        self.ctx.ray_tracing()
+    }
+
+    /// Run the GPU lighting bake (lightmaps + probe SH). Blocks until done;
+    /// invoked from an explicit editor action, never the frame loop.
+    pub fn bake_lighting(&self, input: &BakeInput<'_>) -> Result<BakeOutput> {
+        let allocator = self.allocator();
+        bake::bake(
+            &self.ctx,
+            &allocator,
+            self.command_pool,
+            &self.meshes,
+            input,
+        )
     }
 
     pub fn upload_texture(&mut self, data: &TextureData) -> Result<TextureHandle> {

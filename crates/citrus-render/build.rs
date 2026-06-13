@@ -15,6 +15,11 @@ fn main() {
         "skybox.vert",
         "skybox.frag",
         "shadow.vert",
+        // Lighting bake (compiled only used when ray query is available).
+        "bake_gbuffer.vert",
+        "bake_gbuffer.frag",
+        "bake_lightmap.comp",
+        "bake_probe.comp",
     ] {
         let src = format!("shaders/{name}");
         let dst = Path::new(&out_dir).join(format!("{name}.spv"));

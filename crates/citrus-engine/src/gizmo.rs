@@ -115,9 +115,19 @@ impl GizmoState {
             snap_scale: 0.1,
             pixels_per_point: ui.ctx().pixels_per_point(),
             visuals: GizmoVisuals {
-                // Thicker strokes so the uniform-scale center circle and
-                // plane handles read clearly.
-                stroke_width: 5.0,
+                // Fat, easy-to-grab handles: the pick tolerance scales with
+                // `gizmo_size * 0.1 + stroke_width * 2`, so a thick stroke both
+                // widens the clickable band and makes grabbing reliable (much
+                // less accidental orbit).
+                gizmo_size: 110.0,
+                stroke_width: 11.0,
+                // Per-handle hover emphasis: idle axes are dimmed so the axis
+                // under the cursor (full alpha, its own color) clearly pops as
+                // "this is what you'll grab". The crate highlights only the
+                // hovered/active sub-gizmo, so the rest of the widget is
+                // unaffected (no whole-gizmo resize).
+                inactive_alpha: 0.5,
+                highlight_alpha: 1.0,
                 ..Default::default()
             },
             ..Default::default()

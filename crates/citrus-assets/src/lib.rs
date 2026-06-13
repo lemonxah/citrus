@@ -4,6 +4,7 @@
 //! parsing (humanoid rig, expressions, spring bones) on top of the glTF
 //! loader.
 
+mod bake_file;
 mod fbx_loader;
 mod gltf_loader;
 mod material_file;
@@ -18,13 +19,17 @@ pub use material_file::{
     MATERIAL_EXTENSION, MaterialFile, MaterialTextures, load_material_file, load_texture_file,
     save_material_file,
 };
+pub use bake_file::{
+    LIGHTDATA_EXTENSION, LIGHTMAP_EXTENSION, LightDataFile, LightmapEntry, LightmapFile,
+    ProbeVolumeData, load_lightdata, load_lightmaps, save_lightdata, save_lightmaps,
+};
 pub use procedural::{primitive_mesh, test_scene};
 pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
 pub use scene_file::{
     ComponentData, MaterialRef, ObjectSource, PrimitiveShape, SCENE_EXTENSION, SceneEntry,
-    SceneFile, WorldEnvironment, load_scene_file, save_scene_file,
+    BakeSettings, SceneFile, WorldEnvironment, load_scene_file, save_scene_file,
 };
 pub use shader_file::{
     SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,

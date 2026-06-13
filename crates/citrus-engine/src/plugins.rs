@@ -153,6 +153,19 @@ impl PluginHost {
         std::fs::copy(&built, &copy)
             .with_context(|| format!("copying {} for loading", built.display()))?;
         unsafe {
+            // RTLD_NOW: resolve every symbol at load time. With the default
+            // lazy binding a missing/incompatible symbol becomes a deferred
+            // null-pointer call (a segfault from inside ld.so on first use,
+            // hard to trace) — RTLD_NOW turns that into a clean load error.
+            // RTLD_LOCAL keeps the plugin's symbols out of the global scope.
+            #[cfg(unix)]
+            let lib: libloading::Library = {
+                use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
+                Library::open(Some(&copy), RTLD_NOW | RTLD_LOCAL)
+                    .with_context(|| format!("loading {}", copy.display()))?
+                    .into()
+            };
+            #[cfg(not(unix))]
             let lib = libloading::Library::new(&copy)
                 .with_context(|| format!("loading {}", copy.display()))?;
             let register: libloading::Symbol<fn(&mut ComponentRegistry)> = lib

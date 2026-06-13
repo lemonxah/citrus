@@ -4,7 +4,9 @@
 //! Viewport tab: Scene list, unified Inspector, project Files browser,
 //! menu bar, transform gizmos, picking, and drag & drop assets.
 
+mod audio;
 mod camera;
+mod crash;
 mod gizmo;
 mod icon;
 mod log_capture;
@@ -32,8 +34,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use camera::FlyCamera;
 use citrus_editor::{
-    CodeDiagnostic, CodeEditor, ComponentRegistry, FileBrowser, InspectorContent, InspectorPanel,
-    MaterialModel, ObjectInfoModel, ScenePanel, ShaderUiInfo, TransformModel,
+    CodeDiagnostic, CodeEditor, ComponentCommand, ComponentRegistry, FileBrowser, InspectorContent,
+    InspectorPanel, MaterialModel, ObjectInfoModel, ScenePanel, ShaderUiInfo, TransformModel,
 };
 use citrus_render::{CameraData, FrameInput, LightData, Renderer};
 use gizmo::{GizmoState, GizmoTool};
@@ -67,6 +69,7 @@ pub fn init_logging() {
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
+    crash::install();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let project_root = std::env::current_dir()?;
@@ -89,11 +92,17 @@ pub fn run(config: AppConfig) -> Result<()> {
         lsp_failed: false,
         lsp_requests: HashMap::new(),
         gizmo: GizmoState::new(),
+        widget_filter: WidgetFilter::default(),
+        gizmo_drag: false,
+        orbit_armed: false,
+        audio: audio::AudioEngine::new(),
         actions: Vec::new(),
         undo_stack: UndoStack::default(),
         suppress_undo_record: false,
         components: ComponentRegistry::with_builtins(),
         playing: false,
+        play_scene_switched: false,
+        play_origin_scene: None,
         play_snapshot: None,
         shaders: ShaderLibrary::default(),
         shader_files: Vec::new(),
@@ -106,6 +115,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         camera: FlyCamera::default(),
         orbit_pivot: None,
         looking: false,
+        look_just_ended: false,
         panning: false,
         look_delta: (0.0, 0.0),
         keys: HashSet::new(),
@@ -119,6 +129,8 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_help: false,
         log_filter: LogFilter::default(),
         probe_drag: None,
+        audio_drag: None,
+        collider_drag: None,
         stats: Stats::default(),
         world: hecs::World::new(),
         start: Instant::now(),
@@ -260,6 +272,9 @@ enum EditorAction {
     Spawn(citrus_assets::ObjectSource),
     SpawnLight(citrus_editor::LightKind),
     SpawnProbeVolume,
+    SpawnAudioSource,
+    SpawnBoxCollider,
+    SpawnSphereCollider,
     /// (child, new parent, before-sibling) reorder/move.
     MoveObject(usize, Option<usize>, Option<usize>),
     DeleteObject(usize),
@@ -274,6 +289,10 @@ enum EditorAction {
     CreatePluginCrate,
     /// Rebuild + reload all component plugins.
     ReloadPlugins,
+    /// Run the GPU lighting bake (lightmaps + probes).
+    BakeLighting,
+    /// Discard the baked lighting result.
+    ClearBake,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -286,6 +305,8 @@ enum Tab {
     Inspector,
     /// World lighting / skybox setup.
     Environment,
+    /// Lighting-bake settings + Bake / Clear ("Baker's Man").
+    Baker,
     Files,
     /// Filterable console mirroring all tracing logs.
     Log,
@@ -298,10 +319,12 @@ fn default_layout() -> DockState<Tab> {
     // Inspector node.
     let mut state = DockState::new(vec![Tab::Viewport, Tab::Camera]);
     let tree = state.main_surface_mut();
+    // Right (Inspector) node a touch wider — ~30px at the 1600px default —
+    // so the inspector's rows fit without clipping.
     let [viewport, _right] = tree.split_right(
         NodeIndex::root(),
-        0.78,
-        vec![Tab::Inspector, Tab::Environment],
+        0.76,
+        vec![Tab::Inspector, Tab::Environment, Tab::Baker],
     );
     let [viewport, _left] = tree.split_left(viewport, 0.18, vec![Tab::Scene]);
     let [_viewport, _bottom] = tree.split_below(viewport, 0.74, vec![Tab::Files, Tab::Log]);
@@ -334,6 +357,38 @@ struct ProbeDrag {
     start_cursor: egui::Pos2,
 }
 
+/// Which collider handle is being dragged.
+#[derive(Clone, Copy)]
+enum ColliderHandle {
+    /// Box face: axis (0/1/2) and sign (-1/+1).
+    BoxFace(usize, f32),
+    SphereRadius,
+}
+
+/// Active drag of a Box/Sphere collider handle.
+struct ColliderDrag {
+    object: usize,
+    handle: ColliderHandle,
+    start_center: [f32; 3],
+    start_size: [f32; 3],
+    start_radius: f32,
+    /// World scale along the dragged axis (size→meters); 1.0 for sphere.
+    scale_a: f32,
+    screen_axis: egui::Vec2,
+    start_cursor: egui::Pos2,
+}
+
+/// Active drag of an AudioSource min/max-distance sphere radius.
+struct AudioDrag {
+    object: usize,
+    /// True = max_distance, false = min_distance.
+    max: bool,
+    start_radius: f32,
+    /// Screen pixels per 1 world-meter along the radial (camera-right) dir.
+    screen_axis: egui::Vec2,
+    start_cursor: egui::Pos2,
+}
+
 /// Log tab view state: which levels to show, a substring filter, and whether
 /// to keep the view pinned to the newest entry.
 struct LogFilter {
@@ -344,6 +399,8 @@ struct LogFilter {
     trace: bool,
     search: String,
     autoscroll: bool,
+    /// Wrap long lines instead of extending (and horizontal-scrolling).
+    wrap: bool,
 }
 
 impl Default for LogFilter {
@@ -358,6 +415,7 @@ impl Default for LogFilter {
             trace: true,
             search: String::new(),
             autoscroll: true,
+            wrap: true,
         }
     }
 }
@@ -372,6 +430,35 @@ impl LogFilter {
             tracing::Level::TRACE => self.trace,
         }
     }
+}
+
+/// Per-kind visibility + size for a billboard widget.
+#[derive(Clone, Copy)]
+struct WidgetSetting {
+    visible: bool,
+    size: f32,
+}
+
+impl Default for WidgetSetting {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            // Billboards read better a bit larger by default; the widget
+            // filter still lets each kind be resized.
+            size: 1.6,
+        }
+    }
+}
+
+/// Viewport billboard-widget filter (top-right overlay). Only billboard icons
+/// are filtered — the move/rotate/scale gizmos are never hidden. A filtered-
+/// off billboard still draws when its object is the current selection.
+#[derive(Clone, Default)]
+struct WidgetFilter {
+    lights: WidgetSetting,
+    cameras: WidgetSetting,
+    probes: WidgetSetting,
+    audio: WidgetSetting,
 }
 
 struct EngineApp {
@@ -397,6 +484,16 @@ struct EngineApp {
     /// In-flight LSP completion/hover requests, keyed by request id.
     lsp_requests: HashMap<i64, LspRequestKind>,
     gizmo: GizmoState,
+    widget_filter: WidgetFilter,
+    /// A left-drag that began on a gizmo handle: claims the whole gesture so
+    /// orbit can't steal it even if the gizmo grabs a frame late.
+    gizmo_drag: bool,
+    /// The current left-drag began with the pointer over the viewport, so it
+    /// may orbit. Drags that start on a panel never orbit.
+    orbit_armed: bool,
+    /// Audio playback (None if no output device). Drives AudioSource sounds
+    /// in Play mode.
+    audio: Option<audio::AudioEngine>,
     actions: Vec<EditorAction>,
     undo_stack: UndoStack,
     /// Set while applying undo/redo so the frame diff doesn't re-record it.
@@ -407,6 +504,12 @@ struct EngineApp {
     playing: bool,
     /// Object state captured at Play start, restored at Stop.
     play_snapshot: Option<Vec<ObjectState>>,
+    /// Set if a component switched scenes during play (via `ctx.load_scene`).
+    /// Stop then reloads `play_origin_scene` instead of the snapshot restore.
+    play_scene_switched: bool,
+    /// Scene path active when Play started; reloaded on Stop after a runtime
+    /// scene switch. None if the pre-play scene was never saved.
+    play_origin_scene: Option<PathBuf>,
     /// Custom shader compile cache + hot reload.
     shaders: ShaderLibrary,
     /// Project-relative `.frag` paths for the shader picker.
@@ -428,6 +531,11 @@ struct EngineApp {
     orbit_pivot: Option<Vec3>,
     /// Right mouse held: mouse-look (cursor hidden + locked) + WASD fly.
     looking: bool,
+    /// Set the frame mouse-look ends: egui's pointer was frozen during look
+    /// (it never saw window events), so the next frame injects a PointerMoved
+    /// to resync it — otherwise the first click is hit-tested at the stale
+    /// position and the orbit-arm edge is missed (orbit dead until a 2nd click).
+    look_just_ended: bool,
     /// Middle mouse held: pan.
     panning: bool,
     /// Raw mouse deltas accumulated while looking.
@@ -446,6 +554,8 @@ struct EngineApp {
     log_filter: LogFilter,
     /// In-progress Light Probe Volume face-handle resize.
     probe_drag: Option<ProbeDrag>,
+    audio_drag: Option<AudioDrag>,
+    collider_drag: Option<ColliderDrag>,
     stats: Stats,
     #[allow(dead_code)] // entities arrive with the component-system milestone
     world: hecs::World,
@@ -566,6 +676,7 @@ impl EngineApp {
                 }
             }
         }
+        self.load_bake();
 
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -601,6 +712,8 @@ impl EngineApp {
         }
         if !looking {
             self.look_delta = (0.0, 0.0);
+            // egui's pointer froze during look; resync it next frame.
+            self.look_just_ended = true;
         }
     }
 
@@ -965,6 +1078,7 @@ impl EngineApp {
                                     // Indices into the old scene are invalid.
                                     self.undo_stack.clear();
                                     self.apply_skybox();
+                                    self.load_bake();
                                     self.save_project();
                                 }
                                 Err(e) => {
@@ -1086,6 +1200,57 @@ impl EngineApp {
                         Err(e) => tracing::error!("spawning probe volume: {e:#}"),
                     }
                 }
+                EditorAction::SpawnAudioSource => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(
+                        renderer!(),
+                        citrus_assets::ObjectSource::Empty,
+                        "Audio Source".to_owned(),
+                        p,
+                    ) {
+                        Ok(index) => {
+                            self.scene.objects[index]
+                                .components
+                                .push(Box::new(citrus_editor::AudioSource::default()));
+                            self.selection = Selection::Object(index);
+                        }
+                        Err(e) => tracing::error!("spawning audio source: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnBoxCollider => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(
+                        renderer!(),
+                        citrus_assets::ObjectSource::Empty,
+                        "Box Collider".to_owned(),
+                        p,
+                    ) {
+                        Ok(index) => {
+                            self.scene.objects[index]
+                                .components
+                                .push(Box::new(citrus_editor::BoxCollider::default()));
+                            self.selection = Selection::Object(index);
+                        }
+                        Err(e) => tracing::error!("spawning box collider: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnSphereCollider => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(
+                        renderer!(),
+                        citrus_assets::ObjectSource::Empty,
+                        "Sphere Collider".to_owned(),
+                        p,
+                    ) {
+                        Ok(index) => {
+                            self.scene.objects[index]
+                                .components
+                                .push(Box::new(citrus_editor::SphereCollider::default()));
+                            self.selection = Selection::Object(index);
+                        }
+                        Err(e) => tracing::error!("spawning sphere collider: {e:#}"),
+                    }
+                }
                 EditorAction::SetParent(child, parent) => {
                     self.scene.set_parent(child, parent);
                 }
@@ -1178,6 +1343,11 @@ impl EngineApp {
                             self.plugin_build_error = Some(format!("{e:#}"));
                         }
                     }
+                }
+                EditorAction::BakeLighting => self.run_bake(),
+                EditorAction::ClearBake => {
+                    self.scene.baked = None;
+                    tracing::info!("cleared baked lighting");
                 }
                 EditorAction::StartLook => self.set_looking(true),
                 EditorAction::Dolly(amount) => self.camera.dolly(amount),
@@ -1322,6 +1492,20 @@ impl EngineApp {
                             ui.close();
                         }
                     });
+                    if ui.button("Create Audio Source").clicked() {
+                        self.actions.push(EditorAction::SpawnAudioSource);
+                        ui.close();
+                    }
+                    ui.menu_button("Create Collider", |ui| {
+                        if ui.button("Box Collider").clicked() {
+                            self.actions.push(EditorAction::SpawnBoxCollider);
+                            ui.close();
+                        }
+                        if ui.button("Sphere Collider").clicked() {
+                            self.actions.push(EditorAction::SpawnSphereCollider);
+                            ui.close();
+                        }
+                    });
                     ui.separator();
                     for shape in [
                         PrimitiveShape::Cube,
@@ -1338,9 +1522,9 @@ impl EngineApp {
                 });
                 ui.menu_button("Tools", |ui| {
                     for (tool, label) in [
-                        (GizmoTool::Move, "Move        G"),
+                        (GizmoTool::Move, "Move        W"),
                         (GizmoTool::Rotate, "Rotate      R"),
-                        (GizmoTool::Scale, "Scale       S"),
+                        (GizmoTool::Scale, "Scale       E"),
                     ] {
                         if ui.radio(self.gizmo.tool == tool, label).clicked() {
                             self.gizmo.tool = tool;
@@ -1361,6 +1545,31 @@ impl EngineApp {
                             .clicked()
                     {
                         self.actions.push(EditorAction::ReloadPlugins);
+                        ui.close();
+                    }
+                    ui.separator();
+                    let can_bake = self
+                        .renderer
+                        .as_ref()
+                        .is_some_and(|r| r.supports_baking());
+                    let baked = self.scene.baked.is_some();
+                    if ui
+                        .add_enabled(can_bake, egui::Button::new("Bake Lighting"))
+                        .on_hover_text(if can_bake {
+                            "Ray-trace lightmaps + probes for Static objects and probe volumes (blocks the UI)"
+                        } else {
+                            "This GPU has no ray-query support; baking is unavailable"
+                        })
+                        .clicked()
+                    {
+                        self.actions.push(EditorAction::BakeLighting);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(baked, egui::Button::new("Clear Baked Lighting"))
+                        .clicked()
+                    {
+                        self.actions.push(EditorAction::ClearBake);
                         ui.close();
                     }
                 });
@@ -1408,6 +1617,7 @@ impl EngineApp {
                         (Tab::Scene, "Scene"),
                         (Tab::Inspector, "Inspector"),
                         (Tab::Environment, "Environment"),
+                        (Tab::Baker, "Baker's Man"),
                         (Tab::Files, "Files"),
                         (Tab::Log, "Log"),
                     ] {
@@ -1480,7 +1690,7 @@ impl EngineApp {
                     ui.label("F — focus the selected object");
                     ui.label("Right mouse (hold) — look · WASD fly · Q/E down/up · Shift fast");
                     ui.label("Middle drag — pan · Scroll — dolly");
-                    ui.label("G / R / S — gizmo move / rotate / scale (buttons top-left)");
+                    ui.label("W / E / R — gizmo move / scale / rotate (buttons top-left)");
                     ui.label("Ctrl while dragging — snap to grid (controls top-center)");
                     ui.label("Ctrl+Z / Ctrl+Shift+Z — undo / redo");
                     ui.label("Drag a .material from Files onto a mesh or a material slot");
@@ -1641,9 +1851,206 @@ impl EngineApp {
         }
     }
 
+    /// Gather the scene's static geometry, baked lights, and probe volumes,
+    /// run the GPU lighting bake, and store the result for runtime sampling.
+    /// Blocks the UI while the GPU traces (off the hot path; explicit action).
+    fn run_bake(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        if !renderer.supports_baking() {
+            tracing::warn!("this GPU can't ray trace; lighting bake unavailable");
+            return;
+        }
+        let gather = self.scene.gather_bake();
+        if gather.instances.is_empty() && gather.probes.is_empty() {
+            tracing::warn!(
+                "nothing to bake — mark objects Static and/or add a Light Probe Volume"
+            );
+            return;
+        }
+        let settings = self.scene.environment.bake;
+        let input = citrus_render::BakeInput {
+            instances: &gather.instances,
+            lights: &gather.lights,
+            probes: &gather.probes,
+            sky_color: gather.sky_color,
+            bounces: settings.bounces,
+            samples: settings.samples,
+        };
+        tracing::info!(
+            "baking: {} static instance(s), {} baked light(s), {} probe(s)…",
+            gather.instances.len(),
+            gather.lights.len(),
+            gather.probes.len()
+        );
+        let started = Instant::now();
+        let output = match renderer.bake_lighting(&input) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!("lighting bake failed: {e:#}");
+                return;
+            }
+        };
+        tracing::info!(
+            "bake complete: {} lightmap(s), {} probe(s) in {:.2}s",
+            output.lightmaps.len(),
+            output.probes.len(),
+            started.elapsed().as_secs_f32()
+        );
+        let mut object_lightmap = std::collections::HashMap::new();
+        for (layer, &obj) in gather.instance_objects.iter().enumerate() {
+            object_lightmap.insert(obj, layer);
+        }
+        let baked = scene::BakedData {
+            object_lightmap,
+            lightmaps: output.lightmaps,
+            probe_volumes: gather.probe_volumes,
+            probe_sh: output.probes,
+        };
+        // Runtime sampling (Phase 5) uploads `baked` to the renderer; until
+        // then the bake result lives on the scene (and serializes with it).
+        self.scene.baked = Some(baked);
+        self.save_bake();
+    }
+
+    /// Base path (no extension) for this scene's `.lightmap` / `.lightdata`
+    /// sidecars: next to the scene file, or `baked/untitled` if unsaved.
+    fn bake_base_path(&self) -> PathBuf {
+        match &self.current_scene_path {
+            Some(p) => p.with_extension(""),
+            None => self.project_root.join("baked/untitled"),
+        }
+    }
+
+    /// Write the baked lightmaps (`.lightmap`) and probe data (`.lightdata`).
+    fn save_bake(&self) {
+        let Some(baked) = &self.scene.baked else {
+            return;
+        };
+        let base = self.bake_base_path();
+
+        // .lightmap — static GI, one entry per lit object.
+        let mut lm = citrus_assets::LightmapFile::default();
+        for (&object, &layer) in &baked.object_lightmap {
+            if let Some(map) = baked.lightmaps.get(layer) {
+                lm.entries.push(citrus_assets::LightmapEntry {
+                    object: object as u32,
+                    size: map.size,
+                    pixels: map.pixels.clone(),
+                });
+            }
+        }
+        if let Err(e) = citrus_assets::save_lightmaps(base.with_extension("lightmap"), &lm) {
+            tracing::error!("saving .lightmap: {e:#}");
+        }
+
+        // .lightdata — probe volumes + SH for dynamic objects.
+        let ld = citrus_assets::LightDataFile {
+            volumes: baked
+                .probe_volumes
+                .iter()
+                .map(|v| citrus_assets::ProbeVolumeData {
+                    world_to_local: v.world_to_local.to_cols_array(),
+                    size: v.size,
+                    counts: [v.counts[0] as u32, v.counts[1] as u32, v.counts[2] as u32],
+                    sh_base: v.sh_base as u32,
+                })
+                .collect(),
+            probes: baked
+                .probe_sh
+                .iter()
+                .map(|sh| {
+                    let c = &sh.coeffs;
+                    [
+                        c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0], c[2][1],
+                        c[2][2], c[3][0], c[3][1], c[3][2],
+                    ]
+                })
+                .collect(),
+        };
+        if let Err(e) = citrus_assets::save_lightdata(base.with_extension("lightdata"), &ld) {
+            tracing::error!("saving .lightdata: {e:#}");
+        }
+        tracing::info!(
+            "wrote {} / {}",
+            base.with_extension("lightmap").display(),
+            base.with_extension("lightdata").display()
+        );
+    }
+
+    /// Load `.lightmap` / `.lightdata` sidecars for the current scene, if they
+    /// exist, into `scene.baked`. Missing files are not an error.
+    fn load_bake(&mut self) {
+        let base = self.bake_base_path();
+        let lm_path = base.with_extension("lightmap");
+        let ld_path = base.with_extension("lightdata");
+        if !lm_path.exists() && !ld_path.exists() {
+            return;
+        }
+        let mut baked = scene::BakedData::default();
+        if let Ok(lm) = citrus_assets::load_lightmaps(&lm_path) {
+            for entry in lm.entries {
+                let layer = baked.lightmaps.len();
+                baked.object_lightmap.insert(entry.object as usize, layer);
+                baked.lightmaps.push(citrus_render::BakedLightmap {
+                    size: entry.size,
+                    pixels: entry.pixels,
+                });
+            }
+        }
+        if let Ok(ld) = citrus_assets::load_lightdata(&ld_path) {
+            baked.probe_volumes = ld
+                .volumes
+                .iter()
+                .map(|v| scene::ProbeVolumeMeta {
+                    world_to_local: glam::Mat4::from_cols_array(&v.world_to_local),
+                    size: v.size,
+                    counts: [v.counts[0] as usize, v.counts[1] as usize, v.counts[2] as usize],
+                    sh_base: v.sh_base as usize,
+                })
+                .collect();
+            baked.probe_sh = ld
+                .probes
+                .iter()
+                .map(|p| citrus_render::ProbeSh {
+                    coeffs: [
+                        [p[0], p[1], p[2]],
+                        [p[3], p[4], p[5]],
+                        [p[6], p[7], p[8]],
+                        [p[9], p[10], p[11]],
+                    ],
+                })
+                .collect();
+        }
+        tracing::info!(
+            "loaded baked lighting: {} lightmap(s), {} probe(s)",
+            baked.lightmaps.len(),
+            baked.probe_sh.len()
+        );
+        self.scene.baked = Some(baked);
+    }
+
     fn toggle_play(&mut self) {
         if self.playing {
-            if let Some(snapshot) = self.play_snapshot.take() {
+            self.playing = false;
+            if let Some(audio) = self.audio.as_mut() {
+                audio.stop_all();
+            }
+            if self.play_scene_switched {
+                // A component switched scenes during play; the snapshot indices
+                // no longer match the loaded scene. Return to the scene we
+                // started from (reloaded from disk — unsaved pre-play edits are
+                // lost, a known v1 limitation).
+                self.play_scene_switched = false;
+                self.play_snapshot = None;
+                match self.play_origin_scene.take() {
+                    Some(origin) => self.load_scene_runtime(&origin),
+                    None => tracing::warn!(
+                        "scene switched during play from an unsaved scene; staying put"
+                    ),
+                }
+            } else if let Some(snapshot) = self.play_snapshot.take() {
                 let registry = &self.components;
                 for (object, state) in self.scene.objects.iter_mut().zip(snapshot) {
                     object.translation = state.translation;
@@ -1652,13 +2059,99 @@ impl EngineApp {
                     object.load_components(&state.components, registry);
                 }
             }
-            self.playing = false;
         } else {
             self.play_snapshot = Some(self.scene.objects.iter().map(object_state).collect());
+            self.play_scene_switched = false;
+            self.play_origin_scene = None;
             self.playing = true;
+            let mut commands = Vec::new();
             self.scene
-                .start_components(self.start.elapsed().as_secs_f32());
+                .start_components(self.start.elapsed().as_secs_f32(), &mut commands);
+            // Start play-on-start audio sources.
+            if let Some(audio) = self.audio.as_mut() {
+                let cues = self.scene.gather_audio();
+                let listener = self
+                    .scene
+                    .audio_listener()
+                    .unwrap_or(self.camera.position);
+                audio.start(&cues, listener, &self.project_root);
+            }
+            // A start hook may have requested a scene switch.
+            self.apply_component_commands(commands);
         }
+    }
+
+    /// Apply deferred component requests gathered during a lifecycle pass. The
+    /// last `LoadScene` wins (loading once); a switch during play continues
+    /// playing in the new scene.
+    fn apply_component_commands(&mut self, commands: Vec<ComponentCommand>) {
+        let load = commands
+            .into_iter()
+            .rev()
+            .find_map(|c| match c {
+                ComponentCommand::LoadScene(rel) => Some(rel),
+            });
+        let Some(rel) = load else {
+            return;
+        };
+        if self.playing && !self.play_scene_switched {
+            self.play_origin_scene = self.current_scene_path.clone();
+            self.play_scene_switched = true;
+        }
+        let path = self.project_root.join(&rel);
+        self.load_scene_runtime(&path);
+        if self.playing {
+            // Run the new scene's start hooks + audio so play continues there.
+            let mut commands = Vec::new();
+            self.scene
+                .start_components(self.start.elapsed().as_secs_f32(), &mut commands);
+            if let Some(audio) = self.audio.as_mut() {
+                let cues = self.scene.gather_audio();
+                let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
+                audio.start(&cues, listener, &self.project_root);
+            }
+            // Chained switches from those start hooks.
+            self.apply_component_commands(commands);
+        }
+    }
+
+    /// Load a scene by absolute path, replacing the current one. Used by
+    /// runtime (play-mode) scene switches and Stop-restore. Does not run start
+    /// hooks (the caller decides) and does not persist to project.citrus.
+    fn load_scene_runtime(&mut self, path: &Path) {
+        let file = match citrus_assets::load_scene_file(path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("load scene {path:?}: {e:#}");
+                return;
+            }
+        };
+        if self.renderer.is_none() {
+            return;
+        }
+        if let Err(e) = self.renderer.as_mut().unwrap().reset_scene() {
+            tracing::error!("resetting scene: {e:#}");
+        }
+        let scene = match LoadedScene::load_scene_file(
+            self.renderer.as_mut().unwrap(),
+            &file,
+            &self.project_root,
+            &self.components,
+            &mut self.shaders,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("load scene {path:?}: {e:#}");
+                return;
+            }
+        };
+        self.scene = scene;
+        self.selection = Selection::None;
+        self.file_material = None;
+        self.current_scene_path = Some(path.to_path_buf());
+        self.undo_stack.clear();
+        self.apply_skybox();
+        self.load_bake();
     }
 
     /// Push the scene's skybox (or the procedural sky) to the renderer.
@@ -2086,6 +2579,21 @@ impl EngineApp {
         self.update_camera(dt);
         self.refresh_shaders();
 
+        // If mouse-look just ended, egui's pointer state is stale: window
+        // events are withheld while looking, so egui (a) never saw the right
+        // button RELEASE — it still thinks Secondary is held, which keeps
+        // `press_origin` pinned and breaks drag detection for the next gesture
+        // (a click still registers, but orbit/gizmo/widget drags don't) — and
+        // (b) has a frozen pointer position. Inject both a Secondary release
+        // and a move at the true cursor so the next press starts a clean drag.
+        let resync_pos = if std::mem::take(&mut self.look_just_ended) {
+            let ppp = self.egui_ctx.pixels_per_point();
+            self.last_cursor
+                .map(|(x, y)| egui::pos2(x as f32 / ppp, y as f32 / ppp))
+        } else {
+            None
+        };
+
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -2093,7 +2601,16 @@ impl EngineApp {
             return;
         };
 
-        let raw_input = egui_state.take_egui_input(&window);
+        let mut raw_input = egui_state.take_egui_input(&window);
+        if let Some(pos) = resync_pos {
+            raw_input.events.push(egui::Event::PointerMoved(pos));
+            raw_input.events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
         let size = window.inner_size();
         let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
         let view = self.camera.view();
@@ -2107,6 +2624,11 @@ impl EngineApp {
 
         let pre_edit = self.capture_edit_snapshot();
         let shader_info = self.selected_shader_info();
+        let can_bake = self.renderer.as_ref().is_some_and(|r| r.supports_baking());
+        // Winit-based viewport-hover test: stays correct right after a
+        // cursor-grab (mouse-look) ends, when egui's own pointer state is
+        // briefly stale until the next move. Used to re-arm orbit/dolly.
+        let pointer_in_viewport = self.cursor_in_viewport();
         // Picker entries: standard + every project .frag.
         let mut shader_list: Vec<String> = Vec::with_capacity(self.shader_files.len() + 1);
         shader_list.push("standard".into());
@@ -2143,6 +2665,10 @@ impl EngineApp {
                 open_editors: &mut self.open_editors,
                 focused_code,
                 gizmo: &mut self.gizmo,
+                widget_filter: &mut self.widget_filter,
+                gizmo_drag: &mut self.gizmo_drag,
+                orbit_armed: &mut self.orbit_armed,
+                pointer_in_viewport,
                 actions: &mut self.actions,
                 viewport_rect: &mut self.viewport_rect,
                 registry: &self.components,
@@ -2154,6 +2680,9 @@ impl EngineApp {
                 looking: self.looking,
                 log_filter: &mut self.log_filter,
                 probe_drag: &mut self.probe_drag,
+                audio_drag: &mut self.audio_drag,
+                collider_drag: &mut self.collider_drag,
+                can_bake,
             };
             DockArea::new(&mut dock_state)
                 .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
@@ -2176,7 +2705,17 @@ impl EngineApp {
         if self.playing {
             // Component-driven motion must not land in undo history; play
             // edits are restored wholesale on Stop anyway.
-            self.scene.update_components(dt, t);
+            let mut commands = Vec::new();
+            self.scene.update_components(dt, t, &mut commands);
+            // Spatialize audio against the listener (moves with components).
+            if let Some(audio) = self.audio.as_mut() {
+                let cues = self.scene.gather_audio();
+                let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
+                audio.update(&cues, listener);
+            }
+            // Apply deferred requests (e.g. ctx.load_scene) after the update
+            // pass so the scene isn't swapped mid-iteration.
+            self.apply_component_commands(commands);
         } else {
             self.record_edits(pre_edit);
         }
@@ -2294,6 +2833,11 @@ struct EditorTabs<'a> {
     /// Path of the focused code tab (drives Inspector diagnostics).
     focused_code: Option<PathBuf>,
     gizmo: &'a mut GizmoState,
+    widget_filter: &'a mut WidgetFilter,
+    gizmo_drag: &'a mut bool,
+    orbit_armed: &'a mut bool,
+    /// Winit-based "pointer is over the viewport" (robust after cursor-grab).
+    pointer_in_viewport: bool,
     actions: &'a mut Vec<EditorAction>,
     viewport_rect: &'a mut egui::Rect,
     registry: &'a ComponentRegistry,
@@ -2307,6 +2851,10 @@ struct EditorTabs<'a> {
     looking: bool,
     log_filter: &'a mut LogFilter,
     probe_drag: &'a mut Option<ProbeDrag>,
+    audio_drag: &'a mut Option<AudioDrag>,
+    collider_drag: &'a mut Option<ColliderDrag>,
+    /// GPU can ray-trace (Baker tab enables its Bake button).
+    can_bake: bool,
 }
 
 impl egui_dock::TabViewer for EditorTabs<'_> {
@@ -2319,6 +2867,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
             Tab::Scene => "Scene".into(),
             Tab::Inspector => "Inspector".into(),
             Tab::Environment => "Environment".into(),
+            Tab::Baker => "Baker's Man".into(),
             Tab::Files => "Files".into(),
             Tab::Log => "Log".into(),
             Tab::Code(path) => path
@@ -2352,6 +2901,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
             Tab::Viewport => self.viewport_ui(ui),
             Tab::Camera => self.camera_ui(ui),
             Tab::Environment => self.environment_ui(ui),
+            Tab::Baker => self.baker_ui(ui),
             Tab::Scene => {
                 let rows: Vec<citrus_editor::SceneObjectRow> = self
                     .scene
@@ -2400,6 +2950,18 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         }
                         SpawnKind::LightProbeVolume => {
                             self.actions.push(EditorAction::SpawnProbeVolume);
+                            return;
+                        }
+                        SpawnKind::AudioSource => {
+                            self.actions.push(EditorAction::SpawnAudioSource);
+                            return;
+                        }
+                        SpawnKind::BoxCollider => {
+                            self.actions.push(EditorAction::SpawnBoxCollider);
+                            return;
+                        }
+                        SpawnKind::SphereCollider => {
+                            self.actions.push(EditorAction::SpawnSphereCollider);
                             return;
                         }
                         SpawnKind::Cube => ObjectSource::Primitive {
@@ -2542,6 +3104,253 @@ impl EditorTabs<'_> {
         ))
     }
 
+    /// Radial direction (camera-right, world space) used to place audio range
+    /// handles so they always face the viewer.
+    fn camera_right(&self) -> Vec3 {
+        self.view.inverse().x_axis.truncate().normalize_or(Vec3::X)
+    }
+
+    /// Drive AudioSource min/max-distance sphere resizing: a press on a radius
+    /// handle starts a drag that changes that distance; takes priority over
+    /// orbit (like the probe handles).
+    fn audio_range_interaction(
+        &mut self,
+        response: &egui::Response,
+        cursor: Option<egui::Pos2>,
+        alt: bool,
+    ) {
+        // Continue / end an in-progress drag.
+        if let Some(drag) = self.audio_drag.as_ref() {
+            if !response.dragged_by(egui::PointerButton::Primary) {
+                *self.audio_drag = None;
+                return;
+            }
+            let Some(cur) = cursor else { return };
+            let delta = cur - drag.start_cursor;
+            let len2 = drag.screen_axis.length_sq();
+            let meters = if len2 > 1e-6 {
+                delta.dot(drag.screen_axis) / len2
+            } else {
+                0.0
+            };
+            let new_radius = (drag.start_radius + meters).max(0.01);
+            let (object, max) = (drag.object, drag.max);
+            if let Some(src) = self.scene.objects[object]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_editor::AudioSource>())
+            {
+                if max {
+                    src.max_distance = new_radius.max(src.min_distance + 0.01);
+                } else {
+                    src.min_distance = new_radius.min(src.max_distance - 0.01).max(0.0);
+                }
+            }
+            return;
+        }
+
+        // Maybe start a drag on a min/max handle.
+        if !response.drag_started_by(egui::PointerButton::Primary) || alt {
+            return;
+        }
+        let Selection::Object(i) = *self.selection else {
+            return;
+        };
+        let Some(press) = cursor else { return };
+        if self.gizmo.pick_preview(press) {
+            return;
+        }
+        let Some(src) = self.scene.objects[i]
+            .components
+            .iter()
+            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::AudioSource>())
+        else {
+            return;
+        };
+        if !src.spatial {
+            return;
+        }
+        let full_rect = response.ctx.viewport_rect();
+        let origin = self.scene.world_transform(i).w_axis.truncate();
+        let right = self.camera_right();
+        let mut best: Option<(f32, AudioDrag)> = None;
+        for (max, radius) in [(false, src.min_distance), (true, src.max_distance)] {
+            let handle = origin + right * radius;
+            let Some(hs) = self.world_to_screen(handle, full_rect) else {
+                continue;
+            };
+            let dist = hs.distance(press);
+            if dist > 14.0 {
+                continue;
+            }
+            let Some(plus) = self.world_to_screen(handle + right, full_rect) else {
+                continue;
+            };
+            let drag = AudioDrag {
+                object: i,
+                max,
+                start_radius: radius,
+                screen_axis: plus - hs,
+                start_cursor: press,
+            };
+            if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+                best = Some((dist, drag));
+            }
+        }
+        if let Some((_, drag)) = best {
+            *self.audio_drag = Some(drag);
+        }
+    }
+
+    /// Drive Box/Sphere collider handle resizing: box faces grow the size and
+    /// shift the collider's center to keep the opposite face fixed; the sphere
+    /// handle changes the radius. Takes priority over orbit.
+    fn collider_interaction(
+        &mut self,
+        response: &egui::Response,
+        cursor: Option<egui::Pos2>,
+        alt: bool,
+    ) {
+        // Continue / end a drag.
+        if let Some(drag) = self.collider_drag.as_ref() {
+            if !response.dragged_by(egui::PointerButton::Primary) {
+                *self.collider_drag = None;
+                return;
+            }
+            let Some(cur) = cursor else { return };
+            let delta = cur - drag.start_cursor;
+            let len2 = drag.screen_axis.length_sq();
+            let world_m = if len2 > 1e-6 {
+                delta.dot(drag.screen_axis) / len2
+            } else {
+                0.0
+            };
+            let object = drag.object;
+            match drag.handle {
+                ColliderHandle::BoxFace(axis, sign) => {
+                    let local_delta = if drag.scale_a.abs() > 1e-5 {
+                        world_m / drag.scale_a
+                    } else {
+                        0.0
+                    };
+                    let new_size = (drag.start_size[axis] + local_delta).max(0.01);
+                    let applied = new_size - drag.start_size[axis];
+                    if let Some(b) = self.scene.objects[object]
+                        .components
+                        .iter_mut()
+                        .find_map(|c| c.as_any_mut().downcast_mut::<citrus_editor::BoxCollider>())
+                    {
+                        b.size[axis] = new_size;
+                        // Shift center by half the growth so the opposite face
+                        // stays put.
+                        b.center[axis] = drag.start_center[axis] + sign * applied * 0.5;
+                    }
+                }
+                ColliderHandle::SphereRadius => {
+                    let new_radius = (drag.start_radius + world_m).max(0.01);
+                    if let Some(s) = self.scene.objects[object]
+                        .components
+                        .iter_mut()
+                        .find_map(|c| c.as_any_mut().downcast_mut::<citrus_editor::SphereCollider>())
+                    {
+                        s.radius = new_radius;
+                    }
+                }
+            }
+            return;
+        }
+
+        // Maybe start a drag.
+        if !response.drag_started_by(egui::PointerButton::Primary) || alt {
+            return;
+        }
+        let Selection::Object(i) = *self.selection else {
+            return;
+        };
+        let Some(press) = cursor else { return };
+        if self.gizmo.pick_preview(press) {
+            return;
+        }
+        let full_rect = response.ctx.viewport_rect();
+        let world = self.scene.world_transform(i);
+        let (w_scale, _, _) = world.to_scale_rotation_translation();
+
+        // Box faces.
+        if let Some((center, size)) = self.scene.objects[i]
+            .components
+            .iter()
+            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::BoxCollider>())
+            .map(|b| (b.center, b.size))
+        {
+            let half = Vec3::from(size) * 0.5;
+            let c = Vec3::from(center);
+            let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+            let mut best: Option<(f32, ColliderDrag)> = None;
+            for axis in 0..3 {
+                for sign in [-1.0f32, 1.0] {
+                    let face_local = c + axes[axis] * (sign * half[axis]);
+                    let face_world = world.transform_point3(face_local);
+                    let Some(fs) = self.world_to_screen(face_world, full_rect) else {
+                        continue;
+                    };
+                    let dist = fs.distance(press);
+                    if dist > 14.0 {
+                        continue;
+                    }
+                    let outward = world.transform_vector3(axes[axis]) * sign;
+                    let Some(plus) = self.world_to_screen(face_world + outward, full_rect) else {
+                        continue;
+                    };
+                    let drag = ColliderDrag {
+                        object: i,
+                        handle: ColliderHandle::BoxFace(axis, sign),
+                        start_center: center,
+                        start_size: size,
+                        start_radius: 0.0,
+                        scale_a: w_scale[axis],
+                        screen_axis: plus - fs,
+                        start_cursor: press,
+                    };
+                    if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+                        best = Some((dist, drag));
+                    }
+                }
+            }
+            if let Some((_, drag)) = best {
+                *self.collider_drag = Some(drag);
+                return;
+            }
+        }
+
+        // Sphere radius handle (camera-right side).
+        if let Some((center, radius)) = self.scene.objects[i]
+            .components
+            .iter()
+            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::SphereCollider>())
+            .map(|s| (s.center, s.radius))
+        {
+            let origin = world.transform_point3(Vec3::from(center));
+            let right = self.camera_right();
+            let handle = origin + right * radius;
+            if let Some(hs) = self.world_to_screen(handle, full_rect) {
+                if hs.distance(press) <= 14.0 {
+                    if let Some(plus) = self.world_to_screen(handle + right, full_rect) {
+                        *self.collider_drag = Some(ColliderDrag {
+                            object: i,
+                            handle: ColliderHandle::SphereRadius,
+                            start_center: center,
+                            start_size: [0.0; 3],
+                            start_radius: radius,
+                            scale_a: 1.0,
+                            screen_axis: plus - hs,
+                            start_cursor: press,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     /// Drive the Light Probe Volume face-handle resize: start a drag when the
     /// press lands on a face handle, apply size changes while dragging, and end
     /// on release. Box resize keeps the opposite face fixed (the origin shifts
@@ -2629,7 +3438,7 @@ impl EditorTabs<'_> {
                     continue;
                 };
                 let dist = face_screen.distance(press);
-                if dist > 9.0 {
+                if dist > 14.0 {
                     continue;
                 }
                 let world_axis = (w_rot * axes[axis]) * sign;
@@ -2679,6 +3488,8 @@ impl EditorTabs<'_> {
             }
             ui.separator();
             ui.checkbox(&mut f.autoscroll, "Follow");
+            ui.checkbox(&mut f.wrap, "Wrap")
+                .on_hover_text("Wrap long lines instead of scrolling horizontally");
             if ui
                 .button("🗑 Clear")
                 .on_hover_text("Clear the log")
@@ -2690,11 +3501,14 @@ impl EditorTabs<'_> {
         ui.separator();
 
         let needle = f.search.to_lowercase();
+        let wrap = f.wrap;
         // Snapshot the matching entries under the lock, then release it before
-        // rendering. Multi-line messages (compiler output) are flattened to one
-        // display row per physical line so the virtualized list keeps a uniform
-        // row height; continuation lines are indented under their header.
-        let mut rows: Vec<(egui::Color32, String)> = Vec::new();
+        // rendering. Each entry is one (color, full-message) pair; when wrap is
+        // off the messages are flattened to one row per physical line so the
+        // virtualized list keeps a uniform row height.
+        // (color, timestamp, rest) — split so wrapped lines can hang-indent
+        // past the timestamp column.
+        let mut entries: Vec<(egui::Color32, String, String)> = Vec::new();
         {
             let ring = log_capture::store().lock().unwrap();
             for e in ring.entries.iter().filter(|e| f.shows(e.level)) {
@@ -2712,26 +3526,61 @@ impl EditorTabs<'_> {
                     tracing::Level::TRACE => (LOG_TRACE, "TRACE"),
                 };
                 let short = e.target.rsplit("::").next().unwrap_or(&e.target);
-                let mut lines = e.message.lines();
-                let first = lines.next().unwrap_or("");
-                rows.push((color, format!("{:8.2}  {tag}  {short}: {first}", e.seconds)));
-                for cont in lines {
-                    rows.push((color, format!("{:>20}{cont}", "")));
-                }
+                entries.push((color, e.time.clone(), format!("{tag}  {short}: {}", e.message)));
             }
         }
 
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-        egui::ScrollArea::vertical()
+        let scroll = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .stick_to_bottom(f.autoscroll)
-            .show_rows(ui, row_h, rows.len(), |ui, range| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for (color, line) in &rows[range] {
-                    ui.label(egui::RichText::new(line).monospace().color(*color));
+            .stick_to_bottom(f.autoscroll);
+        let weak = ui.visuals().weak_text_color();
+        if wrap {
+            // Wrapping breaks uniform row height, so render plainly (not
+            // virtualized). The timestamp sits in its own column and the rest
+            // wraps beside it, so continuation lines hang-indent past the time.
+            // Labels are selectable so the log can be copied.
+            scroll.show(ui, |ui| {
+                ui.style_mut().interaction.selectable_labels = true;
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (color, time, rest) in &entries {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(time).monospace().color(weak))
+                                .selectable(true),
+                        );
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(rest).monospace().color(*color))
+                                .wrap()
+                                .selectable(true),
+                        );
+                    });
                 }
             });
+        } else {
+            // Flatten to physical lines for uniform-height virtualization;
+            // continuation lines indent under their header. Selectable for copy.
+            let mut rows: Vec<(egui::Color32, String)> = Vec::new();
+            for (color, time, rest) in &entries {
+                let mut lines = rest.lines();
+                rows.push((*color, format!("{time}  {}", lines.next().unwrap_or(""))));
+                for cont in lines {
+                    rows.push((*color, format!("{:>16}{cont}", "")));
+                }
+            }
+            let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+            scroll.show_rows(ui, row_h, rows.len(), |ui, range| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.style_mut().interaction.selectable_labels = true;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (color, line) in &rows[range] {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(line).monospace().color(*color))
+                            .selectable(true),
+                    );
+                }
+            });
+        }
     }
 
     /// The Camera tab: shows the main camera's offscreen preview, scaled to
@@ -2769,6 +3618,113 @@ impl EditorTabs<'_> {
     }
 
     /// The Environment tab: world sun, ambient, and skybox setup.
+    /// "Baker's Man" — lighting-bake settings + Bake / Clear actions.
+    fn baker_ui(&mut self, ui: &mut egui::Ui) {
+        use egui::{DragValue, RichText, Slider};
+        ui.heading("Baker's Man");
+        ui.label(
+            RichText::new("Ray-traced lightmaps + light probes for static geometry")
+                .small()
+                .weak(),
+        );
+        ui.separator();
+
+        // Scrollable settings; Bake/Clear pinned at the bottom.
+        let baked = self.scene.baked.as_ref();
+        let summary = baked.map(|b| {
+            (
+                b.lightmaps.len(),
+                b.probe_sh.len(),
+                b.lightmaps.iter().map(|l| l.size).max().unwrap_or(0),
+            )
+        });
+        let footer = 84.0;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(ui.available_height() - footer)
+            .show(ui, |ui| {
+                let bake = &mut self.scene.environment.bake;
+                ui.label(RichText::new("Resolution").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Texel Density")
+                        .on_hover_text("Lightmap texels per world meter (Bakery-style)");
+                    ui.add(Slider::new(&mut bake.texel_density, 1.0..=128.0).suffix(" /m"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Max Lightmap");
+                    egui::ComboBox::from_id_salt("citrus-bake-max")
+                        .selected_text(format!("{}", bake.max_lightmap))
+                        .show_ui(ui, |ui| {
+                            for s in [128u32, 256, 512, 1024, 2048] {
+                                ui.selectable_value(&mut bake.max_lightmap, s, format!("{s}"));
+                            }
+                        });
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Quality").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Bounces")
+                        .on_hover_text("Indirect light bounces (0 = direct + sky only)");
+                    ui.add(Slider::new(&mut bake.bounces, 0..=8));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Samples")
+                        .on_hover_text("Paths traced per texel / probe — higher = less noise");
+                    ui.add(DragValue::new(&mut bake.samples).speed(4.0).range(1..=4096));
+                });
+
+                ui.separator();
+                ui.label(RichText::new("Status").strong());
+                match summary {
+                    Some((lm, probes, max)) => {
+                        ui.label(format!("Baked: {lm} lightmap(s) (max {max}px), {probes} probe(s)"));
+                        ui.label(
+                            RichText::new(
+                                ".lightmap = static GI · .lightdata = probe data for dynamic objects",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    None => {
+                        ui.label(RichText::new("No bake yet").weak());
+                    }
+                }
+                if !self.can_bake {
+                    ui.label(
+                        RichText::new("⚠ This GPU has no ray-query support; baking is unavailable")
+                            .small()
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                ui.label(
+                    RichText::new("Tip: mark objects Static (Inspector) and add Light Probe Volumes for dynamic objects.")
+                        .small()
+                        .weak(),
+                );
+            });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            let bake_btn = egui::Button::new(RichText::new("🔥 Bake").strong());
+            if ui
+                .add_enabled(self.can_bake, bake_btn)
+                .on_hover_text("Trace lightmaps + probes now (blocks the UI)")
+                .clicked()
+            {
+                self.actions.push(EditorAction::BakeLighting);
+            }
+            if ui
+                .add_enabled(summary.is_some(), egui::Button::new("Clear"))
+                .on_hover_text("Discard all baked lighting data")
+                .clicked()
+            {
+                self.actions.push(EditorAction::ClearBake);
+            }
+        });
+    }
+
     fn environment_ui(&mut self, ui: &mut egui::Ui) {
         use egui::{DragValue, RichText};
         egui::ScrollArea::vertical()
@@ -2940,9 +3896,11 @@ impl EditorTabs<'_> {
             self.actions.push(EditorAction::StartLook);
         }
 
-        // Scroll over the viewport dollies the camera. Read through egui for
-        // the same reason: the dock consumes wheel events at the winit level.
-        if response.hovered() {
+        // Scroll dollies the camera only while the pointer is over the
+        // viewport. Uses the winit-based test (not egui `contains_pointer`)
+        // so it re-arms immediately after mouse-look ends, when egui's
+        // pointer state is briefly stale.
+        if self.pointer_in_viewport {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
                 self.actions.push(EditorAction::Dolly(scroll / 50.0));
@@ -2953,15 +3911,48 @@ impl EditorTabs<'_> {
         // viewport center) — unless the gizmo grabbed the drag. Alt forces
         // the orbit even when starting on a gizmo handle.
         let alt = ui.input(|i| i.modifiers.alt);
-        let cursor = response.hover_pos();
+        // `hover_pos()` is None while a drag is in progress, which would make
+        // the probe/gizmo handle hit-tests bail the instant a drag starts (so
+        // orbit stole the gesture). Fall back to the interaction position,
+        // which stays valid through the whole press+drag.
+        let cursor = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos());
         let mut gizmo_changed = false;
+
+        // Claim a drag for the gizmo the instant it starts on a handle (using
+        // the gizmo's own enlarged pick band), so orbit is suppressed for the
+        // whole gesture even before/if the gizmo's grab registers. Alt forces
+        // orbit. Cleared when the drag ends.
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            let press = response.interact_pointer_pos();
+            // Orbit may only begin when the press is over the viewport (egui
+            // can otherwise route a panel drag to this big interact); it then
+            // continues through the gesture even if the pointer leaves. The
+            // winit-based check keeps it working right after mouse-look ends.
+            *self.orbit_armed =
+                self.pointer_in_viewport && press.is_some_and(|p| rect.contains(p));
+            *self.gizmo_drag = !alt
+                && matches!(self.selection, Selection::Object(_))
+                && press.is_some_and(|p| self.gizmo.pick_preview(p));
+        }
+        if response.drag_stopped_by(egui::PointerButton::Primary) {
+            *self.gizmo_drag = false;
+            *self.orbit_armed = false;
+        }
 
         // Light Probe Volume box-resize: dragging a face handle changes the
         // volume's size along that axis, keeping the opposite face fixed. Run
         // before the transform gizmo so a grabbed handle wins the drag; the
         // gizmo still moves/rotates the object when no handle is grabbed.
         self.probe_resize_interaction(&response, cursor, alt);
-        let probe_active = self.probe_drag.is_some();
+        // AudioSource min/max range spheres resize the same way.
+        self.audio_range_interaction(&response, cursor, alt);
+        // Box/Sphere collider handles too.
+        self.collider_interaction(&response, cursor, alt);
+        let probe_active = self.probe_drag.is_some()
+            || self.audio_drag.is_some()
+            || self.collider_drag.is_some();
 
         if !probe_active && let Selection::Object(i) = *self.selection {
             {
@@ -3167,8 +4158,13 @@ impl EditorTabs<'_> {
                     line(c[k + 4], c[(k + 1) % 4 + 4]); // front face
                     line(c[k], c[k + 4]); // connecting edges
                 }
-                // Resize handles at each face center: drag to change the box
-                // size along that axis (the opposite face stays put).
+                // Resize handles at each face center: an arrow pointing away
+                // from the box. Drag to change the box size along that axis
+                // (the opposite face stays put).
+                let center_screen = {
+                    let clip = view_proj * world.transform_point3(Vec3::ZERO).extend(1.0);
+                    (clip.w > W_EPS).then(|| to_screen(clip))
+                };
                 let axes = [Vec3::X, Vec3::Y, Vec3::Z];
                 for axis in 0..3 {
                     for sign in [-1.0f32, 1.0] {
@@ -3183,20 +4179,25 @@ impl EditorTabs<'_> {
                             .as_ref()
                             .is_some_and(|d| d.object == i && d.axis == axis);
                         let hovered = self.probe_drag.is_none()
-                            && cursor.is_some_and(|c| c.distance(p) <= 9.0);
-                        if hovered {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-                        }
-                        let (s, col) = if active || hovered {
-                            (4.5, egui::Color32::WHITE)
-                        } else {
-                            (3.0, egui::Color32::from_rgb(120, 200, 255))
-                        };
-                        painter.rect_filled(
-                            egui::Rect::from_center_size(p, egui::vec2(s * 2.0, s * 2.0)),
-                            2.0,
-                            col,
+                            && cursor.is_some_and(|c| c.distance(p) <= 14.0);
+                        // Keep the normal pointer; emphasize hover by growing
+                        // the handle slightly and brightening its color.
+                        let (arrow_scale, col) = handle_style(
+                            active || hovered,
+                            egui::Color32::from_rgb(120, 200, 255),
                         );
+                        // Point away from the box center (fall back to the
+                        // projected face axis if the center is degenerate).
+                        let outward = center_screen
+                            .map(|c| p - c)
+                            .filter(|v| v.length() > 1.0)
+                            .or_else(|| {
+                                let a = view_proj
+                                    * (fc + world.transform_vector3(axes[axis]) * sign).extend(1.0);
+                                (a.w > W_EPS).then(|| to_screen(a) - p)
+                            })
+                            .unwrap_or(egui::vec2(0.0, -1.0));
+                        draw_arrow_handle(painter, p, outward, arrow_scale, col);
                     }
                 }
                 // Probe points, capped so a dense volume doesn't flood the
@@ -3235,7 +4236,17 @@ impl EditorTabs<'_> {
                         .is_some()
                 });
                 let is_camera = matches!(object.source, citrus_assets::ObjectSource::Camera);
-                if !is_light && !is_camera {
+                let is_probe = object.components.iter().any(|c| {
+                    c.as_any()
+                        .downcast_ref::<citrus_editor::LightProbeVolume>()
+                        .is_some()
+                });
+                let is_audio = object.components.iter().any(|c| {
+                    c.as_any()
+                        .downcast_ref::<citrus_editor::AudioSource>()
+                        .is_some()
+                });
+                if !is_light && !is_camera && !is_probe && !is_audio {
                     continue;
                 }
                 let pos = self.scene.world_transform(i).w_axis.truncate();
@@ -3252,10 +4263,28 @@ impl EditorTabs<'_> {
                     continue;
                 }
                 let selected = matches!(*self.selection, Selection::Object(s) if s == i);
-                if is_light {
-                    draw_light_icon(painter, screen, selected);
+                // Icon priority: light, probe volume, audio, then camera.
+                let setting = if is_light {
+                    self.widget_filter.lights
+                } else if is_probe {
+                    self.widget_filter.probes
+                } else if is_audio {
+                    self.widget_filter.audio
                 } else {
-                    draw_camera_icon(painter, screen, selected);
+                    self.widget_filter.cameras
+                };
+                // Filtered-off billboards still show for the selected object.
+                if !setting.visible && !selected {
+                    continue;
+                }
+                if is_light {
+                    draw_light_icon(painter, screen, selected, setting.size);
+                } else if is_probe {
+                    draw_probe_icon(painter, screen, selected, setting.size);
+                } else if is_audio {
+                    draw_audio_icon(painter, screen, selected, setting.size);
+                } else {
+                    draw_camera_icon(painter, screen, selected, setting.size);
                 }
                 billboards.push((screen, i));
             }
@@ -3357,10 +4386,308 @@ impl EditorTabs<'_> {
             }
         }
 
+        // AudioSource range: min/max distance wire spheres around a selected
+        // spatial source, each with a draggable radius handle (camera-right).
+        if let Selection::Object(i) = *self.selection
+            && self.scene.is_active(i)
+            && let Some((min_d, max_d)) = self.scene.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::AudioSource>())
+                .filter(|s| s.spatial)
+                .map(|s| (s.min_distance, s.max_distance))
+        {
+            let view_proj = self.proj * self.view;
+            let full_rect = ui.ctx().viewport_rect();
+            let origin = self.scene.world_transform(i).w_axis.truncate();
+            let right = self.camera_right();
+            let painter = ui.painter();
+            let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
+                let ndc = clip.truncate() / clip.w;
+                egui::pos2(
+                    full_rect.left() + (ndc.x * 0.5 + 0.5) * full_rect.width(),
+                    full_rect.top() + (1.0 - (ndc.y * 0.5 + 0.5)) * full_rect.height(),
+                )
+            };
+            let segline = |a: Vec3, b: Vec3, stroke: egui::Stroke| {
+                const W_EPS: f32 = 0.001;
+                let mut ca = view_proj * a.extend(1.0);
+                let mut cb = view_proj * b.extend(1.0);
+                if ca.w <= W_EPS && cb.w <= W_EPS {
+                    return;
+                }
+                if ca.w < W_EPS {
+                    let t = (W_EPS - ca.w) / (cb.w - ca.w);
+                    ca += (cb - ca) * t;
+                } else if cb.w < W_EPS {
+                    let t = (W_EPS - cb.w) / (ca.w - cb.w);
+                    cb += (ca - cb) * t;
+                }
+                if let Some(seg) = clip_segment_to_rect(to_screen(ca), to_screen(cb), full_rect) {
+                    painter.line_segment(seg, stroke);
+                }
+            };
+            let circle = |radius: f32, a: Vec3, b: Vec3, stroke: egui::Stroke| {
+                const SEG: usize = 32;
+                let mut prev = origin + a * radius;
+                for k in 1..=SEG {
+                    let ang = k as f32 / SEG as f32 * std::f32::consts::TAU;
+                    let p = origin + (a * ang.cos() + b * ang.sin()) * radius;
+                    segline(prev, p, stroke);
+                    prev = p;
+                }
+            };
+            for (is_max, radius, base) in [
+                (false, min_d, egui::Color32::from_rgb(150, 220, 255)),
+                (true, max_d, egui::Color32::from_rgb(95, 150, 200)),
+            ] {
+                if radius <= 0.0 {
+                    continue;
+                }
+                let stroke = egui::Stroke::new(1.4, base);
+                circle(radius, Vec3::X, Vec3::Y, stroke);
+                circle(radius, Vec3::X, Vec3::Z, stroke);
+                circle(radius, Vec3::Y, Vec3::Z, stroke);
+                // Radius handle on the viewer-facing side.
+                let handle = origin + right * radius;
+                if let Some(hs) = self.world_to_screen(handle, full_rect) {
+                    let active = self
+                        .audio_drag
+                        .as_ref()
+                        .is_some_and(|d| d.object == i && d.max == is_max);
+                    let hovered = self.audio_drag.is_none()
+                        && cursor.is_some_and(|c| c.distance(hs) <= 14.0);
+                    let (sc, col) = handle_style(active || hovered, base);
+                    let outward = self
+                        .world_to_screen(origin + right * (radius + 1.0), full_rect)
+                        .map(|p| p - hs)
+                        .unwrap_or(egui::vec2(1.0, 0.0));
+                    draw_arrow_handle(painter, hs, outward, sc, col);
+                }
+            }
+        }
+
+        // Colliders (yellow): box wireframe + face resize arrows, sphere wire
+        // circles + radius arrow, mesh-collider AABB. Drawn for the selection.
+        if let Selection::Object(i) = *self.selection
+            && self.scene.is_active(i)
+        {
+            const YELLOW: egui::Color32 = egui::Color32::from_rgb(240, 220, 70);
+            let world = self.scene.world_transform(i);
+            let view_proj = self.proj * self.view;
+            let full_rect = ui.ctx().viewport_rect();
+            let right = self.camera_right();
+            let painter = ui.painter();
+            let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
+                let ndc = clip.truncate() / clip.w;
+                egui::pos2(
+                    full_rect.left() + (ndc.x * 0.5 + 0.5) * full_rect.width(),
+                    full_rect.top() + (1.0 - (ndc.y * 0.5 + 0.5)) * full_rect.height(),
+                )
+            };
+            let line = |a: Vec3, b: Vec3, stroke: egui::Stroke| {
+                const W_EPS: f32 = 0.001;
+                let mut ca = view_proj * a.extend(1.0);
+                let mut cb = view_proj * b.extend(1.0);
+                if ca.w <= W_EPS && cb.w <= W_EPS {
+                    return;
+                }
+                if ca.w < W_EPS {
+                    let t = (W_EPS - ca.w) / (cb.w - ca.w);
+                    ca += (cb - ca) * t;
+                } else if cb.w < W_EPS {
+                    let t = (W_EPS - cb.w) / (ca.w - cb.w);
+                    cb += (ca - cb) * t;
+                }
+                if let Some(seg) = clip_segment_to_rect(to_screen(ca), to_screen(cb), full_rect) {
+                    painter.line_segment(seg, stroke);
+                }
+            };
+            let stroke = egui::Stroke::new(1.4, YELLOW);
+            let obj = &self.scene.objects[i];
+
+            // Box collider: wireframe + face arrow handles.
+            if let Some((center, size)) = obj
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::BoxCollider>())
+                .map(|b| (Vec3::from(b.center), Vec3::from(b.size)))
+            {
+                let half = size * 0.5;
+                let corner = |sx: f32, sy: f32, sz: f32| {
+                    world.transform_point3(center + Vec3::new(half.x * sx, half.y * sy, half.z * sz))
+                };
+                let c = [
+                    corner(-1.0, -1.0, -1.0),
+                    corner(1.0, -1.0, -1.0),
+                    corner(1.0, 1.0, -1.0),
+                    corner(-1.0, 1.0, -1.0),
+                    corner(-1.0, -1.0, 1.0),
+                    corner(1.0, -1.0, 1.0),
+                    corner(1.0, 1.0, 1.0),
+                    corner(-1.0, 1.0, 1.0),
+                ];
+                for k in 0..4 {
+                    line(c[k], c[(k + 1) % 4], stroke);
+                    line(c[k + 4], c[(k + 1) % 4 + 4], stroke);
+                    line(c[k], c[k + 4], stroke);
+                }
+                let center_screen = self.world_to_screen(world.transform_point3(center), full_rect);
+                let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+                for axis in 0..3 {
+                    for sign in [-1.0f32, 1.0] {
+                        let fw = world.transform_point3(center + axes[axis] * (sign * half[axis]));
+                        let Some(p) = self.world_to_screen(fw, full_rect) else {
+                            continue;
+                        };
+                        let active = matches!(
+                            self.collider_drag.as_ref(),
+                            Some(d) if d.object == i
+                                && matches!(d.handle, ColliderHandle::BoxFace(a, s) if a == axis && s == sign)
+                        );
+                        let hovered = self.collider_drag.is_none()
+                            && cursor.is_some_and(|cc| cc.distance(p) <= 14.0);
+                        let (sc, col) = handle_style(active || hovered, YELLOW);
+                        let outward = center_screen
+                            .map(|cs| p - cs)
+                            .filter(|v| v.length() > 1.0)
+                            .unwrap_or(egui::vec2(0.0, -1.0));
+                        draw_arrow_handle(painter, p, outward, sc, col);
+                    }
+                }
+            }
+
+            // Sphere collider: 3 wire circles + radius arrow handle.
+            if let Some((center, radius)) = obj
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::SphereCollider>())
+                .map(|s| (Vec3::from(s.center), s.radius))
+            {
+                let o = world.transform_point3(center);
+                let circle = |a: Vec3, b: Vec3| {
+                    const SEG: usize = 32;
+                    let mut prev = o + a * radius;
+                    for k in 1..=SEG {
+                        let ang = k as f32 / SEG as f32 * std::f32::consts::TAU;
+                        let p = o + (a * ang.cos() + b * ang.sin()) * radius;
+                        line(prev, p, stroke);
+                        prev = p;
+                    }
+                };
+                circle(Vec3::X, Vec3::Y);
+                circle(Vec3::X, Vec3::Z);
+                circle(Vec3::Y, Vec3::Z);
+                let handle = o + right * radius;
+                if let Some(hs) = self.world_to_screen(handle, full_rect) {
+                    let active = matches!(
+                        self.collider_drag.as_ref(),
+                        Some(d) if d.object == i && matches!(d.handle, ColliderHandle::SphereRadius)
+                    );
+                    let hovered = self.collider_drag.is_none()
+                        && cursor.is_some_and(|cc| cc.distance(hs) <= 14.0);
+                    let (sc, col) = handle_style(active || hovered, YELLOW);
+                    let outward = self
+                        .world_to_screen(handle + right, full_rect)
+                        .map(|p| p - hs)
+                        .unwrap_or(egui::vec2(1.0, 0.0));
+                    draw_arrow_handle(painter, hs, outward, sc, col);
+                }
+            }
+
+            // Mesh collider: the mesh's AABB (follows the mesh, not editable).
+            if obj
+                .components
+                .iter()
+                .any(|c| c.as_any().downcast_ref::<citrus_editor::MeshCollider>().is_some())
+                && let Some((min, max)) = self.scene.render_mesh_bounds(i)
+            {
+                let corner = |sx: f32, sy: f32, sz: f32| {
+                    world.transform_point3(Vec3::new(
+                        if sx < 0.0 { min.x } else { max.x },
+                        if sy < 0.0 { min.y } else { max.y },
+                        if sz < 0.0 { min.z } else { max.z },
+                    ))
+                };
+                let c = [
+                    corner(-1.0, -1.0, -1.0),
+                    corner(1.0, -1.0, -1.0),
+                    corner(1.0, 1.0, -1.0),
+                    corner(-1.0, 1.0, -1.0),
+                    corner(-1.0, -1.0, 1.0),
+                    corner(1.0, -1.0, 1.0),
+                    corner(1.0, 1.0, 1.0),
+                    corner(-1.0, 1.0, 1.0),
+                ];
+                for k in 0..4 {
+                    line(c[k], c[(k + 1) % 4], stroke);
+                    line(c[k + 4], c[(k + 1) % 4 + 4], stroke);
+                    line(c[k], c[k + 4], stroke);
+                }
+            }
+        }
+
+        // Orientation cross: three short gray lines along the selected
+        // object's LOCAL axes, crossing at the pivot, so its orientation is
+        // readable under the move/scale gizmo. Editor-camera overlay only.
+        if let Selection::Object(i) = *self.selection
+            && matches!(self.gizmo.tool, GizmoTool::Move | GizmoTool::Scale)
+            && self.scene.is_active(i)
+        {
+            let world = self.scene.world_transform(i);
+            let origin = world.w_axis.truncate();
+            // Follow the gizmo's orientation mode: object rotation in Local,
+            // world axes in Global.
+            let rot = if self.gizmo.local_orientation {
+                world.to_scale_rotation_translation().1
+            } else {
+                glam::Quat::IDENTITY
+            };
+            let cam = self.view.inverse().w_axis.truncate();
+            // Screen-constant length (~world units that project to a small,
+            // steady on-screen size).
+            let len = ((origin - cam).length() * 0.12).clamp(0.05, 50.0);
+            let view_proj = self.proj * self.view;
+            let full_rect = ui.ctx().viewport_rect();
+            let painter = ui.painter();
+            let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
+                let ndc = clip.truncate() / clip.w;
+                egui::pos2(
+                    full_rect.left() + (ndc.x * 0.5 + 0.5) * full_rect.width(),
+                    full_rect.top() + (1.0 - (ndc.y * 0.5 + 0.5)) * full_rect.height(),
+                )
+            };
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+            let line = |a: Vec3, b: Vec3| {
+                const W_EPS: f32 = 0.001;
+                let mut ca = view_proj * a.extend(1.0);
+                let mut cb = view_proj * b.extend(1.0);
+                if ca.w <= W_EPS && cb.w <= W_EPS {
+                    return;
+                }
+                if ca.w < W_EPS {
+                    let t = (W_EPS - ca.w) / (cb.w - ca.w);
+                    ca += (cb - ca) * t;
+                } else if cb.w < W_EPS {
+                    let t = (W_EPS - cb.w) / (ca.w - cb.w);
+                    cb += (ca - cb) * t;
+                }
+                if let Some(seg) = clip_segment_to_rect(to_screen(ca), to_screen(cb), full_rect) {
+                    painter.line_segment(seg, stroke);
+                }
+            };
+            for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                let d = rot * (axis * len);
+                line(origin - d, origin + d);
+            }
+        }
+
         // Plain left drag (not claimed by the gizmo or a probe handle): orbit
         // the camera around a pivot locked at drag start.
         if response.dragged_by(egui::PointerButton::Primary)
+            && *self.orbit_armed
             && !self.gizmo.is_focused()
+            && !*self.gizmo_drag
             && !probe_active
         {
             let delta = response.drag_delta();
@@ -3403,9 +4730,9 @@ impl EditorTabs<'_> {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for (tool, label, hint) in [
-                            (GizmoTool::Move, "⬌", "Move (G)"),
+                            (GizmoTool::Move, "⬌", "Move (W)"),
                             (GizmoTool::Rotate, "🔄", "Rotate (R)"),
-                            (GizmoTool::Scale, "⛶", "Scale (S)"),
+                            (GizmoTool::Scale, "⛶", "Scale (E)"),
                         ] {
                             if ui
                                 .selectable_label(self.gizmo.tool == tool, label)
@@ -3416,6 +4743,51 @@ impl EditorTabs<'_> {
                             }
                         }
                     });
+                });
+            });
+
+        // Widget filter (top-right): per-billboard visibility + size. The
+        // move/rotate/scale gizmos are deliberately absent — they can't be
+        // hidden. Selected objects always show their billboard regardless.
+        egui::Area::new(ui.id().with("vp-widgets"))
+            .order(egui::Order::Middle)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(rect.right_top() + egui::vec2(-8.0, 8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    // Stay open across checkbox/slider clicks so several kinds
+                    // can be toggled at once (like the View menu).
+                    egui::containers::menu::MenuButton::new("👁 Widgets")
+                        .config(
+                            egui::containers::menu::MenuConfig::new()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| {
+                            ui.label(egui::RichText::new("Billboard widgets").small().weak());
+                            let filter = &mut *self.widget_filter;
+                            for (label, setting) in [
+                                ("Lights", &mut filter.lights),
+                                ("Cameras", &mut filter.cameras),
+                                ("Probe Volumes", &mut filter.probes),
+                                ("Audio Sources", &mut filter.audio),
+                            ] {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut setting.visible, label);
+                                    ui.add_enabled(
+                                        setting.visible,
+                                        egui::Slider::new(&mut setting.size, 0.3..=4.0)
+                                            .show_value(false),
+                                    )
+                                    .on_hover_text("Widget size");
+                                });
+                            }
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Move/Rotate/Scale always shown · selected objects ignore this")
+                                    .small()
+                                    .weak(),
+                            );
+                        });
                 });
             });
         egui::Area::new(ui.id().with("vp-pivot"))
@@ -3488,6 +4860,10 @@ impl EditorTabs<'_> {
     }
 
     fn inspector_ui(&mut self, ui: &mut egui::Ui) {
+        // Keep the inspector laid out at a usable width so its rows don't
+        // collapse if the dock is dragged narrow (egui_dock has no per-leaf
+        // minimum, so we enforce it from the content side).
+        ui.set_min_width(330.0);
         let shader_refs: Vec<&str> = self.shader_list.iter().map(String::as_str).collect();
 
         // When a code tab is focused, show its problems here (kept out of the
@@ -3779,52 +5155,177 @@ fn object_state(o: &scene::SceneObject) -> ObjectState {
     }
 }
 
-/// Draw a little light-bulb icon (glass + screw base) centered at `center`.
-/// egui's bundled font has no 💡 glyph, so the billboard is drawn by hand.
-fn draw_light_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool) {
-    let glass = if selected {
+/// Draw one hand-drawn light bulb: glass disc at `glass`, screw base on the
+/// far side of `up` (the direction the bulb points). egui's font has no 💡
+/// glyph, so lights and probe volumes share this primitive.
+fn draw_bulb(painter: &egui::Painter, glass: egui::Pos2, up: egui::Vec2, scale: f32, selected: bool) {
+    let glass_col = if selected {
         egui::Color32::from_rgb(255, 242, 150)
     } else {
         egui::Color32::from_rgb(235, 215, 120)
     };
     let dark = egui::Color32::from_rgb(70, 62, 35);
-    let r = 7.0;
-    let bulb = center - egui::vec2(0.0, 2.0);
+    let up = up.normalized();
+    let right = egui::vec2(-up.y, up.x);
+    let r = 7.0 * scale;
     if selected {
         // Emitted-light rays.
         for k in 0..8 {
             let a = k as f32 / 8.0 * std::f32::consts::TAU;
             let d = egui::vec2(a.cos(), a.sin());
             painter.line_segment(
-                [bulb + d * (r + 2.0), bulb + d * (r + 5.0)],
-                egui::Stroke::new(1.5, glass),
+                [glass + d * (r + 2.0 * scale), glass + d * (r + 5.0 * scale)],
+                egui::Stroke::new(1.5, glass_col),
             );
         }
     }
-    painter.circle_filled(bulb, r, glass);
-    painter.circle_stroke(bulb, r, egui::Stroke::new(1.0, dark));
-    // Screw base: a small block with a thread line.
-    let base =
-        egui::Rect::from_center_size(center + egui::vec2(0.0, r + 1.5), egui::vec2(r * 1.1, 5.0));
-    painter.rect_filled(base, 1.0, dark);
+    painter.circle_filled(glass, r, glass_col);
+    painter.circle_stroke(glass, r, egui::Stroke::new(1.0, dark));
+    // Screw base: a small block on the far side of `up`, with a thread line.
+    let bc = glass - up * (r + 1.5 * scale);
+    let hw = r * 0.55;
+    let hh = 2.5 * scale;
+    let base = vec![
+        bc + right * hw + up * hh,
+        bc - right * hw + up * hh,
+        bc - right * hw - up * hh,
+        bc + right * hw - up * hh,
+    ];
+    painter.add(egui::Shape::convex_polygon(base, dark, egui::Stroke::NONE));
     painter.line_segment(
-        [
-            egui::pos2(base.left() + 1.0, base.center().y),
-            egui::pos2(base.right() - 1.0, base.center().y),
-        ],
-        egui::Stroke::new(1.0, glass),
+        [bc - right * (hw - 1.0), bc + right * (hw - 1.0)],
+        egui::Stroke::new(1.0, glass_col),
     );
 }
 
+/// Hover/active emphasis for a draggable handle (probe volumes, and the
+/// box/sphere colliders that reuse this): slightly bigger + a bit brighter
+/// when emphasized, the base color otherwise. The pointer stays normal.
+fn handle_style(emphasized: bool, base: egui::Color32) -> (f32, egui::Color32) {
+    if emphasized {
+        // Lighten toward white without going fully white.
+        let lift = |c: u8| c.saturating_add((255 - c) / 2);
+        (
+            1.25,
+            egui::Color32::from_rgb(lift(base.r()), lift(base.g()), lift(base.b())),
+        )
+    } else {
+        (1.0, base)
+    }
+}
+
+/// Draw a resize-handle arrow at `at` pointing along screen-space `dir`
+/// (away from the box). A short shaft + filled triangular head.
+fn draw_arrow_handle(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    dir: egui::Vec2,
+    scale: f32,
+    color: egui::Color32,
+) {
+    let dir = if dir.length() > 1e-3 {
+        dir.normalized()
+    } else {
+        egui::vec2(0.0, -1.0)
+    };
+    let perp = egui::vec2(-dir.y, dir.x);
+    let head = 9.0 * scale;
+    let half_w = 5.5 * scale;
+    let shaft = 6.0 * scale;
+    // Shaft from just outside the face toward the tip.
+    let base = at + dir * shaft;
+    painter.line_segment([at, base], egui::Stroke::new(2.5 * scale, color));
+    // Arrowhead triangle.
+    let tip = base + dir * head;
+    let l = base + perp * half_w;
+    let r = base - perp * half_w;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, l, r],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// Draw a light-bulb billboard (glass + screw base) centered at `center`.
+fn draw_light_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, scale: f32) {
+    draw_bulb(painter, center - egui::vec2(0.0, 2.0 * scale), egui::vec2(0.0, -1.0), scale, selected);
+}
+
+/// Draw the light-probe-volume emblem: three bulbs (the same image as the
+/// light widget) fanned from a shared base at -42° / 0° / +42°, like Unity's
+/// Light Probe Group icon.
+fn draw_probe_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, scale: f32) {
+    let base = center + egui::vec2(0.0, 8.0 * scale);
+    let bulb_scale = scale * 0.62;
+    let stem = 11.0 * scale;
+    for deg in [-42.0_f32, 0.0, 42.0] {
+        let a = deg.to_radians();
+        // 0° points straight up; +deg tilts toward +X (screen-right).
+        let dir = egui::vec2(a.sin(), -a.cos());
+        draw_bulb(painter, base + dir * stem, dir, bulb_scale, selected);
+    }
+}
+
+/// Draw a speaker icon (cabinet + cone + sound waves) centered at `center`.
+fn draw_audio_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, scale: f32) {
+    let body = if selected {
+        egui::Color32::from_rgb(235, 225, 255)
+    } else {
+        egui::Color32::from_rgb(200, 190, 220)
+    };
+    let dark = egui::Color32::from_rgb(55, 50, 70);
+    // Square cabinet on the left, trapezoid cone opening to the right.
+    let cab = egui::Rect::from_center_size(
+        center + egui::vec2(-5.0 * scale, 0.0),
+        egui::vec2(5.0 * scale, 7.0 * scale),
+    );
+    painter.rect_filled(cab, 1.0 * scale, body);
+    let cone = vec![
+        egui::pos2(cab.right(), center.y - 3.0 * scale),
+        egui::pos2(center.x + 3.0 * scale, center.y - 7.0 * scale),
+        egui::pos2(center.x + 3.0 * scale, center.y + 7.0 * scale),
+        egui::pos2(cab.right(), center.y + 3.0 * scale),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        cone,
+        body,
+        egui::Stroke::new(1.0, dark),
+    ));
+    painter.rect_stroke(cab, 1.0 * scale, egui::Stroke::new(1.0, dark), egui::StrokeKind::Inside);
+    // Sound waves: two arcs to the right (brighter when selected).
+    let wave = if selected {
+        egui::Color32::from_rgb(150, 220, 255)
+    } else {
+        egui::Color32::from_rgb(120, 170, 200)
+    };
+    for (k, r) in [(0u8, 4.0_f32), (1, 7.0)] {
+        let cx = center.x + 5.0 * scale;
+        let steps = 7;
+        let mut prev: Option<egui::Pos2> = None;
+        for s in 0..=steps {
+            // -50°..50° arc opening right.
+            let a = (-0.9 + 1.8 * s as f32 / steps as f32) * std::f32::consts::FRAC_PI_2;
+            let p = egui::pos2(cx + a.cos() * r * scale, center.y + a.sin() * r * scale);
+            if let Some(pp) = prev {
+                painter.line_segment([pp, p], egui::Stroke::new(1.0 + k as f32 * 0.0, wave));
+            }
+            prev = Some(p);
+        }
+    }
+}
+
 /// Draw a little video-camera icon (body + lens) centered at `center`.
-fn draw_camera_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool) {
+fn draw_camera_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, scale: f32) {
     let body_col = if selected {
         egui::Color32::from_rgb(225, 238, 255)
     } else {
         egui::Color32::from_rgb(190, 210, 235)
     };
     let dark = egui::Color32::from_rgb(40, 55, 75);
-    let body = egui::Rect::from_min_size(center + egui::vec2(-9.0, -5.0), egui::vec2(12.0, 10.0));
+    let body = egui::Rect::from_min_size(
+        center + egui::vec2(-9.0 * scale, -5.0 * scale),
+        egui::vec2(12.0 * scale, 10.0 * scale),
+    );
     painter.rect_filled(body, 2.0, body_col);
     painter.rect_stroke(
         body,
@@ -3836,10 +5337,10 @@ fn draw_camera_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool)
     let lx = body.right();
     let cy = center.y;
     let lens = vec![
-        egui::pos2(lx, cy - 2.5),
-        egui::pos2(lx + 6.0, cy - 4.5),
-        egui::pos2(lx + 6.0, cy + 4.5),
-        egui::pos2(lx, cy + 2.5),
+        egui::pos2(lx, cy - 2.5 * scale),
+        egui::pos2(lx + 6.0 * scale, cy - 4.5 * scale),
+        egui::pos2(lx + 6.0 * scale, cy + 4.5 * scale),
+        egui::pos2(lx, cy + 2.5 * scale),
     ];
     painter.add(egui::Shape::convex_polygon(
         lens,
@@ -3847,7 +5348,7 @@ fn draw_camera_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool)
         egui::Stroke::new(1.0, dark),
     ));
     // Lens dot on the body front.
-    painter.circle_filled(egui::pos2(body.left() + 4.0, cy), 1.6, dark);
+    painter.circle_filled(egui::pos2(body.left() + 4.0 * scale, cy), 1.6 * scale, dark);
 }
 
 /// Char index → (line, utf-8 byte column) for an LSP position (we negotiate
@@ -4104,9 +5605,12 @@ impl ApplicationHandler for EngineApp {
                         || self.keys.contains(&KeyCode::ControlRight);
                     if !self.looking {
                         match code {
-                            KeyCode::KeyG => self.gizmo.tool = GizmoTool::Move,
-                            KeyCode::KeyR => self.gizmo.tool = GizmoTool::Rotate,
-                            KeyCode::KeyS if !ctrl => self.gizmo.tool = GizmoTool::Scale,
+                            // Unity-style: W move, E scale, R rotate (these
+                            // only fire when not mouse-looking, so they don't
+                            // clash with WASDQE fly).
+                            KeyCode::KeyW if !ctrl => self.gizmo.tool = GizmoTool::Move,
+                            KeyCode::KeyE if !ctrl => self.gizmo.tool = GizmoTool::Scale,
+                            KeyCode::KeyR if !ctrl => self.gizmo.tool = GizmoTool::Rotate,
                             KeyCode::KeyS if ctrl => {
                                 self.actions.push(EditorAction::SaveScene(None));
                             }

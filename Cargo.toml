@@ -48,6 +48,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 openxr = "0.21"
 libloading = "0.8"
 serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Audio playback + decoding (.wav/.flac/.mp3 via the default decoders).
+rodio = "0.19"
+libc = "0.2"
 
 # internal crates
 citrus-engine = { path = "crates/citrus-engine" }

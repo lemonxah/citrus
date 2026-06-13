@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 citrus-render.workspace = true
+bytemuck.workspace = true
 gltf.workspace = true
 ufbx.workspace = true
 image.workspace = true

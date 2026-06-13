@@ -200,6 +200,71 @@ pub struct EguiDraw {
     pub textures_delta: egui::TexturesDelta,
 }
 
+// ---------------------------------------------------------------- baking
+
+/// One static mesh instance fed to the lighting bake. The bake rasters this
+/// object's lightmap in `uv1` space and stores incoming light per texel.
+#[derive(Clone, Copy, Debug)]
+pub struct BakeInstance {
+    pub mesh: MeshHandle,
+    pub transform: Mat4,
+    /// Square lightmap resolution for this object (texels per side).
+    pub lightmap_size: u32,
+    /// Diffuse albedo for indirect bounces (material base color, linear).
+    pub albedo: [f32; 3],
+    /// Emitted radiance (color × intensity, linear) — surfaces glow into GI.
+    pub emission: [f32; 3],
+}
+
+/// A light contributing to the bake. Baked lights contribute their full
+/// direct term; Mixed lights contribute only the indirect/shadow that the
+/// realtime path can't do (the engine decides which to include).
+#[derive(Clone, Copy, Debug)]
+pub struct BakeLight {
+    pub kind: LightKind,
+    pub position: Vec3,
+    pub direction: Vec3,
+    /// Linear RGB × intensity (already scaled).
+    pub color: [f32; 3],
+    pub range: f32,
+    pub spot_inner_deg: f32,
+    pub spot_outer_deg: f32,
+}
+
+/// Everything the GPU bake needs in one renderer-agnostic bundle.
+pub struct BakeInput<'a> {
+    pub instances: &'a [BakeInstance],
+    pub lights: &'a [BakeLight],
+    /// World-space probe centers (flattened across all volumes).
+    pub probes: &'a [Vec3],
+    /// Constant sky/ambient radiance for rays that escape the scene.
+    pub sky_color: [f32; 3],
+    /// Indirect bounces per path (0 = direct + sky only).
+    pub bounces: u32,
+    /// Paths traced per lightmap texel / per probe direction.
+    pub samples: u32,
+}
+
+/// One baked lightmap: `size`×`size` RGBA32F (rgb = irradiance, a = validity).
+#[derive(Clone, Debug)]
+pub struct BakedLightmap {
+    pub size: u32,
+    pub pixels: Vec<f32>,
+}
+
+/// SH-L1 irradiance for one probe: 4 coefficients × RGB.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeSh {
+    pub coeffs: [[f32; 3]; 4],
+}
+
+/// Result of a bake: a lightmap per instance (same order) and SH per probe.
+#[derive(Clone, Debug, Default)]
+pub struct BakeOutput {
+    pub lightmaps: Vec<BakedLightmap>,
+    pub probes: Vec<ProbeSh>,
+}
+
 /// Per-frame render statistics (last completed frame). Categories grow as
 /// render passes are added (reflections, probes, shadows…).
 #[derive(Clone, Copy, Debug, Default)]

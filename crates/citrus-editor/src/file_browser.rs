@@ -672,6 +672,7 @@ fn file_icon(path: &Path) -> &'static str {
         Some("material") => "🎨",
         Some("scene") => "🌍",
         Some("citrus") => "🍋",
+        Some("lightmap" | "lightdata") => "💡",
         Some("png" | "jpg" | "jpeg" | "tga") => "🖼",
         Some("rs") => "🦀",
         Some("vert" | "frag" | "glsl" | "slang" | "spv") => "✨",

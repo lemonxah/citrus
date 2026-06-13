@@ -41,6 +41,25 @@ impl Buffer {
         })
     }
 
+    /// GPU virtual address (buffer must be created with SHADER_DEVICE_ADDRESS
+    /// usage and the device's bufferDeviceAddress feature enabled).
+    pub fn device_address(&self, device: &ash::Device) -> vk::DeviceAddress {
+        unsafe {
+            device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(self.handle),
+            )
+        }
+    }
+
+    /// Read the whole buffer back to host memory (host-visible buffers only).
+    pub fn read(&self) -> Vec<u8> {
+        self.allocation
+            .as_ref()
+            .and_then(|a| a.mapped_slice())
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
+    }
+
     /// Write into a host-visible buffer.
     pub fn write(&mut self, offset: usize, data: &[u8]) {
         let mapped = self

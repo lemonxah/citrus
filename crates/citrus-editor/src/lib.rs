@@ -19,8 +19,10 @@ pub use code_editor::{
     CodeEditor, CodeEditorResponse, CompletionItem, CompletionState, HoverState,
 };
 pub use components::{
-    Bob, CameraComponent, Component, ComponentCtx, ComponentRegistry, ComponentsResponse,
-    LightComponent, LightKind, LightMode, LightProbeVolume, Spin, TypedComponent, components_ui,
+    AudioListener, AudioRolloff, AudioSource, Bob, BoxCollider, CameraComponent, Component,
+    ComponentCommand, ComponentCtx, ComponentRegistry, ComponentsResponse, LightComponent,
+    LightKind, LightMode, LightProbeVolume, MeshCollider, SphereCollider, Spin, TypedComponent,
+    components_ui,
 };
 pub use file_browser::{FileBrowser, FileBrowserResponse};
 pub use inspector::{

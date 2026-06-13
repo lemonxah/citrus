@@ -1,0 +1,1285 @@
+//! GPU lighting bake (Vulkan ray query). Builds acceleration structures over
+//! the scene's static geometry, then:
+//!   - per static object, rasters a world pos+normal gbuffer into lightmap
+//!     (uv1) space and path-traces diffuse irradiance per texel,
+//!   - per light probe, sphere-traces incoming radiance into SH-L1.
+//!
+//! Everything here is transient: created, submitted, waited on, read back to
+//! host data, and torn down. It runs off the hot path (an explicit editor
+//! action), so it submits and blocks rather than pipelining. Requires
+//! `GpuContext::ray_tracing()`; callers check first.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::mem::size_of;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context as _, Result, bail};
+use ash::{khr, vk};
+use glam::Mat4;
+use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::Allocator;
+
+use crate::alloc::{self, Buffer};
+use crate::context::GpuContext;
+use crate::types::{BakeInput, BakeOutput, BakedLightmap, LightKind, ProbeSh};
+use crate::{GpuMesh, Vertex};
+
+const GBUFFER_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_gbuffer.vert.spv"));
+const GBUFFER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_gbuffer.frag.spv"));
+const LIGHTMAP_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_lightmap.comp.spv"));
+const PROBE_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_probe.comp.spv"));
+
+const GBUF_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
+
+/// Mirrors the `Instance` struct in the bake shaders (scalar layout, 48 B).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuInstance {
+    vtx_addr: u64,
+    idx_addr: u64,
+    albedo: [f32; 4],
+    emission: [f32; 4],
+}
+
+/// Mirrors the `Light` struct in the bake shaders (64 B).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuLight {
+    position: [f32; 4],  // xyz, w = kind
+    direction: [f32; 4], // xyz, w = range
+    color: [f32; 4],     // rgb × intensity
+    spot: [f32; 4],      // x cos(inner/2), y cos(outer/2)
+}
+
+fn bytes_of<T: Copy>(slice: &[T]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice))
+    }
+}
+
+/// A built acceleration structure plus its backing buffer.
+struct Accel {
+    handle: vk::AccelerationStructureKHR,
+    buffer: Buffer,
+    address: u64,
+}
+
+/// Run the full bake. Returns one lightmap per instance (same order) and SH
+/// per probe. Transient GPU resources are freed before returning.
+pub fn bake(
+    ctx: &GpuContext,
+    allocator: &Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    meshes: &[GpuMesh],
+    input: &BakeInput<'_>,
+) -> Result<BakeOutput> {
+    let Some(accel_loader) = ctx.accel.as_ref() else {
+        bail!("ray tracing unavailable; cannot bake");
+    };
+    if input.instances.is_empty() && input.probes.is_empty() {
+        return Ok(BakeOutput::default());
+    }
+
+    let device = &ctx.device;
+    let scratch_align = accel_scratch_alignment(ctx);
+
+    // Track everything we create so we can destroy it at the end.
+    let mut buffers: Vec<Buffer> = Vec::new();
+    let mut accels: Vec<Accel> = Vec::new();
+
+    // --- BLAS per unique mesh referenced by an instance --------------------
+    let mut blas_for_mesh: HashMap<usize, usize> = HashMap::new();
+    for inst in input.instances {
+        let mesh_idx = inst.mesh.0;
+        if blas_for_mesh.contains_key(&mesh_idx) {
+            continue;
+        }
+        let mesh = &meshes[mesh_idx];
+        let blas = build_blas(ctx, accel_loader, allocator, command_pool, mesh, scratch_align)
+            .with_context(|| format!("building BLAS for mesh {mesh_idx}"))?;
+        blas_for_mesh.insert(mesh_idx, accels.len());
+        accels.push(blas);
+    }
+
+    // --- Instance descriptors (for shading hits) + TLAS instances ----------
+    let mut gpu_instances = Vec::with_capacity(input.instances.len());
+    let mut tlas_instances: Vec<vk::AccelerationStructureInstanceKHR> =
+        Vec::with_capacity(input.instances.len());
+    for (i, inst) in input.instances.iter().enumerate() {
+        let mesh = &meshes[inst.mesh.0];
+        gpu_instances.push(GpuInstance {
+            vtx_addr: mesh.vertex_buffer.device_address(device),
+            idx_addr: mesh.index_buffer.device_address(device),
+            albedo: [inst.albedo[0], inst.albedo[1], inst.albedo[2], 0.0],
+            emission: [inst.emission[0], inst.emission[1], inst.emission[2], 0.0],
+        });
+        let blas = &accels[blas_for_mesh[&inst.mesh.0]];
+        tlas_instances.push(vk::AccelerationStructureInstanceKHR {
+            transform: transform_matrix(&inst.transform),
+            instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, 0xFF),
+            instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                0,
+                vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+            ),
+            acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                device_handle: blas.address,
+            },
+        });
+    }
+
+    let tlas = if tlas_instances.is_empty() {
+        None
+    } else {
+        Some(
+            build_tlas(
+                ctx,
+                accel_loader,
+                allocator,
+                command_pool,
+                &tlas_instances,
+                scratch_align,
+                &mut buffers,
+            )
+            .context("building TLAS")?,
+        )
+    };
+
+    // --- Shared SSBOs: instance descriptors + lights -----------------------
+    let mut alloc = allocator.lock().unwrap();
+    let instance_ssbo = host_ssbo(device, &mut alloc, bytes_of(&gpu_instances), "bake-instances")?;
+    let gpu_lights: Vec<GpuLight> = input.lights.iter().map(gpu_light).collect();
+    // A zero-length SSBO is invalid; pad to one element so the binding is live.
+    let light_bytes = if gpu_lights.is_empty() {
+        vec![0u8; size_of::<GpuLight>()]
+    } else {
+        bytes_of(&gpu_lights).to_vec()
+    };
+    let light_ssbo = host_ssbo(device, &mut alloc, &light_bytes, "bake-lights")?;
+    drop(alloc);
+
+    let mut output = BakeOutput::default();
+
+    // --- Lightmaps (Phase 3) ----------------------------------------------
+    if let Some(tlas) = &tlas {
+        let gbuffer = GbufferPipeline::new(ctx)?;
+        let lightmap = LightmapPipeline::new(ctx)?;
+        for (i, inst) in input.instances.iter().enumerate() {
+            let mesh = &meshes[inst.mesh.0];
+            let size = inst.lightmap_size.clamp(8, 2048);
+            let lm = bake_one_lightmap(
+                ctx,
+                allocator,
+                command_pool,
+                &gbuffer,
+                &lightmap,
+                tlas,
+                &instance_ssbo,
+                &light_ssbo,
+                mesh,
+                &inst.transform,
+                size,
+                input,
+            )
+            .with_context(|| format!("baking lightmap {i}"))?;
+            output.lightmaps.push(lm);
+        }
+        gbuffer.destroy(device);
+        lightmap.destroy(device);
+    }
+
+    // --- Probes (Phase 4) --------------------------------------------------
+    if let Some(tlas) = &tlas {
+        if !input.probes.is_empty() {
+            output.probes = bake_probes(
+                ctx,
+                allocator,
+                command_pool,
+                tlas,
+                &instance_ssbo,
+                &light_ssbo,
+                input,
+            )
+            .context("baking probes")?;
+        }
+    }
+
+    // --- Teardown ----------------------------------------------------------
+    unsafe { device.device_wait_idle().ok() };
+    let mut alloc = allocator.lock().unwrap();
+    let mut instance_ssbo = instance_ssbo;
+    let mut light_ssbo = light_ssbo;
+    instance_ssbo.destroy(device, &mut alloc);
+    light_ssbo.destroy(device, &mut alloc);
+    if let Some(mut tlas) = tlas {
+        unsafe { accel_loader.destroy_acceleration_structure(tlas.handle, None) };
+        tlas.buffer.destroy(device, &mut alloc);
+    }
+    for mut a in accels {
+        unsafe { accel_loader.destroy_acceleration_structure(a.handle, None) };
+        a.buffer.destroy(device, &mut alloc);
+    }
+    for mut b in buffers {
+        b.destroy(device, &mut alloc);
+    }
+    Ok(output)
+}
+
+fn gpu_light(l: &crate::types::BakeLight) -> GpuLight {
+    let kind = match l.kind {
+        LightKind::Directional => 0.0,
+        LightKind::Point => 1.0,
+        LightKind::Spot => 2.0,
+    };
+    let dir = l.direction.normalize_or_zero();
+    GpuLight {
+        position: [l.position.x, l.position.y, l.position.z, kind],
+        direction: [dir.x, dir.y, dir.z, l.range],
+        color: [l.color[0], l.color[1], l.color[2], 0.0],
+        spot: [
+            (l.spot_inner_deg.to_radians() * 0.5).cos(),
+            (l.spot_outer_deg.to_radians() * 0.5).cos(),
+            0.0,
+            0.0,
+        ],
+    }
+}
+
+/// glam column-major Mat4 → Vulkan row-major 3×4 instance transform.
+fn transform_matrix(m: &Mat4) -> vk::TransformMatrixKHR {
+    let c = m.to_cols_array();
+    vk::TransformMatrixKHR {
+        matrix: [
+            c[0], c[4], c[8], c[12], c[1], c[5], c[9], c[13], c[2], c[6], c[10], c[14],
+        ],
+    }
+}
+
+fn accel_scratch_alignment(ctx: &GpuContext) -> u64 {
+    let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+    unsafe {
+        ctx.instance
+            .get_physical_device_properties2(ctx.physical_device, &mut props2)
+    };
+    as_props
+        .min_acceleration_structure_scratch_offset_alignment
+        .max(1) as u64
+}
+
+/// Host-visible SSBO with device-address usage, filled with `data`.
+fn host_ssbo(
+    device: &ash::Device,
+    alloc: &mut Allocator,
+    data: &[u8],
+    name: &str,
+) -> Result<Buffer> {
+    let mut buf = Buffer::new(
+        device,
+        alloc,
+        data.len().max(4) as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        MemoryLocation::CpuToGpu,
+        name,
+    )?;
+    if !data.is_empty() {
+        buf.write(0, data);
+    }
+    Ok(buf)
+}
+
+/// Scratch buffer whose device address is aligned for an AS build.
+fn scratch_buffer(
+    device: &ash::Device,
+    alloc: &mut Allocator,
+    size: u64,
+    align: u64,
+) -> Result<(Buffer, u64)> {
+    let buf = Buffer::new(
+        device,
+        alloc,
+        size + align,
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        MemoryLocation::GpuOnly,
+        "bake-scratch",
+    )?;
+    let base = buf.device_address(device);
+    let aligned = base.div_ceil(align) * align;
+    Ok((buf, aligned))
+}
+
+fn build_blas(
+    ctx: &GpuContext,
+    accel_loader: &khr::acceleration_structure::Device,
+    allocator: &Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    mesh: &GpuMesh,
+    scratch_align: u64,
+) -> Result<Accel> {
+    let device = &ctx.device;
+    let prim_count = mesh.index_count / 3;
+    let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+        .vertex_format(vk::Format::R32G32B32_SFLOAT)
+        .vertex_data(vk::DeviceOrHostAddressConstKHR {
+            device_address: mesh.vertex_buffer.device_address(device),
+        })
+        .vertex_stride(size_of::<Vertex>() as u64)
+        .max_vertex(mesh.vertex_count.saturating_sub(1))
+        .index_type(vk::IndexType::UINT32)
+        .index_data(vk::DeviceOrHostAddressConstKHR {
+            device_address: mesh.index_buffer.device_address(device),
+        });
+    let geometry = vk::AccelerationStructureGeometryKHR::default()
+        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+        .geometry(vk::AccelerationStructureGeometryDataKHR {
+            triangles: triangles,
+        })
+        .flags(vk::GeometryFlagsKHR::OPAQUE);
+    let geometries = [geometry];
+
+    let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(&geometries);
+
+    let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+    unsafe {
+        accel_loader.get_acceleration_structure_build_sizes(
+            vk::AccelerationStructureBuildTypeKHR::DEVICE,
+            &build_info,
+            &[prim_count],
+            &mut sizes,
+        )
+    };
+
+    let mut alloc = allocator.lock().unwrap();
+    let as_buffer = Buffer::new(
+        device,
+        &mut alloc,
+        sizes.acceleration_structure_size,
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        MemoryLocation::GpuOnly,
+        "blas",
+    )?;
+    let handle = unsafe {
+        accel_loader.create_acceleration_structure(
+            &vk::AccelerationStructureCreateInfoKHR::default()
+                .buffer(as_buffer.handle)
+                .size(sizes.acceleration_structure_size)
+                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL),
+            None,
+        )?
+    };
+    let (mut scratch, scratch_addr) =
+        scratch_buffer(device, &mut alloc, sizes.build_scratch_size, scratch_align)?;
+    drop(alloc);
+
+    build_info = build_info
+        .dst_acceleration_structure(handle)
+        .scratch_data(vk::DeviceOrHostAddressKHR {
+            device_address: scratch_addr,
+        });
+    let range = vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(prim_count);
+    let ranges = [range];
+    alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        accel_loader.cmd_build_acceleration_structures(cb, &[build_info], &[&ranges]);
+    })?;
+
+    let mut alloc = allocator.lock().unwrap();
+    scratch.destroy(device, &mut alloc);
+    drop(alloc);
+
+    let address = unsafe {
+        accel_loader.get_acceleration_structure_device_address(
+            &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                .acceleration_structure(handle),
+        )
+    };
+    Ok(Accel {
+        handle,
+        buffer: as_buffer,
+        address,
+    })
+}
+
+fn build_tlas(
+    ctx: &GpuContext,
+    accel_loader: &khr::acceleration_structure::Device,
+    allocator: &Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    instances: &[vk::AccelerationStructureInstanceKHR],
+    scratch_align: u64,
+    buffers: &mut Vec<Buffer>,
+) -> Result<Accel> {
+    let device = &ctx.device;
+    let inst_bytes = unsafe {
+        std::slice::from_raw_parts(
+            instances.as_ptr() as *const u8,
+            std::mem::size_of_val(instances),
+        )
+    };
+    let mut alloc = allocator.lock().unwrap();
+    let mut instance_buf = Buffer::new(
+        device,
+        &mut alloc,
+        inst_bytes.len() as u64,
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        MemoryLocation::CpuToGpu,
+        "tlas-instances",
+    )?;
+    instance_buf.write(0, inst_bytes);
+    let instance_addr = instance_buf.device_address(device);
+
+    let geometry = vk::AccelerationStructureGeometryKHR::default()
+        .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+        .geometry(vk::AccelerationStructureGeometryDataKHR {
+            instances: vk::AccelerationStructureGeometryInstancesDataKHR::default().data(
+                vk::DeviceOrHostAddressConstKHR {
+                    device_address: instance_addr,
+                },
+            ),
+        })
+        .flags(vk::GeometryFlagsKHR::OPAQUE);
+    let geometries = [geometry];
+    let count = instances.len() as u32;
+
+    let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(&geometries);
+    let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
+    unsafe {
+        accel_loader.get_acceleration_structure_build_sizes(
+            vk::AccelerationStructureBuildTypeKHR::DEVICE,
+            &build_info,
+            &[count],
+            &mut sizes,
+        )
+    };
+    let as_buffer = Buffer::new(
+        device,
+        &mut alloc,
+        sizes.acceleration_structure_size,
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        MemoryLocation::GpuOnly,
+        "tlas",
+    )?;
+    let handle = unsafe {
+        accel_loader.create_acceleration_structure(
+            &vk::AccelerationStructureCreateInfoKHR::default()
+                .buffer(as_buffer.handle)
+                .size(sizes.acceleration_structure_size)
+                .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL),
+            None,
+        )?
+    };
+    let (scratch, scratch_addr) =
+        scratch_buffer(device, &mut alloc, sizes.build_scratch_size, scratch_align)?;
+    drop(alloc);
+
+    build_info = build_info
+        .dst_acceleration_structure(handle)
+        .scratch_data(vk::DeviceOrHostAddressKHR {
+            device_address: scratch_addr,
+        });
+    let range = vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count);
+    let ranges = [range];
+    alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        accel_loader.cmd_build_acceleration_structures(cb, &[build_info], &[&ranges]);
+    })?;
+
+    let address = unsafe {
+        accel_loader.get_acceleration_structure_device_address(
+            &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                .acceleration_structure(handle),
+        )
+    };
+    // The instance + scratch buffers are dead after the build; queue them for
+    // teardown with the rest.
+    buffers.push(instance_buf);
+    buffers.push(scratch);
+    Ok(Accel {
+        handle,
+        buffer: as_buffer,
+        address,
+    })
+}
+
+fn shader_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
+    let code = ash::util::read_spv(&mut Cursor::new(spv))?;
+    Ok(unsafe {
+        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)?
+    })
+}
+
+/// A transient rgba32f image (gbuffer attachment / storage / lightmap target).
+struct BakeImage {
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: Option<gpu_allocator::vulkan::Allocation>,
+}
+
+impl BakeImage {
+    fn new(
+        device: &ash::Device,
+        alloc: &mut Allocator,
+        w: u32,
+        h: u32,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(GBUF_FORMAT)
+            .extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(usage)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let req = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = alloc.allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+            name: "bake-image",
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(GBUF_FORMAT)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )?
+        };
+        Ok(Self {
+            image,
+            view,
+            allocation: Some(allocation),
+        })
+    }
+
+    fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
+        unsafe {
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+        }
+        if let Some(a) = self.allocation.take() {
+            let _ = alloc.free(a);
+        }
+    }
+}
+
+fn image_barrier(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    old: vk::ImageLayout,
+    new: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+) {
+    let barrier = vk::ImageMemoryBarrier2::default()
+        .image(image)
+        .old_layout(old)
+        .new_layout(new)
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        );
+    let barriers = [barrier];
+    unsafe {
+        device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&barriers))
+    };
+}
+
+/// Graphics pipeline that rasters a mesh into the lightmap's pos+normal
+/// gbuffer (two rgba32f attachments, dynamic rendering, model push constant).
+struct GbufferPipeline {
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
+}
+
+impl GbufferPipeline {
+    fn new(ctx: &GpuContext) -> Result<Self> {
+        let device = &ctx.device;
+        let vert = shader_module(device, GBUFFER_VERT)?;
+        let frag = shader_module(device, GBUFFER_FRAG)?;
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .size(size_of::<Mat4>() as u32)];
+        let layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push),
+                None,
+            )?
+        };
+
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag)
+                .name(c"main"),
+        ];
+        let bindings = [vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)];
+        let attrs = [
+            vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
+            vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
+            vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 24 },
+            vk::VertexInputAttributeDescription { location: 3, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 32 },
+            vk::VertexInputAttributeDescription { location: 4, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 48 },
+            vk::VertexInputAttributeDescription { location: 5, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 64 },
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attrs);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        // No culling: lightmap texels for back faces still need their data.
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+            vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA),
+        ];
+        let color_blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let formats = [GBUF_FORMAT, GBUF_FORMAT];
+        let mut rendering =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .push_next(&mut rendering);
+        let pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .map_err(|(_, e)| e)?[0]
+        };
+        Ok(Self {
+            layout,
+            pipeline,
+            vert,
+            frag,
+        })
+    }
+
+    fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_shader_module(self.vert, None);
+            device.destroy_shader_module(self.frag, None);
+        }
+    }
+}
+
+/// Lightmap path-trace compute pipeline (6-binding set: TLAS, instances,
+/// lights, g_pos, g_normal, out_lightmap).
+struct LightmapPipeline {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    module: vk::ShaderModule,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LightmapPush {
+    light_count: u32,
+    sample_count: u32,
+    bounces: u32,
+    frame_seed: u32,
+    sky_color: [f32; 4],
+}
+
+impl LightmapPipeline {
+    fn new(ctx: &GpuContext) -> Result<Self> {
+        let device = &ctx.device;
+        let stage = vk::ShaderStageFlags::COMPUTE;
+        let storage_img = |b: u32| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(stage)
+        };
+        let ssbo = |b: u32| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(stage)
+        };
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .descriptor_count(1)
+                .stage_flags(stage),
+            ssbo(1),
+            ssbo(2),
+            storage_img(3),
+            storage_img(4),
+            storage_img(5),
+        ];
+        let set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )?
+        };
+        let set_layouts = [set_layout];
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(stage)
+            .size(size_of::<LightmapPush>() as u32)];
+        let layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&set_layouts)
+                    .push_constant_ranges(&push),
+                None,
+            )?
+        };
+        let module = shader_module(device, LIGHTMAP_COMP)?;
+        let pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(stage)
+                                .module(module)
+                                .name(c"main"),
+                        )
+                        .layout(layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?[0]
+        };
+        Ok(Self {
+            set_layout,
+            layout,
+            pipeline,
+            module,
+        })
+    }
+
+    fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_shader_module(self.module, None);
+        }
+    }
+}
+
+/// Write a TLAS into a descriptor set binding.
+fn write_tlas(device: &ash::Device, set: vk::DescriptorSet, binding: u32, tlas: vk::AccelerationStructureKHR) {
+    let accels = [tlas];
+    let mut as_write =
+        vk::WriteDescriptorSetAccelerationStructureKHR::default().acceleration_structures(&accels);
+    let mut write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+        .push_next(&mut as_write);
+    write.descriptor_count = 1;
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+
+fn write_ssbo(device: &ash::Device, set: vk::DescriptorSet, binding: u32, buffer: vk::Buffer) {
+    let info = [vk::DescriptorBufferInfo::default()
+        .buffer(buffer)
+        .range(vk::WHOLE_SIZE)];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .buffer_info(&info);
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+
+fn write_storage_image(device: &ash::Device, set: vk::DescriptorSet, binding: u32, view: vk::ImageView) {
+    let info = [vk::DescriptorImageInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::GENERAL)];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+        .image_info(&info);
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bake_one_lightmap(
+    ctx: &GpuContext,
+    allocator: &Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    gbuffer: &GbufferPipeline,
+    lightmap: &LightmapPipeline,
+    tlas: &Accel,
+    instance_ssbo: &Buffer,
+    light_ssbo: &Buffer,
+    mesh: &GpuMesh,
+    transform: &Mat4,
+    size: u32,
+    input: &BakeInput<'_>,
+) -> Result<BakedLightmap> {
+    let device = &ctx.device;
+    let mut alloc = allocator.lock().unwrap();
+    let mut g_pos = BakeImage::new(
+        device,
+        &mut alloc,
+        size,
+        size,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+    )?;
+    let mut g_normal = BakeImage::new(
+        device,
+        &mut alloc,
+        size,
+        size,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+    )?;
+    let mut out_img = BakeImage::new(
+        device,
+        &mut alloc,
+        size,
+        size,
+        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+    )?;
+    let readback = Buffer::new(
+        device,
+        &mut alloc,
+        (size * size * 4 * 4) as u64,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuToCpu,
+        "lightmap-readback",
+    )?;
+    drop(alloc);
+
+    // Transient descriptor pool for this object's compute set.
+    let pool_sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            descriptor_count: 1,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 2,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: 3,
+        },
+    ];
+    let pool = unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes),
+            None,
+        )?
+    };
+    let set_layouts = [lightmap.set_layout];
+    let set = unsafe {
+        device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&set_layouts),
+        )?[0]
+    };
+    write_tlas(device, set, 0, tlas.handle);
+    write_ssbo(device, set, 1, instance_ssbo.handle);
+    write_ssbo(device, set, 2, light_ssbo.handle);
+    write_storage_image(device, set, 3, g_pos.view);
+    write_storage_image(device, set, 4, g_normal.view);
+    write_storage_image(device, set, 5, out_img.view);
+
+    let push = LightmapPush {
+        light_count: input.lights.len() as u32,
+        sample_count: input.samples.max(1),
+        bounces: input.bounces,
+        frame_seed: 1,
+        sky_color: [input.sky_color[0], input.sky_color[1], input.sky_color[2], 0.0],
+    };
+    let model = transform.to_cols_array();
+    let groups = size.div_ceil(8);
+
+    alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        // gbuffer attachments → COLOR_ATTACHMENT_OPTIMAL
+        for img in [g_pos.image, g_normal.image] {
+            image_barrier(
+                device, cb, img,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            );
+        }
+        let clear = vk::ClearValue {
+            color: vk::ClearColorValue { float32: [0.0; 4] },
+        };
+        let attachments = [
+            vk::RenderingAttachmentInfo::default()
+                .image_view(g_pos.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear),
+            vk::RenderingAttachmentInfo::default()
+                .image_view(g_normal.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear),
+        ];
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width: size, height: size },
+        };
+        let rendering = vk::RenderingInfo::default()
+            .render_area(area)
+            .layer_count(1)
+            .color_attachments(&attachments);
+        device.cmd_begin_rendering(cb, &rendering);
+        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, gbuffer.pipeline);
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: size as f32,
+            height: size as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        device.cmd_set_viewport(cb, 0, &[viewport]);
+        device.cmd_set_scissor(cb, 0, &[area]);
+        device.cmd_push_constants(
+            cb,
+            gbuffer.layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            bytes_of(&model),
+        );
+        device.cmd_bind_vertex_buffers(cb, 0, &[mesh.vertex_buffer.handle], &[0]);
+        device.cmd_bind_index_buffer(cb, mesh.index_buffer.handle, 0, vk::IndexType::UINT32);
+        device.cmd_draw_indexed(cb, mesh.index_count, 1, 0, 0, 0);
+        device.cmd_end_rendering(cb);
+
+        // gbuffers → GENERAL (compute read), out image UNDEFINED → GENERAL
+        for img in [g_pos.image, g_normal.image] {
+            image_barrier(
+                device, cb, img,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
+        }
+        image_barrier(
+            device, cb, out_img.image,
+            vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
+        );
+
+        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, lightmap.pipeline);
+        device.cmd_bind_descriptor_sets(
+            cb,
+            vk::PipelineBindPoint::COMPUTE,
+            lightmap.layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_push_constants(
+            cb,
+            lightmap.layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytes_of(std::slice::from_ref(&push)),
+        );
+        device.cmd_dispatch(cb, groups, groups, 1);
+
+        // out image → TRANSFER_SRC, copy to readback buffer
+        image_barrier(
+            device, cb, out_img.image,
+            vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
+            vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ,
+        );
+        let copy = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: size, height: size, depth: 1 });
+        device.cmd_copy_image_to_buffer(
+            cb,
+            out_img.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            readback.handle,
+            &[copy],
+        );
+    })?;
+
+    let bytes = readback.read();
+    let pixels: Vec<f32> = bytemuck::cast_slice(&bytes[..(size * size * 16) as usize]).to_vec();
+
+    let mut alloc = allocator.lock().unwrap();
+    let mut readback = readback;
+    readback.destroy(device, &mut alloc);
+    g_pos.destroy(device, &mut alloc);
+    g_normal.destroy(device, &mut alloc);
+    out_img.destroy(device, &mut alloc);
+    drop(alloc);
+    unsafe { device.destroy_descriptor_pool(pool, None) };
+
+    Ok(BakedLightmap { size, pixels })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProbePush {
+    probe_count: u32,
+    light_count: u32,
+    sample_count: u32,
+    frame_seed: u32,
+    sky_color: [f32; 4],
+}
+
+fn bake_probes(
+    ctx: &GpuContext,
+    allocator: &Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    tlas: &Accel,
+    instance_ssbo: &Buffer,
+    light_ssbo: &Buffer,
+    input: &BakeInput<'_>,
+) -> Result<Vec<ProbeSh>> {
+    let device = &ctx.device;
+    let count = input.probes.len();
+
+    // Probe positions as vec4 (scalar layout), output SH = 4×vec4 per probe.
+    let positions: Vec<[f32; 4]> = input
+        .probes
+        .iter()
+        .map(|p| [p.x, p.y, p.z, 0.0])
+        .collect();
+    let mut alloc = allocator.lock().unwrap();
+    let probe_ssbo = host_ssbo(device, &mut alloc, bytes_of(&positions), "bake-probe-pos")?;
+    let out_ssbo = Buffer::new(
+        device,
+        &mut alloc,
+        (count * 4 * 16) as u64,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::TRANSFER_SRC,
+        MemoryLocation::GpuToCpu,
+        "bake-probe-sh",
+    )?;
+    drop(alloc);
+
+    let stage = vk::ShaderStageFlags::COMPUTE;
+    let ssbo = |b: u32| {
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(b)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(stage)
+    };
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+            .descriptor_count(1)
+            .stage_flags(stage),
+        ssbo(1),
+        ssbo(2),
+        ssbo(3),
+        ssbo(4),
+    ];
+    let set_layout = unsafe {
+        device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )?
+    };
+    let set_layouts = [set_layout];
+    let push = [vk::PushConstantRange::default()
+        .stage_flags(stage)
+        .size(size_of::<ProbePush>() as u32)];
+    let layout = unsafe {
+        device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push),
+            None,
+        )?
+    };
+    let module = shader_module(device, PROBE_COMP)?;
+    let pipeline = unsafe {
+        device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(stage)
+                            .module(module)
+                            .name(c"main"),
+                    )
+                    .layout(layout)],
+                None,
+            )
+            .map_err(|(_, e)| e)?[0]
+    };
+
+    let pool_sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            descriptor_count: 1,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 4,
+        },
+    ];
+    let pool = unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes),
+            None,
+        )?
+    };
+    let set = unsafe {
+        device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&set_layouts),
+        )?[0]
+    };
+    write_tlas(device, set, 0, tlas.handle);
+    write_ssbo(device, set, 1, instance_ssbo.handle);
+    write_ssbo(device, set, 2, light_ssbo.handle);
+    write_ssbo(device, set, 3, probe_ssbo.handle);
+    write_ssbo(device, set, 4, out_ssbo.handle);
+
+    let push_data = ProbePush {
+        probe_count: count as u32,
+        light_count: input.lights.len() as u32,
+        sample_count: input.samples.max(1),
+        frame_seed: 1,
+        sky_color: [input.sky_color[0], input.sky_color[1], input.sky_color[2], 0.0],
+    };
+    let groups = (count as u32).div_ceil(64);
+    alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+        device.cmd_bind_descriptor_sets(
+            cb,
+            vk::PipelineBindPoint::COMPUTE,
+            layout,
+            0,
+            &[set],
+            &[],
+        );
+        device.cmd_push_constants(
+            cb,
+            layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            bytes_of(std::slice::from_ref(&push_data)),
+        );
+        device.cmd_dispatch(cb, groups, 1, 1);
+    })?;
+
+    let bytes = out_ssbo.read();
+    let raw: &[f32] = bytemuck::cast_slice(&bytes[..(count * 4 * 4 * 4).min(bytes.len())]);
+    let mut probes = Vec::with_capacity(count);
+    for p in 0..count {
+        let base = p * 16; // 4 coeffs × 4 floats
+        let mut sh = ProbeSh::default();
+        for c in 0..4 {
+            sh.coeffs[c] = [raw[base + c * 4], raw[base + c * 4 + 1], raw[base + c * 4 + 2]];
+        }
+        probes.push(sh);
+    }
+
+    let mut alloc = allocator.lock().unwrap();
+    let mut probe_ssbo = probe_ssbo;
+    let mut out_ssbo = out_ssbo;
+    probe_ssbo.destroy(device, &mut alloc);
+    out_ssbo.destroy(device, &mut alloc);
+    drop(alloc);
+    unsafe {
+        device.destroy_descriptor_pool(pool, None);
+        device.destroy_pipeline(pipeline, None);
+        device.destroy_pipeline_layout(layout, None);
+        device.destroy_descriptor_set_layout(set_layout, None);
+        device.destroy_shader_module(module, None);
+    }
+    Ok(probes)
+}

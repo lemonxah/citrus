@@ -24,6 +24,9 @@ pub enum SpawnKind {
     Camera,
     Light(crate::LightKind),
     LightProbeVolume,
+    AudioSource,
+    BoxCollider,
+    SphereCollider,
     Cube,
     Sphere,
     Capsule,
@@ -37,6 +40,9 @@ impl SpawnKind {
             Self::Camera => "Camera",
             Self::Light(kind) => kind.label(),
             Self::LightProbeVolume => "Light Probe Volume",
+            Self::AudioSource => "Audio Source",
+            Self::BoxCollider => "Box Collider",
+            Self::SphereCollider => "Sphere Collider",
             Self::Cube => "Cube",
             Self::Sphere => "Sphere",
             Self::Capsule => "Capsule",
@@ -107,6 +113,20 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             ui.close();
         }
     });
+    if ui.button("Audio Source").clicked() {
+        response.spawn = Some(SpawnKind::AudioSource);
+        ui.close();
+    }
+    ui.menu_button("Collider", |ui| {
+        if ui.button("Box Collider").clicked() {
+            response.spawn = Some(SpawnKind::BoxCollider);
+            ui.close();
+        }
+        if ui.button("Sphere Collider").clicked() {
+            response.spawn = Some(SpawnKind::SphereCollider);
+            ui.close();
+        }
+    });
     for kind in [
         SpawnKind::Cube,
         SpawnKind::Sphere,
@@ -170,9 +190,18 @@ impl ScenePanel {
                     !roots.is_empty(),
                     self.root_collapsed,
                     true,
+                    true,
+                    &[],
                 );
                 if root.clicked() {
                     self.root_collapsed = !self.root_collapsed;
+                    // Alt: cascade the whole scene open/closed.
+                    if ui.input(|i| i.modifiers.alt) {
+                        let collapse = self.root_collapsed;
+                        for &r in &roots {
+                            self.cascade(&children, r, collapse);
+                        }
+                    }
                 }
                 if let Some(payload) = root.dnd_release_payload::<usize>() {
                     response.reparent.push((*payload, None));
@@ -181,15 +210,30 @@ impl ScenePanel {
 
                 if filter.is_empty() {
                     if !self.root_collapsed {
-                        for &index in &roots {
-                            self.tree_row(ui, rows, &children, index, 1, selected, &mut response);
+                        let mut ancestry: Vec<bool> = Vec::new();
+                        let last = roots.len().saturating_sub(1);
+                        for (n, &index) in roots.iter().enumerate() {
+                            self.tree_row(
+                                ui,
+                                rows,
+                                &children,
+                                index,
+                                1,
+                                n == last,
+                                &mut ancestry,
+                                selected,
+                                &mut response,
+                            );
                         }
                     }
                 } else {
-                    // Filtered: flat list.
+                    // Filtered: flat list (no tree lines).
                     for (i, row) in rows.iter().enumerate() {
                         if row.name.to_lowercase().contains(&filter) {
-                            self.object_row(ui, rows, false, i, 1, selected, &mut response);
+                            self.object_row(
+                                ui, rows, &children, false, i, 1, true, &[], selected,
+                                &mut response,
+                            );
                         }
                     }
                 }
@@ -209,6 +253,20 @@ impl ScenePanel {
         response
     }
 
+    /// Collapse (`collapse=true`) or expand the whole subtree rooted at
+    /// `index`, inclusive. Used by Alt+click.
+    fn cascade(&mut self, children: &[Vec<usize>], index: usize, collapse: bool) {
+        let mut stack = vec![index];
+        while let Some(n) = stack.pop() {
+            if collapse {
+                self.collapsed.insert(n);
+            } else {
+                self.collapsed.remove(&n);
+            }
+            stack.extend(children[n].iter().copied());
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn tree_row(
         &mut self,
@@ -217,6 +275,8 @@ impl ScenePanel {
         children: &[Vec<usize>],
         index: usize,
         depth: usize,
+        is_last: bool,
+        ancestry: &mut Vec<bool>,
         selected: &mut Option<usize>,
         response: &mut ScenePanelResponse,
     ) {
@@ -224,17 +284,34 @@ impl ScenePanel {
             return;
         }
         let has_children = !children[index].is_empty();
-        self.object_row(ui, rows, has_children, index, depth, selected, response);
+        self.object_row(
+            ui, rows, children, has_children, index, depth, is_last, ancestry, selected,
+            response,
+        );
         if has_children && !self.collapsed.contains(&index) {
-            for &child in &children[index] {
-                self.tree_row(ui, rows, children, child, depth + 1, selected, response);
+            // This node's column continues for its children iff it has a
+            // following sibling.
+            ancestry.push(!is_last);
+            let last = children[index].len() - 1;
+            for (n, &child) in children[index].iter().enumerate() {
+                self.tree_row(
+                    ui,
+                    rows,
+                    children,
+                    child,
+                    depth + 1,
+                    n == last,
+                    ancestry,
+                    selected,
+                    response,
+                );
             }
+            ancestry.pop();
         }
     }
 
-    /// One full-width row: hover highlight + collapse arrow + icon + name,
-    /// left-aligned at its depth. Returns the row's response.
-    #[allow(clippy::too_many_arguments)]
+    /// One full-width row: tree connector lines + hover highlight + collapse
+    /// arrow + icon + name, left-aligned at its depth. Returns the response.
     #[allow(clippy::too_many_arguments)]
     fn row_widget(
         &mut self,
@@ -246,6 +323,8 @@ impl ScenePanel {
         has_children: bool,
         collapsed: bool,
         enabled: bool,
+        is_last: bool,
+        ancestry: &[bool],
     ) -> egui::Response {
         let (rect, row) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), 20.0),
@@ -258,6 +337,28 @@ impl ScenePanel {
         } else if row.hovered() {
             ui.painter()
                 .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+        }
+        // Tree connector lines: faint verticals down each ancestor column that
+        // still has rows below, plus an ├/└ connector into this row.
+        if depth >= 1 {
+            let stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.5));
+            let gx = |d: usize| rect.left() + 4.0 + d as f32 * 14.0 + 6.0;
+            let cy = rect.center().y;
+            for (level, &cont) in ancestry.iter().enumerate() {
+                if cont {
+                    ui.painter()
+                        .vline(gx(level), rect.y_range(), stroke);
+                }
+            }
+            let px = gx(depth - 1);
+            ui.painter()
+                .line_segment([egui::pos2(px, rect.top()), egui::pos2(px, cy)], stroke);
+            ui.painter()
+                .line_segment([egui::pos2(px, cy), egui::pos2(gx(depth) - 2.0, cy)], stroke);
+            if !is_last {
+                ui.painter()
+                    .line_segment([egui::pos2(px, cy), egui::pos2(px, rect.bottom())], stroke);
+            }
         }
         if has_children {
             ui.painter().text(
@@ -296,9 +397,12 @@ impl ScenePanel {
         &mut self,
         ui: &mut Ui,
         rows: &[SceneObjectRow],
+        children: &[Vec<usize>],
         has_children: bool,
         index: usize,
         depth: usize,
+        is_last: bool,
+        ancestry: &[bool],
         selected: &mut Option<usize>,
         response: &mut ScenePanelResponse,
     ) {
@@ -314,6 +418,8 @@ impl ScenePanel {
             has_children,
             collapsed,
             row_data.enabled,
+            is_last,
+            ancestry,
         );
         let indent = 4.0 + depth as f32 * 14.0;
 
@@ -324,8 +430,14 @@ impl ScenePanel {
                     .interact_pointer_pos()
                     .is_some_and(|p| p.x < row.rect.left() + indent + 12.0);
             if on_arrow {
-                if !self.collapsed.remove(&index) {
+                let collapse = !self.collapsed.contains(&index);
+                // Alt: cascade the whole subtree; plain click toggles one node.
+                if ui.input(|i| i.modifiers.alt) {
+                    self.cascade(children, index, collapse);
+                } else if collapse {
                     self.collapsed.insert(index);
+                } else {
+                    self.collapsed.remove(&index);
                 }
             } else {
                 *selected = if is_selected { None } else { Some(index) };

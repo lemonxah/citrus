@@ -113,6 +113,42 @@ pub struct LoadedScene {
     pub skybox: Option<String>,
     /// World lighting / environment (ambient + sun + skybox toggle).
     pub environment: citrus_assets::WorldEnvironment,
+    /// Baked lighting result (None until a bake runs). Re-uploaded to the
+    /// renderer for runtime sampling.
+    pub baked: Option<BakedData>,
+}
+
+/// One probe volume's runtime metadata: where it sits and which SH range it
+/// owns, so dynamic objects can trilinearly interpolate.
+#[derive(Clone)]
+pub struct ProbeVolumeMeta {
+    /// World → volume-local (probe grid spans -size/2..+size/2 in local).
+    pub world_to_local: Mat4,
+    pub size: [f32; 3],
+    pub counts: [usize; 3],
+    /// First probe index (into `BakedData.probe_sh`) for this volume.
+    pub sh_base: usize,
+}
+
+/// Baked lighting, kept on the scene and pushed to the renderer for runtime.
+#[derive(Clone, Default)]
+pub struct BakedData {
+    /// Object index → lightmap layer in the renderer's lightmap array.
+    pub object_lightmap: std::collections::HashMap<usize, usize>,
+    pub lightmaps: Vec<citrus_render::BakedLightmap>,
+    pub probe_volumes: Vec<ProbeVolumeMeta>,
+    pub probe_sh: Vec<citrus_render::ProbeSh>,
+}
+
+/// Owned bake inputs gathered from the scene; `BakeInput` borrows from this.
+pub struct BakeGather {
+    pub instances: Vec<citrus_render::BakeInstance>,
+    /// Object index per instance (parallel to `instances`).
+    pub instance_objects: Vec<usize>,
+    pub lights: Vec<citrus_render::BakeLight>,
+    pub probes: Vec<Vec3>,
+    pub probe_volumes: Vec<ProbeVolumeMeta>,
+    pub sky_color: [f32; 3],
 }
 
 impl LoadedScene {
@@ -131,6 +167,7 @@ impl LoadedScene {
             texture_file_cache: HashMap::new(),
             skybox: None,
             environment: citrus_assets::WorldEnvironment::default(),
+            baked: None,
         }
     }
 
@@ -788,11 +825,13 @@ impl LoadedScene {
         Some((view, proj, position))
     }
 
-    /// Call one lifecycle hook on every component.
+    /// Call one lifecycle hook on every component. Deferred engine requests
+    /// (e.g. load-scene) are appended to `commands` for the caller to drain.
     fn each_component(
         &mut self,
         dt: f32,
         time: f32,
+        commands: &mut Vec<citrus_editor::ComponentCommand>,
         mut call: impl FnMut(&mut Box<dyn citrus_editor::Component>, &mut ComponentCtx),
     ) {
         for object in &mut self.objects {
@@ -812,6 +851,7 @@ impl LoadedScene {
                         translation,
                         rotation,
                         scale,
+                        commands,
                     },
                 );
             }
@@ -819,15 +859,24 @@ impl LoadedScene {
     }
 
     /// Play started: every component's `start` hook.
-    pub fn start_components(&mut self, time: f32) {
-        self.each_component(0.0, time, |c, ctx| c.start(ctx));
+    pub fn start_components(
+        &mut self,
+        time: f32,
+        commands: &mut Vec<citrus_editor::ComponentCommand>,
+    ) {
+        self.each_component(0.0, time, commands, |c, ctx| c.start(ctx));
     }
 
     /// Run all components for one frame (Play mode): all `update`s, then
     /// all `late_update`s.
-    pub fn update_components(&mut self, dt: f32, time: f32) {
-        self.each_component(dt, time, |c, ctx| c.update(ctx));
-        self.each_component(dt, time, |c, ctx| c.late_update(ctx));
+    pub fn update_components(
+        &mut self,
+        dt: f32,
+        time: f32,
+        commands: &mut Vec<citrus_editor::ComponentCommand>,
+    ) {
+        self.each_component(dt, time, commands, |c, ctx| c.update(ctx));
+        self.each_component(dt, time, commands, |c, ctx| c.late_update(ctx));
     }
 
     /// True if the object and all of its ancestors are enabled (a disabled
@@ -890,6 +939,177 @@ impl LoadedScene {
             });
         }
         lights
+    }
+
+    /// Gather everything the GPU lighting bake needs: static-geometry
+    /// instances (with per-object lightmap resolution from texel density),
+    /// Baked-mode lights, and probe-volume grid points. See [`BakeGather`].
+    pub fn gather_bake(&self) -> BakeGather {
+        use citrus_editor::{LightComponent, LightKind, LightMode, LightProbeVolume};
+
+        let settings = self.environment.bake;
+        let mut instances = Vec::new();
+        let mut instance_objects = Vec::new();
+
+        for i in 0..self.objects.len() {
+            let obj = &self.objects[i];
+            if !obj.static_geometry || !self.is_active(i) {
+                continue;
+            }
+            let Some(render) = obj.render else { continue };
+            let world = self.world_transform(i);
+            let (min, max) = self.mesh_bounds[render.mesh];
+            let scale = world.to_scale_rotation_translation().0.abs();
+            let extent = (max - min) * scale;
+            let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
+            let size = (settings.texel_density * max_extent).round() as u32;
+            let lightmap_size = size.clamp(16, settings.max_lightmap.max(16));
+
+            let model = &self.materials[render.material].model;
+            let emission = if model.emission_enabled {
+                [
+                    model.emission_color[0] * model.emission_intensity,
+                    model.emission_color[1] * model.emission_intensity,
+                    model.emission_color[2] * model.emission_intensity,
+                ]
+            } else {
+                [0.0; 3]
+            };
+            instances.push(citrus_render::BakeInstance {
+                mesh: self.mesh_handles[render.mesh],
+                transform: world,
+                lightmap_size,
+                albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
+                emission,
+            });
+            instance_objects.push(i);
+        }
+
+        // Baked-mode lights only: Mixed/Realtime stay in the realtime path so
+        // their direct term isn't double-counted (Unity/Unreal convention).
+        let mut lights = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(light) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
+            else {
+                continue;
+            };
+            if light.mode != LightMode::Baked {
+                continue;
+            }
+            let world = self.world_transform(i);
+            let (_, rotation, position) = world.to_scale_rotation_translation();
+            let direction = rotation * Vec3::NEG_Z;
+            let kind = match light.kind {
+                LightKind::Directional => citrus_render::LightKind::Directional,
+                LightKind::Point => citrus_render::LightKind::Point,
+                LightKind::Spot => citrus_render::LightKind::Spot,
+            };
+            lights.push(citrus_render::BakeLight {
+                kind,
+                position,
+                direction,
+                color: [
+                    light.color[0] * light.intensity,
+                    light.color[1] * light.intensity,
+                    light.color[2] * light.intensity,
+                ],
+                range: light.range,
+                spot_inner_deg: light.spot_angle * (1.0 - light.spot_blend),
+                spot_outer_deg: light.spot_angle,
+            });
+        }
+
+        // Probe volumes → flattened world-space probe points + per-volume
+        // metadata for runtime trilinear lookup.
+        let mut probes = Vec::new();
+        let mut probe_volumes = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(vol) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<LightProbeVolume>())
+            else {
+                continue;
+            };
+            let world = self.world_transform(i);
+            let sh_base = probes.len();
+            for local in vol.local_positions() {
+                probes.push(world.transform_point3(local));
+            }
+            probe_volumes.push(ProbeVolumeMeta {
+                world_to_local: world.inverse(),
+                size: vol.size,
+                counts: vol.counts(),
+                sh_base,
+            });
+        }
+
+        let amb = self.environment.ambient;
+        let ai = self.environment.ambient_intensity;
+        BakeGather {
+            instances,
+            instance_objects,
+            lights,
+            probes,
+            probe_volumes,
+            sky_color: [amb[0] * ai, amb[1] * ai, amb[2] * ai],
+        }
+    }
+
+    /// Object-space AABB (min, max) of an object's render mesh, for the mesh
+    /// collider wireframe.
+    pub fn render_mesh_bounds(&self, index: usize) -> Option<(Vec3, Vec3)> {
+        self.objects[index]
+            .render
+            .map(|r| self.mesh_bounds[r.mesh])
+    }
+
+    /// Flatten every active `AudioSource` into a per-frame cue list (with
+    /// world position) for the audio engine.
+    pub fn gather_audio(&self) -> Vec<crate::audio::AudioCue> {
+        use citrus_editor::AudioSource;
+        let mut cues = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            if let Some(src) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<AudioSource>())
+            {
+                let pos = self.world_transform(i).w_axis.truncate();
+                cues.push(crate::audio::AudioCue::from_source(i, src, pos));
+            }
+        }
+        cues
+    }
+
+    /// World position of the first active `AudioListener` (the spatial "ears").
+    pub fn audio_listener(&self) -> Option<Vec3> {
+        use citrus_editor::AudioListener;
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            if self.objects[i]
+                .components
+                .iter()
+                .any(|c| c.as_any().downcast_ref::<AudioListener>().is_some())
+            {
+                return Some(self.world_transform(i).w_axis.truncate());
+            }
+        }
+        None
     }
 
     /// Sync all draw transforms from object TRS (cheap; runs every frame).

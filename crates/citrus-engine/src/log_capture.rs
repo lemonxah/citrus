@@ -7,7 +7,6 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
 
 use tracing::Level;
 use tracing_subscriber::layer::Context;
@@ -18,8 +17,8 @@ pub struct LogEntry {
     pub level: Level,
     pub target: String,
     pub message: String,
-    /// Seconds since process start (monotonic; no timezone needed).
-    pub seconds: f64,
+    /// Local wall-clock time the event occurred, "HH:MM:SS.mmm".
+    pub time: String,
 }
 
 /// Ring buffer of recent log entries, oldest dropped past the cap.
@@ -47,22 +46,16 @@ impl LogRing {
 pub type LogStore = Arc<Mutex<LogRing>>;
 
 static STORE: OnceLock<LogStore> = OnceLock::new();
-static START: OnceLock<Instant> = OnceLock::new();
 
 /// The shared log ring (created on first use).
 pub fn store() -> &'static LogStore {
     STORE.get_or_init(|| Arc::new(Mutex::new(LogRing::new(5000))))
 }
 
-fn elapsed() -> f64 {
-    START.get_or_init(Instant::now).elapsed().as_secs_f64()
-}
-
 /// Install the global tracing subscriber: stdout formatting (honouring
 /// `RUST_LOG`, default `info`) plus the in-app capture layer. Call once at
 /// startup in place of the bare `tracing_subscriber::fmt().init()`.
 pub fn init() {
-    START.get_or_init(Instant::now);
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     tracing_subscriber::registry()
@@ -84,7 +77,7 @@ impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
             level: *meta.level(),
             target: meta.target().to_owned(),
             message: visitor.finish(),
-            seconds: elapsed(),
+            time: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
         });
     }
 }
