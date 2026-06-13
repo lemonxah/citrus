@@ -22,7 +22,7 @@ pub struct SceneObjectRow {
 pub enum SpawnKind {
     Empty,
     Camera,
-    Light(crate::LightKind),
+    Light(citrus_core::LightKind),
     LightProbeVolume,
     AudioSource,
     BoxCollider,
@@ -101,7 +101,7 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
         }
     }
     ui.menu_button("Light", |ui| {
-        for kind in crate::LightKind::ALL {
+        for kind in citrus_core::LightKind::ALL {
             if ui.button(kind.label()).clicked() {
                 response.spawn = Some(SpawnKind::Light(kind));
                 ui.close();
@@ -424,6 +424,40 @@ impl ScenePanel {
         let indent = 4.0 + depth as f32 * 14.0;
 
         row.dnd_set_drag_payload(index);
+        // Also publish the dragged index into egui memory as a plain usize, so
+        // ObjectRef drop boxes (incl. plugin inspectors with their own egui)
+        // can read it without egui's DragAndDrop plugin. Cleared each frame the
+        // pointer is up (engine, end of frame).
+        if row.dragged() {
+            ui.data_mut(|d| d.insert_temp(egui::Id::new(crate::DRAG_OBJECT_KEY), index));
+            // Floating "ghost" of the dragged row, following the cursor, so the
+            // drag has visual feedback (and the same chip lands in an ObjectRef
+            // drop box). Painted on a top layer, no egui dnd context involved.
+            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("citrus-drag-ghost"),
+                ));
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let galley =
+                    painter.layout_no_wrap(row_data.name.clone(), font, egui::Color32::WHITE);
+                let pad = egui::vec2(8.0, 4.0);
+                let origin = pos + egui::vec2(14.0, 6.0);
+                let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
+                painter.rect_filled(
+                    rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(60, 46, 110, 235),
+                );
+                painter.rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 120, 220)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.galley(origin + pad, galley, egui::Color32::WHITE);
+            }
+        }
         if row.clicked() {
             let on_arrow = has_children
                 && row

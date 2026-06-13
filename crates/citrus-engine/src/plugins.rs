@@ -17,7 +17,8 @@ use std::process::Command;
 use std::sync::mpsc;
 
 use anyhow::{Context as _, Result, bail};
-use citrus_editor::{CodeDiagnostic, ComponentRegistry};
+use citrus_core::ComponentRegistry;
+use citrus_editor::{CodeDiagnostic, EditorComponents};
 
 pub fn check_shader(path: &Path) -> Vec<CodeDiagnostic> {
     let output = Command::new("glslc").arg("-o").arg("-").arg(path).output();
@@ -112,13 +113,17 @@ impl PluginHost {
         &mut self,
         project_root: &Path,
         registry: &mut ComponentRegistry,
+        editor: &mut EditorComponents,
     ) -> Result<Vec<String>> {
         let mut loaded = Vec::new();
         for (_dir, name) in discover(project_root) {
             tracing::info!("building component plugin {name}…");
+            // `--features editor`: the editor needs each plugin's inspector +
+            // gizmo (and its `citrus_register_editor` export). A shipped game
+            // builds plugins without it, so citrus-editor/egui never link in.
             let output = Command::new("cargo")
                 .current_dir(project_root)
-                .args(["build", "-p", &name])
+                .args(["build", "-p", &name, "--features", "editor"])
                 .output()
                 .context("running cargo")?;
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -129,7 +134,7 @@ impl PluginHost {
             if stderr.contains("warning:") {
                 tracing::warn!("plugin {name} built with warnings:\n{}", stderr.trim());
             }
-            self.load(project_root, &name, registry)
+            self.load(project_root, &name, registry, editor)
                 .with_context(|| format!("loading plugin {name}"))?;
             loaded.push(name);
         }
@@ -141,6 +146,7 @@ impl PluginHost {
         project_root: &Path,
         name: &str,
         registry: &mut ComponentRegistry,
+        editor: &mut EditorComponents,
     ) -> Result<()> {
         let file = dylib_name(name);
         let built = project_root.join("target/debug").join(&file);
@@ -172,6 +178,13 @@ impl PluginHost {
                 .get(b"citrus_register")
                 .context("plugin has no `citrus_register` export")?;
             register(registry);
+            // Editor-only inspector/gizmo registration (optional — a runtime
+            // game build of a plugin won't export it).
+            if let Ok(register_editor) =
+                lib.get::<fn(&mut EditorComponents)>(b"citrus_register_editor")
+            {
+                register_editor(editor);
+            }
             self.libs.push(lib); // keep mapped forever
         }
         tracing::info!("loaded component plugin {name}");
@@ -211,27 +224,48 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The editor builds plugins with `--features editor` (inspector + gizmo + egui);
+# a shipped game builds without it, so the editor crate and egui never link in.
+default = []
+editor = ["dep:citrus-editor", "dep:egui"]
+
 [dependencies]
-citrus-editor.workspace = true
-egui.workspace = true
+citrus-core.workspace = true
+citrus-editor = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
 serde.workspace = true
 glam.workspace = true
 "#,
     )?;
     std::fs::write(
         dir.join("src/lib.rs"),
-        r#"//! Project components, compiled and hot-loaded by the citrus editor
-//! (Tools → Build & Reload Components). Add a struct, implement
-//! [`TypedComponent`], and register it below.
+        r#"//! Project components, hot-loaded by the citrus editor (Tools → Build &
+//! Reload Components).
+//!
+//! A component's RUNTIME behaviour is `citrus_core::TypedComponent` (no UI) and
+//! always compiles. Its EDITOR inspector (`citrus_editor::Inspect`) and gizmo
+//! (`citrus_editor::Gizmo`) are gated behind the `editor` feature, so a shipped
+//! game (built without that feature) links neither citrus-editor nor egui.
 
-use citrus_editor::{ComponentCtx, ComponentRegistry, TypedComponent};
+use citrus_core::{ComponentCtx, ComponentRegistry, TypedComponent};
+#[cfg(feature = "editor")]
+use citrus_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
 use serde::{Deserialize, Serialize};
 
-/// Called by the editor after this plugin is (re)loaded.
+/// Register runtime behaviour (called by the editor and a shipped game).
 #[unsafe(no_mangle)]
 pub fn citrus_register(registry: &mut ComponentRegistry) {
     registry.register::<Orbit>();
     // citrus: new components register here
+}
+
+/// Register editor-only traits; compiled only with `--features editor`.
+#[cfg(feature = "editor")]
+#[unsafe(no_mangle)]
+pub fn citrus_register_editor(editor: &mut EditorComponents) {
+    editor.register::<Orbit>();
+    // citrus: new components register their editor traits here
 }
 
 /// Example: circle around the object's authored position.
@@ -256,7 +290,17 @@ impl Default for Orbit {
 impl TypedComponent for Orbit {
     const NAME: &'static str = "Orbit";
 
-    fn inspector_ui(&mut self, ui: &mut egui::Ui) -> bool {
+    fn update(&mut self, ctx: &mut ComponentCtx) {
+        let angle = ctx.time * self.degrees_per_second.to_radians();
+        let offset = glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * self.radius;
+        *ctx.translation += offset - self.applied;
+        self.applied = offset;
+    }
+}
+
+#[cfg(feature = "editor")]
+impl Inspect for Orbit {
+    fn inspector_ui(&mut self, ui: &mut egui::Ui, _ctx: &InspectCtx) -> bool {
         let mut changed = false;
         changed |= ui
             .add(egui::Slider::new(&mut self.degrees_per_second, -360.0..=360.0).text("Speed (°/s)"))
@@ -266,14 +310,10 @@ impl TypedComponent for Orbit {
             .changed();
         changed
     }
-
-    fn update(&mut self, ctx: &mut ComponentCtx) {
-        let angle = ctx.time * self.degrees_per_second.to_radians();
-        let offset = glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * self.radius;
-        *ctx.translation += offset - self.applied;
-        self.applied = offset;
-    }
 }
+
+#[cfg(feature = "editor")]
+impl Gizmo for Orbit {}
 "#,
     )?;
     Ok(dir)
@@ -348,6 +388,8 @@ fn parse_cargo_messages(stdout: &[u8], out: &mut Vec<CodeDiagnostic>) {
 }
 
 const REGISTER_MARKER: &str = "// citrus: new components register here";
+const EDITOR_REGISTER_MARKER: &str =
+    "// citrus: new components register their editor traits here";
 
 /// Files → Create → New Component: a fresh component module in the plugin
 /// crate (created on demand), prefilled with every engine-called hook, and
@@ -396,18 +438,28 @@ pub fn create_component(project_root: &Path) -> Result<PathBuf> {
     } else {
         bail!("plugin lib.rs has no citrus_register function to extend");
     }
+    // Editor-trait registration (best-effort; gated behind the `editor` feature
+    // in the template).
+    let editor_reg = format!("    editor.register::<{mod_name}::{struct_name}>();\n");
+    if let Some(marker) = text.find(EDITOR_REGISTER_MARKER) {
+        let line_start = text[..marker].rfind('\n').map_or(0, |i| i + 1);
+        text.insert_str(line_start, &editor_reg);
+    }
     std::fs::write(&lib, text)?;
     Ok(file)
 }
 
-/// Starter component with every hook the engine calls.
+/// Starter component: runtime behaviour always compiles; the editor inspector
+/// + gizmo are gated behind the `editor` feature.
 fn component_template(name: &str) -> String {
     format!(
         r#"//! {name} — describe what it does.
 //!
 //! Rename the struct + NAME, then Tools → Build & Reload Components.
 
-use citrus_editor::{{ComponentCtx, TypedComponent}};
+use citrus_core::{{ComponentCtx, TypedComponent}};
+#[cfg(feature = "editor")]
+use citrus_editor::{{Gizmo, Inspect, InspectCtx}};
 use serde::{{Deserialize, Serialize}};
 
 #[derive(Serialize, Deserialize)]
@@ -425,20 +477,11 @@ impl TypedComponent for {name} {{
     /// Shown in the Add Component menu and saved into .scene files.
     const NAME: &'static str = "{name}";
 
-    /// Inspector widgets; return true when something changed.
-    fn inspector_ui(&mut self, ui: &mut egui::Ui) -> bool {{
-        let mut changed = false;
-        changed |= ui
-            .add(egui::Slider::new(&mut self.speed, 0.0..=10.0).text("Speed"))
-            .changed();
-        changed
-    }}
-
     /// Called once when ▶ Play starts.
     fn start(&mut self, _ctx: &mut ComponentCtx) {{}}
 
-    /// Called every frame while playing. `ctx` carries dt, time, and the
-    /// object's local translation / rotation / scale.
+    /// Called every frame while playing. `ctx` carries dt, time, the object's
+    /// local TRS, and the in-game API (object references, scene load, …).
     fn update(&mut self, ctx: &mut ComponentCtx) {{
         // Example: spin around Y at `speed` rad/s.
         let step = glam::Quat::from_rotation_y(self.speed * ctx.dt);
@@ -448,6 +491,22 @@ impl TypedComponent for {name} {{
     /// Called every frame after all components ran `update`.
     fn late_update(&mut self, _ctx: &mut ComponentCtx) {{}}
 }}
+
+/// Editor inspector (editor build only).
+#[cfg(feature = "editor")]
+impl Inspect for {name} {{
+    fn inspector_ui(&mut self, ui: &mut egui::Ui, _ctx: &InspectCtx) -> bool {{
+        let mut changed = false;
+        changed |= ui
+            .add(egui::Slider::new(&mut self.speed, 0.0..=10.0).text("Speed"))
+            .changed();
+        changed
+    }}
+}}
+
+/// Editor viewport gizmo (editor build only). Override `draw_gizmo` to draw.
+#[cfg(feature = "editor")]
+impl Gizmo for {name} {{}}
 "#
     )
 }

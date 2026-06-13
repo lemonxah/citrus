@@ -6,8 +6,15 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The editor builds plugins with `--features editor` (inspector + gizmo + egui);
+# a shipped game builds without it, so the editor crate and egui never link in.
+default = []
+editor = ["dep:citrus-editor", "dep:egui"]
+
 [dependencies]
-citrus-editor.workspace = true
-egui.workspace = true
+citrus-core.workspace = true
+citrus-editor = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
 serde.workspace = true
 glam.workspace = true

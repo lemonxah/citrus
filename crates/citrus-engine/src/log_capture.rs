@@ -56,8 +56,12 @@ pub fn store() -> &'static LogStore {
 /// `RUST_LOG`, default `info`) plus the in-app capture layer. Call once at
 /// startup in place of the bare `tracing_subscriber::fmt().init()`.
 pub fn init() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    // `calloop` spams benign "event for non-existence source" WARNs during
+    // cursor-grab churn on Wayland; cap it at error so it stays quiet even when
+    // RUST_LOG raises the global level.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into())
+        .add_directive("calloop=error".parse().expect("valid directive"));
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())

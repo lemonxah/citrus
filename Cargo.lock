@@ -387,14 +387,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-editor"
+name = "citrus-core"
 version = "0.1.0"
 dependencies = [
- "egui",
- "egui_extras",
+ "getrandom",
  "glam",
  "ron",
  "serde",
+ "tracing",
+]
+
+[[package]]
+name = "citrus-editor"
+version = "0.1.0"
+dependencies = [
+ "citrus-core",
+ "egui",
+ "egui_extras",
+ "glam",
+ "image",
+ "regex",
+ "ron",
+ "serde",
+ "syntect",
  "tracing",
 ]
 
@@ -405,6 +420,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "citrus-assets",
+ "citrus-core",
  "citrus-editor",
  "citrus-render",
  "egui",
@@ -427,6 +443,7 @@ dependencies = [
 name = "citrus-project-components"
 version = "0.1.0"
 dependencies = [
+ "citrus-core",
  "citrus-editor",
  "egui",
  "glam",

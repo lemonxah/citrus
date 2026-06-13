@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use citrus_assets::{MaterialRef, ObjectSource, SceneEntry, SceneFile};
-use citrus_editor::{AlphaModeModel, Component, ComponentCtx, ComponentRegistry, MaterialModel};
+use citrus_core::{Component, ComponentCtx, ComponentRegistry, ObjectId};
+use citrus_editor::{AlphaModeModel, MaterialModel};
 use citrus_render::{
     AlphaMode, DrawCmd, MaterialDesc, MaterialFeatures, MaterialHandle, MaterialParams, MeshHandle,
     Renderer, TextureHandle,
@@ -26,6 +27,9 @@ pub struct RenderInfo {
 }
 
 pub struct SceneObject {
+    /// Stable unique identity (assigned at creation, serialized in `.scene`).
+    /// Cross-object references use this, not the name or array index.
+    pub id: ObjectId,
     pub name: String,
     pub render: Option<RenderInfo>,
     pub source: ObjectSource,
@@ -423,6 +427,7 @@ impl LoadedScene {
             _ => None,
         };
         self.objects.push(SceneObject {
+            id: ObjectId::new(),
             name,
             render,
             source,
@@ -515,6 +520,7 @@ impl LoadedScene {
                 },
             };
             self.objects.push(SceneObject {
+                id: ObjectId::new(),
                 name: instance.name.clone(),
                 render: Some(RenderInfo { mesh, material }),
                 source,
@@ -762,7 +768,7 @@ impl LoadedScene {
     /// and reloads. Returns true if any id was assigned (so the caller can
     /// persist the change).
     pub fn ensure_camera_ids(&mut self) -> bool {
-        use citrus_editor::CameraComponent;
+        use citrus_core::CameraComponent;
         let mut max_id = 0u32;
         for object in &self.objects {
             for c in &object.components {
@@ -790,7 +796,7 @@ impl LoadedScene {
     /// Run [`ensure_camera_ids`](Self::ensure_camera_ids) first so every camera
     /// has an id.
     pub fn main_camera(&self) -> Option<usize> {
-        use citrus_editor::CameraComponent;
+        use citrus_core::CameraComponent;
         let mut best: Option<(usize, u32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
             if let Some(cam) = object
@@ -808,7 +814,7 @@ impl LoadedScene {
     /// View, projection, and world position of the main camera for the given
     /// aspect ratio (cameras look down -Z, glTF convention).
     pub fn main_camera_view_proj(&self, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
-        use citrus_editor::CameraComponent;
+        use citrus_core::CameraComponent;
         let i = self.main_camera()?;
         let cam = self.objects[i]
             .components
@@ -831,10 +837,18 @@ impl LoadedScene {
         &mut self,
         dt: f32,
         time: f32,
-        commands: &mut Vec<citrus_editor::ComponentCommand>,
-        mut call: impl FnMut(&mut Box<dyn citrus_editor::Component>, &mut ComponentCtx),
+        commands: &mut Vec<citrus_core::ComponentCommand>,
+        mut call: impl FnMut(&mut Box<dyn citrus_core::Component>, &mut ComponentCtx),
     ) {
-        for object in &mut self.objects {
+        // Read-only world snapshot for object references (computed once at the
+        // start of the pass; parallel to `objects`). Stale-by-one-frame for
+        // objects updated earlier this pass, which is fine for references.
+        let world_transforms: Vec<Mat4> =
+            (0..self.objects.len()).map(|i| self.world_transform(i)).collect();
+        let object_names: Vec<String> = self.objects.iter().map(|o| o.name.clone()).collect();
+        let object_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
+        for (index, object) in self.objects.iter_mut().enumerate() {
+            let parent_world = object.parent.and_then(|p| world_transforms.get(p).copied());
             let SceneObject {
                 components,
                 translation,
@@ -852,6 +866,11 @@ impl LoadedScene {
                         rotation,
                         scale,
                         commands,
+                        world_transforms: &world_transforms,
+                        object_names: &object_names,
+                        object_ids: &object_ids,
+                        self_index: index,
+                        parent_world,
                     },
                 );
             }
@@ -862,7 +881,7 @@ impl LoadedScene {
     pub fn start_components(
         &mut self,
         time: f32,
-        commands: &mut Vec<citrus_editor::ComponentCommand>,
+        commands: &mut Vec<citrus_core::ComponentCommand>,
     ) {
         self.each_component(0.0, time, commands, |c, ctx| c.start(ctx));
     }
@@ -873,7 +892,7 @@ impl LoadedScene {
         &mut self,
         dt: f32,
         time: f32,
-        commands: &mut Vec<citrus_editor::ComponentCommand>,
+        commands: &mut Vec<citrus_core::ComponentCommand>,
     ) {
         self.each_component(dt, time, commands, |c, ctx| c.update(ctx));
         self.each_component(dt, time, commands, |c, ctx| c.late_update(ctx));
@@ -903,7 +922,12 @@ impl LoadedScene {
     /// are included for now (the bake path isn't built yet), so scenes don't
     /// go dark.
     pub fn gather_lights(&self) -> Vec<citrus_render::LightInstance> {
-        use citrus_editor::{LightComponent, LightKind};
+        use citrus_core::{LightComponent, LightKind, LightMode};
+        // Once a bake with probe GI exists, Baked-mode lights are represented by
+        // the bake (ambient/probes), so drop them from the realtime loop to
+        // avoid double-counting. Without probe GI we keep them so the scene
+        // isn't dark (lightmap-only sampling is a later phase).
+        let drop_baked = self.baked_ambient().is_some();
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -916,6 +940,9 @@ impl LoadedScene {
             else {
                 continue;
             };
+            if drop_baked && light.mode == LightMode::Baked {
+                continue;
+            }
             let world = self.world_transform(i);
             let (_, rotation, position) = world.to_scale_rotation_translation();
             // Forward (-Z) is the light's travel direction.
@@ -941,11 +968,32 @@ impl LoadedScene {
         lights
     }
 
+    /// Coarse scene ambient from the baked probe SH (average L0 radiance), or
+    /// None when there are no baked probes. Phase 5a: a flat fallback so the
+    /// bake visibly affects the scene before per-fragment probe/lightmap
+    /// sampling lands.
+    pub fn baked_ambient(&self) -> Option<[f32; 3]> {
+        let baked = self.baked.as_ref()?;
+        if baked.probe_sh.is_empty() {
+            return None;
+        }
+        let n = baked.probe_sh.len() as f32;
+        let mut acc = [0.0f32; 3];
+        for sh in &baked.probe_sh {
+            for (a, c) in acc.iter_mut().zip(sh.coeffs[0]) {
+                *a += c;
+            }
+        }
+        // SH L0 basis Y0 = 0.282095 → average constant radiance term.
+        const Y0: f32 = 0.282_094_8;
+        Some([acc[0] / n * Y0, acc[1] / n * Y0, acc[2] / n * Y0])
+    }
+
     /// Gather everything the GPU lighting bake needs: static-geometry
     /// instances (with per-object lightmap resolution from texel density),
     /// Baked-mode lights, and probe-volume grid points. See [`BakeGather`].
     pub fn gather_bake(&self) -> BakeGather {
-        use citrus_editor::{LightComponent, LightKind, LightMode, LightProbeVolume};
+        use citrus_core::{LightComponent, LightKind, LightMode, LightProbeVolume};
 
         let settings = self.environment.bake;
         let mut instances = Vec::new();
@@ -1076,7 +1124,7 @@ impl LoadedScene {
     /// Flatten every active `AudioSource` into a per-frame cue list (with
     /// world position) for the audio engine.
     pub fn gather_audio(&self) -> Vec<crate::audio::AudioCue> {
-        use citrus_editor::AudioSource;
+        use citrus_core::AudioSource;
         let mut cues = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -1096,7 +1144,7 @@ impl LoadedScene {
 
     /// World position of the first active `AudioListener` (the spatial "ears").
     pub fn audio_listener(&self) -> Option<Vec3> {
-        use citrus_editor::AudioListener;
+        use citrus_core::AudioListener;
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
                 continue;
@@ -1240,6 +1288,7 @@ impl LoadedScene {
                     },
                 };
                 SceneEntry {
+                    id: object.id.to_string(),
                     name: object.name.clone(),
                     source: object.source.clone(),
                     enabled: object.enabled,
@@ -1403,6 +1452,8 @@ impl LoadedScene {
             };
 
             scene.objects.push(SceneObject {
+                // Use the saved id; generate one for legacy scenes (empty).
+                id: entry.id.parse().unwrap_or_else(|_| ObjectId::new()),
                 name: entry.name.clone(),
                 render,
                 source: entry.source.clone(),

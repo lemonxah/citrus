@@ -12,6 +12,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+# citrus-core: engine-runtime API shared by the engine, editor, and plugins
+# (component/behaviour traits, ComponentCtx, Transform). Deliberately egui-free
+# so a shipped game links it without any editor code.
+citrus-core = { path = "crates/citrus-core" }
 # graphics
 ash = "0.38"
 ash-window = "0.13"
@@ -26,6 +30,9 @@ hecs = "0.10"
 glam = { version = "0.30", features = ["mint"] }
 serde = { version = "1", features = ["derive"] }
 ron = "0.10"
+regex = "1"
+# Randomness for v4 object UUIDs (avoids pulling the whole `uuid` crate).
+getrandom = "0.3"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -35,6 +42,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 egui = "0.33"
 # "syntect" upgrades syntax highlighting to full grammars (Rust, GLSL, …).
 egui_extras = { version = "0.33", default-features = false, features = ["syntect"] }
+# syntect directly, for the code editor's custom purple theme (pure-Rust regex).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 egui-winit = { version = "0.33", default-features = false }
 egui-ash-renderer = { version = "0.11", features = ["gpu-allocator", "dynamic-rendering"] }
 transform-gizmo-egui = "0.8" # 0.9 needs egui 0.34

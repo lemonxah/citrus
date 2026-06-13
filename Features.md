@@ -60,9 +60,27 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Menu bar (File/Edit/Tools/View/Help), New/Open/Save scene
 - [done] Viewport widget filter (per-billboard visibility + size)
 - [done] Billboard widgets: lights, cameras (frustum), probe volumes (3 bulbs), audio (speaker)
+- [done] Global bottom status bar: project + object count, live rust-analyzer activity
+  spinner, and compile/result messages ("Compiling components…", shader reloads). Global
+  minimum text size (folder-explorer 13px) so nothing renders unreadably small
 - [done] Log console tab (tracing ring buffer, level filter + search, follow, wrap, timestamps)
-- [done] Code editor tabs + syntect highlighting + debounced auto-save
-- [partial] rust-analyzer LSP (diagnostics, completion, hover on `.rs`)
+- [done] Code editor tabs with a custom **Citrus Purple** syntect theme (solid-black
+  background, purple-leaning palette, borderless text box); line-number gutter; fills the
+  dock; debounced auto-save; bottom status line (mode / file / language / line:col /
+  unsaved, folds in the vim `:` command line); caret stays solid while moving. Minimal
+  header (problem counts + hint) — the tab name carries the filename
+- [done] Vim mode (toggle in **Edit menu**, persisted in `project.citrus`; per-file
+  mode): Normal / Insert /
+  Visual / Visual-line / Command. Motions h j k l w b e 0 ^ $ gg {n}gg G {n}G (counts);
+  i a I A o O; x D C dd cc yy dw cw yw d$/c$/y$ p P; visual d y c p; `u` undo / Ctrl+R
+  redo (per-file snapshot stack, an insert session = one undo); `gd` go-to-definition,
+  `gr` references (picker popup). Command line (`:`): `:w` write, `:q`/`:wq`/`:x` close,
+  `:{n}` goto line, `[%]s/pat/rep/[g]` regex substitution (`$1`/`${name}` capture refs)
+  with **live preview** — matches/replacements highlight as you type and revert on
+  Escape, commit on Enter. Core subset — `f`/`t`, `/` search, `.` repeat can follow
+- [partial] rust-analyzer LSP (diagnostics, completion, hover, go-to-definition,
+  find-references on `.rs`); file browser badges files (and aggregates onto folders)
+  with red/yellow problem dots, and live-updates as files change on disk
 - [done] App icon (procedural citrus slice; X11 window icon + desktop entry install)
 - [done] Crash handler (symbolized backtrace on SIGSEGV/SIGBUS/SIGILL/SIGABRT)
 
@@ -154,9 +172,20 @@ components use to read/affect the world, identical in editor Play mode and in a 
 game.
 
 - [todo] Expand `ComponentCtx` (or a new `World`/`Api` handle) with:
-  - [todo] **Self transform**: world + local read/write (have local; add world-space)
-  - [todo] **Object graph**: find by name/id/tag, parent/children, spawn/despawn, set active
-  - [todo] **Transforms of other objects**: get/set translation/rotation/scale
+  - [partial] **Self transform**: local read/write (done); `self_transform()` world read
+    (done); `set_world_position(world)` world-space *write* (done — converts through the
+    parent chain via `parent_world`, so a nested object lands at the right world spot);
+    world-space rotation/scale write still todo
+  - [partial] **Object graph**: every object has a stable UUID (`ObjectId`, assigned at
+    create, serialized in `.scene`); `ObjectRef` field type + inspector **drag-drop
+    target** (drag an object from the Scene tree onto the reference box; ✕ clears);
+    resolve via `ctx.resolve`/`transform_of`/`position_of`/`index_of`/`self_id`;
+    `find_object(name)` kept as a convenience. tags, parent/children, spawn/despawn,
+    set-active still todo
+  - [partial] **Transforms of other objects**: any object resolves to a `Transform`
+    (translation/rotation/scale, + forward/right/up/matrix) via `object_transform` /
+    `object_transform_named` / `object_position` / `object_matrix` (world snapshot);
+    *set* still todo
   - [todo] **Components**: get/add/remove a component on any object; typed access
   - [todo] **Input**: read the binding-system action snapshot (2C)
   - [todo] **Physics queries**: raycast, shape-cast, overlap; apply force/impulse; collision/
@@ -242,6 +271,45 @@ Editor authoring
 - [todo] Screen-space canvas previewed at reference resolution; world-space canvas edited
   in 3D like any object.
 
+### 2G. Networking & multiplayer [todo]
+Built-in networking so games can be multiplayer, supporting **both** topologies:
+**client-server** (an authoritative server, dedicated or player-hosted) and
+**peer-to-peer**. One replication/API surface; the topology is a choice per game.
+
+Transport & connection
+- [todo] **Transport layer** abstraction over reliable + unreliable channels (candidate:
+  `renet`/`renetcode` on UDP, or `quinn` (QUIC); `webrtc`/`matchbox` for browser + P2P).
+  Pluggable so server-based and P2P share the same send/recv API.
+- [todo] **Connection management**: host / join, lobby, player slots, disconnect + timeout
+  handling, and (P2P) host migration.
+- [todo] **NAT traversal for P2P**: STUN/TURN/ICE (or a relay fallback) so peers connect
+  without port-forwarding; matchmaking/relay service is a later add.
+
+Topologies
+- [todo] **Client-server (authoritative)**: server owns the simulation; clients send input,
+  receive state. Includes client-side **prediction + reconciliation** and **interpolation**
+  so movement is smooth under latency, and server authority to resist cheating.
+- [todo] **Peer-to-peer**: shared/host authority or deterministic **lockstep** (input-only
+  sync — pairs with a deterministic physics step, see #26). Trust model documented.
+
+Replication
+- [todo] **Networked objects + ownership**: mark which objects/components replicate and who
+  has authority over each (`Networked` marker / per-object owner). Spawn/despawn replicate.
+- [todo] **State sync**: transform + component-field replication with **delta compression**
+  and snapshots; tick rate + bandwidth budget. Relevancy/interest management (don't send
+  everything to everyone) as a follow-up.
+- [todo] **RPCs / networked events**: reliable messages between peers/clients/server,
+  delivered to components (ties to the in-game API event bus, 2D).
+
+Integration
+- [todo] **In-game API surface** (2D): `is_server` / `is_client` / `local_player`, object
+  ownership queries, `spawn_networked`, send/receive RPCs — so components write
+  network-aware logic without touching the transport.
+- [todo] **Voice chat** (VR-first: spatial voice) + **IK pose replication** for avatars
+  (folds in the existing M6 milestone scope).
+- [todo] Editor/runtime tooling: a local "host + N clients" test harness, a net-stats
+  overlay (ping, bandwidth, packet loss), and lag simulation for testing.
+
 ---
 
 ## 3. Dependencies between goals
@@ -269,6 +337,11 @@ physics engine (#26) --+                              |
   system (2C) for navigation; its 2D renderer + text subsystem are independent and can
   start now. World-space UI is built/tested with a mouse ray; the VR controller ray
   plugs into the same event path once VR (M4) lands.
+- **Networking (2G)** builds on the in-game API (2D) for the replication/RPC surface and
+  on the physics engine (#26) for a deterministic step (P2P lockstep). The transport +
+  connection layer is independent and can start now; client-server prediction and P2P
+  lockstep are largely separate tracks sharing one replication model. Subsumes the M6
+  milestone (world/avatar sync, voice, IK).
 
 ---
 

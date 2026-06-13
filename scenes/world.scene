@@ -1,6 +1,7 @@
 (
     entries: [
         (
+            id: "24637271-82bc-4d02-b7a9-6e5d0a1bd510",
             name: "Floor",
             source: Builtin(
                 mesh: 2,
@@ -14,6 +15,7 @@
             scale: (1.0, 1.0, 1.0),
         ),
         (
+            id: "454a79dd-9db1-4839-ae4a-1a22a7b40651",
             name: "Toon Sphere",
             source: Builtin(
                 mesh: 0,
@@ -27,6 +29,7 @@
             scale: (1.0, 1.0, 1.0),
         ),
         (
+            id: "5859cb67-c440-4ed7-93f9-b98a3d878b63",
             name: "Metal Cube",
             source: Builtin(
                 mesh: 1,
@@ -40,6 +43,7 @@
             scale: (1.0, 1.0, 1.0),
         ),
         (
+            id: "67adbf0b-a039-4196-942c-6918b5b1ca54",
             name: "Emissive Core",
             source: Builtin(
                 mesh: 0,
@@ -48,11 +52,18 @@
             static_geometry: false,
             material: File("materials/shinyball.material"),
             parent: Some(6),
-            translation: (-2.7956839, -1.0914907, 0.32709014),
-            rotation: (0.0, 0.0, 0.0, 1.0),
+            components: [
+                (
+                    kind: "Orbit",
+                    data: "(degrees_per_second:90.0,radius:1.5,target:(Some(\"5859cb67-c440-4ed7-93f9-b98a3d878b63\")))",
+                ),
+            ],
+            translation: (-0.014766693, -0.78896916, -0.83440495),
+            rotation: (-0.0, -0.0, -0.0, 1.0),
             scale: (0.6, 0.6, 0.6),
         ),
         (
+            id: "2bd7b3f5-eabc-4744-a5b7-305fb6932777",
             name: "Glass Panel",
             source: Builtin(
                 mesh: 1,
@@ -66,6 +77,7 @@
             scale: (1.600004, 0.99998003, 0.05000062),
         ),
         (
+            id: "55d59c77-2e32-406a-8f9d-7a34e54f101a",
             name: "Camera",
             source: Camera,
             enabled: true,
@@ -104,6 +116,7 @@
             scale: (0.99997723, 1.0, 0.99997723),
         ),
         (
+            id: "03ab5a6c-83ac-4fa4-998b-2764577e9f9e",
             name: "Root",
             source: Empty,
             enabled: true,
@@ -136,6 +149,7 @@
             scale: (1.0, 1.0, 1.0),
         ),
         (
+            id: "f6e4b8ad-5e33-4385-b0b9-52936f06aa8e",
             name: "Cube",
             source: Primitive(
                 shape: Cube,
@@ -149,6 +163,7 @@
             scale: (1.0, 1.0, 1.0),
         ),
         (
+            id: "7382f19c-8096-4507-b80b-4a86835586fa",
             name: "Point Light",
             source: Light,
             enabled: true,
@@ -187,6 +202,7 @@
             scale: (1.0, 1.0, 1.0),
         ),
         (
+            id: "c69c5dcd-986d-4f7d-ba52-fbae30ec3a91",
             name: "Light Probe Volume",
             source: Empty,
             enabled: true,
@@ -236,5 +252,11 @@
         shadow_resolution: 2048,
         shadow_softness: 1.0,
         shadow_distance: 25.0,
+        bake: (
+            texel_density: 16.0,
+            bounces: 2,
+            samples: 128,
+            max_lightmap: 512,
+        ),
     ),
 )

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+citrus-core.workspace = true
 citrus-render.workspace = true
 citrus-assets.workspace = true
 citrus-editor.workspace = true

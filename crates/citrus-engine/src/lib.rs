@@ -33,9 +33,10 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use camera::FlyCamera;
+use citrus_core::{ComponentCommand, ComponentRegistry, ObjectId};
 use citrus_editor::{
-    CodeDiagnostic, CodeEditor, ComponentCommand, ComponentRegistry, FileBrowser, InspectorContent,
-    InspectorPanel, MaterialModel, ObjectInfoModel, ScenePanel, ShaderUiInfo, TransformModel,
+    CodeDiagnostic, CodeEditor, EditorComponents, FileBrowser, InspectorContent, InspectorPanel,
+    MaterialModel, ObjectInfoModel, ScenePanel, ShaderUiInfo, TransformModel,
 };
 use citrus_render::{CameraData, FrameInput, LightData, Renderer};
 use gizmo::{GizmoState, GizmoTool};
@@ -91,6 +92,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         lsp: None,
         lsp_failed: false,
         lsp_requests: HashMap::new(),
+        file_diagnostics: HashMap::new(),
         gizmo: GizmoState::new(),
         widget_filter: WidgetFilter::default(),
         gizmo_drag: false,
@@ -100,6 +102,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         undo_stack: UndoStack::default(),
         suppress_undo_record: false,
         components: ComponentRegistry::with_builtins(),
+        editor_components: EditorComponents::with_builtins(),
         playing: false,
         play_scene_switched: false,
         play_origin_scene: None,
@@ -111,6 +114,8 @@ pub fn run(config: AppConfig) -> Result<()> {
         last_material_edit: None,
         plugins: plugins::PluginHost::default(),
         plugin_build_error: None,
+        status: None,
+        reload_pending: false,
         project: citrus_assets::ProjectFile::default(),
         camera: FlyCamera::default(),
         orbit_pivot: None,
@@ -177,6 +182,8 @@ struct OpenEditor {
     hover: Option<citrus_editor::HoverState>,
     /// Pending go-to-definition jump (0-based line, utf-8 column).
     goto: Option<(u32, u32)>,
+    /// Reference list to show in the `gr` picker popup.
+    references: Option<Vec<citrus_editor::ReferenceItem>>,
 }
 
 /// An in-flight LSP request, keyed by request id, awaiting its response.
@@ -185,6 +192,7 @@ enum LspRequestKind {
     Completion { path: PathBuf, anchor_char: usize },
     Hover { path: PathBuf },
     Definition,
+    References { path: PathBuf },
 }
 
 /// Extensions the code editor opens (scene/material files have dedicated
@@ -248,10 +256,15 @@ enum EditorAction {
     OpenCodeFile(PathBuf),
     /// Save the open editor for this path.
     SaveOpenEditor(PathBuf),
+    /// Close a code tab by path (vim `:q`/`:wq`).
+    CloseCodeTab(PathBuf),
     /// Request LSP completion / hover / definition at a cursor char index.
     LspCompletion(PathBuf, usize),
     LspHover(PathBuf, usize),
     LspGoto(PathBuf, usize),
+    LspReferences(PathBuf, usize),
+    /// Open a file (if needed) and jump to a 0-based line/col (reference pick).
+    OpenAndGoto(PathBuf, u32, u32),
     /// New Rust component module in the plugin crate.
     CreateComponent,
     LoadScene(PathBuf),
@@ -270,7 +283,7 @@ enum EditorAction {
     Redo,
     /// Create an empty/camera/primitive in the scene.
     Spawn(citrus_assets::ObjectSource),
-    SpawnLight(citrus_editor::LightKind),
+    SpawnLight(citrus_core::LightKind),
     SpawnProbeVolume,
     SpawnAudioSource,
     SpawnBoxCollider,
@@ -483,6 +496,9 @@ struct EngineApp {
     lsp_failed: bool,
     /// In-flight LSP completion/hover requests, keyed by request id.
     lsp_requests: HashMap<i64, LspRequestKind>,
+    /// Per-file LSP problem tally (errors, warnings) for file-browser badges;
+    /// keyed by absolute path, updated on every publishDiagnostics.
+    file_diagnostics: HashMap<PathBuf, (u32, u32)>,
     gizmo: GizmoState,
     widget_filter: WidgetFilter,
     /// A left-drag that began on a gizmo handle: claims the whole gesture so
@@ -500,6 +516,8 @@ struct EngineApp {
     suppress_undo_record: bool,
     /// Registered component types (built-ins now; plugins extend this).
     components: ComponentRegistry,
+    /// Editor-side inspector/gizmo dispatch (built-ins + plugin editor traits).
+    editor_components: EditorComponents,
     /// Play mode: components run every frame; edits aren't recorded to undo.
     playing: bool,
     /// Object state captured at Play start, restored at Stop.
@@ -524,6 +542,11 @@ struct EngineApp {
     plugins: plugins::PluginHost,
     /// Last failed plugin build's compiler output (shown in a window).
     plugin_build_error: Option<String>,
+    /// Global status-bar message: (text, when set, show a spinner).
+    status: Option<(String, Instant, bool)>,
+    /// A plugin reload was requested; deferred one frame so the status bar can
+    /// show "Compiling components…" before the (blocking) cargo build.
+    reload_pending: bool,
     /// project.citrus: name, last scene, per-project engine settings.
     project: citrus_assets::ProjectFile,
     camera: FlyCamera,
@@ -565,6 +588,17 @@ struct EngineApp {
 
 impl EngineApp {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        // Global minimum text size = the folder-explorer text (13px): bump any
+        // smaller text style up so nothing renders unreadably small; larger
+        // styles (headings) are left alone.
+        self.egui_ctx.style_mut(|style| {
+            for font_id in style.text_styles.values_mut() {
+                if font_id.size < 13.0 {
+                    font_id.size = 13.0;
+                }
+            }
+        });
+
         let (icon_w, icon_h, icon_rgba) = icon::rgba();
         let attrs = Window::default_attributes()
             .with_title(self.config.title.clone())
@@ -589,9 +623,11 @@ impl EngineApp {
 
         // Plugins first: scene files may reference plugin components.
         if plugins::PluginHost::any_plugins(&self.project_root)
-            && let Err(e) = self
-                .plugins
-                .build_and_load(&self.project_root, &mut self.components)
+            && let Err(e) = self.plugins.build_and_load(
+                &self.project_root,
+                &mut self.components,
+                &mut self.editor_components,
+            )
         {
             tracing::error!("building component plugins: {e:#}");
             self.plugin_build_error = Some(format!("{e:#}"));
@@ -1011,6 +1047,12 @@ impl EngineApp {
                         lsp.save(&path);
                     }
                 }
+                EditorAction::CloseCodeTab(path) => {
+                    if let Some(loc) = self.dock_state.find_tab(&Tab::Code(path.clone())) {
+                        self.dock_state.remove_tab(loc);
+                    }
+                    self.open_editors.retain(|e| e.path != path);
+                }
                 EditorAction::LspCompletion(path, cursor) => {
                     if let Some(editor) = self.open_editors.iter().find(|e| e.path == path) {
                         let (line, character) = char_to_line_col(&editor.text, cursor);
@@ -1038,6 +1080,22 @@ impl EngineApp {
                             let id = lsp.definition(&path, line, character);
                             self.lsp_requests.insert(id, LspRequestKind::Definition);
                         }
+                    }
+                }
+                EditorAction::LspReferences(path, cursor) => {
+                    if let Some(editor) = self.open_editors.iter().find(|e| e.path == path) {
+                        let (line, character) = char_to_line_col(&editor.text, cursor);
+                        if let Some(lsp) = self.lsp.as_mut() {
+                            let id = lsp.references(&path, line, character);
+                            self.lsp_requests
+                                .insert(id, LspRequestKind::References { path });
+                        }
+                    }
+                }
+                EditorAction::OpenAndGoto(path, line, col) => {
+                    self.open_code_file(path.clone());
+                    if let Some(editor) = self.open_editors.iter_mut().find(|e| e.path == path) {
+                        editor.goto = Some((line, col));
                     }
                 }
                 EditorAction::CreateComponent => {
@@ -1145,7 +1203,7 @@ impl EngineApp {
                     }
                 }
                 EditorAction::SpawnLight(kind) => {
-                    use citrus_editor::{LightComponent, LightKind};
+                    use citrus_core::{LightComponent, LightKind};
                     let name = format!("{} Light", kind.label());
                     // Directional lights default to aiming down-ish (a sun);
                     // point/spot spawn in front of the camera like other
@@ -1194,7 +1252,7 @@ impl EngineApp {
                         Ok(index) => {
                             self.scene.objects[index]
                                 .components
-                                .push(Box::new(citrus_editor::LightProbeVolume::default()));
+                                .push(Box::new(citrus_core::LightProbeVolume::default()));
                             self.selection = Selection::Object(index);
                         }
                         Err(e) => tracing::error!("spawning probe volume: {e:#}"),
@@ -1211,7 +1269,7 @@ impl EngineApp {
                         Ok(index) => {
                             self.scene.objects[index]
                                 .components
-                                .push(Box::new(citrus_editor::AudioSource::default()));
+                                .push(Box::new(citrus_core::AudioSource::default()));
                             self.selection = Selection::Object(index);
                         }
                         Err(e) => tracing::error!("spawning audio source: {e:#}"),
@@ -1228,7 +1286,7 @@ impl EngineApp {
                         Ok(index) => {
                             self.scene.objects[index]
                                 .components
-                                .push(Box::new(citrus_editor::BoxCollider::default()));
+                                .push(Box::new(citrus_core::BoxCollider::default()));
                             self.selection = Selection::Object(index);
                         }
                         Err(e) => tracing::error!("spawning box collider: {e:#}"),
@@ -1245,7 +1303,7 @@ impl EngineApp {
                         Ok(index) => {
                             self.scene.objects[index]
                                 .components
-                                .push(Box::new(citrus_editor::SphereCollider::default()));
+                                .push(Box::new(citrus_core::SphereCollider::default()));
                             self.selection = Selection::Object(index);
                         }
                         Err(e) => tracing::error!("spawning sphere collider: {e:#}"),
@@ -1323,26 +1381,10 @@ impl EngineApp {
                     }
                 }
                 EditorAction::ReloadPlugins => {
-                    match self
-                        .plugins
-                        .build_and_load(&self.project_root, &mut self.components)
-                    {
-                        Ok(names) => {
-                            self.plugin_build_error = None;
-                            // Old instances point at the previous build:
-                            // re-create every component from serialized
-                            // state through the fresh registry.
-                            for object in &mut self.scene.objects {
-                                let saved = object.save_components();
-                                object.load_components(&saved, &self.components);
-                            }
-                            tracing::info!("reloaded plugins: {names:?}");
-                        }
-                        Err(e) => {
-                            tracing::error!("reloading plugins: {e:#}");
-                            self.plugin_build_error = Some(format!("{e:#}"));
-                        }
-                    }
+                    // Defer the blocking cargo build one frame so the status
+                    // bar paints "Compiling components…" first.
+                    self.set_status("Compiling components…", true);
+                    self.reload_pending = true;
                 }
                 EditorAction::BakeLighting => self.run_bake(),
                 EditorAction::ClearBake => {
@@ -1468,6 +1510,13 @@ impl EngineApp {
                         self.actions.push(EditorAction::Redo);
                         ui.close();
                     }
+                    ui.separator();
+                    if ui
+                        .checkbox(&mut self.project.settings.vim_mode, "Vim mode")
+                        .changed()
+                    {
+                        self.save_project();
+                    }
                 });
                 ui.menu_button("Object", |ui| {
                     use citrus_assets::{ObjectSource, PrimitiveShape};
@@ -1480,7 +1529,7 @@ impl EngineApp {
                         ui.close();
                     }
                     ui.menu_button("Create Light", |ui| {
-                        for kind in citrus_editor::LightKind::ALL {
+                        for kind in citrus_core::LightKind::ALL {
                             if ui.button(kind.label()).clicked() {
                                 self.actions.push(EditorAction::SpawnLight(kind));
                                 ui.close();
@@ -1726,6 +1775,7 @@ impl EngineApp {
                         completion: None,
                         hover: None,
                         goto: None,
+                        references: None,
                     });
                 }
                 Ok(_) => {
@@ -1749,6 +1799,16 @@ impl EngineApp {
             }
             self.dock_state.push_to_focused_leaf(tab);
         }
+    }
+
+    /// True when the active/focused dock tab is a code editor — used to keep
+    /// Escape from doing the global deselect while editing (Escape is the vim
+    /// Insert -> Normal key there).
+    fn code_tab_focused(&mut self) -> bool {
+        self.dock_state
+            .find_active_focused()
+            .map(|(_, tab)| matches!(tab, Tab::Code(_)))
+            .unwrap_or(false)
     }
 
     /// Close the focused code tab (Ctrl+W), dropping its editor buffer.
@@ -1810,6 +1870,15 @@ impl EngineApp {
             for event in lsp.poll() {
                 match event {
                     lsp::LspEvent::Diagnostics { path, diags } => {
+                        // Project-wide tally so the file browser can badge files
+                        // (and folders) that have problems, even unopened ones.
+                        let errors = diags.iter().filter(|d| d.severity <= 1).count() as u32;
+                        let warns = diags.len() as u32 - errors;
+                        if errors == 0 && warns == 0 {
+                            self.file_diagnostics.remove(&path);
+                        } else {
+                            self.file_diagnostics.insert(path.clone(), (errors, warns));
+                        }
                         if let Some(editor) = self.open_editors.iter_mut().find(|e| e.path == path)
                         {
                             editor.diagnostics = diags
@@ -2202,6 +2271,68 @@ impl EngineApp {
 
     /// Rescan project `.frag` files for the shader picker and hot-reload any
     /// loaded shaders whose files changed. Called at most every 2 seconds.
+    /// Set the global status-bar message (`spinner` shows a busy indicator).
+    fn set_status(&mut self, msg: impl Into<String>, spinner: bool) {
+        self.status = Some((msg.into(), Instant::now(), spinner));
+    }
+
+    /// Build + reload the component plugins (blocking cargo build), then
+    /// re-instantiate scene components from their serialized state.
+    fn do_reload_plugins(&mut self) {
+        match self.plugins.build_and_load(
+            &self.project_root,
+            &mut self.components,
+            &mut self.editor_components,
+        ) {
+            Ok(names) => {
+                self.plugin_build_error = None;
+                for object in &mut self.scene.objects {
+                    let saved = object.save_components();
+                    object.load_components(&saved, &self.components);
+                }
+                tracing::info!("reloaded plugins: {names:?}");
+                self.set_status(format!("Components reloaded ({})", names.len()), false);
+            }
+            Err(e) => {
+                tracing::error!("reloading plugins: {e:#}");
+                self.plugin_build_error = Some(format!("{e:#}"));
+                self.set_status("Component build failed", false);
+            }
+        }
+    }
+
+    /// Bottom status bar for the whole editor: project + object count on the
+    /// left, current activity (rust-analyzer analyzing, compiling, last result)
+    /// on the right.
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        let lsp_busy = !self.lsp_requests.is_empty();
+        let recent = self
+            .status
+            .as_ref()
+            .filter(|(_, t, _)| t.elapsed().as_secs_f32() < 6.0)
+            .map(|(m, _, s)| (m.clone(), *s));
+        let project = self.project.name.clone();
+        let objects = self.scene.objects.len();
+        egui::TopBottomPanel::bottom("citrus-status-bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{project}  ·  {objects} objects")).size(14.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if lsp_busy {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(egui::RichText::new("rust-analyzer").size(14.0));
+                    } else if let Some((msg, spinner)) = recent {
+                        if spinner {
+                            ui.add(egui::Spinner::new().size(14.0));
+                        }
+                        ui.label(egui::RichText::new(msg).size(14.0));
+                    } else {
+                        ui.label(egui::RichText::new("Ready").size(14.0).weak());
+                    }
+                });
+            });
+        });
+    }
+
     fn refresh_shaders(&mut self) {
         if self
             .last_shader_scan
@@ -2220,6 +2351,7 @@ impl EngineApp {
                     &self.project_root,
                     &changed,
                 );
+                self.set_status(format!("Reloaded {} shader(s)", changed.len()), false);
             }
         }
     }
@@ -2637,6 +2769,7 @@ impl EngineApp {
         let egui_ctx = self.egui_ctx.clone();
         let output = egui_ctx.run(raw_input, |ctx| {
             self.menu_bar(ctx);
+            self.status_bar(ctx);
             if self.show_stats_overlay {
                 self.stats_overlay(ctx, render_stats);
             }
@@ -2661,6 +2794,8 @@ impl EngineApp {
                 inspector_lock_target: &mut self.inspector_lock_target,
                 scene_panel: &mut self.scene_panel,
                 file_browser: &mut self.file_browser,
+                file_diagnostics: &self.file_diagnostics,
+                editor_components: &self.editor_components,
                 file_material: &mut self.file_material,
                 open_editors: &mut self.open_editors,
                 focused_code,
@@ -2678,6 +2813,7 @@ impl EngineApp {
                 view,
                 proj,
                 looking: self.looking,
+                vim_mode: self.project.settings.vim_mode,
                 log_filter: &mut self.log_filter,
                 probe_drag: &mut self.probe_drag,
                 audio_drag: &mut self.audio_drag,
@@ -2692,6 +2828,13 @@ impl EngineApp {
                 .show_leaf_close_all_buttons(false)
                 .show(ctx, &mut tabs);
             self.dock_state = dock_state;
+
+            // Clear the published "dragged object" once the pointer is up, after
+            // ObjectRef drop boxes have had this frame to consume it (so a later
+            // plain release over a box can't re-apply a stale drag).
+            if !ctx.input(|i| i.pointer.any_down()) {
+                ctx.data_mut(|d| d.remove::<usize>(egui::Id::new(citrus_editor::DRAG_OBJECT_KEY)));
+            }
         });
 
         if let Some(egui_state) = self.egui_state.as_mut() {
@@ -2757,11 +2900,13 @@ impl EngineApp {
             } else {
                 0.0
             },
-            ambient: [
+            // Baked probe ambient (which already folds in sky + baked lights)
+            // replaces the flat env ambient once a bake with probes exists.
+            ambient: self.scene.baked_ambient().unwrap_or([
                 env.ambient[0] * env.ambient_intensity,
                 env.ambient[1] * env.ambient_intensity,
                 env.ambient[2] * env.ambient_intensity,
-            ],
+            ]),
         };
 
         // Render the main-camera preview only while a Camera tab is open.
@@ -2816,6 +2961,15 @@ impl EngineApp {
             tracing::error!("render failed: {e:#}");
             event_loop.exit();
         }
+
+        // Deferred plugin reload: this frame already painted "Compiling
+        // components…", so run the blocking cargo build now (the next frame
+        // shows the result).
+        if self.reload_pending {
+            self.reload_pending = false;
+            self.do_reload_plugins();
+        }
+
         window.request_redraw();
     }
 }
@@ -2828,6 +2982,9 @@ struct EditorTabs<'a> {
     inspector_lock_target: &'a mut Option<Selection>,
     scene_panel: &'a mut ScenePanel,
     file_browser: &'a mut FileBrowser,
+    file_diagnostics: &'a HashMap<PathBuf, (u32, u32)>,
+    editor_components: &'a EditorComponents,
+    vim_mode: bool,
     file_material: &'a mut Option<FileMaterial>,
     open_editors: &'a mut Vec<OpenEditor>,
     /// Path of the focused code tab (drives Inspector diagnostics).
@@ -2993,6 +3150,8 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         &mut editor.completion,
                         &mut editor.hover,
                         &mut editor.goto,
+                        &mut editor.references,
+                        self.vim_mode,
                     );
                     if response.text_changed {
                         editor.dirty = true;
@@ -3002,6 +3161,10 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     if response.save_requested {
                         self.actions
                             .push(EditorAction::SaveOpenEditor(path.clone()));
+                    }
+                    if response.close_requested {
+                        self.actions
+                            .push(EditorAction::CloseCodeTab(path.clone()));
                     }
                     if let Some(cursor) = response.request_completion {
                         self.actions
@@ -3015,6 +3178,13 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         self.actions
                             .push(EditorAction::LspGoto(path.clone(), cursor));
                     }
+                    if let Some(cursor) = response.request_references {
+                        self.actions
+                            .push(EditorAction::LspReferences(path.clone(), cursor));
+                    }
+                    if let Some((target, line, col)) = response.goto_location {
+                        self.actions.push(EditorAction::OpenAndGoto(target, line, col));
+                    }
                 } else {
                     ui.label(format!("No editor buffer for {}", path.display()));
                 }
@@ -3025,7 +3195,9 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     Selection::File(path) => Some(path.clone()),
                     _ => None,
                 };
-                let response = self.file_browser.ui(ui, selected.as_deref());
+                let response = self
+                    .file_browser
+                    .ui(ui, selected.as_deref(), self.file_diagnostics);
                 if let Some(path) = response.clicked {
                     // Single click just selects (Inspector shows file info).
                     self.actions.push(EditorAction::SelectFile(path));
@@ -3138,7 +3310,7 @@ impl EditorTabs<'_> {
             if let Some(src) = self.scene.objects[object]
                 .components
                 .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_editor::AudioSource>())
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::AudioSource>())
             {
                 if max {
                     src.max_distance = new_radius.max(src.min_distance + 0.01);
@@ -3163,7 +3335,7 @@ impl EditorTabs<'_> {
         let Some(src) = self.scene.objects[i]
             .components
             .iter()
-            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::AudioSource>())
+            .find_map(|c| c.as_any().downcast_ref::<citrus_core::AudioSource>())
         else {
             return;
         };
@@ -3238,7 +3410,7 @@ impl EditorTabs<'_> {
                     if let Some(b) = self.scene.objects[object]
                         .components
                         .iter_mut()
-                        .find_map(|c| c.as_any_mut().downcast_mut::<citrus_editor::BoxCollider>())
+                        .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::BoxCollider>())
                     {
                         b.size[axis] = new_size;
                         // Shift center by half the growth so the opposite face
@@ -3251,7 +3423,7 @@ impl EditorTabs<'_> {
                     if let Some(s) = self.scene.objects[object]
                         .components
                         .iter_mut()
-                        .find_map(|c| c.as_any_mut().downcast_mut::<citrus_editor::SphereCollider>())
+                        .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::SphereCollider>())
                     {
                         s.radius = new_radius;
                     }
@@ -3279,7 +3451,7 @@ impl EditorTabs<'_> {
         if let Some((center, size)) = self.scene.objects[i]
             .components
             .iter()
-            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::BoxCollider>())
+            .find_map(|c| c.as_any().downcast_ref::<citrus_core::BoxCollider>())
             .map(|b| (b.center, b.size))
         {
             let half = Vec3::from(size) * 0.5;
@@ -3326,7 +3498,7 @@ impl EditorTabs<'_> {
         if let Some((center, radius)) = self.scene.objects[i]
             .components
             .iter()
-            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::SphereCollider>())
+            .find_map(|c| c.as_any().downcast_ref::<citrus_core::SphereCollider>())
             .map(|s| (s.center, s.radius))
         {
             let origin = world.transform_point3(Vec3::from(center));
@@ -3392,7 +3564,7 @@ impl EditorTabs<'_> {
                 .iter_mut()
                 .find_map(|c| {
                     c.as_any_mut()
-                        .downcast_mut::<citrus_editor::LightProbeVolume>()
+                        .downcast_mut::<citrus_core::LightProbeVolume>()
                 })
             {
                 volume.size[axis] = new_size;
@@ -3421,7 +3593,7 @@ impl EditorTabs<'_> {
         let Some(volume) = self.scene.objects[i]
             .components
             .iter()
-            .find_map(|c| c.as_any().downcast_ref::<citrus_editor::LightProbeVolume>())
+            .find_map(|c| c.as_any().downcast_ref::<citrus_core::LightProbeVolume>())
         else {
             return;
         };
@@ -4025,7 +4197,7 @@ impl EditorTabs<'_> {
                 let camera = object
                     .components
                     .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<citrus_editor::CameraComponent>());
+                    .find_map(|c| c.as_any().downcast_ref::<citrus_core::CameraComponent>());
                 let (fov, near, far) =
                     camera.map_or((60.0, 0.1, 100.0), |c| (c.fov_deg, c.near, c.far));
                 let world = self.scene.world_transform(i);
@@ -4133,7 +4305,7 @@ impl EditorTabs<'_> {
                 let Some(volume) = object
                     .components
                     .iter()
-                    .find_map(|c| c.as_any().downcast_ref::<citrus_editor::LightProbeVolume>())
+                    .find_map(|c| c.as_any().downcast_ref::<citrus_core::LightProbeVolume>())
                 else {
                     continue;
                 };
@@ -4232,18 +4404,18 @@ impl EditorTabs<'_> {
                 }
                 let is_light = object.components.iter().any(|c| {
                     c.as_any()
-                        .downcast_ref::<citrus_editor::LightComponent>()
+                        .downcast_ref::<citrus_core::LightComponent>()
                         .is_some()
                 });
                 let is_camera = matches!(object.source, citrus_assets::ObjectSource::Camera);
                 let is_probe = object.components.iter().any(|c| {
                     c.as_any()
-                        .downcast_ref::<citrus_editor::LightProbeVolume>()
+                        .downcast_ref::<citrus_core::LightProbeVolume>()
                         .is_some()
                 });
                 let is_audio = object.components.iter().any(|c| {
                     c.as_any()
-                        .downcast_ref::<citrus_editor::AudioSource>()
+                        .downcast_ref::<citrus_core::AudioSource>()
                         .is_some()
                 });
                 if !is_light && !is_camera && !is_probe && !is_audio {
@@ -4298,9 +4470,9 @@ impl EditorTabs<'_> {
             && let Some(light) = self.scene.objects[i]
                 .components
                 .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::LightComponent>())
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::LightComponent>())
         {
-            use citrus_editor::LightKind;
+            use citrus_core::LightKind;
             let view_proj = self.proj * self.view;
             let full_rect = ui.ctx().viewport_rect();
             let painter = ui.painter();
@@ -4393,7 +4565,7 @@ impl EditorTabs<'_> {
             && let Some((min_d, max_d)) = self.scene.objects[i]
                 .components
                 .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::AudioSource>())
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::AudioSource>())
                 .filter(|s| s.spatial)
                 .map(|s| (s.min_distance, s.max_distance))
         {
@@ -4510,7 +4682,7 @@ impl EditorTabs<'_> {
             if let Some((center, size)) = obj
                 .components
                 .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::BoxCollider>())
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::BoxCollider>())
                 .map(|b| (Vec3::from(b.center), Vec3::from(b.size)))
             {
                 let half = size * 0.5;
@@ -4561,7 +4733,7 @@ impl EditorTabs<'_> {
             if let Some((center, radius)) = obj
                 .components
                 .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_editor::SphereCollider>())
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::SphereCollider>())
                 .map(|s| (Vec3::from(s.center), s.radius))
             {
                 let o = world.transform_point3(center);
@@ -4599,7 +4771,7 @@ impl EditorTabs<'_> {
             if obj
                 .components
                 .iter()
-                .any(|c| c.as_any().downcast_ref::<citrus_editor::MeshCollider>().is_some())
+                .any(|c| c.as_any().downcast_ref::<citrus_core::MeshCollider>().is_some())
                 && let Some((min, max)) = self.scene.render_mesh_bounds(i)
             {
                 let corner = |sx: f32, sy: f32, sz: f32| {
@@ -4880,7 +5052,7 @@ impl EditorTabs<'_> {
                 ui.label(egui::RichText::new(name).small().weak());
             });
             if editor.diagnostics.is_empty() {
-                ui.label(egui::RichText::new("✓ No problems").small().weak());
+                ui.label(egui::RichText::new("✓ No problems").size(14.0).weak());
             } else {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -4898,7 +5070,7 @@ impl EditorTabs<'_> {
                                     d.line,
                                     d.message
                                 ))
-                                .small()
+                                .size(14.0)
                                 .color(color),
                             );
                         }
@@ -4956,6 +5128,15 @@ impl EditorTabs<'_> {
                         }),
                     };
                     let material_index = render.map(|r| r.material);
+                    // Object list (id + name) for ObjectRef pickers — built as an
+                    // owned Vec before the mutable component borrow so it doesn't
+                    // alias scene.objects.
+                    let objects: Vec<(ObjectId, String)> = self
+                        .scene
+                        .objects
+                        .iter()
+                        .map(|o| (o.id, o.name.clone()))
+                        .collect();
                     // Split borrows: components live on the object, the
                     // material model in the scene's material list.
                     let scene = &mut *self.scene;
@@ -4969,6 +5150,8 @@ impl EditorTabs<'_> {
                             shader_info: self.shader_info,
                             components,
                             registry: self.registry,
+                            editor_components: self.editor_components,
+                            objects: &objects,
                         },
                         &shader_refs,
                     );
@@ -5444,7 +5627,43 @@ fn apply_lsp_response(editors: &mut [OpenEditor], kind: LspRequestKind, result: 
         }
         // Definition jumps are handled in `pump_lsp` (they need to open files).
         LspRequestKind::Definition => {}
+        LspRequestKind::References { path } => {
+            let refs = parse_references(&result);
+            if let Some(editor) = editors.iter_mut().find(|e| e.path == path) {
+                editor.references = if refs.is_empty() { None } else { Some(refs) };
+            }
+        }
     }
+}
+
+/// Parse an LSP `textDocument/references` result (array of `Location`) into a
+/// pickable list.
+fn parse_references(result: &serde_json::Value) -> Vec<citrus_editor::ReferenceItem> {
+    let Some(arr) = result.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|loc| {
+            let uri = loc.get("uri").and_then(|u| u.as_str())?;
+            let path = uri.strip_prefix("file://").map(PathBuf::from)?;
+            let range = loc.get("range")?;
+            let line = range.pointer("/start/line").and_then(|l| l.as_u64())? as u32;
+            let col = range
+                .pointer("/start/character")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(0) as u32;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some(citrus_editor::ReferenceItem {
+                label: format!("{name}:{}", line + 1),
+                path,
+                line,
+                col,
+            })
+        })
+        .collect()
 }
 
 /// Parse an LSP `textDocument/definition` result into `(path, line, col)`.
@@ -5582,8 +5801,12 @@ impl ApplicationHandler for EngineApp {
                         ..
                     },
                 ..
-            } if !egui_wants && !self.egui_ctx.wants_keyboard_input() => {
-                // ...but not while a code editor / text field has focus.
+            } if !egui_wants
+                && !self.egui_ctx.wants_keyboard_input()
+                && !self.code_tab_focused() =>
+            {
+                // ...but not while a code editor / text field has focus (there
+                // Escape is the vim Insert -> Normal key, not a deselect).
                 self.selection = Selection::None;
                 self.file_material = None;
             }

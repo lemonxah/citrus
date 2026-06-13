@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use egui::{DragValue, Frame, RichText, Ui};
 
-use crate::components::{Component, ComponentRegistry, components_ui};
+use citrus_core::{Component, ComponentRegistry, ObjectId};
+
+use crate::components::{EditorComponents, components_ui};
 use crate::sections::{ShaderUiInfo, material_editor_ui};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,6 +97,10 @@ pub enum InspectorContent<'a> {
         shader_info: Option<&'a ShaderUiInfo>,
         components: &'a mut Vec<Box<dyn Component>>,
         registry: &'a ComponentRegistry,
+        /// Editor-side inspector/gizmo dispatch for the components.
+        editor_components: &'a EditorComponents,
+        /// (id, name) of every scene object, for `ObjectRef` picker dropdowns.
+        objects: &'a [(ObjectId, String)],
     },
     MaterialFile {
         path: String,
@@ -206,6 +212,8 @@ impl InspectorPanel {
                 shader_info,
                 components,
                 registry,
+                editor_components,
+                objects,
             } => {
                 self.object_ui(
                     ui,
@@ -214,6 +222,8 @@ impl InspectorPanel {
                     shader_info,
                     components,
                     registry,
+                    editor_components,
+                    objects,
                     shaders,
                     &mut response,
                 );
@@ -273,6 +283,8 @@ impl InspectorPanel {
         shader_info: Option<&ShaderUiInfo>,
         components: &mut Vec<Box<dyn Component>>,
         registry: &ComponentRegistry,
+        editor_components: &EditorComponents,
+        objects: &[(ObjectId, String)],
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
@@ -318,7 +330,7 @@ impl InspectorPanel {
         // Components (Unity-style: list + Add Component at the bottom).
         ui.separator();
         ui.label(RichText::new("Components").strong());
-        let comp = components_ui(ui, components, registry);
+        let comp = components_ui(ui, components, registry, editor_components, objects);
         response.object_changed |= comp.changed;
         response.add_component = comp.add;
         response.remove_component = comp.remove;

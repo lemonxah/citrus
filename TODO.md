@@ -11,6 +11,28 @@ feature status here — flip it in Features.md.
 
 ## Design notes — upcoming / in-progress work
 
+- **Crate-layering refactor** (IN PROGRESS) — the built game must link only
+  `citrus-engine` + deps, never the editor. Today `citrus-engine` IS the editor app and
+  depends on `citrus-editor`, and the runtime component API lived in `citrus-editor`.
+  Target + progress:
+  - [x] **`citrus-core`** (new, egui-free) created; `Transform` + `ComponentCtx` +
+        `ComponentCommand` moved there. Engine, plugins, and the plugin template import
+        them straight from `citrus-core`; editor no longer re-exports them (its
+        `pub use` list is trimmed). Build green.
+  - [x] Moved `Component`/`TypedComponent` (lifecycle only, no `inspector_ui`) +
+        `ComponentRegistry` + all built-in component structs (data + start/update/late)
+        into `citrus-core`.
+  - [x] Editor `Inspect` trait (`inspector_ui`) + `Gizmo` trait (`draw_gizmo` + `GizmoCtx`)
+        + `EditorComponents` name→fn dispatch registry; built-in `Inspect` impls moved
+        there; `components_ui` dispatches through it. Plugins export `citrus_register`
+        (runtime) + `citrus_register_editor` (editor traits); the loader calls both.
+  - [x] Engine/editor/plugins import runtime types from `citrus-core`; `citrus-editor`
+        re-exports nothing from core. Build green. (Built-in interactive viewport gizmos —
+        collider/probe/audio handles — still drawn in EngineApp; migrate to `Gizmo` impls
+        during Stage B.)
+  - [ ] **Stage B**: move `EngineApp` out of `citrus-engine` into `citrus-editor` so the
+        engine is a pure runtime lib; `citrus` bin launches the editor.
+
 These back the goals tracked in Features.md; this is where the implementation detail
 lives.
 
@@ -34,11 +56,17 @@ lives.
         + cosine-hemisphere multi-bounce indirect + sky on miss). **Needs GPU validation.**
   - [x] **Phase 4 — probe bake**: per `LightProbeVolume`, sphere-traces incoming
         radiance and projects to SH-L1. **Needs GPU validation.**
-  - [ ] **Phase 5 — runtime sampling** (NEXT): descriptor set 2 — static objects
-        sample their lightmap (uv1), dynamic objects trilinearly interpolate probe SH;
-        Baked lights drop out of the realtime loop. Needs: lightmap atlas/array upload
-        (resample to a uniform runtime size), probe SSBO, per-draw lightmap layer (free
-        `emission.w` push slot), and standard.frag changes.
+  - [ ] **Phase 5 — runtime sampling** (IN PROGRESS):
+        - [x] **5a — coarse baked ambient**: `Scene::baked_ambient` averages the probe
+              SH L0 into a flat ambient that replaces the env ambient when a bake with
+              probes exists; Baked-mode lights drop out of `gather_lights` in that case
+              (no double-count). Makes the bake visibly affect the scene; needs GPU eyes.
+        - [ ] **5b — per-fragment probe SH**: descriptor set 2 SSBO (probe coeffs +
+              volume metadata), trilinear interpolation in standard.frag → spatially
+              varying GI for all objects.
+        - [ ] **5c — lightmaps**: uv1 vertex plumbing, lightmap texture array (resample
+              to a uniform size), per-draw layer (free `emission.w`), sample in
+              standard.frag for crisp static GI.
   - [x] **Phase 6 — editor UX**: dockable **"Baker's Man"** tab (texel density / max
         lightmap / bounces / samples), baked-state readout, **Bake** / **Clear** (Bake
         gated on ray-query support); writes `.lightmap` + `.lightdata` sidecars, loaded
@@ -88,7 +116,28 @@ lives.
   keep that invariant when adding new built-ins.
 
 - **Pawns / controllers / binding system / in-game API** — see Features.md sections
-  2A–2E for the full task breakdown and dependency graph.
+  2A–2E for the full task breakdown and dependency graph. Landed so far: deferred
+  `ComponentCommand` (load-scene), and an **object-reference world read** —
+  `ComponentCtx` carries a per-frame world snapshot (`world_transforms` + `object_names`)
+  resolving any object reference to a `Transform` (translation/rotation/scale +
+  forward/right/up/matrix). **Stable object identity**: every `SceneObject` has an
+  `ObjectId` (v4 UUID via `getrandom`, assigned at create, serialized as a string in
+  `.scene`, legacy scenes get one on load); components hold an `ObjectRef` (resolved by
+  id each frame via `ctx.resolve`/`transform_of`/`position_of`). The editor renders
+  `ObjectRef` as a **drag-drop target** (`InspectCtx::object_ref` via `dnd_drop_zone`):
+  drag an object from the Scene tree onto the box, ✕ clears. The tree drags a `usize`
+  index (a std type, so the payload crosses the plugin/egui boundary), mapped to id via
+  the object list. Scene-tree + viewport selection are release-based (`clicked()`), so
+  starting a drag never changes the inspector. `find_object(name)` stays a convenience;
+  the Orbit plugin's target is an `ObjectRef` set by drag. Follow-ups: tags, world-space
+  writes, parent-aware target positioning.
+
+- **Networking & multiplayer** — built-in, supporting both client-server (authoritative,
+  prediction + reconciliation) and peer-to-peer (shared-authority / deterministic
+  lockstep). Transport abstraction (renet/QUIC; webrtc for P2P/browser), NAT traversal,
+  networked-object ownership + state replication (delta/snapshots), RPCs, in-game API
+  surface (`is_server`/`local_player`/`spawn_networked`), voice + IK replication. Subsumes
+  milestone M6. Full breakdown in Features.md section 2G.
 
 - **Game UI system (runtime UI)** — retained scene-graph UI (Unity uGUI-style),
   screen-space + world-space (VR), visually authored. UICanvas + UIRect + widgets
@@ -151,6 +200,42 @@ lives.
   toggle; scroll-dolly fix; left-drag orbit / click select.
 
 ### Done (later editor work)
+- Code editor: line-number gutter (wrapping-aware, drawn from galley row positions);
+  vim mode (toggle + per-file modal state in egui memory, `vim.rs` — core motions/
+  operators, see Features.md); fills the dock vertically; muted selection color.
+  Vim command line (`:w`/`:q`/`:wq`/`:{n}`/`[%]s/pat/rep/[g]`); `{n}gg`/`{n}G` goto;
+  visual `p` paste-over. `:q` routes through new `EditorAction::CloseCodeTab`.
+  Substitution uses the `regex` crate (`pat` = regex, `rep` = `$1`/`${name}` refs).
+  `u`/Ctrl+R undo/redo: per-file snapshot stack in egui memory, insert session = one
+  unit. `gd` go-to-def (reuses LspGoto); `gr` references → `textDocument/references`
+  (new `lsp.references`, `LspRequestKind::References`, `parse_references`) shown in a
+  picker popup; picking routes through `EditorAction::OpenAndGoto`. Live `:s`/`:%s`
+  preview: `vim::preview_substitute` recomputed each frame against a stashed base
+  (`VimState::preview_base`), highlighted via `draw_ranges`, reverted on Escape.
+  File browser is already live (reads fs each frame; app redraws continuously).
+  Code editor: bottom status line (`line_col` helper) showing mode / file / language /
+  Ln:Col / unsaved, folding in the vim `:` command line (removed from the header); caret
+  forced solid for ~0.6s after vim keystrokes so it stays visible while moving.
+  Custom **Citrus Purple** syntect theme (own `syntect` dep + `assets/citrus-purple.tmTheme`,
+  `highlight_code` with a thread-local cache): black bg, purple palette, borderless box.
+  Vim toggle moved to the **Edit menu** and persisted in `ProjectSettings::vim_mode`
+  (passed through `EditorTabs::vim_mode`); header stripped of filename / Save / full path
+  (the tab + status line cover it; code auto-saves). Escape keeps editor focus (re-grab
+  after vim activity) so it only does Insert->Normal in-editor. Removed the
+  Ctrl+Space/Ctrl+hover hint; per-editor status line made visible by capping the scroll
+  viewport (`max_height`).
+- Global editor status bar (`EngineApp::status_bar`): project + object count, live
+  rust-analyzer spinner (`lsp_requests` non-empty), and transient compile/result messages
+  (`set_status`); shader reloads + component builds report there. Plugin reload is deferred
+  one frame (`reload_pending` + `do_reload_plugins`) so "Compiling components…" paints
+  before the blocking cargo build. Global minimum text size (13px floor applied to egui
+  text styles in `init`) so small UI text is readable.
+- File browser: LSP problem badges — red/yellow dots on files with errors/warnings,
+  aggregated onto folders. Engine keeps a project-wide `path -> (errors, warns)` map fed
+  by every publishDiagnostics (not just open files).
+- File browser: `.rs` files show the Ferris (rustcrab) image instead of the 🦀 glyph —
+  official CC0 art (`crates/citrus-editor/assets/ferris.png`, embedded via `include_bytes!`),
+  decoded + uploaded as an egui texture once on first use.
 - Runtime scene loading: `ComponentCtx::load_scene(path)` queues a `ComponentCommand`
   (new, in citrus-editor) drained by the engine after the update pass — switches levels /
   menu -> game during Play, starts the new scene's components + audio, continues playing.

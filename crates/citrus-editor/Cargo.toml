@@ -5,9 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+citrus-core.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 glam.workspace = true
+image.workspace = true
+regex.workspace = true
 serde.workspace = true
+syntect.workspace = true
 ron.workspace = true
 tracing.workspace = true

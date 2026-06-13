@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
 
-use citrus_editor::{AudioRolloff, AudioSource};
+use citrus_core::{AudioRolloff, AudioSource};
 use glam::Vec3;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 

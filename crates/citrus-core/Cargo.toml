@@ -1,0 +1,18 @@
+[package]
+name = "citrus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Engine-runtime API shared by the engine, editor, and plugins: the
+# component/behaviour traits, ComponentCtx, Transform, the registry, and the
+# built-in component data. Deliberately egui-free — a shipped game links this
+# (via the engine) without any editor code. Editor-only concerns (inspector UI,
+# gizmos) live in citrus-editor as separate traits.
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true
+tracing.workspace = true
+getrandom.workspace = true

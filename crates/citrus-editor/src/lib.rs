@@ -10,18 +10,20 @@
 
 mod code_editor;
 mod components;
+mod vim;
 mod file_browser;
 mod inspector;
 mod scene_panel;
 mod sections;
 
 pub use code_editor::{
-    CodeEditor, CodeEditorResponse, CompletionItem, CompletionState, HoverState,
+    CodeEditor, CodeEditorResponse, CompletionItem, CompletionState, HoverState, ReferenceItem,
 };
+// Editor-only component UI. The runtime component types (Component,
+// ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
+// citrus-core — import those directly, not through the editor.
 pub use components::{
-    AudioListener, AudioRolloff, AudioSource, Bob, BoxCollider, CameraComponent, Component,
-    ComponentCommand, ComponentCtx, ComponentRegistry, ComponentsResponse, LightComponent,
-    LightKind, LightMode, LightProbeVolume, MeshCollider, SphereCollider, Spin, TypedComponent,
+    ComponentsResponse, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoCtx, Inspect, InspectCtx,
     components_ui,
 };
 pub use file_browser::{FileBrowser, FileBrowserResponse};

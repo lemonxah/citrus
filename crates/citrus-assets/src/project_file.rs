@@ -38,6 +38,8 @@ pub struct ProjectSettings {
     /// Gizmo grid snapping.
     pub snap: bool,
     pub grid_size: f32,
+    /// Vim modal editing in the code editor.
+    pub vim_mode: bool,
 }
 
 impl Default for ProjectSettings {
@@ -48,6 +50,7 @@ impl Default for ProjectSettings {
             show_stats_overlay: false,
             snap: false,
             grid_size: 0.5,
+            vim_mode: false,
         }
     }
 }

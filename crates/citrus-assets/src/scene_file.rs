@@ -87,6 +87,10 @@ fn default_true() -> bool {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SceneEntry {
+    /// Stable object id (UUID string). Empty in legacy scenes; the engine
+    /// assigns a fresh one on load.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub source: ObjectSource,
     /// Whether the object renders / its light contributes. Disabled objects

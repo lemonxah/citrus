@@ -125,6 +125,18 @@ impl LspClient {
         )
     }
 
+    /// Request reference locations at a position; returns the request id.
+    pub fn references(&mut self, path: &Path, line: u32, character: u32) -> i64 {
+        self.send_request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": path_to_uri(path)},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": true},
+            }),
+        )
+    }
+
     fn send_request(&mut self, method: &str, params: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;

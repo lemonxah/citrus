@@ -32,6 +32,12 @@ pub struct FileBrowser {
     open_dirs: HashSet<PathBuf>,
     clipboard: Option<Clipboard>,
     renaming: Option<Renaming>,
+    /// Ferris (the Rust mascot) tile icon for `.rs` files, decoded + uploaded
+    /// once on first use.
+    ferris: Option<egui::TextureHandle>,
+    /// Per-file LSP problem tally (errors, warnings), refreshed each frame from
+    /// the engine. Used to badge files (and aggregate onto folders).
+    diags: std::collections::HashMap<PathBuf, (u32, u32)>,
 }
 
 #[derive(Default)]
@@ -64,11 +70,64 @@ impl FileBrowser {
             open_dirs: HashSet::new(),
             clipboard: None,
             renaming: None,
+            ferris: None,
+            diags: std::collections::HashMap::new(),
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, selected: Option<&Path>) -> FileBrowserResponse {
+    /// (errors, warns) for a file, or aggregated over a folder's descendants.
+    fn diag_counts(&self, path: &Path, is_dir: bool) -> (u32, u32) {
+        if is_dir {
+            let (mut e, mut w) = (0, 0);
+            for (p, (pe, pw)) in &self.diags {
+                if p.starts_with(path) {
+                    e += pe;
+                    w += pw;
+                }
+            }
+            (e, w)
+        } else {
+            self.diags.get(path).copied().unwrap_or((0, 0))
+        }
+    }
+
+    /// Small problem dot (red = has errors, yellow = warnings only).
+    fn diag_dot(painter: &egui::Painter, center: egui::Pos2, errors: u32, warns: u32) {
+        if errors == 0 && warns == 0 {
+            return;
+        }
+        let color = if errors > 0 {
+            egui::Color32::from_rgb(235, 90, 80)
+        } else {
+            egui::Color32::from_rgb(220, 180, 70)
+        };
+        painter.circle_filled(center, 4.0, color);
+    }
+
+    /// Lazily decode + upload the embedded Ferris image; cheap to clone after.
+    fn ferris_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        self.ferris
+            .get_or_insert_with(|| {
+                let bytes = include_bytes!("../assets/ferris.png");
+                let image = image::load_from_memory(bytes)
+                    .expect("embedded ferris.png decodes")
+                    .to_rgba8();
+                let size = [image.width() as usize, image.height() as usize];
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                ctx.load_texture("citrus-ferris", color, egui::TextureOptions::LINEAR)
+            })
+            .clone()
+    }
+
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        selected: Option<&Path>,
+        diags: &std::collections::HashMap<PathBuf, (u32, u32)>,
+    ) -> FileBrowserResponse {
         let mut response = FileBrowserResponse::default();
+        // Refresh the per-frame diagnostics snapshot for the badge helpers.
+        self.diags = diags.clone();
         if !self.current_dir.starts_with(&self.root) || !self.current_dir.is_dir() {
             self.current_dir = self.root.clone();
         }
@@ -120,7 +179,7 @@ impl FileBrowser {
                 } else {
                     crumb
                 };
-                ui.label(RichText::new(crumb).small().weak());
+                ui.label(RichText::new(crumb).size(14.0).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let dir = self.current_dir.clone();
                     ui.menu_button("➕ Create", |ui| {
@@ -216,6 +275,14 @@ impl FileBrowser {
                 format!("🗀 {name}"),
                 FontId::proportional(13.0),
                 text_color,
+            );
+            // Aggregate problem badge for the folder's contents.
+            let (errs, warns) = self.diag_counts(dir, true);
+            Self::diag_dot(
+                &ui.painter(),
+                egui::pos2(rect.right() - 9.0, rect.center().y),
+                errs,
+                warns,
             );
 
             if row.clicked() {
@@ -321,13 +388,43 @@ impl FileBrowser {
                 .rect_filled(rect, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
         }
 
-        let icon = if is_dir { "🗀" } else { file_icon(path) };
-        ui.painter().text(
-            egui::pos2(rect.center().x, rect.top() + 26.0),
-            Align2::CENTER_CENTER,
-            icon,
-            FontId::proportional(30.0),
-            ui.visuals().text_color(),
+        let is_rust = !is_dir
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        let icon_center = egui::pos2(rect.center().x, rect.top() + 26.0);
+        if is_rust {
+            // Ferris (the rustcrab) for .rs files. Fit ~32px tall, keep aspect.
+            let tex = self.ferris_texture(ui.ctx());
+            let [tw, th] = tex.size();
+            let h = 32.0;
+            let w = h * tw as f32 / th as f32;
+            let img_rect = egui::Rect::from_center_size(icon_center, egui::vec2(w, h));
+            ui.painter().image(
+                tex.id(),
+                img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            let icon = if is_dir { "🗀" } else { file_icon(path) };
+            ui.painter().text(
+                icon_center,
+                Align2::CENTER_CENTER,
+                icon,
+                FontId::proportional(30.0),
+                ui.visuals().text_color(),
+            );
+        }
+
+        // LSP problem badge at the icon's top-right.
+        let (errs, warns) = self.diag_counts(path, is_dir);
+        Self::diag_dot(
+            &ui.painter(),
+            egui::pos2(icon_center.x + 15.0, icon_center.y - 13.0),
+            errs,
+            warns,
         );
 
         let renaming_this = self.renaming.as_ref().is_some_and(|r| r.path == path);
@@ -353,7 +450,7 @@ impl FileBrowser {
                 &name,
                 0.0,
                 egui::TextFormat {
-                    font_id: FontId::proportional(11.0),
+                    font_id: FontId::proportional(13.0),
                     color,
                     ..Default::default()
                 },
@@ -674,7 +771,7 @@ fn file_icon(path: &Path) -> &'static str {
         Some("citrus") => "🍋",
         Some("lightmap" | "lightdata") => "💡",
         Some("png" | "jpg" | "jpeg" | "tga") => "🖼",
-        Some("rs") => "🦀",
+        // ".rs" is drawn as the Ferris image in `tile`, not as a glyph here.
         Some("vert" | "frag" | "glsl" | "slang" | "spv") => "✨",
         Some("toml" | "ron" | "json") => "⚙",
         Some("md") => "📄",
