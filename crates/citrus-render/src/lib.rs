@@ -129,6 +129,8 @@ struct FrameUbo {
     /// Baked probe volumes (count in `misc.w`); SH coefficients live in the
     /// set-0 binding-2 storage buffer, indexed via each volume's `size_base.w`.
     probe_volumes: [GpuProbeVolume; MAX_PROBE_VOLUMES],
+    /// x = lightmap-UV-checker preview flag (>0.5 on); yzw reserved.
+    debug: [f32; 4],
 }
 
 #[repr(C)]
@@ -1245,16 +1247,17 @@ impl Renderer {
     /// Object→layer indices come from `BakedData.object_lightmap`; the draw path
     /// puts the layer in the push constant.
     pub fn set_baked_lightmaps(&mut self, lightmaps: &[BakedLightmap]) {
-        // All layers share the largest baked size (texture-array requirement).
-        // Cap at 2048 for memory — each RGBA32F layer at 2048² is 64 MB, and
-        // every object's layer is padded to this size. (A per-object atlas would
-        // avoid the padding; that's a follow-up.)
+        // All layers share the largest baked size (texture-array requirement),
+        // so a big surface (e.g. the floor) keeps full resolution. Capped at
+        // 4096 (matches the max_lightmap dropdown). Note: every object's layer is
+        // padded to this size, so a uniform 4096² array costs 256 MB *per
+        // object* — the follow-up per-object atlas removes that padding.
         let size = lightmaps
             .iter()
             .map(|l| l.size)
             .max()
             .unwrap_or(1)
-            .clamp(1, 2048);
+            .clamp(1, 4096);
         let layers: Vec<Vec<f32>> = if lightmaps.is_empty() {
             vec![vec![0.0; 4]]
         } else {
@@ -2217,6 +2220,7 @@ fn frame_ubo(
         lights,
         shadow_vp,
         probe_volumes: volumes,
+        debug: [if input.lightmap_preview { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
     }
 }
 
@@ -2318,7 +2322,13 @@ impl Renderer {
                         p.alpha_cutoff,
                         p.normal_strength,
                         p.occlusion_strength,
-                        draw.lightmap_layer as f32,
+                        // Normally the lightmap layer; in UV-checker preview the
+                        // object's lightmap resolution (the shader reads it then).
+                        if input.lightmap_preview {
+                            draw.lightmap_size as f32
+                        } else {
+                            draw.lightmap_layer as f32
+                        },
                     ],
                 }
             };
@@ -2646,6 +2656,8 @@ impl Drop for Renderer {
                 texture.destroy(device, &mut alloc);
             }
             self.shadow_atlas.destroy(device, &mut alloc);
+            self.lightmaps.destroy(device, &mut alloc);
+            self.probe_buffer.destroy(device, &mut alloc);
             for ubo in &mut self.frame_ubos {
                 ubo.destroy(device, &mut alloc);
             }

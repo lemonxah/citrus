@@ -195,6 +195,10 @@ pub struct DrawCmd {
     /// Baked-lightmap array layer for this object's static GI, or -1 when the
     /// object has no lightmap (sample probes / flat ambient instead).
     pub lightmap_layer: i32,
+    /// This object's lightmap resolution (texels/side) for the UV-checker
+    /// preview — its native baked size, or the would-be size from bake settings
+    /// for an un-baked static object. 0 = not lightmapped.
+    pub lightmap_size: u32,
 }
 
 pub struct EguiDraw {
@@ -311,5 +315,8 @@ pub struct FrameInput<'a> {
     /// Seconds since app start; drives animated shader effects.
     pub time: f32,
     pub draws: &'a [DrawCmd],
+    /// Debug: render objects as a lightmap-UV checkerboard (cell size tracks
+    /// each object's lightmap resolution) instead of their material.
+    pub lightmap_preview: bool,
     pub egui: Option<EguiDraw>,
 }

@@ -41,6 +41,7 @@ layout(set = 0, binding = 0) uniform FrameData {
     Light lights[MAX_LIGHTS];
     mat4 shadow_vp[MAX_SHADOW_VIEWS];
     ProbeVolume probe_volumes[MAX_PROBE_VOLUMES];
+    vec4 debug; // x = lightmap-UV checker preview
 } frame;
 
 layout(set = 0, binding = 1) uniform sampler2DArrayShadow u_shadow;
@@ -251,6 +252,21 @@ vec3 f_schlick_rough(float cosT, vec3 f0, float rough) {
 }
 
 void main() {
+    // Lightmap-UV checker preview: visualise per-object texel density. params1.w
+    // carries this object's lightmap resolution (texels/side) in preview mode; a
+    // fixed 8-texel cell means low-res objects show big squares, high-res small.
+    if (frame.debug.x > 0.5) {
+        float res = pc.params1.w;
+        if (res < 1.0) {
+            o_color = vec4(0.12, 0.12, 0.14, 1.0); // not lightmapped (non-static)
+        } else {
+            vec2 c = floor(v_uv1 * res / 8.0);
+            float check = mod(c.x + c.y, 2.0);
+            o_color = vec4(mix(vec3(0.12, 0.12, 0.15), vec3(0.95, 0.55, 0.2), check), 1.0);
+        }
+        return;
+    }
+
     vec4 albedo = texture(t_albedo, v_uv) * pc.base_color * v_color;
     if (ALPHA_MODE == 1u && albedo.a < pc.params1.x) {
         discard;

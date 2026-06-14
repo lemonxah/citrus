@@ -118,6 +118,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_new_project: false,
         show_open_project: false,
         open_project_path: String::new(),
+        lightmap_preview: false,
         scene_dirty: false,
         show_quit_dialog: false,
         quit_after_frame: false,
@@ -582,6 +583,8 @@ struct EngineApp {
     /// Open Project dialog open + the folder path being entered.
     show_open_project: bool,
     open_project_path: String,
+    /// Baker's Man: render objects as a lightmap-UV checker (texel-density preview).
+    lightmap_preview: bool,
     /// Last Build Game result message (shown in the settings/log).
     build_status: Option<String>,
     /// Scene has unsaved edits since the last save/load (drives the exit prompt).
@@ -730,8 +733,6 @@ impl EngineApp {
                 }
             }
         }
-        self.load_bake();
-
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -743,6 +744,10 @@ impl EngineApp {
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.apply_skybox();
+        // Load + upload the scene's baked lighting AFTER the renderer is stored,
+        // so `upload_baked_probes` can actually push the lightmaps/probes to the
+        // GPU (otherwise a scene with a bake loads black until re-baked).
+        self.load_bake();
         Ok(())
     }
 
@@ -943,6 +948,10 @@ impl EngineApp {
                     }
                 }
                 EditorAction::PickAt(pos) => {
+                    // Clicking the 3D viewport drops any lingering code-editor
+                    // text focus, so keyboard shortcuts (Ctrl+Z/Y) route to the
+                    // editor again instead of egui's TextEdit consuming them.
+                    self.egui_ctx.memory_mut(|m| m.stop_text_input());
                     if let Some((origin, dir)) = self.cursor_ray(pos) {
                         let hit = self.scene.pick(origin, dir);
                         self.select_object(hit);
@@ -1478,7 +1487,10 @@ impl EngineApp {
                         }
                     }
                 }
-                EditorAction::StartLook => self.set_looking(true),
+                EditorAction::StartLook => {
+                    self.egui_ctx.memory_mut(|m| m.stop_text_input());
+                    self.set_looking(true);
+                }
                 EditorAction::Dolly(amount) => self.camera.dolly(amount),
                 EditorAction::FocusSelected => {
                     if let Selection::Object(i) = self.selection {
@@ -3159,6 +3171,7 @@ impl EngineApp {
                 audio_drag: &mut self.audio_drag,
                 collider_drag: &mut self.collider_drag,
                 can_bake,
+                lightmap_preview: &mut self.lightmap_preview,
             };
             DockArea::new(&mut dock_state)
                 .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
@@ -3306,6 +3319,7 @@ impl EngineApp {
             shadow_distance: env.shadow_distance,
             time: t,
             draws: &self.scene.draws,
+            lightmap_preview: self.lightmap_preview,
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
                 primitives,
@@ -3367,6 +3381,8 @@ struct EditorTabs<'a> {
     collider_drag: &'a mut Option<ColliderDrag>,
     /// GPU can ray-trace (Baker tab enables its Bake button).
     can_bake: bool,
+    /// Baker tab: lightmap-UV checker preview toggle.
+    lightmap_preview: &'a mut bool,
 }
 
 impl egui_dock::TabViewer for EditorTabs<'_> {
@@ -4254,6 +4270,13 @@ impl EditorTabs<'_> {
                 self.actions.push(EditorAction::ClearBake);
             }
         });
+        ui.separator();
+        ui.checkbox(self.lightmap_preview, "UV checker preview")
+            .on_hover_text(
+                "Show objects as a lightmap-UV checkerboard — the cell size tracks each \
+                 object's texel density (big squares = low resolution, stretched squares = \
+                 UV distortion). Grey = not lightmapped (non-static).",
+            );
     }
 
     fn environment_ui(&mut self, ui: &mut egui::Ui) {
@@ -5475,6 +5498,7 @@ impl EditorTabs<'_> {
                         name: object.name.clone(),
                         enabled: object.enabled,
                         static_geometry: object.static_geometry,
+                        lightmap_scale: object.lightmap_scale,
                         kind: object.kind_label(),
                         transform: TransformModel {
                             translation: object.translation.to_array(),
@@ -5519,6 +5543,7 @@ impl EditorTabs<'_> {
                         object.name = info.name;
                         object.enabled = info.enabled;
                         object.static_geometry = info.static_geometry;
+                        object.lightmap_scale = info.lightmap_scale;
                         object.translation = Vec3::from(info.transform.translation);
                         object.rotation = glam::Quat::from_euler(
                             glam::EulerRot::XYZ,
@@ -6231,7 +6256,23 @@ impl ApplicationHandler for EngineApp {
                         }
                     }
                 }
-                ElementState::Pressed => {}
+                ElementState::Pressed => {
+                    // egui consumed the press (e.g. a focused text field), but
+                    // still track modifier keys so `self.keys` doesn't desync —
+                    // otherwise a Ctrl press swallowed here leaves `ctrl` false
+                    // for a later viewport shortcut (Ctrl+Z undo, etc.).
+                    if matches!(
+                        code,
+                        KeyCode::ControlLeft
+                            | KeyCode::ControlRight
+                            | KeyCode::ShiftLeft
+                            | KeyCode::ShiftRight
+                            | KeyCode::AltLeft
+                            | KeyCode::AltRight
+                    ) {
+                        self.keys.insert(code);
+                    }
+                }
             },
             WindowEvent::Resized(_) => {
                 if let Some(renderer) = &mut self.renderer {

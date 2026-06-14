@@ -116,6 +116,45 @@ Legend: `[ ]` open · `[verify]` believed fixed, confirm after a rebuild · `[x]
   frame once the pointer is up. (General rule: don't call egui's dnd/selection context-
   plugin APIs from plugin inspector/gizmo code — use memory + pointer state.)
 
+- [x] **Baked scene loaded black until a manual re-bake** — fixed. In `EngineApp::init`,
+  `load_bake()` ran *before* `self.renderer = Some(renderer)`, so `upload_baked_probes`
+  saw no renderer and skipped pushing the lightmaps/probes to the GPU. The bake still
+  loaded into `scene.baked` (so baked-mode lights + the env sun dropped from the realtime
+  pass), but static objects sampled the empty 1×1 default lightmap → everything black until
+  the user re-baked (which uploads with the renderer present). This also looked like "the
+  ground plane gets no light data" (the gbuffer pass is `cull_mode = NONE`, so the plane
+  bakes fine — it just wasn't uploaded). Fix: moved `load_bake()` to after the renderer +
+  window are stored in `init`.
+
+- [x] **SIGSEGV in a running editor when a second editor opens the same project** — fixed.
+  The plugin hot-loader copies each built `.so` to `target/citrus-plugins/<name>-<gen>.so`
+  and `dlopen`s the copy, but `<gen>` is a per-process counter starting at 0 — so two
+  editor instances on the same project both write `<name>-0.so`, and the second's
+  `fs::copy` overwrote the file the first had `mmap`ped, faulting the first editor when it
+  next called into the plugin. Fix: the copy filename now includes the process PID
+  (`<name>-<pid>-<gen>.so`), so instances never collide. (Explains the "random" crash —
+  it happened whenever a second `citrus` process started, e.g. during dev.)
+
+- [x] **Ctrl+Z stopped triggering undo in the viewport (menu Undo still worked)** —
+  fixed. Editor keyboard shortcuts are handled in the winit `KeyboardInput` path, gated
+  on `!egui_wants` (the egui `on_window_event` `consumed` flag). The code editor clings to
+  keyboard focus (vim re-grabs it; the "focused last frame" heuristic keeps it sticky), so
+  a lingering `TextEdit` made egui consume Ctrl+Z as its own text-undo shortcut → the
+  viewport handler was skipped. Two fixes: (1) clicking/looking the 3D viewport now calls
+  `memory.stop_text_input()` so a stale code-editor field releases focus; (2) modifier
+  keys (Ctrl/Shift/Alt) are tracked in `self.keys` even when egui consumed the press, so a
+  Ctrl press swallowed by a focused field can't desync the set and leave `ctrl == false`
+  for a later Z press. (Ctrl+S/Ctrl+Y weren't egui text shortcuts, so they slipped through
+  — which is why save and the menu kept working.)
+
+- [x] **GPU memory leak at shutdown ("lightmap array" + "probe sh")** — fixed.
+  `gpu_allocator` reported two leaked chunks on exit: the baked-lightmap 2D array
+  (`self.lightmaps`) and the probe-SH SSBO (`self.probe_buffer`). Both were swapped
+  correctly on each re-bake (the replaced resource was destroyed), but the final live
+  ones were never freed — `Renderer::drop` destroyed the shadow atlas, meshes, textures,
+  UBOs, etc. but not these two. Added `self.lightmaps.destroy()` + `self.probe_buffer
+  .destroy()` in `Drop`, inside the same allocator lock, after `device_wait_idle`.
+
 ## Crash / stability
 
 - [x] **SIGSEGV on editor close** — fixed. `Renderer` declared `window: Arc<Window>`

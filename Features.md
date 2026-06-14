@@ -58,7 +58,12 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   environment sun/sky; **Realtime lights are never baked**. Once a bake exists, those
   baked lights (incl. the env sun) drop from the realtime pass to avoid double-counting;
   with no bake they all stay realtime, so an un-baked scene is never dark (baking is
-  opt-in). Default light mode is Realtime. Only **Static** objects get lightmaps.
+  opt-in). Default light mode is Realtime. Only objects with **Contribute GI**
+  (the per-object static flag) get lightmaps.
+- [done] Per-object lightmap controls (Unity-style), in the inspector's Mesh section:
+  a **Contribute GI** toggle (object is baked as a lightmapped surface + ray-trace
+  occluder) and a **Scale In Lightmap** multiplier that scales that object's texel
+  density up/down from the scene default (sharper surface or fewer texels).
 - [done] Primitive lightmap UVs: a second UV set (`uv1`) — plane/sphere/capsule reuse their
   single non-overlapping `uv0` chart; the **cube packs its 6 faces into a non-overlapping
   3×2 atlas** (with a gutter) so faces don't share lightmap texels. Imported meshes use
@@ -70,7 +75,10 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   into the gutter) so bilinear sampling at chart edges never reads the black background —
   fixes the cube-edge seams.
 - [done] Baker's Man dock tab (texel density 1–1024 /m log, bounces, samples up to 65536,
-  max size, Bake/Clear)
+  max size, Bake/Clear) + a **UV-checker preview** toggle: renders objects as a
+  lightmap-UV checkerboard whose cell size tracks each object's would-be texel density
+  (big squares = low resolution, stretched = UV distortion; grey = non-static) — live from
+  the current bake settings, no re-bake needed.
 
 ### Editor
 - [done] Dockable panels (egui_dock): Scene / Inspector / Files / Log / Code / Baker

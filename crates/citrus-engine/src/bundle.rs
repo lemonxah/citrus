@@ -71,6 +71,7 @@ fn entry(name: &str, source: ObjectSource, translation: [f32; 3], scale: [f32; 3
         source,
         enabled: true,
         static_geometry: false,
+        lightmap_scale: 1.0,
         material: inline_material(),
         parent: None,
         components: Vec::new(),

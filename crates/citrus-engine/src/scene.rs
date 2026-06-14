@@ -40,6 +40,8 @@ pub struct SceneObject {
     /// lighting bake (lightmaps + as a ray-trace occluder). Dynamic objects
     /// instead sample baked light probes.
     pub static_geometry: bool,
+    /// Per-object lightmap-resolution multiplier ("Scale In Lightmap").
+    pub lightmap_scale: f32,
     /// Parent object index; transform is local to it.
     pub parent: Option<usize>,
     pub translation: Vec3,
@@ -189,6 +191,23 @@ impl LoadedScene {
     /// collider to a mesh's extents.
     pub fn mesh_aabb(&self, mesh: usize) -> (Vec3, Vec3) {
         self.mesh_bounds[mesh]
+    }
+
+    /// Lightmap resolution (texels/side) this object would bake at under the
+    /// current bake settings: `texel_density × world AABB`, clamped to
+    /// `max_lightmap`. 0 if it has no mesh. Used by the UV-checker preview and
+    /// the bake.
+    pub fn lightmap_size_for(&self, i: usize) -> u32 {
+        let Some(render) = self.objects[i].render else {
+            return 0;
+        };
+        let scale = self.world_transform(i).to_scale_rotation_translation().0;
+        let (min, max) = self.mesh_bounds[render.mesh];
+        let extent = (max - min) * scale;
+        let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
+        let s = self.environment.bake;
+        let density = s.texel_density * self.objects[i].lightmap_scale.max(0.0);
+        ((density * max_extent).round() as u32).clamp(16, s.max_lightmap.max(16))
     }
 
     /// World transform of an object (walks the parent chain).
@@ -439,6 +458,7 @@ impl LoadedScene {
             source,
             enabled: true,
             static_geometry: false,
+            lightmap_scale: 1.0,
             parent: None,
             translation: position,
             rotation: Quat::IDENTITY,
@@ -532,6 +552,7 @@ impl LoadedScene {
                 source,
                 enabled: true,
                 static_geometry: false,
+                lightmap_scale: 1.0,
                 parent: None,
                 translation,
                 rotation,
@@ -1256,6 +1277,13 @@ impl LoadedScene {
                 .and_then(|b| b.object_lightmap.get(&i))
                 .map(|&l| l as i32)
                 .unwrap_or(-1);
+            // For the UV-checker preview: the would-be lightmap resolution for
+            // static objects (0 otherwise).
+            let lightmap_size = if self.objects[i].static_geometry {
+                self.lightmap_size_for(i)
+            } else {
+                0
+            };
             self.draws.push(DrawCmd {
                 mesh: self.mesh_handles[render.mesh],
                 material: self.materials[render.material].handle,
@@ -1263,6 +1291,7 @@ impl LoadedScene {
                 highlight: if selected == Some(i) { highlight } else { 0.0 },
                 mesh_center: self.mesh_center_local(render.mesh),
                 lightmap_layer,
+                lightmap_size,
             });
         }
     }
@@ -1380,6 +1409,7 @@ impl LoadedScene {
                     source: object.source.clone(),
                     enabled: object.enabled,
                     static_geometry: object.static_geometry,
+                    lightmap_scale: object.lightmap_scale,
                     material,
                     parent: object.parent,
                     components: object
@@ -1546,6 +1576,7 @@ impl LoadedScene {
                 source: entry.source.clone(),
                 enabled: entry.enabled,
                 static_geometry: entry.static_geometry,
+                lightmap_scale: entry.lightmap_scale,
                 parent: None, // applied below once all objects exist
                 translation: Vec3::from(entry.translation),
                 rotation: Quat::from_array(entry.rotation),

@@ -25,6 +25,8 @@ pub struct ObjectInfoModel {
     pub enabled: bool,
     /// Non-moving: included in the lighting bake (lightmaps + occluder).
     pub static_geometry: bool,
+    /// Per-object lightmap-resolution multiplier ("Scale In Lightmap").
+    pub lightmap_scale: f32,
     /// "Mesh" / "Empty" / "Camera" / "Primitive".
     pub kind: &'static str,
     pub transform: TransformModel,
@@ -246,8 +248,10 @@ impl InspectorPanel {
             ui.label(RichText::new(info.kind).small().weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .checkbox(&mut info.static_geometry, "Static")
-                    .on_hover_text("Non-moving: included in the lighting bake")
+                    .checkbox(&mut info.static_geometry, "Contribute GI")
+                    .on_hover_text(
+                        "Non-moving: included in the lighting bake (lightmapped + occluder)",
+                    )
                     .changed()
                 {
                     response.object_changed = true;
@@ -283,7 +287,7 @@ impl InspectorPanel {
     fn material_ui(
         &mut self,
         ui: &mut Ui,
-        info: &ObjectInfoModel,
+        info: &mut ObjectInfoModel,
         material: &mut MaterialModel,
         shader_info: Option<&ShaderUiInfo>,
         shaders: &[&str],
@@ -293,6 +297,24 @@ impl InspectorPanel {
         if let Some((vertices, triangles)) = info.mesh {
             ui.label(RichText::new("Mesh").strong());
             ui.label(format!("{vertices} vertices · {triangles} triangles"));
+            ui.add_enabled_ui(info.static_geometry, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Scale In Lightmap");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut info.lightmap_scale)
+                                .speed(0.05)
+                                .range(0.0..=16.0),
+                        )
+                        .on_hover_text(
+                            "Per-object lightmap-resolution multiplier (needs Contribute GI)",
+                        )
+                        .changed()
+                    {
+                        response.object_changed = true;
+                    }
+                });
+            });
             ui.separator();
         }
         ui.label(RichText::new("Material Slots").strong());

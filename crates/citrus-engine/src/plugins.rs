@@ -155,10 +155,16 @@ impl PluginHost {
         let file = dylib_name(name);
         let built = project_root.join("target/debug").join(&file);
         // Copy to a unique path: the next `cargo build` overwrites the
-        // original, and dlopen caches by path.
+        // original, and dlopen caches by path. The filename includes this
+        // process's PID so two editor instances open on the same project don't
+        // overwrite each other's mmapped copy (which SIGSEGVs the other editor).
         let dir = project_root.join("target/citrus-plugins");
         std::fs::create_dir_all(&dir)?;
-        let copy = dir.join(format!("{name}-{}.{DYLIB_EXT}", self.generation));
+        let copy = dir.join(format!(
+            "{name}-{}-{}.{DYLIB_EXT}",
+            std::process::id(),
+            self.generation
+        ));
         self.generation += 1;
         std::fs::copy(&built, &copy)
             .with_context(|| format!("copying {} for loading", built.display()))?;

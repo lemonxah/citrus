@@ -923,6 +923,8 @@ fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, it
                 }
                 let p0 = [pos[ci], pos[ci + 1], pos[ci + 2]];
                 let n0 = [nrm[ci], nrm[ci + 1], nrm[ci + 2]];
+                let lum = |i: usize| 0.2126 * src[i] + 0.7152 * src[i + 1] + 0.0722 * src[i + 2];
+                let l0 = lum(ci);
                 let h = neighbor_spacing(pos, &src, x, y, step, s);
                 let inv2h2 = if h > 1e-6 { 1.0 / (2.0 * h * h) } else { 0.0 };
                 let mut sum = [0.0f32; 3];
@@ -942,7 +944,12 @@ fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, it
                         let wp = if inv2h2 > 0.0 { (-d2 * inv2h2).exp() } else { 1.0 };
                         let ndot =
                             (nrm[ni] * n0[0] + nrm[ni + 1] * n0[1] + nrm[ni + 2] * n0[2]).max(0.0);
-                        let w = wk * wp * ndot.powf(32.0);
+                        // Luminance edge-stop (relative, scale-invariant): smooths
+                        // similar-brightness noise but preserves lighting edges
+                        // (shadow boundaries, falloff) on flat surfaces — without
+                        // this the denoiser washes shadows/gradients away.
+                        let wl = (-(lum(ni) - l0).abs() / (0.6 * (l0 + 0.02))).exp();
+                        let w = wk * wp * ndot.powf(32.0) * wl;
                         sum[0] += src[ni] * w;
                         sum[1] += src[ni + 1] * w;
                         sum[2] += src[ni + 2] * w;
@@ -1266,6 +1273,30 @@ fn bake_one_lightmap(
     out_img.destroy(device, &mut alloc);
     drop(alloc);
     unsafe { device.destroy_descriptor_pool(pool, None) };
+
+    // Diagnostic: brightness range of the baked lightmap. A near-flat range
+    // (min ≈ max) means the bake produced uniform light (no shadow/spot detail)
+    // — distinguishes a bake problem from a resolution/display one.
+    {
+        let lum = |i: usize| 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+        let (mut lo, mut hi, mut acc) = (f32::INFINITY, 0.0f32, 0.0f64);
+        let n = (size * size) as usize;
+        for t in 0..n {
+            if pixels[t * 4 + 3] <= 0.0 {
+                continue;
+            }
+            let l = lum(t * 4);
+            lo = lo.min(l);
+            hi = hi.max(l);
+            acc += l as f64;
+        }
+        tracing::info!(
+            "lightmap {size}²: luminance min {:.3} max {:.3} avg {:.3}",
+            if lo.is_finite() { lo } else { 0.0 },
+            hi,
+            acc / n.max(1) as f64
+        );
+    }
 
     Ok(BakedLightmap { size, pixels })
 }

@@ -85,6 +85,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_lightmap_scale() -> f32 {
+    1.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SceneEntry {
     /// Stable object id (UUID string). Empty in legacy scenes; the engine
@@ -98,9 +102,14 @@ pub struct SceneEntry {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Marks the object as non-moving so the lighting bake includes it as a
-    /// lightmapped surface + ray-trace occluder.
+    /// lightmapped surface + ray-trace occluder ("Contribute GI" in the editor).
     #[serde(default)]
     pub static_geometry: bool,
+    /// Per-object lightmap-resolution multiplier (Unity's "Scale In Lightmap").
+    /// 1.0 = the scene texel density; raise for a sharper surface, lower to save
+    /// texels.
+    #[serde(default = "default_lightmap_scale")]
+    pub lightmap_scale: f32,
     pub material: MaterialRef,
     /// Index of the parent entry in this file, if any. Transforms are local
     /// to the parent.

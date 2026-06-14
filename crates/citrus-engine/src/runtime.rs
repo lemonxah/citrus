@@ -277,6 +277,7 @@ impl GameApp {
             shadow_distance: env.shadow_distance,
             time: t,
             draws: &self.scene.draws,
+            lightmap_preview: false,
             egui: None,
         };
         if let Err(e) = renderer.render(&frame) {
