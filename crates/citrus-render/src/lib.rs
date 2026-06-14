@@ -8,12 +8,14 @@ mod alloc;
 mod bake;
 mod context;
 mod frame;
+mod gpu_gi;
 mod pipeline;
 pub mod sdf;
 mod swapchain;
 mod texture;
 mod types;
 
+pub use gpu_gi::{GpuGiEmitter, GpuGiMarch, GpuGiMaterial};
 pub use types::*;
 
 use std::collections::VecDeque;
@@ -884,6 +886,8 @@ pub struct Renderer {
     lightmaps: GpuTexture,
     last_stats: RenderStats,
     vsync: bool,
+    /// GPU software-GI march pipeline (None if compute init failed → CPU march).
+    gpu_gi: Option<gpu_gi::GpuGi>,
 
     /// Declared last so it drops last: `GpuContext::drop` destroys the Vulkan
     /// surface, which must happen while the underlying winit window still
@@ -1176,6 +1180,11 @@ impl Renderer {
         )
         .map_err(|e| anyhow::anyhow!("creating egui renderer: {e}"))?;
 
+        // GPU software-GI march pipeline; None falls back to the CPU march.
+        let gpu_gi = gpu_gi::GpuGi::new(&ctx.device)
+            .map_err(|e| tracing::warn!("GPU GI init failed, using CPU march: {e:#}"))
+            .ok();
+
         Ok(Self {
             window,
             ctx,
@@ -1210,6 +1219,7 @@ impl Renderer {
             lightmaps,
             last_stats: RenderStats::default(),
             vsync: true,
+            gpu_gi,
         })
     }
 
@@ -1436,6 +1446,50 @@ impl Renderer {
             &self.meshes,
             input,
         )
+    }
+
+    /// (Re)upload the cached Global Distance Field for the GPU GI march. Call only
+    /// when geometry changes; `gi_march` then reuses it every trace. No-op if the
+    /// GPU pipeline is unavailable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gi_set_gdf(
+        &mut self,
+        dist: &[f32],
+        index: &[u32],
+        dims: [u32; 3],
+        min: [f32; 3],
+        max: [f32; 3],
+        materials: &[GpuGiMaterial],
+    ) {
+        let allocator = self.allocator();
+        if let Some(gpu) = self.gpu_gi.as_mut()
+            && let Err(e) =
+                gpu.set_gdf(&self.ctx, &allocator, self.command_pool, dist, index, dims, min, max, materials)
+        {
+            tracing::warn!("GPU GI set_gdf failed: {e:#}");
+        }
+    }
+
+    /// Whether the GPU GI compute pipeline initialised. When false the realtime-GI
+    /// driver skips the GDF build/upload entirely and marches on the CPU instead.
+    pub fn gi_gpu_available(&self) -> bool {
+        self.gpu_gi.is_some()
+    }
+
+    /// March the probes against the cached GDF on the GPU. Returns one `ProbeSh`
+    /// per probe, or None if the GPU pipeline is unavailable / no GDF is uploaded
+    /// / the march failed (the realtime-GI driver then falls back to the CPU march).
+    pub fn gi_march(&self, m: &GpuGiMarch<'_>) -> Option<Vec<ProbeSh>> {
+        let gpu = self.gpu_gi.as_ref()?;
+        let allocator = self.allocator();
+        match gpu.march(&self.ctx, &allocator, self.command_pool, m) {
+            Ok(out) if !out.is_empty() => Some(out),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("GPU GI march failed: {e:#}");
+                None
+            }
+        }
     }
 
     pub fn upload_texture(&mut self, data: &TextureData) -> Result<TextureHandle> {
@@ -2742,6 +2796,9 @@ impl Drop for Renderer {
             self.shadow_atlas.destroy(device, &mut alloc);
             self.lightmaps.destroy(device, &mut alloc);
             self.probe_buffer.destroy(device, &mut alloc);
+            if let Some(gpu_gi) = &mut self.gpu_gi {
+                gpu_gi.destroy(device, &mut alloc);
+            }
             for ubo in &mut self.frame_ubos {
                 ubo.destroy(device, &mut alloc);
             }

@@ -104,8 +104,18 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   CPU SDF generation — `sdf::generate_sdf`, closest-point-on-triangle distance + nearest-tri
   normal sign, unit-tested) are done. Phase 1c is a CPU **multi-bounce** path march
   (`sw_gi.rs`, honors the Bounces setting, throughput ×albedo per hop) reusing the SDFs,
-  **parallelized across cores** on a **background thread** so Play-mode moving objects don't
-  hitch. Each fresh trace is **spatially denoised** first — a separable [1,2,1] blur over the
+  **parallelized across cores** on a **background thread** (now the CPU fallback). The default
+  path is a **GPU compute march** (`sw_gi.comp` + `gpu_gi.rs`): the per-mesh SDFs are merged
+  CPU-side into one **Global Distance Field** (`sw_gi::build_gdf` → a 3D distance texture +
+  nearest-instance index texture), and a compute shader marches that single field per probe (one
+  texture sample per step instead of looping meshes), writing the packed probe layout directly —
+  far cheaper than the CPU march, so it runs synchronously per re-trace. The GDF is **cached on the
+  GPU** (`Renderer::gi_set_gdf`) and re-uploaded only when a geometry/materials/bounds hash
+  (`hash_gdf_inputs`) changes, so a static scene keeps a high-res field for free while lights and
+  emitters move; `Renderer::gi_march` then runs each trace against the cached field.
+  `gi_gpu_available()` gates the whole path — when compute init failed it returns false and the
+  driver builds nothing, marching on the CPU thread instead. Each fresh trace is **spatially denoised**
+  first — a separable [1,2,1] blur over the
   probe SH grid (`sw_gi::blur_probe_grid`) that cancels the blotchy per-probe Monte-Carlo
   variance with **no temporal lag**, so Responsiveness can run high (snappy updates to moving
   objects) without trading back into noise. The denoised trace is then blended in with a
@@ -119,7 +129,12 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   software, single 32 grid for hardware). The shader picks the finest cascade containing a
   fragment and **cross-fades into the next coarser one near its boundary** (`sample_volume` +
   edge fade in `standard.frag`) so the resolution change isn't a visible seam — this is what
-  removes the trilinear "squares" near the action while keeping edges/sky cheap. Each cascade is
+  removes the trilinear "squares" near the action while keeping edges/sky cheap. The 8-corner
+  blend also **smoothsteps the trilinear factor** (Hermite, C1-continuous across cell boundaries),
+  so the per-cell gradient kink that reads as faceting/banding on smooth falloff is gone without a
+  finer grid. All cascades are
+  concentric (scene-centered) so the cross-fade lines up and the GI doesn't shift with the camera.
+  Each cascade is
   blurred by its own grid layout. **DDGI-style visibility (leak prevention)**: the march also
   records the SH-L1 of the directional first-hit distance per probe (`ProbeSh::dist`, packed into
   the probe SSBO's previously-unused `.w` lanes — no extra buffer). The shader replaces plain
@@ -130,7 +145,16 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   leaks. Bake/hardware paths leave `dist` zero, which disables the test (plain trilinear). **4
   bounces** cap so a CPU trace finishes inside the update interval; probe-spacing floor 0.25 m so
   a tiny value can't silently explode the probe count. **Emissive
-  materials are area emitters** in both bake (static objects) + realtime GI. Next: surface cache
+  materials are area emitters** in both bake (static objects) + realtime GI, sampled by
+  **next-event estimation (NEE)**: each emissive instance is reduced to a sphere area-light
+  (`sw_gi::emitter_spheres`) the march samples *directly* — both the probe's direct view (added
+  analytically to the SH) and at every bounce surface — instead of relying on random rays to hit a
+  small bright surface. This removes the blotchy Monte-Carlo fill that otherwise rings an emitter
+  (the dominant direct term is variance-free in a single trace; the dim indirect residual is cleaned
+  by the temporal accumulation + grid blur). Implemented in both the CPU march and the GPU
+  `sw_gi.comp` (emitter SSBO, binding 6). The headless `cargo run --example gi_preview` renders a
+  minimal plane+emissive-sphere scene through the real march to a PNG for tuning without the editor.
+  Next: surface cache
   / screen probes for contact-scale GI — probe GI is low-frequency, so tight contact fill
   (under-object darkening) is still limited.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;

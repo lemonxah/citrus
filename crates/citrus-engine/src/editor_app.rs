@@ -4492,10 +4492,10 @@ impl EditorTabs<'_> {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Quality");
-                                // Software is CPU-bound per ray, so its grid cost
-                                // scales with spp — cap it lower. The denoise keeps
-                                // low spp clean, so high values only cost latency.
-                                let max_spp = if software { 128 } else { 256 };
+                                // GPU march affords more rays/probe than the old
+                                // CPU path; the denoise + stratified sampling keep
+                                // even low spp clean, so this is mostly headroom.
+                                let max_spp = if software { 256 } else { 256 };
                                 ui.add(
                                     egui::Slider::new(&mut gi.samples, 16..=max_spp)
                                         .suffix(" spp")
@@ -4530,19 +4530,25 @@ impl EditorTabs<'_> {
                                 ui.label("Responsiveness");
                                 ui.add(egui::Slider::new(&mut gi.temporal_blend, 0.05..=1.0))
                                     .on_hover_text(
-                                        "How fast bounce light tracks MOVING lights/emitters — \
-                                         higher = snappier realtime tracking. Still scenes always \
-                                         settle smoothly (denoised), so raising this does NOT add \
-                                         flicker when nothing is moving.",
+                                        "How fast bounce light tracks MOVING lights/emitters — at \
+                                         max it snaps straight to the latest (clean GPU) trace, so \
+                                         a moving emitter lights at full brightness immediately. \
+                                         Still scenes always settle smoothly (denoised), so raising \
+                                         this does NOT add flicker when nothing is moving.",
                                     );
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Update Interval");
                                 ui.add(
-                                    egui::Slider::new(&mut gi.update_interval, 0.05..=1.0)
+                                    egui::Slider::new(&mut gi.update_interval, 0.0..=1.0)
                                         .suffix(" s"),
                                 )
-                                .on_hover_text("Seconds between re-traces while the scene changes");
+                                .on_hover_text(
+                                    "Seconds between re-traces while the scene changes. 0 = every \
+                                     frame (the GPU march is cheap) for the snappiest moving-light \
+                                     bounce; raise it to throttle GI cost. Still scenes stop \
+                                     tracing once settled regardless.",
+                                );
                             });
                         });
                     });

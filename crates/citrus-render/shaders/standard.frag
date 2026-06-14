@@ -101,10 +101,14 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
     vec3 size = max(v.size_base.xyz, vec3(1e-4));
     vec3 center = -v.world_to_local[3].xyz; // meta stores translate(-center)
     vec3 cell = size / max(vec3(cnt - 1), vec3(1.0));
-    float band = max(cell.x, max(cell.y, cell.z));
     vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
     ivec3 g0 = ivec3(floor(g));
     vec3 f = g - vec3(g0);
+    // Smoothstep (Hermite) the interpolation factor so the trilinear blend is
+    // C1-continuous across cell boundaries. Plain linear trilinear has a kink in
+    // its gradient at every boundary, which reads as visible facets/"squares" on
+    // a smooth gradient; this removes that without needing a finer grid.
+    f = f * f * (3.0 - 2.0 * f);
 
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
@@ -122,11 +126,20 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
         vec3 dir = pd > 1e-5 ? to_frag / pd : n;
         float md = max(dist_at(idx, dir), 0.0);
         // Visibility: full until the fragment is past the seen distance, then
-        // fade over ~one cell. md==0 (no data) disables the test.
-        float vis = md > 1e-4 ? clamp(1.0 - max(0.0, pd - md) / max(band, 1e-3), 0.02, 1.0) : 1.0;
-        // Front-facing weight (probe should be on the surface's lit side).
+        // fade gradually. The stored distance is only SH-L1 (very smooth/blobby),
+        // so a tight one-cell fade with a near-zero floor carves a hard wavy
+        // iso-contour through the bounce (the "edge" behind occluders). Fade over
+        // a few cells and keep a generous floor: the cube still softly darkens the
+        // bounce in its shadow, but as a smooth gradient, not a sharp line. md==0
+        // (no data) disables the test.
+        float band = 3.0 * max(cell.x, max(cell.y, cell.z));
+        float vis = md > 1e-4 ? clamp(1.0 - max(0.0, pd - md) / max(band, 1e-3), 0.25, 1.0) : 1.0;
+        // Front-facing weight (probe should be on the surface's lit side). Kept
+        // gentle + a generous floor so shadowed/back faces still gather soft fill
+        // from surrounding probes instead of crushing to black — leak prevention
+        // is the visibility term's job, not this one.
         float nw = clamp(dot(-dir, n) * 0.5 + 0.5, 0.0, 1.0);
-        nw = nw * nw + 0.15;
+        nw = nw * 0.65 + 0.35;
         w *= vis * nw;
         sum += w * sh_eval(idx, n);
         wsum += w;
@@ -166,9 +179,10 @@ float sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
             irradiance = fine;
             return 1.0;
         }
-        // Outermost cascade: narrow fade-to-ambient only at the very edge.
+        // Outermost cascade: wide, gentle fade-to-ambient so GI melts into the
+        // ambient term over a broad ring instead of stopping at a visible line.
         irradiance = fine;
-        return smoothstep(0.0, 0.08, e);
+        return smoothstep(0.0, 0.2, e);
     }
     irradiance = vec3(0.0);
     return 0.0;

@@ -16,7 +16,7 @@ use crate::scene::{BakeGather, LoadedScene};
 /// How many blended re-traces to run after an input change (temporal settle).
 /// Paired with the low default temporal blend (~0.12) this gives a gentle
 /// ~2-3s ease-in to the converged GI, then idles.
-const SETTLE_UPDATES: u32 = 14;
+const SETTLE_UPDATES: u32 = 96;
 
 /// Probe-grid layout (`world_to_local`, size, counts, sh_base) for an upload.
 type VolUpload = (glam::Mat4, [f32; 3], [u32; 3], u32);
@@ -42,6 +42,10 @@ pub struct RealtimeGiState {
     /// Monotonic per-trace seed so software-GI samples jitter each update and
     /// temporal accumulation averages out the noise.
     seed: u32,
+    /// Hash of the geometry the cached GPU GDF was built from. The GDF (3D
+    /// distance/index textures) is re-uploaded only when this changes, so a static
+    /// scene keeps a high-resolution GDF for free instead of rebuilding per trace.
+    gdf_hash: Option<u64>,
     /// Latest finished trace (intensity applied) — the per-frame ease target.
     target: Vec<citrus_render::ProbeSh>,
     /// Volume layout to upload alongside `target` / `accum`.
@@ -91,7 +95,10 @@ impl RealtimeGiState {
         // 2) Kick off a new trace on the cadence, when inputs changed / settling.
         self.timer -= dt;
         if self.timer <= 0.0 && self.job.is_none() {
-            self.timer = gi.update_interval.max(0.05);
+            // Floor 0 → trace every frame (the GPU march is cheap); the user's
+            // Update Interval throttles it back up to save GPU. Static scenes stop
+            // tracing once settled regardless, so 0 only costs while things move.
+            self.timer = gi.update_interval.max(0.0);
             if let Some(gather) = scene.gather_realtime_gi() {
                 let hash = hash_inputs(&gather, &gi);
                 let changed = hash != self.hash || !self.active;
@@ -108,18 +115,89 @@ impl RealtimeGiState {
                     let vols = vol_uploads(&gather);
                     let counts = gather.probe_volumes[0].counts;
                     if gi.mode == citrus_assets::GiMode::Software {
-                        // Spawn the CPU march on a worker thread (non-blocking).
                         let (insts, scene_size) = scene.software_gi_inputs(&gather);
-                        let lights = gather.lights.clone();
-                        let probes = gather.probes.clone();
-                        let (sky, samples, seed) = (gather.sky_color, gi.samples, self.seed);
-                        let bounces = gi.bounces;
-                        let handle = std::thread::spawn(move || {
-                            crate::sw_gi::march_probes(
-                                &insts, &lights, &probes, sky, samples, scene_size, bounces, seed,
-                            )
-                        });
-                        self.job = Some((handle, vols, counts));
+                        // GDF bounds/dims over the coarsest cascade (full-scene box).
+                        let coarsest = gather.probe_volumes.last().unwrap();
+                        let center = -coarsest.world_to_local.w_axis.truncate();
+                        let size = glam::Vec3::from(coarsest.size);
+                        let (gmin, gmax) = (center - size * 0.5, center + size * 0.5);
+                        let voxel = (size.max_element() / 64.0).max(0.05);
+                        let dims = [
+                            ((size.x / voxel).round() as u32 + 1).clamp(8, 64),
+                            ((size.y / voxel).round() as u32 + 1).clamp(8, 64),
+                            ((size.z / voxel).round() as u32 + 1).clamp(8, 64),
+                        ];
+                        let eps = (scene_size * 0.004).max(1e-3);
+                        let max_dist = scene_size * 1.5 + 1.0;
+                        // `vols`/`counts` go to whichever path produces the trace,
+                        // exactly once — GPU march (fresh) or CPU thread (job).
+                        let mut pending = Some((vols, counts));
+                        if renderer.gi_gpu_available() {
+                            // The GDF is geometry-only: rebuild + re-upload it only
+                            // when the geometry/materials/bounds hash changes, not
+                            // every trace, so a static scene keeps a sharp cached
+                            // field for free while lights/emitters move.
+                            let gh = hash_gdf_inputs(&insts, gmin, gmax, dims);
+                            if self.gdf_hash != Some(gh) {
+                                let gdf = crate::sw_gi::build_gdf(&insts, gmin, gmax, dims);
+                                let materials: Vec<_> = insts
+                                    .iter()
+                                    .map(|i| citrus_render::GpuGiMaterial {
+                                        albedo: i.albedo,
+                                        emission: i.emission,
+                                    })
+                                    .collect();
+                                renderer.gi_set_gdf(
+                                    &gdf.dist,
+                                    &gdf.index,
+                                    gdf.dims,
+                                    gdf.min.to_array(),
+                                    gdf.max.to_array(),
+                                    &materials,
+                                );
+                                self.gdf_hash = Some(gh);
+                            }
+                            // Emissive instances → sphere area-lights for NEE, so
+                            // their GI fill is sampled directly (smooth) instead of
+                            // via blotchy random ray hits.
+                            let emitters: Vec<_> = crate::sw_gi::emitter_spheres(&insts)
+                                .into_iter()
+                                .map(|(center, radius, emission)| citrus_render::GpuGiEmitter {
+                                    center,
+                                    radius,
+                                    emission,
+                                })
+                                .collect();
+                            let march = citrus_render::GpuGiMarch {
+                                lights: &gather.lights,
+                                emitters: &emitters,
+                                probes: &gather.probes,
+                                samples: gi.samples,
+                                bounces: gi.bounces,
+                                sky: gather.sky_color,
+                                eps,
+                                max_dist,
+                                seed: self.seed,
+                            };
+                            if let Some(out) = renderer.gi_march(&march) {
+                                let (vols, counts) = pending.take().unwrap();
+                                fresh = Some((out, vols, counts));
+                            }
+                        }
+                        // No GPU compute (or the march failed) → CPU march thread.
+                        if let Some((vols, counts)) = pending.take() {
+                            let lights = gather.lights.clone();
+                            let probes = gather.probes.clone();
+                            let (sky, samples, seed) = (gather.sky_color, gi.samples, self.seed);
+                            let bounces = gi.bounces;
+                            let handle = std::thread::spawn(move || {
+                                crate::sw_gi::march_probes(
+                                    &insts, &lights, &probes, sky, samples, scene_size, bounces,
+                                    seed,
+                                )
+                            });
+                            self.job = Some((handle, vols, counts));
+                        }
                     } else {
                         // Hardware ray-query: synchronous (GPU async is a follow-up).
                         let input = citrus_render::BakeInput {
@@ -153,7 +231,7 @@ impl RealtimeGiState {
             // kernel also softens the trilinear cell facets (the "squares"). The
             // flat probe array is N concatenated cascade grids, so blur each
             // sub-grid by its own (counts, sh_base) layout.
-            let iters = if gi.mode == citrus_assets::GiMode::Software { 3 } else { 2 };
+            let iters = if gi.mode == citrus_assets::GiMode::Software { 6 } else { 2 };
             for (_, _, c, base) in &vols {
                 let cnt = [c[0] as usize, c[1] as usize, c[2] as usize];
                 let n = cnt[0] * cnt[1] * cnt[2];
@@ -194,14 +272,21 @@ impl RealtimeGiState {
                 //     `Responsiveness`, so cranking it up never makes a still
                 //     scene shimmer.
                 let alpha = if self.moving {
-                    // Map Responsiveness into a capped range. Even at max we keep
-                    // ~2-trace averaging (alpha 0.5) so a continuously-changing
-                    // scene can never show raw per-trace flicker — a full snap
-                    // (alpha 1.0) means zero temporal smoothing, which is exactly
-                    // the shimmer seen at Responsiveness 1.0.
-                    0.1 + 0.4 * gi.temporal_blend.clamp(0.0, 1.0)
+                    // Map Responsiveness across the full range. The GPU traces are
+                    // clean (high-spp + spatially denoised), so at max we can snap
+                    // straight to the latest trace — a moving emitter's bounce
+                    // reaches full brightness in one trace instead of fading in
+                    // over several. Static scenes use the gentle rate below, so
+                    // this never makes a still scene shimmer.
+                    0.2 + 0.8 * gi.temporal_blend.clamp(0.0, 1.0)
                 } else {
-                    0.08
+                    // Static: a low blend rate widens the temporal average over many
+                    // independent-seed traces, which is what actually cancels the
+                    // blotchy per-probe variance around bright emitters (a fixed-
+                    // alpha EMA caps variance reduction at ~alpha/(2-alpha), so a
+                    // smaller alpha = a cleaner converged fill). SETTLE_UPDATES is
+                    // sized to let this reach steady state before idling.
+                    0.03
                 };
                 for (t, f) in self.target.iter_mut().zip(&probes) {
                     for b in 0..4 {
@@ -241,8 +326,9 @@ impl RealtimeGiState {
         if self.target.is_empty() || self.accum.len() != self.target.len() {
             return;
         }
-        // Glide faster while moving (track) than when settling (smooth).
-        let tau = if self.moving { 0.04 } else { 0.08 };
+        // Glide near-instantly while moving (track the latest trace) and gently
+        // when settling (smooth out residual variance).
+        let tau = if self.moving { 0.015 } else { 0.08 };
         let f = 1.0 - (-dt / tau).exp();
         let mut max_delta = 0.0f32;
         for (acc, tgt) in self.accum.iter_mut().zip(&self.target) {
@@ -322,5 +408,36 @@ fn hash_inputs(gather: &BakeGather, gi: &citrus_assets::RealtimeGi) -> u64 {
     }
     gi.bounces.hash(&mut h);
     gi.samples.hash(&mut h);
+    h.finish()
+}
+
+/// Hash only the inputs the cached GDF is built from — per-instance geometry
+/// (world→local transform, world scale, mesh SDF identity) and materials
+/// (albedo/emission), plus the field bounds and resolution. Lights/probes/sky
+/// are NOT included: they change per trace but don't affect the distance field,
+/// so the GDF survives a moving light and is re-uploaded only when geometry does.
+fn hash_gdf_inputs(
+    insts: &[crate::sw_gi::SdfInstance],
+    min: glam::Vec3,
+    max: glam::Vec3,
+    dims: [u32; 3],
+) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let f = |x: f32, h: &mut std::collections::hash_map::DefaultHasher| x.to_bits().hash(h);
+    for inst in insts {
+        for v in inst.inv.to_cols_array() {
+            f(v, &mut h);
+        }
+        f(inst.scale, &mut h);
+        for v in inst.albedo.iter().chain(inst.emission.iter()) {
+            f(*v, &mut h);
+        }
+        // Mesh SDF identity: same Arc → same field, so pointer is enough.
+        (std::sync::Arc::as_ptr(&inst.sdf) as usize).hash(&mut h);
+    }
+    for v in min.to_array().iter().chain(max.to_array().iter()) {
+        f(*v, &mut h);
+    }
+    dims.hash(&mut h);
     h.finish()
 }

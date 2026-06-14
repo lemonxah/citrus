@@ -13,7 +13,8 @@ mod plugins;
 mod realtime_gi;
 mod runtime;
 mod scene;
-mod sw_gi;
+// Public so the headless `gi_preview` example can drive the real probe march.
+pub mod sw_gi;
 mod shaders;
 
 // Editor-only modules (egui, gizmos, LSP, undo, free-fly camera, window icon).

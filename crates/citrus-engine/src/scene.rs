@@ -1377,15 +1377,21 @@ impl LoadedScene {
         let software = self.environment.realtime_gi.mode == citrus_assets::GiMode::Software;
         let spacing = self.environment.realtime_gi.probe_spacing.max(0.25);
         // Margin so geometry (esp. a large floor) sits well inside the outermost
-        // cascade — its edge fades to ambient, so too little pad darkens the rim.
-        let pad = ((hi - lo).length() * 0.08).max(1.0);
+        // cascade — its edge fades to ambient, so too little pad lands that fade
+        // ring on the visible floor as a hard line. Generous pad pushes the box
+        // boundary off the geometry; it also enlarges the coarsest box, which
+        // auto-raises the cascade count below, so the center stays dense.
+        let pad = ((hi - lo).length() * 0.20).max(2.0);
         let (lo, hi) = (lo - pad, hi + pad);
         let center = (lo + hi) * 0.5;
         let size = (hi - lo).max(Vec3::splat(0.1)); // coarsest (full-scene) box
         // Per-axis probe count for every cascade, derived from the full-scene box
-        // and clamped. Software marches on the CPU so it gets a coarser cap; the
-        // grid blur + trilinear keep it smooth. Hardware ray-query is cheap.
-        let max_axis = if software { 16 } else { 32 };
+        // and clamped. Kept at 32: pushing it higher makes the coarse cell fine
+        // enough that the cascade-count formula below collapses to a single grid,
+        // which paradoxically coarsens the (off-center) emitter region — the
+        // multi-cascade nest at 32 keeps the center denser. Grid-cell structure is
+        // smoothed by the probe-grid denoise blur, not by raw count alone.
+        let max_axis = if software { 32 } else { 32 };
         let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, max_axis) as usize;
         let counts = [axis_count(size.x), axis_count(size.y), axis_count(size.z)];
 
@@ -1403,7 +1409,9 @@ impl LoadedScene {
         };
 
         // Emit finest-first so the shader's first-containing-volume rule selects
-        // the densest cascade available at each fragment.
+        // the densest cascade available at each fragment. All cascades share the
+        // scene center (concentric) so the cross-fade between levels lines up and
+        // the GI doesn't shift as the camera moves.
         let mut probes = Vec::new();
         let mut probe_volumes = Vec::new();
         for k in 0..cascades {

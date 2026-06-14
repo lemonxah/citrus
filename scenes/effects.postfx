@@ -4,7 +4,7 @@
         exposure: 0.5,
     ),
     bloom: (
-        enabled: false,
+        enabled: true,
         threshold: 5.0,
         intensity: 1.35,
         radius: 0.45,

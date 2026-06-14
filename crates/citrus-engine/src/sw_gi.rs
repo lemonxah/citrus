@@ -30,6 +30,81 @@ pub struct SdfInstance {
     pub emission: [f32; 3],
 }
 
+/// An emissive instance reduced to a sphere area-light for next-event estimation
+/// (NEE). Sampling emitters directly — instead of waiting for random bounce rays
+/// to stumble onto a small bright surface — is what removes the blotchy variance
+/// in the GI fill around emissive objects.
+struct Emitter {
+    center: Vec3,
+    radius: f32,
+    emission: Vec3,
+}
+
+/// Reduce the emissive instances to sphere area-lights. Center = the SDF's local
+/// AABB center transformed to world; radius = the inscribed extent (minus the
+/// 0.1 SDF pad) scaled to world. Non-emissive instances are skipped.
+fn collect_emitters(insts: &[SdfInstance]) -> Vec<Emitter> {
+    insts
+        .iter()
+        .filter_map(|i| {
+            let emission = Vec3::from(i.emission);
+            if emission.max_element() <= 1e-4 {
+                return None;
+            }
+            let world = i.inv.inverse();
+            let center = world.transform_point3((i.sdf.min + i.sdf.max) * 0.5);
+            let half = (i.sdf.max - i.sdf.min) * 0.5;
+            let radius = ((half.min_element() - 0.1).max(0.01)) * i.scale;
+            Some(Emitter { center, radius, emission })
+        })
+        .collect()
+}
+
+/// Emissive instances reduced to sphere area-lights for the GPU march's NEE:
+/// `(world_center, world_radius, emission)` per emitter. Same reduction the CPU
+/// march uses, exposed so the realtime-GI driver can hand them to the shader.
+pub fn emitter_spheres(insts: &[SdfInstance]) -> Vec<([f32; 3], f32, [f32; 3])> {
+    collect_emitters(insts)
+        .into_iter()
+        .map(|e| (e.center.to_array(), e.radius, e.emission.to_array()))
+        .collect()
+}
+
+/// Solid angle a sphere of `radius` subtends at `dist` (dist > radius), 0 inside.
+fn sphere_solid_angle(radius: f32, dist: f32) -> f32 {
+    if dist <= radius {
+        return 2.0 * PI;
+    }
+    let s = (radius / dist).min(0.999);
+    2.0 * PI * (1.0 - (1.0 - s * s).sqrt())
+}
+
+/// Irradiance at surface point `p` (normal `n`) from every visible emitter,
+/// each treated as a sphere area-light: `emission · (n·l) · Ω`, occlusion-tested
+/// up to the emitter's near surface. The caller folds in `albedo/π`. This is the
+/// low-variance (analytic) replacement for catching emitters via random hits.
+fn emitter_light(insts: &[SdfInstance], emitters: &[Emitter], p: Vec3, n: Vec3, eps: f32) -> Vec3 {
+    let mut sum = Vec3::ZERO;
+    for em in emitters {
+        let d = em.center - p;
+        let dist = d.length();
+        if dist <= em.radius + eps {
+            continue;
+        }
+        let l = d / dist;
+        let ndl = n.dot(l).max(0.0);
+        if ndl <= 0.0 {
+            continue;
+        }
+        let reach = dist - em.radius - eps;
+        if occluded(insts, p + n * (eps * 2.0), l, reach, eps) {
+            continue;
+        }
+        sum += em.emission * (ndl * sphere_solid_angle(em.radius, dist));
+    }
+    sum
+}
+
 fn hash(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x7feb352d);
@@ -174,6 +249,7 @@ fn direct_light(insts: &[SdfInstance], lights: &[BakeLight], p: Vec3, n: Vec3, e
 fn incoming(
     insts: &[SdfInstance],
     lights: &[BakeLight],
+    emitters: &[Emitter],
     origin: Vec3,
     dir: Vec3,
     sky: Vec3,
@@ -204,9 +280,13 @@ fn incoming(
                 }
                 let inst = &insts[who];
                 let albedo = Vec3::from(inst.albedo);
-                radiance += throughput * Vec3::from(inst.emission);
-                // Lambert emit toward the ray: albedo/π · direct (cosine in direct).
-                radiance += throughput * (albedo / PI) * direct_light(insts, lights, hp, n, eps);
+                // Emitters are sampled via NEE below (not added on random hit),
+                // so a hit on an emissive surface contributes no emission here —
+                // that's what kills the firefly variance from small bright sources.
+                // Lambert emit toward the ray: albedo/π · (direct lights + emitters).
+                let direct = direct_light(insts, lights, hp, n, eps)
+                    + emitter_light(insts, emitters, hp, n, eps);
+                radiance += throughput * (albedo / PI) * direct;
                 // Continue the path: cosine-weighted bounce; for a Lambert BRDF the
                 // /π, cosine and pdf cancel, so throughput just folds in albedo.
                 throughput *= albedo;
@@ -226,6 +306,7 @@ fn incoming(
 fn probe_sh(
     insts: &[SdfInstance],
     lights: &[BakeLight],
+    emitters: &[Emitter],
     origin: Vec3,
     sky: Vec3,
     eps: f32,
@@ -245,7 +326,7 @@ fn probe_sh(
     let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for _ in 0..samples {
         let d = uniform_sphere(&mut rng);
-        let (r, fd) = incoming(insts, lights, origin, d, sky, eps, max_dist, bounces, &mut rng);
+        let (r, fd) = incoming(insts, lights, emitters, origin, d, sky, eps, max_dist, bounces, &mut rng);
         let r = r.min(Vec3::splat(8.0));
         sh0 += r * 0.282095;
         sh1 += r * (0.488603 * d.y);
@@ -257,9 +338,31 @@ fn probe_sh(
         d3 += fd * (0.488603 * d.x);
     }
     let wgt = (4.0 * PI) / samples as f32;
+    let (mut sh0, mut sh1, mut sh2, mut sh3) = (sh0 * wgt, sh1 * wgt, sh2 * wgt, sh3 * wgt);
+    // Analytic NEE: add the probe's DIRECT view of each visible emitter straight
+    // into the SH (radiance L over the solid angle Ω it subtends in direction l).
+    // This replaces the removed random-hit emission with a zero-variance term, so
+    // the bright fill right around an emitter is smooth in a single trace.
+    for em in emitters {
+        let dir = em.center - origin;
+        let dist = dir.length();
+        if dist <= em.radius + eps {
+            continue;
+        }
+        let l = dir / dist;
+        let reach = dist - em.radius - eps;
+        if occluded(insts, origin, l, reach, eps) {
+            continue;
+        }
+        let le = em.emission * sphere_solid_angle(em.radius, dist);
+        sh0 += le * 0.282095;
+        sh1 += le * (0.488603 * l.y);
+        sh2 += le * (0.488603 * l.z);
+        sh3 += le * (0.488603 * l.x);
+    }
     let pack = |v: Vec3| [v.x, v.y, v.z];
     ProbeSh {
-        coeffs: [pack(sh0 * wgt), pack(sh1 * wgt), pack(sh2 * wgt), pack(sh3 * wgt)],
+        coeffs: [pack(sh0), pack(sh1), pack(sh2), pack(sh3)],
         dist: [d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt],
     }
 }
@@ -282,6 +385,7 @@ pub fn march_probes(
     let max_dist = scene_size * 1.5 + 1.0;
     let samples = samples.max(1);
     let bounces = bounces.clamp(1, 16);
+    let emitters = collect_emitters(insts);
     let n = probes.len();
     let mut out = vec![ProbeSh::default(); n];
     let cores = std::thread::available_parallelism()
@@ -289,19 +393,82 @@ pub fn march_probes(
         .unwrap_or(4)
         .max(1);
     let chunk = n.div_ceil(cores).max(1);
+    let emitters = &emitters; // shared ref so each scoped thread can read it
     std::thread::scope(|s| {
         for (ci, (pchunk, ochunk)) in probes.chunks(chunk).zip(out.chunks_mut(chunk)).enumerate() {
             let base = ci * chunk;
             s.spawn(move || {
                 for (k, &origin) in pchunk.iter().enumerate() {
                     ochunk[k] = probe_sh(
-                        insts, lights, origin, sky, eps, max_dist, samples, bounces, base + k, seed,
+                        insts, lights, &emitters, origin, sky, eps, max_dist, samples, bounces,
+                        base + k, seed,
                     );
                 }
             });
         }
     });
     out
+}
+
+/// A merged Global Distance Field over the scene AABB: one signed-distance grid
+/// (min over all instances) plus the nearest-instance index per voxel. Uploaded
+/// to the GPU as a 3D distance texture (trilinear) + index texture (nearest) so
+/// the GPU march samples one field per step instead of looping instances. Built
+/// from the already-cached per-mesh SDFs, only when the scene changes.
+pub struct Gdf {
+    pub dims: [u32; 3],
+    pub min: Vec3,
+    pub max: Vec3,
+    /// Signed distance per voxel (x fastest, then y, then z).
+    pub dist: Vec<f32>,
+    /// Nearest-instance index per voxel (same layout) — looks up albedo/emission.
+    pub index: Vec<u32>,
+}
+
+/// Build the GDF over `[min,max]` at `dims` resolution from the marchable
+/// instances. Parallel over z-slices. Empty instances → a far, single-cell field.
+pub fn build_gdf(insts: &[SdfInstance], min: Vec3, max: Vec3, dims: [u32; 3]) -> Gdf {
+    let dims = [dims[0].max(2), dims[1].max(2), dims[2].max(2)];
+    let n = (dims[0] * dims[1] * dims[2]) as usize;
+    let mut dist = vec![f32::MAX; n];
+    let mut index = vec![0u32; n];
+    if insts.is_empty() {
+        return Gdf { dims, min, max, dist, index };
+    }
+    let extent = (max - min).max(Vec3::splat(1e-4));
+    let step = Vec3::new(
+        extent.x / (dims[0] - 1) as f32,
+        extent.y / (dims[1] - 1) as f32,
+        extent.z / (dims[2] - 1) as f32,
+    );
+    let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
+    let slice = nx * ny;
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4)
+        .max(1);
+    let zchunk = nz.div_ceil(cores).max(1);
+    std::thread::scope(|s| {
+        for (ci, (dchunk, ichunk)) in dist
+            .chunks_mut(zchunk * slice)
+            .zip(index.chunks_mut(zchunk * slice))
+            .enumerate()
+        {
+            let z0 = ci * zchunk;
+            s.spawn(move || {
+                for (local, (d, idx)) in dchunk.iter_mut().zip(ichunk.iter_mut()).enumerate() {
+                    let z = z0 + local / slice;
+                    let rem = local % slice;
+                    let (y, x) = (rem / nx, rem % nx);
+                    let p = min + Vec3::new(x as f32, y as f32, z as f32) * step;
+                    let (best, who) = scene_distance(insts, p);
+                    *d = best;
+                    *idx = who as u32;
+                }
+            });
+        }
+    });
+    Gdf { dims, min, max, dist, index }
 }
 
 /// One separable [1,2,1]/4 blur pass along a single grid axis (`axis`: 0=x, 1=y,
@@ -436,5 +603,41 @@ mod tests {
         blur_probe_grid(&mut spike, counts, 1);
         assert!(spike[center].coeffs[0][0] < 1.0, "spike center should fall");
         assert!(spike[neighbor].coeffs[0][0] > 0.0, "neighbour should gain");
+    }
+
+    // The GDF must carry the merged scene's sign (negative inside the cube,
+    // positive outside) and tag every voxel with the (only) instance.
+    #[test]
+    fn gdf_merges_sign_and_index() {
+        let h = 0.5f32;
+        let v: Vec<Vec3> = [
+            [-h, -h, -h], [h, -h, -h], [h, h, -h], [-h, h, -h],
+            [-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h],
+        ]
+        .iter()
+        .map(|c| Vec3::from_array(*c))
+        .collect();
+        let idx = vec![
+            0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7,
+            3, 1, 2, 6, 1, 6, 5,
+        ];
+        let sdf = std::sync::Arc::new(citrus_render::sdf::generate_sdf(&v, &idx, 32, 0.1));
+        let inst = SdfInstance {
+            inv: Mat4::IDENTITY,
+            scale: 1.0,
+            sdf,
+            albedo: [0.8; 3],
+            emission: [0.0; 3],
+        };
+        let dims = [16, 16, 16];
+        let gdf = build_gdf(&[inst], Vec3::splat(-1.5), Vec3::splat(1.5), dims);
+        let at = |x: usize, y: usize, z: usize| {
+            gdf.dist[(z * dims[1] as usize + y) * dims[0] as usize + x]
+        };
+        // Grid center (voxel 8,8,8 spans -1.5..1.5) is the cube center → inside.
+        assert!(at(8, 8, 8) < 0.0, "cube center should be inside (negative)");
+        // A corner voxel is well outside → positive.
+        assert!(at(0, 0, 0) > 0.0, "far corner should be outside (positive)");
+        assert!(gdf.index.iter().all(|&i| i == 0), "only instance 0 exists");
     }
 }
