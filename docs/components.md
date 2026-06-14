@@ -118,6 +118,23 @@ nested object it pushes `world_point` back through the parent's inverse world
 matrix so the object ends up exactly there. (World-space rotation/scale writes
 are not exposed yet.)
 
+**Smoothed / lerped moves (planned).** Today `set_world_position` snaps to the
+target. A planned addition lets a transform change *ease* instead, so motion
+looks nicer without per-component hand-rolled smoothing:
+
+```rust
+// constant speed toward a target, framerate-independent
+ctx.move_towards(target, max_delta_per_second * ctx.dt);
+// exponential smoothing: 1 - exp(-smoothing * dt), stable at any framerate
+ctx.lerp_position(target, smoothing);
+ctx.slerp_rotation(target_rot, smoothing);
+```
+
+A higher-level tween (duration + easing curve: linear / ease-in-out / spring)
+will run a transform change over time. All operate in world space and convert
+through `parent_world` like `set_world_position`. Tracked in
+[Features.md](../Features.md) §2D.
+
 ### Reading other objects
 
 Objects are referenced by **stable id**, not name or index (see

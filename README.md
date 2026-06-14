@@ -3,7 +3,8 @@
 A Rust + Vulkan game engine with a dockable in-engine editor, built VR-first
 (OpenXR). Powers [vrsh](../vrsh), a social-VR platform — but citrus itself is
 general-purpose: scenes, materials, FBX/glTF import, components and Rust
-plugins, custom shaders, lighting, audio, colliders, and a growing editor.
+plugins, custom shaders, lighting + GPU bake, audio, physics (rapier3d), and a
+growing editor that builds standalone games.
 
 ## Project docs
 
@@ -81,20 +82,34 @@ the Scene tree; an in-game API (`ComponentCtx`) for transforms (incl.
 parent-aware world writes), object lookups, and runtime scene switching; runtime
 custom **GLSL shaders**. Full reference in [docs/components.md](docs/components.md).
 
+**Projects & game builds** — **File → New Project** scaffolds a standalone cargo
+project (`scenes/ materials/ shaders/ textures/ src/main.rs` + a `plugins/components`
+crate + `project.citrus`) that builds and runs immediately; **File → Project Settings**
+sets the starting (boot) scene; **File → Build Game** (or `citrus --build`) compiles a
+**standalone executable + bundled `assets/`** under `build/`. A shipped game links the
+runtime only — `citrus-engine` with the editor cargo feature off, so no editor/egui_dock
+in the binary; the boot scene comes from `project.citrus` and is overridable in the
+editable `src/main.rs`. Unsaved-changes prompt on exit.
+
 **Audio** — spatial / non-spatial `AudioSource` + `AudioListener` with distance
 attenuation, driven in play mode.
 
 **Physics / collision** — Box / Sphere / Mesh colliders with editable viewport
-widgets (authoring only; the physics engine is planned).
+widgets, plus a `RigidBody` component driving a rapier3d simulation (gravity,
+collisions, transform writeback) in both the editor's Play mode and a built game.
+Foundational slice — joints, queries, and trigger events are still to come.
 
 **Lighting bake — IN TESTING, NOT YET VERIFIED.** A GPU lightmap + light-probe
 bake (Vulkan ray query: BLAS/TLAS, path-traced direct + soft shadows +
 multi-bounce indirect, SH-L1 probes) with a "Baker's Man" editor tab and
-`.lightmap`/`.lightdata` sidecars. Runtime sampling has started (Phase 5a:
-baked probe SH feeds the frame's ambient term, and baked-mode lights drop out of
-the realtime pass), but per-fragment probe sampling and lightmap application in
-the standard shader are not done, and the GPU bake output has not been visually
-validated — so it does not fully light the scene yet.
+`.lightmap`/`.lightdata` sidecars. Runtime sampling: Phase 5a (flat probe-average
+ambient) and **5b (per-fragment probe SH)** are in — baked probes upload to a
+storage buffer and the standard shader trilinearly samples SH-L1 per fragment for
+the indirect term, and per-object **lightmaps** (5c) are sampled by `uv1` for static
+geometry — in both the editor and a built game (the runtime loads the scene's
+`.lightmap`/`.lightdata`, which bundle with the scene). The standard shader's PBR is
+energy-conserving (Cook-Torrance Fresnel kS / diffuse kD). The GPU bake output still
+needs visual validation.
 
 ## Planned
 
@@ -106,9 +121,11 @@ goals:
 - **Input binding system** — device-independent actions + control schemes (KB/mouse, gamepad).
 - **In-game API** — a scripting surface so components read/affect the world (objects, transforms, physics, materials, audio, camera, scene).
 - **Editor-only vs gameplay components** — components that never ship in a built game.
-- **Game UI system** — retained scene-graph UI (screen + world-space) for menus/HUD/inventory.
-- **3D physics engine** — rigid bodies, materials, joints, layer matrix, queries (Rapier3d).
-- **Lighting** — bake runtime sampling + lightmap GI in the standard shader; HDR skybox + IBL.
+- **Game UI system** — developer's choice per project: immediate-mode egui *or* a retained
+  scene-graph UI (screen + world-space) for menus/HUD/inventory.
+- **3D physics** — rigid bodies + gravity already land (rapier3d); still to come: joints,
+  layer-collision matrix, queries (raycast/overlap), trigger events.
+- **Lighting** — bake GPU output still needs visual validation; HDR skybox + IBL.
 - **VR** — OpenXR stereo rendering, controller input, and in-headset world/avatar editing.
 - **Custom shaders phase 2** — Slang frontend with SPIR-V reflection.
 - **Milestones M3–M7** — VRM avatars, VR, full editor, networking, content pipeline.
@@ -141,8 +158,9 @@ Open a model or scene directly: `cargo run -- world.glb` / `model.fbx` /
 ### Editor
 
 Dockable layout (drag tabs to rearrange): **Viewport**, **Scene**, **Inspector**,
-**Files**, **Log**, **Baker**, and **Code** tabs. Menu bar: File (new/open/save
-scenes), Edit (undo/redo), Tools, View (stats, layout, camera preview), Help.
+**Files**, **Log**, **Baker**, and **Code** tabs. Menu bar: File (new project,
+project settings, build game, new/open/save scenes), Edit (undo/redo), Tools
+(plugins, bake), View (stats, layout, camera preview), Help.
 
 | Input | Action |
 |---|---|
@@ -163,3 +181,17 @@ grid size (top-center); widget filter (top-right).
 
 `RUST_LOG=debug` for verbose logs. Install `vulkan-validation-layers` to get
 validation automatically in dev.
+
+### Building a game
+
+From the editor: **File → New Project** to scaffold one, **File → Project Settings**
+to pick the boot scene, **File → Build Game** to produce `build/<game>` + `build/assets/`.
+The same is available headless:
+
+```sh
+citrus --new-project <parent-dir> <name>   # scaffold a project
+citrus --build [project-dir]                # cargo build --release + bundle assets
+```
+
+The output `build/` folder is self-contained and relocatable; run the executable
+inside it.

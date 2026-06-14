@@ -12,6 +12,9 @@ use glam::{Mat4, Quat, Vec3};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+mod models;
+pub use models::{AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};
+
 // ------------------------------------------------------------------ object id
 
 /// A stable, globally-unique object identity (UUID v4). Assigned when an object
@@ -364,6 +367,7 @@ impl ComponentRegistry {
         registry.register::<MeshCollider>();
         registry.register::<Spin>();
         registry.register::<Bob>();
+        registry.register::<RigidBody>();
         registry
     }
 
@@ -787,4 +791,56 @@ impl Default for MeshCollider {
 
 impl TypedComponent for MeshCollider {
     const NAME: &'static str = "Mesh Collider";
+}
+
+/// How the physics engine simulates a body. Dynamic bodies fall and react to
+/// forces/collisions; Kinematic are moved by gameplay but push dynamics;
+/// Fixed never move (static geometry / level colliders).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum BodyKind {
+    Dynamic,
+    Kinematic,
+    Fixed,
+}
+
+impl BodyKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dynamic => "Dynamic",
+            Self::Kinematic => "Kinematic",
+            Self::Fixed => "Fixed",
+        }
+    }
+    pub const ALL: [BodyKind; 3] = [Self::Dynamic, Self::Kinematic, Self::Fixed];
+}
+
+/// Makes an object participate in the physics simulation (paired with a
+/// collider for its shape). The engine builds a rapier rigid body from this on
+/// Play and writes the simulated transform back each step.
+#[derive(Serialize, Deserialize)]
+pub struct RigidBody {
+    pub kind: BodyKind,
+    /// Mass in kg (Dynamic only; <= 0 falls back to the collider's density).
+    pub mass: f32,
+    /// Bounciness 0..1.
+    pub restitution: f32,
+    pub friction: f32,
+    /// Per-body gravity multiplier (0 = floats).
+    pub gravity_scale: f32,
+}
+
+impl Default for RigidBody {
+    fn default() -> Self {
+        Self {
+            kind: BodyKind::Dynamic,
+            mass: 1.0,
+            restitution: 0.0,
+            friction: 0.5,
+            gravity_scale: 1.0,
+        }
+    }
+}
+
+impl TypedComponent for RigidBody {
+    const NAME: &'static str = "Rigid Body";
 }

@@ -128,7 +128,7 @@ void main() {
     vec3 sh0 = vec3(0.0), sh1 = vec3(0.0), sh2 = vec3(0.0), sh3 = vec3(0.0);
     for (uint s = 0u; s < samples; ++s) {
         vec3 d = uniform_sphere(rng);
-        vec3 r = incoming(origin, d);
+        vec3 r = min(incoming(origin, d), vec3(8.0)); // firefly clamp
         sh0 += r * 0.282095;
         sh1 += r * (0.488603 * d.y);
         sh2 += r * (0.488603 * d.z);

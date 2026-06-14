@@ -872,6 +872,140 @@ fn write_storage_image(device: &ash::Device, set: vk::DescriptorSet, binding: u3
 }
 
 #[allow(clippy::too_many_arguments)]
+#[inline]
+fn texel(x: i32, y: i32, size: i32) -> usize {
+    ((y * size + x) as usize) * 4
+}
+
+/// Largest world-space spacing to a valid axis neighbor `step` away — the local
+/// texel size, used to scale the denoise position weight (scale-invariant).
+fn neighbor_spacing(pos: &[f32], px: &[f32], x: i32, y: i32, step: i32, s: i32) -> f32 {
+    let ci = texel(x, y, s);
+    let p0 = [pos[ci], pos[ci + 1], pos[ci + 2]];
+    let mut best = 0.0f32;
+    for (dx, dy) in [(step, 0), (0, step), (-step, 0), (0, -step)] {
+        let nx = (x + dx).clamp(0, s - 1);
+        let ny = (y + dy).clamp(0, s - 1);
+        let ni = texel(nx, ny, s);
+        if px[ni + 3] <= 0.0 {
+            continue;
+        }
+        let d = ((pos[ni] - p0[0]).powi(2)
+            + (pos[ni + 1] - p0[1]).powi(2)
+            + (pos[ni + 2] - p0[2]).powi(2))
+        .sqrt();
+        best = best.max(d);
+    }
+    best
+}
+
+/// Edge-aware À-Trous denoise (Dammertz et al.): a few wavelet passes with
+/// increasing hole size, each a 5×5 B3-spline blur weighted by world-position
+/// and normal similarity (from the bake gbuffer) so it smooths Monte-Carlo
+/// grain without crossing shadow/geometry edges or UV-chart seams. RGBA32F;
+/// `.a` is per-texel validity (0 = no surface).
+fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, iters: u32) {
+    let s = size as i32;
+    if s < 3 {
+        return;
+    }
+    const K: [f32; 5] = [1.0, 4.0, 6.0, 4.0, 1.0]; // B3 spline
+    let mut src = pixels.clone();
+    let mut dst = pixels.clone();
+    for it in 0..iters {
+        let step = 1i32 << it;
+        for y in 0..s {
+            for x in 0..s {
+                let ci = texel(x, y, s);
+                if src[ci + 3] <= 0.0 {
+                    dst[ci..ci + 4].copy_from_slice(&src[ci..ci + 4]);
+                    continue;
+                }
+                let p0 = [pos[ci], pos[ci + 1], pos[ci + 2]];
+                let n0 = [nrm[ci], nrm[ci + 1], nrm[ci + 2]];
+                let h = neighbor_spacing(pos, &src, x, y, step, s);
+                let inv2h2 = if h > 1e-6 { 1.0 / (2.0 * h * h) } else { 0.0 };
+                let mut sum = [0.0f32; 3];
+                let mut wsum = 0.0f32;
+                for ky in -2..=2i32 {
+                    for kx in -2..=2i32 {
+                        let nx = (x + kx * step).clamp(0, s - 1);
+                        let ny = (y + ky * step).clamp(0, s - 1);
+                        let ni = texel(nx, ny, s);
+                        if src[ni + 3] <= 0.0 {
+                            continue;
+                        }
+                        let wk = K[(kx + 2) as usize] * K[(ky + 2) as usize];
+                        let d2 = (pos[ni] - p0[0]).powi(2)
+                            + (pos[ni + 1] - p0[1]).powi(2)
+                            + (pos[ni + 2] - p0[2]).powi(2);
+                        let wp = if inv2h2 > 0.0 { (-d2 * inv2h2).exp() } else { 1.0 };
+                        let ndot =
+                            (nrm[ni] * n0[0] + nrm[ni + 1] * n0[1] + nrm[ni + 2] * n0[2]).max(0.0);
+                        let w = wk * wp * ndot.powf(32.0);
+                        sum[0] += src[ni] * w;
+                        sum[1] += src[ni + 1] * w;
+                        sum[2] += src[ni + 2] * w;
+                        wsum += w;
+                    }
+                }
+                if wsum > 1e-8 {
+                    dst[ci] = sum[0] / wsum;
+                    dst[ci + 1] = sum[1] / wsum;
+                    dst[ci + 2] = sum[2] / wsum;
+                    dst[ci + 3] = src[ci + 3];
+                } else {
+                    dst[ci..ci + 4].copy_from_slice(&src[ci..ci + 4]);
+                }
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    *pixels = src;
+}
+
+/// Dilate valid texels outward into invalid (gutter) texels, `iters` rings.
+/// Bilinear sampling at a UV-chart edge then reads the surface colour instead
+/// of the black background — removes lightmap seams.
+fn dilate_lightmap(pixels: &mut [f32], size: u32, iters: u32) {
+    let s = size as i32;
+    for _ in 0..iters {
+        let src = pixels.to_vec();
+        for y in 0..s {
+            for x in 0..s {
+                let ci = texel(x, y, s);
+                if src[ci + 3] > 0.0 {
+                    continue;
+                }
+                let mut sum = [0.0f32; 3];
+                let mut n = 0u32;
+                for dy in -1..=1i32 {
+                    for dx in -1..=1i32 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = (x + dx).clamp(0, s - 1);
+                        let ny = (y + dy).clamp(0, s - 1);
+                        let ni = texel(nx, ny, s);
+                        if src[ni + 3] > 0.0 {
+                            sum[0] += src[ni];
+                            sum[1] += src[ni + 1];
+                            sum[2] += src[ni + 2];
+                            n += 1;
+                        }
+                    }
+                }
+                if n > 0 {
+                    pixels[ci] = sum[0] / n as f32;
+                    pixels[ci + 1] = sum[1] / n as f32;
+                    pixels[ci + 2] = sum[2] / n as f32;
+                    pixels[ci + 3] = 1.0;
+                }
+            }
+        }
+    }
+}
+
 fn bake_one_lightmap(
     ctx: &GpuContext,
     allocator: &Arc<Mutex<Allocator>>,
@@ -909,13 +1043,24 @@ fn bake_one_lightmap(
         size,
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
     )?;
+    let rb_bytes = (size * size * 4 * 4) as u64;
     let readback = Buffer::new(
         device,
         &mut alloc,
-        (size * size * 4 * 4) as u64,
+        rb_bytes,
         vk::BufferUsageFlags::TRANSFER_DST,
         MemoryLocation::GpuToCpu,
         "lightmap-readback",
+    )?;
+    // Read the gbuffer back too, for the edge-aware denoise (CPU À-Trous uses
+    // per-texel world position + normal to avoid blurring across edges/seams).
+    let pos_readback = Buffer::new(
+        device, &mut alloc, rb_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "lightmap-pos-readback",
+    )?;
+    let nrm_readback = Buffer::new(
+        device, &mut alloc, rb_bytes,
+        vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "lightmap-nrm-readback",
     )?;
     drop(alloc);
 
@@ -1083,14 +1228,39 @@ fn bake_one_lightmap(
             readback.handle,
             &[copy],
         );
+        // Gbuffer → readback (for the CPU edge-aware denoise): GENERAL → TRANSFER_SRC.
+        for (img, buf) in [(g_pos.image, pos_readback.handle), (g_normal.image, nrm_readback.handle)]
+        {
+            image_barrier(
+                device, cb, img,
+                vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ,
+            );
+            device.cmd_copy_image_to_buffer(cb, img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &[copy]);
+        }
     })?;
 
     let bytes = readback.read();
-    let pixels: Vec<f32> = bytemuck::cast_slice(&bytes[..(size * size * 16) as usize]).to_vec();
+    let mut pixels: Vec<f32> =
+        bytemuck::cast_slice(&bytes[..(size * size * 16) as usize]).to_vec();
+    let pos: Vec<f32> =
+        bytemuck::cast_slice(&pos_readback.read()[..(size * size * 16) as usize]).to_vec();
+    let nrm: Vec<f32> =
+        bytemuck::cast_slice(&nrm_readback.read()[..(size * size * 16) as usize]).to_vec();
+    // Edge-aware denoise (smooth MC noise, keep shadow/geometry edges), then
+    // dilate valid texels into the gutter so bilinear sampling at chart edges
+    // never reads the black background (fixes lightmap seams).
+    denoise_atrous(&mut pixels, &pos, &nrm, size, 4);
+    dilate_lightmap(&mut pixels, size, 4);
 
     let mut alloc = allocator.lock().unwrap();
     let mut readback = readback;
+    let mut pos_readback = pos_readback;
+    let mut nrm_readback = nrm_readback;
     readback.destroy(device, &mut alloc);
+    pos_readback.destroy(device, &mut alloc);
+    nrm_readback.destroy(device, &mut alloc);
     g_pos.destroy(device, &mut alloc);
     g_normal.destroy(device, &mut alloc);
     out_img.destroy(device, &mut alloc);

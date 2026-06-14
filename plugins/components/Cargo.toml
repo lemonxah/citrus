@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib: hot-loaded by the editor. rlib: statically linked into a bundled
+# game's binary (no dylib shipped) — both produced from one build.
+crate-type = ["cdylib", "rlib"]
 
 [features]
 # The editor builds plugins with `--features editor` (inspector + gizmo + egui);

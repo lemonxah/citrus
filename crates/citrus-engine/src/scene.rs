@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use citrus_assets::{MaterialRef, ObjectSource, SceneEntry, SceneFile};
 use citrus_core::{Component, ComponentCtx, ComponentRegistry, ObjectId};
-use citrus_editor::{AlphaModeModel, MaterialModel};
+use citrus_core::{AlphaModeModel, MaterialModel};
 use citrus_render::{
     AlphaMode, DrawCmd, MaterialDesc, MaterialFeatures, MaterialHandle, MaterialParams, MeshHandle,
     Renderer, TextureHandle,
@@ -183,6 +183,12 @@ impl LoadedScene {
     pub fn mesh_center_local(&self, mesh: usize) -> Vec3 {
         let (min, max) = self.mesh_bounds[mesh];
         (min + max) * 0.5
+    }
+
+    /// Object-space AABB (min, max) of a mesh — used by physics to fit a
+    /// collider to a mesh's extents.
+    pub fn mesh_aabb(&self, mesh: usize) -> (Vec3, Vec3) {
+        self.mesh_bounds[mesh]
     }
 
     /// World transform of an object (walks the parent chain).
@@ -923,11 +929,12 @@ impl LoadedScene {
     /// go dark.
     pub fn gather_lights(&self) -> Vec<citrus_render::LightInstance> {
         use citrus_core::{LightComponent, LightKind, LightMode};
-        // Once a bake with probe GI exists, Baked-mode lights are represented by
-        // the bake (ambient/probes), so drop them from the realtime loop to
-        // avoid double-counting. Without probe GI we keep them so the scene
-        // isn't dark (lightmap-only sampling is a later phase).
-        let drop_baked = self.baked_ambient().is_some();
+        // Once a bake exists, Baked + Mixed lights are represented by it
+        // (lightmaps/probes), so drop them from the realtime loop to avoid
+        // double-counting. Realtime lights are always kept. With NO bake we keep
+        // everything so an un-baked scene is never dark (baking stays opt-in).
+        // `baked.is_some()` (not probe-based) so a lightmap-only bake counts too.
+        let drop_baked = self.baked.is_some();
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -940,7 +947,7 @@ impl LoadedScene {
             else {
                 continue;
             };
-            if drop_baked && light.mode == LightMode::Baked {
+            if drop_baked && light.mode != LightMode::Realtime {
                 continue;
             }
             let world = self.world_transform(i);
@@ -966,6 +973,60 @@ impl LoadedScene {
             });
         }
         lights
+    }
+
+    /// Load the `.lightmap` / `.lightdata` bake sidecars sitting next to a scene
+    /// into `self.baked` (clearing it if neither file exists). `base` is the
+    /// scene path with its extension removed (e.g. `scenes/world`). Shared by
+    /// the editor and the game runtime so both light the scene from a bake.
+    pub fn load_bake_sidecars(&mut self, base: &std::path::Path) {
+        let lm_path = base.with_extension("lightmap");
+        let ld_path = base.with_extension("lightdata");
+        if !lm_path.exists() && !ld_path.exists() {
+            self.baked = None;
+            return;
+        }
+        let mut baked = BakedData::default();
+        if let Ok(lm) = citrus_assets::load_lightmaps(&lm_path) {
+            for entry in lm.entries {
+                let layer = baked.lightmaps.len();
+                baked.object_lightmap.insert(entry.object as usize, layer);
+                baked.lightmaps.push(citrus_render::BakedLightmap {
+                    size: entry.size,
+                    pixels: entry.pixels,
+                });
+            }
+        }
+        if let Ok(ld) = citrus_assets::load_lightdata(&ld_path) {
+            baked.probe_volumes = ld
+                .volumes
+                .iter()
+                .map(|v| ProbeVolumeMeta {
+                    world_to_local: Mat4::from_cols_array(&v.world_to_local),
+                    size: v.size,
+                    counts: [v.counts[0] as usize, v.counts[1] as usize, v.counts[2] as usize],
+                    sh_base: v.sh_base as usize,
+                })
+                .collect();
+            baked.probe_sh = ld
+                .probes
+                .iter()
+                .map(|p| citrus_render::ProbeSh {
+                    coeffs: [
+                        [p[0], p[1], p[2]],
+                        [p[3], p[4], p[5]],
+                        [p[6], p[7], p[8]],
+                        [p[9], p[10], p[11]],
+                    ],
+                })
+                .collect();
+        }
+        tracing::info!(
+            "loaded baked lighting: {} lightmap(s), {} probe(s)",
+            baked.lightmaps.len(),
+            baked.probe_sh.len()
+        );
+        self.baked = Some(baked);
     }
 
     /// Coarse scene ambient from the baked probe SH (average L0 radiance), or
@@ -1033,8 +1094,10 @@ impl LoadedScene {
             instance_objects.push(i);
         }
 
-        // Baked-mode lights only: Mixed/Realtime stay in the realtime path so
-        // their direct term isn't double-counted (Unity/Unreal convention).
+        // Bake captures Baked + Mixed lights (+ the environment sun below);
+        // Realtime lights are never baked — they stay purely in the realtime
+        // path. (Baked/Mixed are dropped from realtime once a bake exists; see
+        // gather_lights.)
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -1047,7 +1110,7 @@ impl LoadedScene {
             else {
                 continue;
             };
-            if light.mode != LightMode::Baked {
+            if light.mode == LightMode::Realtime {
                 continue;
             }
             let world = self.world_transform(i);
@@ -1098,6 +1161,23 @@ impl LoadedScene {
                 size: vol.size,
                 counts: vol.counts(),
                 sh_base,
+            });
+        }
+
+        // The environment sun is an environment light → bake it (and it's
+        // dropped from the realtime sun when a bake exists).
+        if self.environment.sun_enabled {
+            let dir = Vec3::from(self.environment.sun_direction).normalize_or(Vec3::NEG_Y);
+            let c = self.environment.sun_color;
+            let s = self.environment.sun_intensity;
+            lights.push(citrus_render::BakeLight {
+                kind: citrus_render::LightKind::Directional,
+                position: Vec3::ZERO,
+                direction: dir,
+                color: [c[0] * s, c[1] * s, c[2] * s],
+                range: 0.0,
+                spot_inner_deg: 0.0,
+                spot_outer_deg: 0.0,
             });
         }
 
@@ -1170,12 +1250,19 @@ impl LoadedScene {
             if !self.is_active(i) {
                 continue;
             }
+            let lightmap_layer = self
+                .baked
+                .as_ref()
+                .and_then(|b| b.object_lightmap.get(&i))
+                .map(|&l| l as i32)
+                .unwrap_or(-1);
             self.draws.push(DrawCmd {
                 mesh: self.mesh_handles[render.mesh],
                 material: self.materials[render.material].handle,
                 transform: self.world_transform(i),
                 highlight: if selected == Some(i) { highlight } else { 0.0 },
                 mesh_center: self.mesh_center_local(render.mesh),
+                lightmap_layer,
             });
         }
     }

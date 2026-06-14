@@ -14,8 +14,14 @@ pub const PROJECT_FILE_NAME: &str = "project.citrus";
 #[serde(default)]
 pub struct ProjectFile {
     pub name: String,
-    /// Project-relative path of the last opened scene; reloaded on startup.
+    /// Project-relative path of the last opened scene; reloaded on startup
+    /// (editor convenience — which scene to reopen).
     pub last_scene: Option<String>,
+    /// Project-relative path of the scene a built game loads first. Distinct
+    /// from `last_scene`: the editor restores `last_scene`, a shipped game boots
+    /// `boot_scene`. Set in Project Settings.
+    #[serde(default)]
+    pub boot_scene: Option<String>,
     pub settings: ProjectSettings,
 }
 
@@ -24,6 +30,7 @@ impl Default for ProjectFile {
         Self {
             name: "citrus project".into(),
             last_scene: None,
+            boot_scene: None,
             settings: ProjectSettings::default(),
         }
     }

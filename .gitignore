@@ -1,2 +1,5 @@
-/target
+example-game
+*.lightdata
+*.lightmap
+target
 **/*.spv

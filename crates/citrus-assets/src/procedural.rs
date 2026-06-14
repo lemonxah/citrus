@@ -305,21 +305,34 @@ fn cube(size: f32) -> MeshData {
     ];
     let mut vertices = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(36);
-    for (normal, tangent, corners) in faces {
+    // uv0 is per-face 0..1 (texture mapping, tiles/overlaps across faces); uv1
+    // is a non-overlapping lightmap atlas — the 6 faces packed into a 3x2 grid,
+    // each face inset by a gutter so the bake/bilinear filter don't bleed
+    // between faces. (uv0 alone can't be a lightmap: all faces would share the
+    // same 0..1 region and fight over the same texels.)
+    const M: f32 = 0.04; // per-cell inset (gutter)
+    for (f, (normal, tangent, corners)) in faces.into_iter().enumerate() {
         let base = vertices.len() as u32;
+        let col = (f % 3) as f32;
+        let row = (f / 3) as f32;
         for (i, position) in corners.into_iter().enumerate() {
             let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]][i];
+            let uv1 = [
+                (col + M + uv[0] * (1.0 - 2.0 * M)) / 3.0,
+                (row + M + uv[1] * (1.0 - 2.0 * M)) / 2.0,
+            ];
             vertices.push(Vertex {
                 position,
                 normal,
                 uv,
+                uv1,
                 tangent,
                 ..Default::default()
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    mesh_with_lightmap(vertices, indices)
+    MeshData { vertices, indices }
 }
 
 fn uv_sphere(radius: f32, segments: u32, rings: u32) -> MeshData {

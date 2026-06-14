@@ -1,6 +1,7 @@
 (
     name: "citrus",
     last_scene: Some("scenes/world.scene"),
+    boot_scene: None,
     settings: (
         vsync: true,
         show_stats: true,

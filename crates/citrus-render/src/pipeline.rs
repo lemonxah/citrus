@@ -230,7 +230,8 @@ impl PipelineCache {
             )?
         };
 
-        // set 0: per-frame UBO (binding 0) + shadow-map array (binding 1).
+        // set 0: per-frame UBO (binding 0), shadow-map array (binding 1), and
+        // the baked light-probe SH storage buffer (binding 2, runtime GI).
         let frame_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -239,6 +240,17 @@ impl PipelineCache {
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Baked lightmap array (static-object GI), sampled by uv1 + layer.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -431,6 +443,13 @@ impl PipelineCache {
                 binding: 0,
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: 48,
+            },
+            // uv1 (lightmap UVs), offset 64 — after tangent.
+            vk::VertexInputAttributeDescription {
+                location: 5,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 64,
             },
         ];
         // The skybox is a vertex-buffer-less fullscreen triangle.

@@ -4,24 +4,44 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# `editor` (on by default) pulls in the egui editor shell. A built game depends
+# on citrus-engine with `default-features = false`, so it links the runtime only
+# — no citrus-editor, egui_dock, gizmos, or LSP.
+default = ["editor"]
+editor = [
+    "dep:citrus-editor",
+    "dep:egui",
+    "dep:egui-winit",
+    "dep:transform-gizmo-egui",
+    "dep:egui_dock",
+    "dep:hecs",
+    "dep:image",
+    "dep:serde_json",
+    "dep:libc",
+]
+
 [dependencies]
 citrus-core.workspace = true
 citrus-render.workspace = true
 citrus-assets.workspace = true
-citrus-editor.workspace = true
 winit.workspace = true
-egui.workspace = true
-egui-winit.workspace = true
-transform-gizmo-egui.workspace = true
-egui_dock.workspace = true
-hecs.workspace = true
-glam.workspace = true
-image.workspace = true
+# Always-on (runtime needs them): plugin loading, audio, logging.
 libloading.workspace = true
-serde_json.workspace = true
-chrono.workspace = true
 rodio.workspace = true
-libc.workspace = true
+glam.workspace = true
+chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Editor-only (optional; enabled by the `editor` feature).
+citrus-editor = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+egui-winit = { workspace = true, optional = true }
+transform-gizmo-egui = { workspace = true, optional = true }
+egui_dock = { workspace = true, optional = true }
+hecs = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+rapier3d = "0.33.0"

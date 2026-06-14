@@ -87,6 +87,30 @@ fn gpu_light(l: &LightInstance) -> GpuLight {
 /// Shadow view-projection matrices, one per shadow-map layer.
 const MAX_SHADOW_VIEWS: usize = MAX_SHADOW_MAPS;
 
+/// Max baked light-probe volumes sampled per frame (in the FrameUbo).
+const MAX_PROBE_VOLUMES: usize = 4;
+
+/// One probe volume's runtime metadata in std140 layout. Mirrors
+/// `ProbeVolume` in standard.frag.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct GpuProbeVolume {
+    /// World → volume-local; local grid spans -size/2..+size/2.
+    world_to_local: [[f32; 4]; 4],
+    /// xyz = local box size, w = first probe index (sh_base) as float.
+    size_base: [f32; 4],
+    /// xyz = probe counts per axis (as floats), w unused.
+    counts: [f32; 4],
+}
+
+/// One probe's SH-L1 in the GPU storage buffer (std430): 4 coefficients, each
+/// an RGB padded to vec4. Matches `ProbeSh` projection in bake_probe.comp.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
+struct GpuProbe {
+    coeffs: [[f32; 4]; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct FrameUbo {
@@ -97,11 +121,14 @@ struct FrameUbo {
     light_dir: [f32; 4],
     light_color: [f32; 4],
     ambient: [f32; 4],
-    misc: [f32; 4], // x = time in seconds, y = active light count
+    misc: [f32; 4], // x = time, y = light count, z = shadow spacing, w = probe-volume count
     /// Far view-space distance of each directional cascade (xyzw = up to 4).
     cascade_splits: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
     shadow_vp: [[[f32; 4]; 4]; MAX_SHADOW_VIEWS],
+    /// Baked probe volumes (count in `misc.w`); SH coefficients live in the
+    /// set-0 binding-2 storage buffer, indexed via each volume's `size_base.w`.
+    probe_volumes: [GpuProbeVolume; MAX_PROBE_VOLUMES],
 }
 
 #[repr(C)]
@@ -483,6 +510,9 @@ impl CameraPreview {
         sampler: vk::Sampler,
         shadow_view: vk::ImageView,
         shadow_sampler: vk::Sampler,
+        probe_buffer: vk::Buffer,
+        lightmap_view: vk::ImageView,
+        lightmap_sampler: vk::Sampler,
         egui: &mut egui_ash_renderer::Renderer,
     ) -> Result<Self> {
         let device = &ctx.device;
@@ -522,7 +552,12 @@ impl CameraPreview {
                             descriptor_count: FRAMES_IN_FLIGHT as u32,
                         },
                         vk::DescriptorPoolSize {
+                            // shadow (binding 1) + lightmap (binding 3)
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            descriptor_count: 2 * FRAMES_IN_FLIGHT as u32,
+                        },
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::STORAGE_BUFFER,
                             descriptor_count: FRAMES_IN_FLIGHT as u32,
                         },
                     ]),
@@ -555,6 +590,13 @@ impl CameraPreview {
                 .sampler(shadow_sampler)
                 .image_view(shadow_view)
                 .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)];
+            let probe_info = [vk::DescriptorBufferInfo::default()
+                .buffer(probe_buffer)
+                .range(vk::WHOLE_SIZE)];
+            let lightmap_info = [vk::DescriptorImageInfo::default()
+                .sampler(lightmap_sampler)
+                .image_view(lightmap_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let writes = [
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -566,6 +608,16 @@ impl CameraPreview {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&shadow_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&probe_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&lightmap_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
             ubos.push(buffer);
@@ -789,6 +841,15 @@ pub struct Renderer {
     /// Offscreen main-camera target, created lazily the first frame the Camera
     /// tab asks for it.
     camera_preview: Option<CameraPreview>,
+    /// Baked light-probe SH (set-0 binding 2). A 1-probe zero buffer until a
+    /// bake is loaded, so the binding is always valid.
+    probe_buffer: Buffer,
+    /// Probe-volume metadata mirrored into each frame's FrameUbo (count drives
+    /// `misc.w`). Empty = fall back to flat ambient.
+    probe_volumes: Vec<GpuProbeVolume>,
+    /// Baked lightmap array (set-0 binding 3), one layer per static object. A
+    /// 1x1 black single layer until a bake is loaded.
+    lightmaps: GpuTexture,
     last_stats: RenderStats,
     vsync: bool,
 
@@ -851,7 +912,12 @@ impl Renderer {
                 descriptor_count: FRAMES_IN_FLIGHT as u32,
             },
             vk::DescriptorPoolSize {
+                // shadow atlas (binding 1) + lightmap array (binding 3)
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 2 * FRAMES_IN_FLIGHT as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: FRAMES_IN_FLIGHT as u32,
             },
         ];
@@ -932,6 +998,57 @@ impl Renderer {
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
+
+        // Baked-probe SH buffer (set 0, binding 2): a single zero probe until a
+        // bake is loaded, so the binding is always valid. Wire it into every
+        // frame set.
+        let probe_buffer = {
+            let mut alloc = allocator.lock().unwrap();
+            let mut buf = Buffer::new(
+                &ctx.device,
+                &mut alloc,
+                size_of::<GpuProbe>() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::CpuToGpu,
+                "probe sh (default)",
+            )?;
+            buf.write(0, bytemuck::bytes_of(&GpuProbe::default()));
+            buf
+        };
+        for &set in &frame_sets {
+            let info = [vk::DescriptorBufferInfo::default()
+                .buffer(probe_buffer.handle)
+                .range(vk::WHOLE_SIZE)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&info);
+            unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
+
+        // Baked-lightmap array (set 0, binding 3): a 1x1 black single layer
+        // until a bake loads, wired into every frame set.
+        let lightmaps = GpuTexture::upload_lightmap_array(
+            &ctx.device,
+            &mut allocator.lock().unwrap(),
+            command_pool,
+            ctx.queue,
+            &[vec![0.0; 4]],
+            1,
+        )?;
+        for &set in &frame_sets {
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(lightmaps.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&info);
             unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
@@ -1040,9 +1157,149 @@ impl Renderer {
             egui: Some(egui),
             egui_free_queue: VecDeque::new(),
             camera_preview: None,
+            probe_buffer,
+            probe_volumes: Vec::new(),
+            lightmaps,
             last_stats: RenderStats::default(),
             vsync: true,
         })
+    }
+
+    /// Upload baked light-probe SH (set-0 binding 2) and the per-volume
+    /// metadata sampled in the standard shader. Empty `volumes` reverts to the
+    /// 1-probe zero buffer so fragments fall back to flat ambient. Call after a
+    /// bake or when loading a scene's `.lightdata`.
+    pub fn set_baked_probes(
+        &mut self,
+        probes: &[ProbeSh],
+        volumes: &[(Mat4, [f32; 3], [u32; 3], u32)],
+    ) {
+        // Pack probes into std430 GpuProbe (4 vec4 each); at least one entry so
+        // the buffer is never zero-sized.
+        let gpu: Vec<GpuProbe> = if probes.is_empty() {
+            vec![GpuProbe::default()]
+        } else {
+            probes
+                .iter()
+                .map(|p| GpuProbe {
+                    coeffs: [
+                        [p.coeffs[0][0], p.coeffs[0][1], p.coeffs[0][2], 0.0],
+                        [p.coeffs[1][0], p.coeffs[1][1], p.coeffs[1][2], 0.0],
+                        [p.coeffs[2][0], p.coeffs[2][1], p.coeffs[2][2], 0.0],
+                        [p.coeffs[3][0], p.coeffs[3][1], p.coeffs[3][2], 0.0],
+                    ],
+                })
+                .collect()
+        };
+        self.probe_volumes = volumes
+            .iter()
+            .map(|(w2l, size, counts, base)| GpuProbeVolume {
+                world_to_local: w2l.to_cols_array_2d(),
+                size_base: [size[0], size[1], size[2], *base as f32],
+                counts: [counts[0] as f32, counts[1] as f32, counts[2] as f32, 0.0],
+            })
+            .collect();
+
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+        let alloc = self.allocator();
+        let bytes = std::mem::size_of_val(gpu.as_slice()) as u64;
+        let mut buf = match Buffer::new(
+            &self.ctx.device,
+            &mut alloc.lock().unwrap(),
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::CpuToGpu,
+            "probe sh",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("probe buffer alloc: {e:#}");
+                return;
+            }
+        };
+        buf.write(0, bytemuck::cast_slice(&gpu));
+        // Re-point binding 2 on every frame set + the camera preview's sets.
+        let mut sets: Vec<vk::DescriptorSet> = self.frame_sets.clone();
+        if let Some(preview) = &self.camera_preview {
+            sets.extend_from_slice(&preview.sets);
+        }
+        for set in sets {
+            let info = [vk::DescriptorBufferInfo::default()
+                .buffer(buf.handle)
+                .range(vk::WHOLE_SIZE)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&info);
+            unsafe { self.ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
+        let mut old = std::mem::replace(&mut self.probe_buffer, buf);
+        old.destroy(&self.ctx.device, &mut alloc.lock().unwrap());
+    }
+
+    /// Upload baked lightmaps (set-0 binding 3) as a 2D array, one layer per
+    /// object (resampled to a common size). Empty reverts to a 1x1 black layer.
+    /// Object→layer indices come from `BakedData.object_lightmap`; the draw path
+    /// puts the layer in the push constant.
+    pub fn set_baked_lightmaps(&mut self, lightmaps: &[BakedLightmap]) {
+        // All layers share the largest baked size (texture-array requirement).
+        // Cap at 2048 for memory — each RGBA32F layer at 2048² is 64 MB, and
+        // every object's layer is padded to this size. (A per-object atlas would
+        // avoid the padding; that's a follow-up.)
+        let size = lightmaps
+            .iter()
+            .map(|l| l.size)
+            .max()
+            .unwrap_or(1)
+            .clamp(1, 2048);
+        let layers: Vec<Vec<f32>> = if lightmaps.is_empty() {
+            vec![vec![0.0; 4]]
+        } else {
+            lightmaps
+                .iter()
+                .map(|l| resample_rgba32f(&l.pixels, l.size, size))
+                .collect()
+        };
+
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+        let alloc = self.allocator();
+        let tex = match GpuTexture::upload_lightmap_array(
+            &self.ctx.device,
+            &mut alloc.lock().unwrap(),
+            self.command_pool,
+            self.ctx.queue,
+            &layers,
+            size,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("lightmap array upload: {e:#}");
+                return;
+            }
+        };
+        let mut sets: Vec<vk::DescriptorSet> = self.frame_sets.clone();
+        if let Some(preview) = &self.camera_preview {
+            sets.extend_from_slice(&preview.sets);
+        }
+        for set in sets {
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(tex.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { self.ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
+        let mut old = std::mem::replace(&mut self.lightmaps, tex);
+        old.destroy(&self.ctx.device, &mut alloc.lock().unwrap());
     }
 
     /// Toggle vsync (FIFO ↔ MAILBOX/IMMEDIATE); takes effect next frame via
@@ -1502,6 +1759,7 @@ impl Renderer {
             count,
             shadow_vp,
             cascade_splits,
+            &self.probe_volumes,
         );
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
 
@@ -1520,13 +1778,24 @@ impl Renderer {
                         self.sampler,
                         self.shadow_atlas.array_view,
                         self.shadow_atlas.sampler,
+                        self.probe_buffer.handle,
+                        self.lightmaps.view,
+                        self.sampler,
                         self.egui.as_mut().unwrap(),
                     )?;
                     self.camera_preview = Some(preview);
                 }
             }
             if let Some(preview) = &mut self.camera_preview {
-                let cam_ubo = frame_ubo(camera, input, lights, count, shadow_vp, cascade_splits);
+                let cam_ubo = frame_ubo(
+                    camera,
+                    input,
+                    lights,
+                    count,
+                    shadow_vp,
+                    cascade_splits,
+                    &self.probe_volumes,
+                );
                 preview.ubos[self.frame_index].write(0, bytemuck::bytes_of(&cam_ubo));
             }
         }
@@ -1872,6 +2141,44 @@ impl Renderer {
     }
 }
 
+/// Bilinear resample of a square RGBA32F image (`src_size`²) to `dst`². Used to
+/// pack per-object lightmaps (varying resolutions) into one uniform texture
+/// array. Same-size (or malformed) input is copied/padded.
+fn resample_rgba32f(src: &[f32], src_size: u32, dst: u32) -> Vec<f32> {
+    let s = src_size.max(1) as usize;
+    let d = dst.max(1) as usize;
+    if s == d || src.len() < s * s * 4 {
+        let mut out = vec![0.0; d * d * 4];
+        let k = out.len().min(src.len());
+        out[..k].copy_from_slice(&src[..k]);
+        return out;
+    }
+    let mut out = vec![0.0f32; d * d * 4];
+    let smax = (s - 1) as f32;
+    for y in 0..d {
+        let fy = (y as f32 + 0.5) * s as f32 / d as f32 - 0.5;
+        let y0 = fy.floor().clamp(0.0, smax) as usize;
+        let y1 = (y0 + 1).min(s - 1);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..d {
+            let fx = (x as f32 + 0.5) * s as f32 / d as f32 - 0.5;
+            let x0 = fx.floor().clamp(0.0, smax) as usize;
+            let x1 = (x0 + 1).min(s - 1);
+            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+            for c in 0..4 {
+                let p00 = src[(y0 * s + x0) * 4 + c];
+                let p10 = src[(y0 * s + x1) * 4 + c];
+                let p01 = src[(y1 * s + x0) * 4 + c];
+                let p11 = src[(y1 * s + x1) * 4 + c];
+                let top = p00 + (p10 - p00) * tx;
+                let bot = p01 + (p11 - p01) * tx;
+                out[(y * d + x) * 4 + c] = top + (bot - top) * ty;
+            }
+        }
+    }
+    out
+}
+
 /// Build the per-frame UBO for a given camera, sharing the already-packed
 /// scene lights and ambient/key-light fallback.
 #[allow(clippy::too_many_arguments)]
@@ -1882,7 +2189,11 @@ fn frame_ubo(
     count: usize,
     shadow_vp: [[[f32; 4]; 4]; MAX_SHADOW_VIEWS],
     cascade_splits: [f32; 4],
+    probe_volumes: &[GpuProbeVolume],
 ) -> FrameUbo {
+    let mut volumes = [GpuProbeVolume::default(); MAX_PROBE_VOLUMES];
+    let nv = probe_volumes.len().min(MAX_PROBE_VOLUMES);
+    volumes[..nv].copy_from_slice(&probe_volumes[..nv]);
     FrameUbo {
         view: camera.view.to_cols_array_2d(),
         proj: camera.proj.to_cols_array_2d(),
@@ -1901,10 +2212,11 @@ fn frame_ubo(
             input.light.ambient[2],
             1.0,
         ],
-        misc: [input.time, count as f32, input.shadow_pcf_texel, 0.0],
+        misc: [input.time, count as f32, input.shadow_pcf_texel, nv as f32],
         cascade_splits,
         lights,
         shadow_vp,
+        probe_volumes: volumes,
     }
 }
 
@@ -1999,11 +2311,14 @@ impl Renderer {
                         0.0,
                     ],
                     params0: [p.metallic, p.roughness, p.toon_steps, p.pbr_toon_blend],
+                    // w = baked-lightmap layer (-1 = none); the standard shader
+                    // samples it for static GI. (Selection highlight is drawn by
+                    // the separate outline pass, so w is free here.)
                     params1: [
                         p.alpha_cutoff,
                         p.normal_strength,
                         p.occlusion_strength,
-                        draw.highlight,
+                        draw.lightmap_layer as f32,
                     ],
                 }
             };

@@ -33,6 +33,9 @@ pub enum PivotMode {
 impl GizmoTool {
     fn modes(self) -> EnumSet<GizmoMode> {
         match self {
+            // TranslateView: a camera-facing screen-plane handle (the center
+            // square) for dragging in the view plane, alongside the axis/plane
+            // handles.
             Self::Move => enum_set!(
                 GizmoMode::TranslateX
                     | GizmoMode::TranslateY
@@ -40,8 +43,13 @@ impl GizmoTool {
                     | GizmoMode::TranslateXY
                     | GizmoMode::TranslateXZ
                     | GizmoMode::TranslateYZ
+                    | GizmoMode::TranslateView
             ),
-            Self::Rotate => enum_set!(GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ),
+            // RotateView: a camera-facing ring (screen-aligned rotation) plus
+            // the three world axes.
+            Self::Rotate => enum_set!(
+                GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ | GizmoMode::RotateView
+            ),
             Self::Scale => enum_set!(
                 GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ | GizmoMode::ScaleUniform
             ),

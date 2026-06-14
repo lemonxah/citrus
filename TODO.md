@@ -129,8 +129,14 @@ lives.
   index (a std type, so the payload crosses the plugin/egui boundary), mapped to id via
   the object list. Scene-tree + viewport selection are release-based (`clicked()`), so
   starting a drag never changes the inspector. `find_object(name)` stays a convenience;
-  the Orbit plugin's target is an `ObjectRef` set by drag. Follow-ups: tags, world-space
-  writes, parent-aware target positioning.
+  the Orbit plugin's target is an `ObjectRef` set by drag. **World-space writes**:
+  `ctx.set_world_position(world)` converts a world point to local through the owner's
+  parent (`ComponentCtx::parent_world`), so a parented object lands at the right world
+  spot (fixed Orbit circling a displaced center). Follow-ups: tags, world-space
+  rotation/scale writes, and **smoothed/lerped transform moves** (`move_towards`,
+  `lerp_position`/`slerp_rotation` with framerate-independent `1 - exp(-k*dt)`
+  smoothing, plus a duration+easing tween) so setting a transform can ease instead of
+  snap — see Features.md 2D.
 
 - **Networking & multiplayer** — built-in, supporting both client-server (authoritative,
   prediction + reconciliation) and peer-to-peer (shared-authority / deterministic
@@ -139,19 +145,55 @@ lives.
   surface (`is_server`/`local_player`/`spawn_networked`), voice + IK replication. Subsumes
   milestone M6. Full breakdown in Features.md section 2G.
 
-- **Game UI system (runtime UI)** — retained scene-graph UI (Unity uGUI-style),
-  screen-space + world-space (VR), visually authored. UICanvas + UIRect + widgets
-  (Text/Image/Button/Checkbox/Radio/Slider) as scene objects; 2D batched renderer +
-  font subsystem in citrus-render; pointer/key event system delivered to components via
-  the in-game API. Full breakdown in Features.md section 2F.
+- **Render-to-texture cameras** — a `Camera` renders the scene into an offscreen
+  `RenderTexture` a material can sample, so a plane becomes an in-world screen (CCTV/TV,
+  mirror, portal, minimap). Generalizes the existing editor `CameraPreview` offscreen
+  target; adds a camera output mode, a typed material texture source
+  (`FilePath` | `RenderTarget(camera id)`), offscreen-first frame-graph ordering with the
+  color→shader-read barrier, and a one-frame-latency feedback guard. Full breakdown in
+  Features.md section 2H.
+
+- **Build & bundle (game export)** — turn a project into a standalone runnable game.
+  **Landed (end-to-end working):** `citrus_engine::run_game(GameConfig, register)` in
+  `runtime.rs` — a no-editor game loop (window + renderer + scene load + `start`/`update`/
+  `late_update` + render with `egui: None`), draining `LoadScene`, using the scene `Camera`;
+  `GameConfig::from_project_dir` reads `boot_scene`/title from `project.citrus`. Component
+  crate builds `cdylib`+`rlib` (static link, no shipped dylib). **New Project** (File menu +
+  `citrus --new-project <parent> <name>`) — `bundle::scaffold_project` writes a standalone
+  cargo workspace (root game `Cargo.toml` with `[workspace.dependencies]` path-pointing at
+  the citrus checkout via `bundle::citrus_root`, editable `src/main.rs`, `plugins/components`
+  cdylib+rlib, `scenes/materials/shaders/textures`, starter scene, `project.citrus` with
+  `boot_scene`), then switches the editor to it. **Project Settings UI** (File -> Project
+  Settings…) edits name + boot-scene picker. **Build Game** (File menu + `citrus --build`) —
+  `bundle::build_game` runs `cargo build --release` and assembles `build/<game>` +
+  `build/assets/`; verified: a scaffolded project builds and the bundled exe runs standalone
+  (window/Vulkan/scene render). **Boot scene decision:** `boot_scene` setting drives the
+  default, generated `src/main.rs` is editable for override. **Next:** feature-gate
+  `citrus-editor` out of `citrus-engine` (so `default-features = false` doesn't link the
+  editor — biggest remaining task), shader SPIR-V precompile (no runtime `glslc`), dead-asset
+  stripping, `GameState` blackboard + savegame persistence. Rust-native (Bevy single-exe +
+  assets) model, not Unity/Godot data-pack. Full breakdown in Features.md 2I.
+
+- **Game UI system (runtime UI)** — **developer's choice per project, both first-class:**
+  (A) the citrus-native **retained scene-graph UI** (Unity uGUI-style, screen + world-space
+  VR, visually authored: UICanvas + UIRect + widgets as scene objects, 2D batched renderer
+  + font subsystem in citrus-render, pointer/key events via the in-game API), and (B)
+  **immediate-mode egui** (same egui the editor uses, driven from a per-frame game
+  callback) for debug HUDs / tools / prototypes. egui stays in the render path in every
+  build (~1.5M, acceptable — not gated), so option B needs no feature flag, just a
+  `run_game` egui hook. Either or both. Full breakdown in Features.md section 2F.
 
 ### Smaller backlog
 - [ ] Multi-select + multi-object gizmo
 - [ ] Stencil/JFA-based outline (upgrade from inverted hull; perfect concave silhouettes)
 - [ ] Material texture-slot assignment UI (thumbnails, drag textures from Files panel)
 - [ ] Per-section material presets (save/load partial `.material`)
-- [ ] Unsaved-changes dialog on exit (save / discard / cancel)
-- [ ] Camera-facing axis handles on move/scale gizmo (requires vendoring transform-gizmo)
+- [x] Unsaved-changes dialog on exit (save / discard / cancel) — `scene_dirty` set on
+  edits/spawns/deletes, cleared on save/load; close is intercepted and a Save & Quit /
+  Discard & Quit / Cancel dialog runs (Save&Quit saves the scene, then exits next frame).
+- [x] Camera-facing axis handles on move/scale gizmo — no vendoring needed:
+  `transform-gizmo` already has `TranslateView` (screen-plane move) + `RotateView`
+  (screen-aligned rotate); added both to the gizmo mode sets.
 
 ## Changelog
 

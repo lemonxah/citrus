@@ -18,8 +18,10 @@ use std::sync::mpsc;
 
 use anyhow::{Context as _, Result, bail};
 use citrus_core::ComponentRegistry;
+#[cfg(feature = "editor")]
 use citrus_editor::{CodeDiagnostic, EditorComponents};
 
+#[cfg(feature = "editor")]
 pub fn check_shader(path: &Path) -> Vec<CodeDiagnostic> {
     let output = Command::new("glslc").arg("-o").arg("-").arg(path).output();
 
@@ -109,6 +111,7 @@ impl PluginHost {
 
     /// Build every plugin crate and load + register it. Returns the loaded
     /// plugin names; the first failure aborts with the compiler output.
+    #[cfg(feature = "editor")]
     pub fn build_and_load(
         &mut self,
         project_root: &Path,
@@ -141,6 +144,7 @@ impl PluginHost {
         Ok(loaded)
     }
 
+    #[cfg(feature = "editor")]
     fn load(
         &mut self,
         project_root: &Path,
@@ -323,6 +327,7 @@ impl Gizmo for Orbit {}
 /// rustc errors and clippy lints arrive on the returned channel as
 /// simplified diagnostics. (rust-analyzer LSP integration is the eventual
 /// upgrade; clippy already includes all compiler errors.)
+#[cfg(feature = "editor")]
 pub fn run_check(project_root: &Path) -> mpsc::Receiver<Vec<CodeDiagnostic>> {
     let (tx, rx) = mpsc::channel();
     let root = project_root.to_owned();
@@ -348,6 +353,7 @@ pub fn run_check(project_root: &Path) -> mpsc::Receiver<Vec<CodeDiagnostic>> {
     rx
 }
 
+#[cfg(feature = "editor")]
 fn parse_cargo_messages(stdout: &[u8], out: &mut Vec<CodeDiagnostic>) {
     for line in stdout.split(|&b| b == b'\n') {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {

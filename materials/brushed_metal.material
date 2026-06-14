@@ -2,7 +2,7 @@
     name: "Brushed Metal",
     shader: "standard",
     params: (
-        base_color: (0.016076028, 0.019657271, 0.03156822, 1.0),
+        base_color: (1.0, 1.0, 1.0, 1.0),
         emission_color: (0.0, 0.0, 0.0),
         emission_intensity: 1.0,
         metallic: 0.0,

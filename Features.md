@@ -13,7 +13,9 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 
 ### Rendering
 - [done] Vulkan 1.3 renderer (ash 0.38, dynamic rendering, sync2)
-- [done] PBR standard shader (metal/rough, base/normal/emission), multi-light frag loop
+- [done] PBR standard shader (metal/rough, base/normal/emission), multi-light frag loop —
+  energy-conserving Cook-Torrance (Fresnel kS / diffuse kD = 1-F) + roughness-aware ambient;
+  indirect term fed by baked lightmaps / probe SH (else flat ambient)
 - [done] Lights: directional / point / spot — color, intensity, range, spot angle/blend
   (up to 16/frame, distance attenuation + spot cones)
 - [partial] Shadow-casting lights (shadow-map array, PCF; needs acne/bias GPU validation)
@@ -38,9 +40,37 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 
 ### Lighting / baking
 - [partial] GPU light bake (Vulkan ray query): BLAS/TLAS, lightmap path tracer (direct +
-  shadow + multi-bounce indirect), light-probe SH-L1 bake. Built, needs GPU
-  validation; runtime sampling (Phase 5) not done — bake isn't visible yet.
-- [done] Baker's Man dock tab (texel density / bounces / samples / max size, Bake/Clear)
+  shadow + multi-bounce indirect), light-probe SH-L1 bake. Built, needs GPU visual
+  validation. **Runtime sampling**: 5a flat probe-average ambient (done); **5b
+  per-fragment probe SH** (done) — probes uploaded to a set-0 storage buffer (binding 2)
+  + volume metadata in the frame UBO; `standard.frag` finds the containing volume,
+  trilinearly blends 8 probes, evaluates SH-L1 in the surface normal, and uses it as the
+  indirect term (flat ambient fallback outside any volume). Active in **both** the editor
+  viewport and the **game runtime** — `run_game` loads the scene's `.lightmap`/`.lightdata`
+  sidecars (shared `LoadedScene::load_bake_sidecars`) and uploads the probes. The sidecars
+  bundle automatically (they live in `scenes/`, copied with the scene). **5c
+  per-object lightmaps (done)**: baked lightmaps upload as a `R32G32B32A32_SFLOAT` 2D array
+  (one layer per static object, resampled to a common size; set-0 binding 3), `uv1` is
+  forwarded through the vertex pipeline, and `standard.frag` samples the layer (per-object
+  index in the push constant) for static-object GI — lightmap takes priority, else probes,
+  else flat ambient. Active in editor + game. Bake output still needs visual validation.
+- [done] **Bake light policy**: the bake captures **Baked + Mixed** lights *and* the
+  environment sun/sky; **Realtime lights are never baked**. Once a bake exists, those
+  baked lights (incl. the env sun) drop from the realtime pass to avoid double-counting;
+  with no bake they all stay realtime, so an un-baked scene is never dark (baking is
+  opt-in). Default light mode is Realtime. Only **Static** objects get lightmaps.
+- [done] Primitive lightmap UVs: a second UV set (`uv1`) — plane/sphere/capsule reuse their
+  single non-overlapping `uv0` chart; the **cube packs its 6 faces into a non-overlapping
+  3×2 atlas** (with a gutter) so faces don't share lightmap texels. Imported meshes use
+  their 2nd UV set, or `uv0` (glTF) / a planar unwrap (FBX) when absent.
+- [done] **Bake denoise + seam fix**: after the path trace, each lightmap is run through
+  an edge-aware **À-Trous denoiser** (CPU; reads back the position+normal gbuffer, weights
+  a 5×5 wavelet blur by world-position + normal similarity so it smooths MC grain without
+  crossing shadow/geometry edges or UV-chart seams), then **dilated** (valid texels spread
+  into the gutter) so bilinear sampling at chart edges never reads the black background —
+  fixes the cube-edge seams.
+- [done] Baker's Man dock tab (texel density 1–1024 /m log, bounces, samples up to 65536,
+  max size, Bake/Clear)
 
 ### Editor
 - [done] Dockable panels (egui_dock): Scene / Inspector / Files / Log / Code / Baker
@@ -103,7 +133,14 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 
 ### Physics / collision
 - [done] Collider components (Box / Sphere / Mesh-convex) with is_trigger + layer, spawnable
-  standalone or as components, yellow editable viewport widgets — authoring only
+  standalone or as components, yellow editable viewport widgets
+- [partial] Physics simulation (rapier3d): a `RigidBody` component (Dynamic / Kinematic /
+  Fixed, mass, restitution, friction, gravity scale). On Play (editor) and scene load
+  (game) the engine builds a rapier world — colliders become cuboid/ball shapes (Mesh ->
+  AABB cuboid), `RigidBody` objects get that body kind, collider-only objects become fixed
+  (static) bodies — steps it under gravity each frame, and writes the simulated transforms
+  back. Foundational slice; still todo: joints, layer-collision matrix, queries
+  (raycast/overlap), trigger events, CCD tuning, parented-body world↔local conversion.
 
 ---
 
@@ -176,6 +213,15 @@ game.
     (done); `set_world_position(world)` world-space *write* (done — converts through the
     parent chain via `parent_world`, so a nested object lands at the right world spot);
     world-space rotation/scale write still todo
+  - [todo] **Smoothed / lerped transform moves**: instead of snapping when a component
+    sets a transform, ease toward the target so motion looks nicer. Surface:
+    `move_towards(target, max_delta)` (constant speed, frame-rate independent via dt),
+    `lerp_position(target, smoothing)` / `slerp_rotation(target, smoothing)` (exponential
+    smoothing, `1 - exp(-smoothing * dt)` so it's stable at any framerate), and a
+    higher-level tween (duration + easing curve: linear / ease-in-out / spring) that runs
+    a transform change over time. Works on self now, on referenced objects once world
+    *set* lands. Each operates in world space and converts through `parent_world` like
+    `set_world_position`.
   - [partial] **Object graph**: every object has a stable UUID (`ObjectId`, assigned at
     create, serialized in `.scene`); `ObjectRef` field type + inspector **drag-drop
     target** (drag an object from the Scene tree onto the reference box; ✕ clears);
@@ -220,11 +266,31 @@ shipped game.
   serialization + the future game-build path strip editor-only behavior cleanly
 
 ### 2F. Game UI system (runtime UI) [todo]
-A retained, scene-graph UI for in-game menus / inventory / HUD — Unity uGUI-style.
-Widgets are scene objects carrying UI components; the tree lives under a UICanvas and
-serializes into `.scene` like any other objects. Distinct from the editor's egui UI.
-Decisions: **retained scene-graph** (not immediate-mode), **screen-space + world-space**
-(world-space for VR controller-ray interaction), **visually authored** in the editor.
+In-game menus / inventory / HUD. **The developer picks the approach per project** —
+both are first-class and can coexist (e.g. egui debug overlay on top of a retained HUD):
+
+- **A. Retained scene-graph UI** (the citrus-native system, below) — Unity uGUI-style:
+  widgets are scene objects under a `UICanvas`, **visually authored** in the editor and
+  serialized into `.scene`, **screen-space + world-space** (world-space for VR
+  controller-ray interaction). Best for polished, designer-authored, VR, and
+  shipped-game UI. This is the default and the larger build.
+- **B. Immediate-mode UI (egui)** — opt-in, code-driven. The same egui the editor uses,
+  exposed to gameplay so a component builds its UI each frame in Rust. Best for debug
+  HUDs, dev tools, prototypes, and devs who already know egui. Lighter to author (no
+  scene wiring), but not visually authored and weaker for world-space/VR.
+
+How the choice works in a build:
+- [todo] egui (option B) is always **available** — `citrus-render` keeps the egui pass in
+  every build (~1.5M; not worth gating out). To use it a game just opts in at the API
+  level: `run_game` hands each frame's egui `Context` to a game callback, and
+  `FrameInput.egui` carries the tessellated output exactly as the editor's path does (the
+  plumbing already exists; a default game leaves it `None`).
+- [todo] The retained system (A) never requires egui; egui (B) never requires the
+  retained system. A project can use both — retained HUD + an egui debug panel.
+- [todo] Editor authoring (visual rect editing, inspector wiring) applies to the retained
+  system only; egui UI is authored in code.
+
+The rest of this section specifies the **retained scene-graph system (A)**.
 
 Foundations
 - [todo] `UICanvas` component: the UI root. Mode = **Screen-space** overlay (reference
@@ -310,6 +376,165 @@ Integration
 - [todo] Editor/runtime tooling: a local "host + N clients" test harness, a net-stats
   overlay (ping, bandwidth, packet loss), and lag simulation for testing.
 
+### 2H. Render-to-texture cameras (camera output as a material input) [todo]
+Let a `Camera` render the scene from its viewpoint into an offscreen texture that a
+material can sample, so a plane + that material becomes an in-world screen — a CCTV
+monitor, a TV showing a moveable camera, a mirror, a portal, a minimap, or
+picture-in-picture. The camera is an ordinary scene object, so moving it (or
+possessing it, 2A) updates the screen live.
+
+Foundation already in place: the renderer's `CameraPreview` (`citrus-render`) is
+exactly a render-to-texture pass — an offscreen color+depth target with per-frame
+camera UBOs, rendered by the scene pass and exposed to egui as a user texture. This
+feature generalizes that single editor-only target into a reusable, material-sampled
+resource.
+
+- [todo] **`RenderTexture` GPU resource**: an offscreen target = color image (+ its own
+  depth), a sampler, and per-frame-in-flight descriptor wiring. Configurable extent and
+  format — `rgba8 srgb` (LDR / UI), `rgba16f` linear (HDR, feeds bloom/tonemap), optional
+  mip chain for minified screens. Managed in a pool keyed by a handle; created/resized/
+  destroyed as cameras opt in or change size.
+- [todo] **Camera output mode**: extend `CameraComponent` with an output target —
+  `Display` (default: the main swapchain pass) vs `RenderTexture { handle, width, height,
+  format, clear_color, update: EveryFrame | OnDemand | Hz(n) }`. A camera in
+  `RenderTexture` mode is excluded from the main display pass.
+- [todo] **Material texture source**: today `MaterialTextures` slots are project-relative
+  file paths bound into set 1 (`t_albedo`/`t_normal`/`t_orm`/`t_emission`, combined image
+  samplers). Make a slot a typed source — `FilePath(path)` | `RenderTarget(camera ref)` —
+  serialized in `.material`. At bind time a `RenderTarget` slot points the descriptor at
+  the live `RenderTexture` image view instead of a disk-loaded image; an emissive TV uses
+  `t_emission`/`t_albedo`. References the source camera by `ObjectId` (survives reload /
+  reorder).
+- [todo] **Frame graph ordering**: record all active RTT camera passes *before* the main
+  pass each frame (offscreen-first), then the main pass samples their results. Insert the
+  `COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL` image barrier between an RTT pass
+  and any pass that samples it. Build a per-frame dependency order (camera A's target is
+  sampled by a material camera B renders → A before B).
+- [todo] **Feedback / recursion guard**: a camera filming a screen that shows its own
+  feed is a cycle. Bound it — render each `RenderTexture` at most once per frame and let a
+  cyclic sampler read *last frame's* result (one-frame latency), or drop the camera's own
+  target from its view. No unbounded recursion.
+- [todo] **Mirror / portal variant**: a mirror is an RTT camera whose view matrix is the
+  main camera reflected across the screen plane, with an oblique near-plane clip at the
+  mirror surface; a portal pairs two cameras. Same resource, different view derivation —
+  list as a follow-on once the basic RTT path works.
+- [todo] **Editor**: Camera inspector picks output (Display / Render Texture + size +
+  format); a Render Texture shows in the file browser / material texture slots as a
+  droppable source (drag onto a slot, like a file). Drop it on a plane's material and you
+  have a working TV whose picture tracks the camera.
+- [todo] **Performance & culling**: each active RTT camera is an extra scene pass per
+  frame — skip rendering a target no visible material samples (or whose screen is
+  off-camera / too small in screen space), throttle via the `Hz`/`OnDemand` update mode,
+  cap resolution, and share the shadow map with the main pass. Document the per-target
+  cost.
+
+Ties to camera control in the in-game API (2D — set active camera, FOV) and to camera
+possession (2A — the moveable camera can be a possessed pawn). HDR targets feed the
+existing tonemap/bloom path.
+
+### 2I. Build & bundle (game export) [in progress]
+Turn a project into a standalone, runnable game: compile the runtime with the project's
+components linked in, collect every asset the game needs, and emit a `build/` folder with
+an executable a player can double-click. No editor, no toolchain assumptions on the
+target machine.
+
+citrus is a **Rust-native** engine, so its build model matches Bevy, not Unity/Godot:
+the components *are* Rust code compiled into the binary, so a build is fundamentally a
+`cargo build --release` of a thin runtime binary + an assets folder resolved relative to
+the executable. Unity (player exe + `_Data/` with managed DLLs) and Godot (export-template
+binary + a `.pck` data pack) ship scripts *as data* because they're interpreted/managed;
+citrus does not. An optional packed-archive step (Godot-style `.pck`) is a later add — v1
+emits a folder.
+
+**Boot-scene decision:** both a project setting *and* an editable entry file. The
+generated `src/main.rs` is real, editable Rust that by default reads `boot_scene` from the
+project config and calls `run_game` — beginners never touch it (Godot "Main Scene"
+convention), advanced users edit it for custom startup (splash, save-driven scene choice;
+Bevy "main.rs is code"). The setting is the default; `main.rs` is the override.
+
+Landed so far:
+- [done] **Runtime game loop** — `citrus_engine::run_game(GameConfig, register)` (in
+  `citrus-engine/src/runtime.rs`): opens a window, creates the renderer, loads the boot
+  scene, fires `start`, then runs `update`/`late_update` + render each frame with
+  `FrameInput.egui = None` and `camera_preview = None` (no editor code on the path). Drains
+  `ComponentCommand::LoadScene` to switch scenes. Uses the scene's `Camera` component for
+  view/proj (fixed fallback if none). `GameConfig::from_project_dir` reads `boot_scene` +
+  title from `project.citrus`.
+- [done] **Static component linking** — the project's component crate builds as both
+  `cdylib` (editor hot-load) and `rlib` (`crate-type = ["cdylib", "rlib"]`); a game binary
+  depends on it as a normal crate (editor feature off) and calls `citrus_register`
+  directly — no shipped dylib, no `libloading`.
+- [done] **`New Project`** (File menu + `citrus --new-project <parent> <name>`) —
+  `bundle::scaffold_project` writes a standalone cargo workspace: root `Cargo.toml` (game
+  bin + `[workspace.dependencies]` path-pointing at the citrus checkout, found via
+  `bundle::citrus_root`), editable `src/main.rs`, `plugins/components` (cdylib+rlib),
+  `scenes/ materials/ shaders/ textures/`, a starter scene (camera + lit cube on a plane),
+  and `project.citrus` with `boot_scene`. The editor then switches to the new project
+  (reloads project file, file browser, plugins, boot scene).
+- [done] **Project Settings UI** (File -> Project Settings…) — edits `project.citrus`:
+  name + a **Starting scene** picker (boot scene), with a Build Game button. Saves on
+  change.
+- [done] **Build Game** (File menu + `citrus --build [dir]`) — `bundle::build_game` runs
+  `cargo build --release --bin <game>`, then assembles `build/<game>` + `build/assets/`
+  (the asset dirs + `project.citrus`, copied so paths resolve exe-relative). Verified
+  end-to-end: a scaffolded project builds and the bundled executable runs standalone
+  (window + Vulkan + scene render confirmed).
+- [done] **Editor-free runtime path proven** — `examples/sample-game` (detached package)
+  links `citrus-engine` + a components crate and runs a scene.
+
+- [done] **Editor stripped from a build** — `citrus-engine` now has a default-on `editor`
+  cargo feature. The `EngineApp` moved into a gated `editor_app` module; `citrus-editor`,
+  `egui`, `egui_dock`, `egui-winit`, `transform-gizmo-egui`, `hecs`, `image`, `serde_json`,
+  `libc` and the editor-only modules (gizmo/lsp/undo/camera/icon/crash) are optional, and
+  the `plugins.rs` editor/clippy paths are gated. The egui-free **data models**
+  (`MaterialModel`, `AlphaModeModel`, `ShaderUiInfo`, `ShaderPropUi`, `ShaderPropKindUi`)
+  moved to `citrus-core`, so the always-on scene/shader path no longer touches the editor.
+  A game depends on `citrus-engine` with `default-features = false`: verified that
+  `citrus-editor`, `egui_dock`, `transform-gizmo`, and `syntect` are **absent** from a
+  built game's dependency tree (egui itself stays, shared via the renderer). Editor and
+  game both build; the game still runs.
+
+Also landed:
+- [done] **Lean release profile** — the scaffold's generated `Cargo.toml` sets
+  `[profile.release]` with `lto`, `codegen-units = 1`, `strip`, `panic = "abort"`. A
+  sample game shrank 9.6M (default release) → 5.8M with no behaviour change. Editor is
+  unaffected (the profile lives in the generated project).
+
+Still to do:
+- **egui stays in the render path** (decided) — `citrus-render` always links
+  `egui`/`egui-ash-renderer` for its overlay. That adds ~1.5M to a game binary, which is
+  acceptable, so it is *not* gated out. Upside: **immediate-mode egui game UI** (2F option
+  B) needs no feature flag — it's just a matter of `run_game` handing the per-frame egui
+  `Context` to a game callback (the egui render pass is already there). The default game
+  links egui but never invokes it (`FrameInput.egui = None`).
+- [todo] **Shader precompilation** — shaders compile via `glslc` at runtime today; the
+  bundler compiles every material/custom shader to **SPIR-V** ahead of time and ships the
+  `.spv`, so the player's machine needs no `shaderc`/`glslc`.
+- [todo] **Asset collection** — walk the scenes reachable from the boot scene (and their
+  materials → textures → meshes → audio → bake sidecars `.lightmap`/`.lightdata`) and copy
+  only what's referenced into `build/assets/`. Path resolution switches from
+  project-relative to **exe-relative** at runtime (`GameConfig.assets_root` already drives
+  this). Dead-asset stripping; a "copy everything" fallback for the first cut. Skip / warn
+  on missing assets rather than aborting.
+- [todo] **`GameState` (global runtime state / blackboard)** — a project-defined,
+  serializable type the runtime owns **outside any scene**, so it survives scene swaps
+  (player health, inventory, score, progression, which level is next). Exposed through the
+  in-game API (2D) so components read/write it; lives in the project's component crate.
+  This is the persistent layer beneath the scene flow — scenes come and go via
+  `ComponentCtx::load_scene` (already implemented), `GameState` does not. Distinguish two
+  concerns that are *separate*: (a) this in-memory global state, and (b) **savegame
+  persistence** — serialize `GameState` (+ optionally live scene object/component state) to
+  a save file under an OS user-data dir and restore it, so a player can quit and resume.
+  Save/load is its own in-game API slice.
+- [todo] **Remaining build polish** — window icon/size from project config into the
+  generated entry; cross-compilation to other targets; an optional packed-archive
+  (`.pck`-style) instead of a loose `build/assets/` folder. (Core Build Game action +
+  `build/<game>` + `build/assets/` output already land above.)
+
+Depends on the in-game API (2D) for `GameState` access + save/load, and on the
+editor/gameplay component split (2E) so editor-only components are excluded from the
+build. The scene-flow primitive it relies on (`load_scene`) is already in place.
+
 ---
 
 ## 3. Dependencies between goals
@@ -347,9 +572,13 @@ physics engine (#26) --+                              |
 
 ## 4. Other tracked goals (see TODO.md for detail)
 
-- [todo] 3D physics engine (Rapier3d: rigid bodies, materials, joints, layer matrix, queries)
-- [todo] Phase 5 runtime sampling — make the bake actually light the scene
-- [todo] Global illumination in the standard shader (sample baked lightmap / probe SH)
+- [partial] 3D physics engine (rapier3d) — rigid bodies + gravity step + transform
+  writeback done (see Physics/collision); joints, layer matrix, queries, triggers todo
+- [done] Phase 5 runtime sampling — 5a flat ambient, 5b per-fragment probe SH, 5c
+  per-object lightmaps; all sampled in the standard shader (editor + game), sidecars
+  bundled. Pending: visual validation of the GPU bake output.
+- [partial] Global illumination in the standard shader — probe SH-L1 sampled per fragment
+  (done); baked lightmap sampling for static objects still todo
 - [todo] HDR skybox + IBL
 - [todo] VR rendering (OpenXR) + VR editing
 - [todo] Slang custom-shader frontend (phase 2)

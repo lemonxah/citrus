@@ -200,7 +200,10 @@ void main() {
             rn = hn;
             if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) break;
         }
-        irradiance += radiance;
+        // Firefly clamp: cap a single path's contribution so a rare bright
+        // bounce can't blow up the texel's average (the main source of MC
+        // speckle in the indirect term).
+        irradiance += min(radiance, vec3(8.0));
     }
     irradiance /= float(samples);
     imageStore(out_lightmap, px, vec4(irradiance, 1.0));

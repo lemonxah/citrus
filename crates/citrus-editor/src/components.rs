@@ -11,9 +11,10 @@
 use std::collections::HashMap;
 
 use citrus_core::{
-    AudioListener, AudioRolloff, AudioSource, Bob, BoxCollider, CameraComponent, Component,
-    ComponentRegistry, LightComponent, LightKind, LightMode, LightProbeVolume, MeshCollider,
-    ObjectId, ObjectRef, Spin, SphereCollider, TypedComponent, COLLISION_LAYERS,
+    AudioListener, AudioRolloff, AudioSource, Bob, BodyKind, BoxCollider, CameraComponent,
+    Component, ComponentRegistry, LightComponent, LightKind, LightMode, LightProbeVolume,
+    MeshCollider, ObjectId, ObjectRef, RigidBody, Spin, SphereCollider, TypedComponent,
+    COLLISION_LAYERS,
 };
 use egui::collapsing_header::{CollapsingState, paint_default_icon};
 use egui::{DragValue, Label, RichText, ScrollArea, Sense, Ui};
@@ -144,6 +145,7 @@ impl EditorComponents {
         e.register::<MeshCollider>();
         e.register::<Spin>();
         e.register::<Bob>();
+        e.register::<RigidBody>();
         e
     }
 
@@ -485,6 +487,45 @@ impl Inspect for Bob {
     }
 }
 impl Gizmo for Bob {}
+
+impl Inspect for RigidBody {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Type", &mut changed, |ui| {
+            let mut resp = egui::ComboBox::from_id_salt("citrus-body-kind")
+                .selected_text(self.kind.label())
+                .show_ui(ui, |ui| {
+                    let mut clicked = false;
+                    for k in BodyKind::ALL {
+                        clicked |= ui
+                            .selectable_value(&mut self.kind, k, k.label())
+                            .clicked();
+                    }
+                    clicked
+                });
+            if resp.inner == Some(true) {
+                resp.response.mark_changed();
+            }
+            resp.response
+        });
+        if self.kind == BodyKind::Dynamic {
+            property_row(ui, "Mass (kg)", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.mass).speed(0.1).range(0.0..=1e6))
+            });
+            property_row(ui, "Gravity scale", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.gravity_scale).speed(0.05))
+            });
+        }
+        property_row(ui, "Restitution", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.restitution).speed(0.02).range(0.0..=1.0))
+        });
+        property_row(ui, "Friction", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.friction).speed(0.02).range(0.0..=2.0))
+        });
+        changed
+    }
+}
+impl Gizmo for RigidBody {}
 
 impl Inspect for LightProbeVolume {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {

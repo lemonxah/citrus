@@ -18,6 +18,15 @@ struct Light {
 };
 
 const int MAX_SHADOW_VIEWS = 12;
+const int MAX_PROBE_VOLUMES = 4;
+
+// One baked light-probe volume: world->local plus the grid layout (matches
+// GpuProbeVolume on the CPU).
+struct ProbeVolume {
+    mat4 world_to_local; // local box spans -size/2 .. +size/2
+    vec4 size_base;      // xyz = local box size, w = first probe index (sh_base)
+    vec4 counts;         // xyz = probe counts per axis
+};
 
 layout(set = 0, binding = 0) uniform FrameData {
     mat4 view;
@@ -27,13 +36,79 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 light_dir;
     vec4 light_color;
     vec4 ambient;
-    vec4 misc; // x = time in seconds, y = active light count
+    vec4 misc; // x = time, y = light count, z = shadow spacing, w = probe-volume count
     vec4 cascade_splits; // far view-space distance of each directional cascade
     Light lights[MAX_LIGHTS];
     mat4 shadow_vp[MAX_SHADOW_VIEWS];
+    ProbeVolume probe_volumes[MAX_PROBE_VOLUMES];
 } frame;
 
 layout(set = 0, binding = 1) uniform sampler2DArrayShadow u_shadow;
+
+// Baked probe SH-L1: 4 coefficients (RGB in .xyz) per probe.
+struct Probe { vec4 c[4]; };
+layout(set = 0, binding = 2) readonly buffer Probes { Probe probes[]; };
+
+// Baked lightmaps (static-object GI): one array layer per object, sampled by
+// uv1. Each texel is incoming irradiance E; the caller applies albedo/PI.
+layout(set = 0, binding = 3) uniform sampler2DArray u_lightmap;
+
+// Diffuse irradiance / PI from the probe's SH-L1 radiance coefficients, in
+// direction n. The bake stores radiance projected onto SH (Y0 = 0.282095,
+// Y1 = 0.488603; sh1~y, sh2~z, sh3~x). Converting radiance SH to Lambertian
+// irradiance applies the cosine-lobe band factors A0 = PI, A1 = 2PI/3; dividing
+// by PI (the diffuse BRDF) leaves the L1 band scaled by 2/3
+// (0.488603 * 2/3 = 0.325735). The constant term then matches the flat ambient.
+vec3 sh_eval(uint i, vec3 n) {
+    return probes[i].c[0].rgb * 0.282095
+         + 0.325735 * (probes[i].c[1].rgb * n.y
+                     + probes[i].c[2].rgb * n.z
+                     + probes[i].c[3].rgb * n.x);
+}
+
+// Sample one probe by integer grid coords (x fastest, then y, then z).
+vec3 probe_at(ProbeVolume v, ivec3 g, ivec3 cnt, vec3 n) {
+    g = clamp(g, ivec3(0), cnt - 1);
+    uint idx = uint(v.size_base.w) + uint(g.x + g.y * cnt.x + g.z * cnt.x * cnt.y);
+    return sh_eval(idx, n);
+}
+
+// Trilinearly-interpolated baked irradiance at world_pos for normal n. Returns
+// false when no probe volume contains the point (caller falls back to ambient).
+bool sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
+    int vcount = int(frame.misc.w + 0.5);
+    for (int vi = 0; vi < vcount && vi < MAX_PROBE_VOLUMES; ++vi) {
+        ProbeVolume v = frame.probe_volumes[vi];
+        vec3 local = (v.world_to_local * vec4(world_pos, 1.0)).xyz;
+        vec3 size = max(v.size_base.xyz, vec3(1e-4));
+        vec3 t = (local + size * 0.5) / size; // 0..1 across the box
+        if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) {
+            continue;
+        }
+        ivec3 cnt = ivec3(v.counts.xyz + 0.5);
+        vec3 g = t * vec3(cnt - 1);
+        ivec3 g0 = ivec3(floor(g));
+        vec3 f = g - vec3(g0);
+        // 8-corner trilinear blend of SH-evaluated irradiance.
+        vec3 c000 = probe_at(v, g0 + ivec3(0,0,0), cnt, n);
+        vec3 c100 = probe_at(v, g0 + ivec3(1,0,0), cnt, n);
+        vec3 c010 = probe_at(v, g0 + ivec3(0,1,0), cnt, n);
+        vec3 c110 = probe_at(v, g0 + ivec3(1,1,0), cnt, n);
+        vec3 c001 = probe_at(v, g0 + ivec3(0,0,1), cnt, n);
+        vec3 c101 = probe_at(v, g0 + ivec3(1,0,1), cnt, n);
+        vec3 c011 = probe_at(v, g0 + ivec3(0,1,1), cnt, n);
+        vec3 c111 = probe_at(v, g0 + ivec3(1,1,1), cnt, n);
+        vec3 x00 = mix(c000, c100, f.x);
+        vec3 x10 = mix(c010, c110, f.x);
+        vec3 x01 = mix(c001, c101, f.x);
+        vec3 x11 = mix(c011, c111, f.x);
+        vec3 y0 = mix(x00, x10, f.y);
+        vec3 y1 = mix(x01, x11, f.y);
+        irradiance = max(mix(y0, y1, f.z), vec3(0.0));
+        return true;
+    }
+    return false;
+}
 
 // Returns 1.0 fully lit, 0.0 fully shadowed. `light.spot` packs
 // (cos_inner, shadow_base_layer, bias, view_count); base < 0 = no shadow.
@@ -144,6 +219,7 @@ layout(location = 1) in vec3 v_normal;
 layout(location = 2) in vec2 v_uv;
 layout(location = 3) in vec4 v_color;
 layout(location = 4) in vec4 v_tangent;
+layout(location = 5) in vec2 v_uv1;
 
 layout(location = 0) out vec4 o_color;
 
@@ -165,6 +241,13 @@ float g_smith(float NdotV, float NdotL, float roughness) {
 
 vec3 f_schlick(float VdotH, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
+}
+
+// Roughness-aware Fresnel for the ambient/indirect term (rougher surfaces
+// reflect less at grazing angles, so more energy stays in the diffuse).
+vec3 f_schlick_rough(float cosT, vec3 f0, float rough) {
+    vec3 fmax = max(vec3(1.0 - rough), f0);
+    return f0 + (fmax - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 
 void main() {
@@ -235,16 +318,22 @@ void main() {
         float NdotH = max(dot(N, H), 0.0);
         float VdotH = max(dot(V, H), 0.0);
 
+        // Cook-Torrance specular + energy-conserving Lambertian diffuse: the
+        // Fresnel term F is the specular reflectance kS, so the diffuse keeps
+        // only the remaining energy kD = (1 - F). (Metallic is already folded
+        // into diffuse_color, which is 0 for pure metals.)
+        vec3 F = f_schlick(VdotH, f0);
         vec3 spec = d_ggx(NdotH, roughness * roughness)
             * g_smith(NdotV, NdotL, roughness)
-            * f_schlick(VdotH, f0)
+            * F
             / max(4.0 * NdotV * NdotL, 1e-4);
-        vec3 lit = (diffuse_color / PI + spec) * NdotL;
+        vec3 kd = vec3(1.0) - F;
+        vec3 lit = (kd * diffuse_color / PI + spec) * NdotL;
 
         if (FEAT_TOON) {
             float steps = max(pc.params0.z, 2.0);
             float banded = floor(clamp(NdotL, 0.0, 0.999) * steps) / (steps - 1.0);
-            vec3 lit_toon = (diffuse_color / PI) * banded
+            vec3 lit_toon = (kd * diffuse_color / PI) * banded
                 + spec * NdotL * step(0.001, banded);
             lit = mix(lit, lit_toon, clamp(pc.params0.w, 0.0, 1.0));
         }
@@ -252,7 +341,20 @@ void main() {
         color += lit * radiance * shadow_factor(light, v_world_pos, N, L);
     }
 
-    color += frame.ambient.rgb * diffuse_color * ao;
+    // Indirect diffuse (as irradiance/PI), in priority order:
+    //   1. baked lightmap for static objects (params1.w = array layer, >= 0),
+    //   2. baked probe SH where a volume covers this fragment,
+    //   3. flat scene ambient.
+    vec3 indirect;
+    if (pc.params1.w >= 0.0) {
+        int layer = int(pc.params1.w + 0.5);
+        indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
+    } else if (!sample_probes(v_world_pos, N, indirect)) {
+        indirect = frame.ambient.rgb;
+    }
+    // Energy-conserving ambient diffuse: keep only the non-reflected share.
+    vec3 kd_amb = vec3(1.0) - f_schlick_rough(NdotV, f0, roughness);
+    color += kd_amb * indirect * diffuse_color * ao;
 
     if (FEAT_EMISSION) {
         color += texture(t_emission, v_uv).rgb * pc.emission.rgb;

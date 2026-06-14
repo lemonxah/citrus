@@ -192,6 +192,9 @@ pub struct DrawCmd {
     /// Mesh AABB center in object space; the outline pass inflates radially
     /// from it so hard-edged meshes stay watertight (no corner gaps).
     pub mesh_center: Vec3,
+    /// Baked-lightmap array layer for this object's static GI, or -1 when the
+    /// object has no lightmap (sample probes / flat ambient instead).
+    pub lightmap_layer: i32,
 }
 
 pub struct EguiDraw {

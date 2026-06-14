@@ -6,35 +6,7 @@
 use egui::collapsing_header::{CollapsingState, paint_default_icon};
 use egui::{ComboBox, DragValue, Label, RichText, Sense, Slider, Ui};
 
-use crate::inspector::{AlphaModeModel, MaterialModel};
-
-/// Reflected custom-shader property kinds (mirrors the pragma metadata
-/// parsed by citrus-assets; the engine converts between the two).
-#[derive(Clone, Copy, Debug)]
-pub enum ShaderPropKindUi {
-    Float { min: f32, max: f32 },
-    Toggle,
-    Color,
-    Color3,
-}
-
-#[derive(Clone, Debug)]
-pub struct ShaderPropUi {
-    pub label: String,
-    pub kind: ShaderPropKindUi,
-    /// Flat float offset into `MaterialModel::custom_values`.
-    pub offset: usize,
-}
-
-/// Everything the inspector needs to draw a custom shader's material UI.
-#[derive(Clone, Debug, Default)]
-pub struct ShaderUiInfo {
-    pub display_name: String,
-    pub props: Vec<ShaderPropUi>,
-    /// Compile/parse error; shown instead of properties (error swirl in the
-    /// viewport).
-    pub error: Option<String>,
-}
+use citrus_core::{AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderUiInfo};
 
 /// Section metadata for search: (title, keywords).
 const SECTIONS: [(&str, &[&str]); 5] = [

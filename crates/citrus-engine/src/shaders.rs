@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use citrus_assets::{ShaderPropKind, ShaderSource};
-use citrus_editor::{ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};
+use citrus_core::{ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};
 use citrus_render::{Renderer, ShaderId};
 
 pub struct ShaderEntry {

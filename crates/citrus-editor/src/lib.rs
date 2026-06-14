@@ -27,9 +27,13 @@ pub use components::{
     components_ui,
 };
 pub use file_browser::{FileBrowser, FileBrowserResponse};
+// The egui-free material/shader data models live in citrus-core now; re-export
+// them so existing `citrus_editor::MaterialModel`-style paths keep working.
+pub use citrus_core::{
+    AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo,
+};
 pub use inspector::{
-    AlphaModeModel, CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse,
-    MaterialModel, ObjectInfoModel, TransformModel,
+    CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse, ObjectInfoModel,
+    TransformModel,
 };
 pub use scene_panel::{SceneObjectRow, ScenePanel, ScenePanelResponse, SpawnKind};
-pub use sections::{ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};

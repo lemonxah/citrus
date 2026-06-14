@@ -6,66 +6,10 @@ use std::path::PathBuf;
 
 use egui::{DragValue, Frame, RichText, Ui};
 
-use citrus_core::{Component, ComponentRegistry, ObjectId};
+use citrus_core::{Component, ComponentRegistry, MaterialModel, ObjectId, ShaderUiInfo};
 
 use crate::components::{EditorComponents, components_ui};
-use crate::sections::{ShaderUiInfo, material_editor_ui};
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AlphaModeModel {
-    Opaque,
-    Cutout,
-    Blend,
-}
-
-impl AlphaModeModel {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Opaque => "Opaque",
-            Self::Cutout => "Cutout",
-            Self::Blend => "Transparent",
-        }
-    }
-
-    /// Default render queue for this alpha mode (Unity-style breakpoints).
-    pub fn default_render_queue(self) -> i32 {
-        match self {
-            Self::Opaque => 2000, // Geometry
-            Self::Cutout => 2450, // AlphaTest
-            Self::Blend => 3000,  // Transparent
-        }
-    }
-}
-
-/// Editor-side view of one material (standard or custom shader).
-#[derive(Clone, PartialEq)]
-pub struct MaterialModel {
-    pub name: String,
-    /// "standard" or a project-relative `.frag` custom shader path.
-    pub shader: String,
-    /// Custom-shader property values, packed by property offset (16 floats
-    /// once initialized; empty = take the shader's defaults).
-    pub custom_values: Vec<f32>,
-    pub base_color: [f32; 4],
-    pub metallic: f32,
-    pub roughness: f32,
-    pub occlusion_strength: f32,
-    pub toon_enabled: bool,
-    pub toon_steps: f32,
-    pub pbr_toon_blend: f32,
-    pub emission_enabled: bool,
-    pub emission_color: [f32; 3],
-    pub emission_intensity: f32,
-    pub alpha_mode: AlphaModeModel,
-    pub alpha_cutoff: f32,
-    pub has_normal_texture: bool,
-    pub normal_map_enabled: bool,
-    pub normal_strength: f32,
-    pub double_sided: bool,
-    /// Draw-order priority (Unity render queue): Geometry 2000, AlphaTest
-    /// 2450, Transparent 3000, Overlay 4000.
-    pub render_queue: i32,
-}
+use crate::sections::material_editor_ui;
 
 #[derive(Clone, PartialEq)]
 pub struct TransformModel {
