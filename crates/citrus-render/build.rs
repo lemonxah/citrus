@@ -15,6 +15,8 @@ fn main() {
         "skybox.vert",
         "skybox.frag",
         "shadow.vert",
+        "fullscreen.vert",
+        "post.frag",
         // Lighting bake (compiled only used when ray query is available).
         "bake_gbuffer.vert",
         "bake_gbuffer.frag",

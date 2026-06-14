@@ -181,17 +181,23 @@ fn incoming(
     max_dist: f32,
     bounces: u32,
     rng: &mut u32,
-) -> Vec3 {
+) -> (Vec3, f32) {
     let mut radiance = Vec3::ZERO;
     let mut throughput = Vec3::ONE;
     let (mut ro, mut rd) = (origin, dir);
-    for _ in 0..bounces.max(1) {
+    // Distance from the probe to the first surface seen along `dir` (max_dist on
+    // escape to sky) — the DDGI visibility moment for this direction.
+    let mut first_dist = max_dist;
+    for b in 0..bounces.max(1) {
         match march(insts, ro, rd, eps, max_dist) {
             None => {
                 radiance += throughput * sky;
                 break;
             }
             Some((hp, who)) => {
+                if b == 0 {
+                    first_dist = (hp - origin).length();
+                }
                 let mut n = scene_normal(insts, hp, eps);
                 if n.dot(rd) > 0.0 {
                     n = -n;
@@ -212,7 +218,7 @@ fn incoming(
             }
         }
     }
-    radiance
+    (radiance, first_dist)
 }
 
 /// SH-L1 radiance at one probe (uniform-sphere Monte-Carlo + multi-bounce).
@@ -235,19 +241,26 @@ fn probe_sh(
             .wrapping_add(seed.wrapping_mul(26699)),
     );
     let (mut sh0, mut sh1, mut sh2, mut sh3) = (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO);
+    // SH-L1 of the directional first-hit distance (scalar), for visibility.
+    let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for _ in 0..samples {
         let d = uniform_sphere(&mut rng);
-        let r = incoming(insts, lights, origin, d, sky, eps, max_dist, bounces, &mut rng)
-            .min(Vec3::splat(8.0));
+        let (r, fd) = incoming(insts, lights, origin, d, sky, eps, max_dist, bounces, &mut rng);
+        let r = r.min(Vec3::splat(8.0));
         sh0 += r * 0.282095;
         sh1 += r * (0.488603 * d.y);
         sh2 += r * (0.488603 * d.z);
         sh3 += r * (0.488603 * d.x);
+        d0 += fd * 0.282095;
+        d1 += fd * (0.488603 * d.y);
+        d2 += fd * (0.488603 * d.z);
+        d3 += fd * (0.488603 * d.x);
     }
     let wgt = (4.0 * PI) / samples as f32;
     let pack = |v: Vec3| [v.x, v.y, v.z];
     ProbeSh {
         coeffs: [pack(sh0 * wgt), pack(sh1 * wgt), pack(sh2 * wgt), pack(sh3 * wgt)],
+        dist: [d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt],
     }
 }
 
@@ -289,6 +302,56 @@ pub fn march_probes(
         }
     });
     out
+}
+
+/// One separable [1,2,1]/4 blur pass along a single grid axis (`axis`: 0=x, 1=y,
+/// 2=z), edge-clamped, reading `src` and writing `dst`. The flat layout is
+/// x-fastest then y then z, matching the gather/shader probe ordering.
+fn blur_axis(src: &[ProbeSh], dst: &mut [ProbeSh], counts: [usize; 3], axis: usize) {
+    let [nx, ny, nz] = counts;
+    let idx = |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let (a, b) = match axis {
+                    0 => (idx(x.saturating_sub(1), y, z), idx((x + 1).min(nx - 1), y, z)),
+                    1 => (idx(x, y.saturating_sub(1), z), idx(x, (y + 1).min(ny - 1), z)),
+                    _ => (idx(x, y, z.saturating_sub(1)), idx(x, y, (z + 1).min(nz - 1))),
+                };
+                let (c, pa, pb) = (&src[idx(x, y, z)], &src[a], &src[b]);
+                let mut o = ProbeSh::default();
+                for bi in 0..4 {
+                    for ci in 0..3 {
+                        o.coeffs[bi][ci] =
+                            (pa.coeffs[bi][ci] + 2.0 * c.coeffs[bi][ci] + pb.coeffs[bi][ci]) * 0.25;
+                    }
+                    o.dist[bi] = (pa.dist[bi] + 2.0 * c.dist[bi] + pb.dist[bi]) * 0.25;
+                }
+                dst[idx(x, y, z)] = o;
+            }
+        }
+    }
+}
+
+/// Spatially denoise the probe SH grid in place with `iterations` separable
+/// blur passes. This is what cancels the blotchy per-probe Monte-Carlo variance
+/// — adjacent probes are independent noisy estimates, so averaging across the
+/// grid pulls them toward the true (smooth, low-frequency) irradiance field with
+/// *no* temporal lag, unlike the EMA. Soft by design, which is the look we want.
+pub fn blur_probe_grid(probes: &mut [ProbeSh], counts: [usize; 3], iterations: u32) {
+    let [nx, ny, nz] = counts;
+    if probes.len() != nx * ny * nz || (nx < 3 && ny < 3 && nz < 3) {
+        return;
+    }
+    let mut src = probes.to_vec();
+    let mut dst = vec![ProbeSh::default(); probes.len()];
+    for _ in 0..iterations.max(1) {
+        blur_axis(&src, &mut dst, counts, 0);
+        blur_axis(&dst, &mut src, counts, 1);
+        blur_axis(&src, &mut dst, counts, 2);
+        std::mem::swap(&mut src, &mut dst); // latest result lives in `src`
+    }
+    probes.copy_from_slice(&src);
 }
 
 #[cfg(test)]
@@ -338,5 +401,40 @@ mod tests {
             l0[0] > 0.0,
             "probe should gather bounced light from the lit cube top, got L0 {l0:?}"
         );
+        // Visibility moment: mean directional distance must be positive/finite,
+        // and the downward (-Y) direction (toward the cube top ~0.7 below) must
+        // read closer than the overall mean (the rest escapes to max_dist).
+        let mean = out[0].dist[0] * 0.282095;
+        assert!(mean > 0.0 && mean.is_finite(), "mean probe distance {mean}");
+        let down = out[0].dist[0] * 0.282095 + 0.488603 * out[0].dist[1] * (-1.0);
+        assert!(
+            down < mean,
+            "downward seen-distance ({down}) should be nearer than mean ({mean})"
+        );
+    }
+
+    // The grid blur must leave a constant field untouched and spread an isolated
+    // spike into its neighbours (variance reduction without bias).
+    #[test]
+    fn blur_smooths_spike_preserves_flat() {
+        let counts = [3, 3, 3];
+        let n = counts[0] * counts[1] * counts[2];
+
+        // Flat field is a fixed point of the blur.
+        let mut flat = vec![ProbeSh { coeffs: [[0.5; 3]; 4], ..Default::default() }; n];
+        blur_probe_grid(&mut flat, counts, 2);
+        for p in &flat {
+            assert!((p.coeffs[0][0] - 0.5).abs() < 1e-4, "flat field changed");
+        }
+
+        // A single hot probe at the center spreads outward; the center drops and
+        // a neighbour rises.
+        let mut spike = vec![ProbeSh::default(); n];
+        let center = (1 * 3 + 1) * 3 + 1;
+        let neighbor = (1 * 3 + 1) * 3 + 0;
+        spike[center].coeffs[0][0] = 1.0;
+        blur_probe_grid(&mut spike, counts, 1);
+        assert!(spike[center].coeffs[0][0] < 1.0, "spike center should fall");
+        assert!(spike[neighbor].coeffs[0][0] > 0.0, "neighbour should gain");
     }
 }

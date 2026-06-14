@@ -24,6 +24,7 @@ pub enum SpawnKind {
     Camera,
     Light(citrus_core::LightKind),
     LightProbeVolume,
+    PostFxVolume,
     AudioSource,
     BoxCollider,
     SphereCollider,
@@ -40,6 +41,7 @@ impl SpawnKind {
             Self::Camera => "Camera",
             Self::Light(kind) => kind.label(),
             Self::LightProbeVolume => "Light Probe Volume",
+            Self::PostFxVolume => "Post FX Volume",
             Self::AudioSource => "Audio Source",
             Self::BoxCollider => "Box Collider",
             Self::SphereCollider => "Sphere Collider",
@@ -112,6 +114,10 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
         ui.separator();
         if ui.button("Light Probe Volume").clicked() {
             response.spawn = Some(SpawnKind::LightProbeVolume);
+            ui.close();
+        }
+        if ui.button("Post FX Volume").clicked() {
+            response.spawn = Some(SpawnKind::PostFxVolume);
             ui.close();
         }
     });

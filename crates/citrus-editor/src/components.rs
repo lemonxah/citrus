@@ -24,6 +24,10 @@ use egui::{DragValue, Label, RichText, ScrollArea, Sense, Ui};
 /// currently being dragged (a `usize`, so its slot is shared across the
 /// plugin/egui dylib boundary). `ObjectRef` drop targets read it.
 pub const DRAG_OBJECT_KEY: &str = "citrus-drag-object";
+/// egui-memory key holding the project-relative path of the file currently
+/// dragged from the file browser (a `String`, shared across the dylib boundary —
+/// same plugin-safe pattern as [`DRAG_OBJECT_KEY`]). Drop targets read it.
+pub const DRAG_FILE_KEY: &str = "citrus-drag-file";
 
 /// Context handed to a component's inspector: the scene's object list (for
 /// `ObjectRef` pickers) plus a helper to draw the picker.
@@ -91,6 +95,57 @@ impl InspectCtx<'_> {
             if target.is_set() && ui.small_button("✕").on_hover_text("Clear").clicked() {
                 *target = ObjectRef::NONE;
                 changed = true;
+            }
+        });
+        changed
+    }
+
+    /// An asset-path field that's also a **drop target**: drag a file from the
+    /// file browser onto it to set `value` to that file's project-relative path.
+    /// `exts` (lowercase, no dot) restricts which files are accepted; empty =
+    /// any. Returns true if the value changed. Uses the same plugin-safe memory
+    /// pattern as [`object_ref`] (the file browser publishes the dragged path
+    /// into egui memory as a `String`).
+    pub fn file_field(
+        &self,
+        ui: &mut Ui,
+        label: &str,
+        value: &mut String,
+        hint: &str,
+        exts: &[&str],
+    ) -> bool {
+        let mut changed = false;
+        let dragging: Option<String> = ui.data(|d| d.get_temp(egui::Id::new(DRAG_FILE_KEY)));
+        let droppable = dragging.as_ref().is_some_and(|p| {
+            exts.is_empty()
+                || std::path::Path::new(p)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .is_some_and(|e| exts.contains(&e.as_str()))
+        });
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let edit = ui.add(
+                egui::TextEdit::singleline(value)
+                    .hint_text(hint)
+                    .desired_width(f32::INFINITY),
+            );
+            changed |= edit.changed();
+            // Highlight while a compatible file is dragged over the field.
+            if droppable && ui.rect_contains_pointer(edit.rect) {
+                ui.painter().rect_stroke(
+                    edit.rect,
+                    2.0,
+                    egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                    egui::StrokeKind::Inside,
+                );
+                if ui.input(|i| i.pointer.any_released())
+                    && let Some(p) = &dragging
+                {
+                    *value = p.clone();
+                    changed = true;
+                }
             }
         });
         changed
@@ -490,15 +545,16 @@ impl Inspect for LightComponent {
 impl Gizmo for LightComponent {}
 
 impl Inspect for VolumeComponent {
-    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
         let mut changed = false;
-        property_row(ui, "Profile", &mut changed, |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.profile)
-                    .hint_text("post/cinematic.postfx"),
-            )
-            .on_hover_text("Project-relative path to a .postfx profile")
-        });
+        // Drag a .postfx from the file browser onto this field to set it.
+        changed |= ctx.file_field(
+            ui,
+            "Profile",
+            &mut self.profile,
+            "drag a .postfx here",
+            &["postfx"],
+        );
         property_row(ui, "Global", &mut changed, |ui| {
             ui.checkbox(&mut self.global, "")
                 .on_hover_text("Affects the whole scene (else only within the box bounds)")

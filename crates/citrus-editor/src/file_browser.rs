@@ -114,7 +114,11 @@ impl FileBrowser {
                     .expect("embedded ferris.png decodes")
                     .to_rgba8();
                 let size = [image.width() as usize, image.height() as usize];
-                let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                // Monochrome silhouette: white RGB + original alpha, so drawing
+                // it with a tint colours the whole crab one flat colour (matches
+                // the rest of the file icons).
+                let mono: Vec<u8> = image.pixels().flat_map(|p| [255, 255, 255, p[3]]).collect();
+                let color = egui::ColorImage::from_rgba_unmultiplied(size, &mono);
                 ctx.load_texture("citrus-ferris", color, egui::TextureOptions::LINEAR)
             })
             .clone()
@@ -304,11 +308,9 @@ impl FileBrowser {
                 if on_arrow && !subdirs.is_empty() {
                     self.toggle_open(dir);
                 } else {
-                    // Single click navigates the grid + selects in Inspector.
+                    // Single click only navigates the grid — folders aren't
+                    // inspectable assets, so it doesn't change the selection.
                     self.current_dir = dir.to_owned();
-                    if !is_root {
-                        response.clicked = Some(dir.to_owned());
-                    }
                 }
             }
             if row.double_clicked() {
@@ -406,27 +408,37 @@ impl FileBrowser {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
         let icon_center = egui::pos2(rect.center().x, rect.top() + 26.0);
+        let icon_color = if is_selected {
+            ui.visuals().selection.stroke.color
+        } else {
+            ui.visuals().text_color()
+        };
         if is_rust {
-            // Ferris (the rustcrab) for .rs files. Fit ~32px tall, keep aspect.
+            // Monochrome Ferris silhouette for .rs files. ~30px tall, keep aspect.
             let tex = self.ferris_texture(ui.ctx());
             let [tw, th] = tex.size();
-            let h = 32.0;
+            let h = 30.0;
             let w = h * tw as f32 / th as f32;
             let img_rect = egui::Rect::from_center_size(icon_center, egui::vec2(w, h));
             ui.painter().image(
                 tex.id(),
                 img_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
+                icon_color,
             );
         } else {
-            let icon = if is_dir { "🗀" } else { file_icon(path) };
+            // Phosphor icon glyph for the file/folder type.
+            let glyph = if is_dir {
+                egui_phosphor::regular::FOLDER
+            } else {
+                phosphor_icon(icon_kind(path))
+            };
             ui.painter().text(
                 icon_center,
                 Align2::CENTER_CENTER,
-                icon,
+                glyph,
                 FontId::proportional(30.0),
-                ui.visuals().text_color(),
+                icon_color,
             );
         }
 
@@ -447,11 +459,9 @@ impl FileBrowser {
             );
             self.rename_editor(ui, name_rect, response);
         } else {
-            // Name under the icon, wrapped to two lines, cropped with `…`.
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // Name under the icon, single line, cropped with `…`. Known asset
+            // extensions are hidden (the icon conveys the type).
+            let name = display_name(path, is_dir);
             let color = if is_selected {
                 ui.visuals().selection.stroke.color
             } else {
@@ -469,7 +479,7 @@ impl FileBrowser {
             );
             job.wrap = egui::text::TextWrapping {
                 max_width: TILE.x - 8.0,
-                max_rows: 2,
+                max_rows: 1,
                 break_anywhere: true,
                 overflow_character: Some('…'),
             };
@@ -483,6 +493,52 @@ impl FileBrowser {
         }
 
         tile.dnd_set_drag_payload(path.to_owned());
+        if tile.dragged() {
+            // Also publish the dragged file's project-relative path into egui
+            // memory (a String) so inspector drop-fields can read it across the
+            // plugin egui boundary — same pattern as the scene tree's
+            // dragged-object key.
+            if !is_dir {
+                let rel = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                ui.data_mut(|d| d.insert_temp(egui::Id::new(crate::DRAG_FILE_KEY), rel));
+            }
+            // Floating "ghost" of the dragged tile (icon + name) following the
+            // cursor, so the drag has visual feedback. Painted on a top layer,
+            // mirroring the scene tree's drag ghost.
+            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("citrus-drag-ghost"),
+                ));
+                let glyph = if is_dir {
+                    egui_phosphor::regular::FOLDER
+                } else {
+                    phosphor_icon(icon_kind(path))
+                };
+                let label = format!("{glyph} {}", display_name(path, is_dir));
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let galley = painter.layout_no_wrap(label, font, egui::Color32::WHITE);
+                let pad = egui::vec2(8.0, 4.0);
+                let origin = pos + egui::vec2(14.0, 6.0);
+                let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
+                painter.rect_filled(
+                    rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(60, 46, 110, 235),
+                );
+                painter.rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 120, 220)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.galley(origin + pad, galley, egui::Color32::WHITE);
+            }
+        }
         if tile.double_clicked() {
             // Double-click opens: folders enter; files are activated.
             if is_dir {
@@ -491,8 +547,10 @@ impl FileBrowser {
             } else {
                 response.activated = Some(path.to_owned());
             }
-        } else if tile.clicked() && !renaming_this {
-            // Single-click only selects (files and folders alike).
+        } else if tile.clicked() && !renaming_this && !is_dir {
+            // Single-click selects a file (shown in the Inspector). Folders are
+            // navigation only — they aren't inspectable assets, so a folder
+            // click doesn't change the selection.
             response.clicked = Some(path.to_owned());
         }
         if is_dir {
@@ -779,23 +837,76 @@ fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn file_icon(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_lowercase)
-        .as_deref()
-    {
-        Some("gltf" | "glb" | "fbx") => "🧊",
-        Some("material") => "🎨",
-        Some("scene") => "🌍",
-        Some("citrus") => "🍋",
-        Some("lightmap" | "lightdata") => "💡",
-        Some("png" | "jpg" | "jpeg" | "tga") => "🖼",
-        // ".rs" is drawn as the Ferris image in `tile`, not as a glyph here.
-        Some("vert" | "frag" | "glsl" | "slang" | "spv") => "✨",
-        Some("toml" | "ron" | "json") => "⚙",
-        Some("md") => "📄",
-        _ => "·",
+/// Extensions whose type is conveyed by the icon, so the name hides them.
+const KNOWN_EXTS: &[&str] = &[
+    "rs", "gltf", "glb", "fbx", "material", "scene", "citrus", "lightmap", "lightdata", "png",
+    "jpg", "jpeg", "tga", "bmp", "vert", "frag", "glsl", "slang", "spv", "postfx", "toml", "ron",
+    "json", "md",
+];
+
+fn lower_ext(path: &Path) -> Option<String> {
+    path.extension().and_then(|e| e.to_str()).map(str::to_lowercase)
+}
+
+/// The kind of icon drawn for a file, by extension.
+#[derive(Clone, Copy)]
+enum IconKind {
+    Scene,
+    Material,
+    Model,
+    Image,
+    Shader,
+    PostFx,
+    Lightmap,
+    Lightdata,
+    Config,
+    Markdown,
+    Citrus,
+    Doc,
+}
+
+fn icon_kind(path: &Path) -> IconKind {
+    match lower_ext(path).as_deref() {
+        Some("scene") => IconKind::Scene,
+        Some("material") => IconKind::Material,
+        Some("gltf" | "glb" | "fbx") => IconKind::Model,
+        Some("png" | "jpg" | "jpeg" | "tga" | "bmp") => IconKind::Image,
+        Some("vert" | "frag" | "glsl" | "slang" | "spv") => IconKind::Shader,
+        Some("postfx") => IconKind::PostFx,
+        Some("lightmap") => IconKind::Lightmap,
+        Some("lightdata") => IconKind::Lightdata,
+        Some("toml" | "ron" | "json") => IconKind::Config,
+        Some("md") => IconKind::Markdown,
+        Some("citrus") => IconKind::Citrus,
+        _ => IconKind::Doc,
     }
 }
+
+/// Display label: directory name, or the file stem with a known extension
+/// hidden (the icon conveys the type), else the full name.
+fn display_name(path: &Path, is_dir: bool) -> String {
+    let hide = !is_dir
+        && lower_ext(path).is_some_and(|e| KNOWN_EXTS.contains(&e.as_str()));
+    let part = if hide { path.file_stem() } else { path.file_name() };
+    part.map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Phosphor icon glyph for a file kind.
+fn phosphor_icon(kind: IconKind) -> &'static str {
+    use egui_phosphor::regular as ph;
+    match kind {
+        IconKind::Scene => ph::GLOBE_HEMISPHERE_WEST,
+        IconKind::Material => ph::SPHERE,
+        IconKind::Model => ph::CUBE,
+        IconKind::Image => ph::IMAGE,
+        IconKind::Shader => ph::SPARKLE,
+        IconKind::PostFx => ph::APERTURE,
+        IconKind::Lightmap => ph::MAP_TRIFOLD,
+        IconKind::Lightdata => ph::DATABASE,
+        IconKind::Config => ph::GEAR_SIX,
+        IconKind::Markdown => ph::FILE_TEXT,
+        IconKind::Citrus => ph::ORANGE_SLICE,
+        IconKind::Doc => ph::FILE,
+    }
+}
+

@@ -23,10 +23,18 @@ pub use code_editor::{
 // ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
 // citrus-core — import those directly, not through the editor.
 pub use components::{
-    ComponentsResponse, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoCtx, Inspect, InspectCtx,
-    components_ui,
+    ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoCtx, Inspect,
+    InspectCtx, components_ui,
 };
 pub use file_browser::{FileBrowser, FileBrowserResponse};
+
+/// Register the Phosphor icon font with egui so the file browser (and any UI)
+/// can render its icon glyphs. Call once at startup.
+pub fn install_icon_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
 // The egui-free material/shader data models live in citrus-core now; re-export
 // them so existing `citrus_editor::MaterialModel`-style paths keep working.
 pub use citrus_core::{

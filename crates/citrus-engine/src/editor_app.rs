@@ -86,6 +86,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         editor_components: EditorComponents::with_builtins(),
         playing: false,
         play_paused: false,
+        play_time: 0.0,
         play_scene_switched: false,
         play_origin_scene: None,
         play_snapshot: None,
@@ -281,6 +282,7 @@ enum EditorAction {
     Spawn(citrus_assets::ObjectSource),
     SpawnLight(citrus_core::LightKind),
     SpawnProbeVolume,
+    SpawnPostFxVolume,
     SpawnAudioSource,
     SpawnBoxCollider,
     SpawnSphereCollider,
@@ -527,6 +529,9 @@ struct EngineApp {
     /// Paused while playing: components/physics/audio freeze but the played
     /// state stays so you can inspect it. Cleared on Stop.
     play_paused: bool,
+    /// Play clock (seconds) — advances only while playing and not paused, so
+    /// time-based components don't jump across a pause. Reset on Play start.
+    play_time: f32,
     /// Object state captured at Play start, restored at Stop.
     play_snapshot: Option<Vec<ObjectState>>,
     /// Active physics simulation (built on Play, cleared on Stop).
@@ -624,6 +629,8 @@ struct EngineApp {
 
 impl EngineApp {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        // Phosphor icon font (file-browser type icons, etc.).
+        citrus_editor::install_icon_font(&self.egui_ctx);
         // Global minimum text size = the folder-explorer text (13px): bump any
         // smaller text style up so nothing renders unreadably small; larger
         // styles (headings) are left alone.
@@ -868,6 +875,7 @@ impl EngineApp {
                 EditorAction::Spawn(_)
                     | EditorAction::SpawnLight(_)
                     | EditorAction::SpawnProbeVolume
+                    | EditorAction::SpawnPostFxVolume
                     | EditorAction::SpawnAudioSource
                     | EditorAction::SpawnBoxCollider
                     | EditorAction::SpawnSphereCollider
@@ -1328,6 +1336,23 @@ impl EngineApp {
                             self.selection = Selection::Object(index);
                         }
                         Err(e) => tracing::error!("spawning probe volume: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnPostFxVolume => {
+                    let p = self.camera.position + self.camera.forward() * 4.0;
+                    match self.scene.spawn(
+                        renderer!(),
+                        citrus_assets::ObjectSource::Empty,
+                        "Post FX Volume".to_owned(),
+                        p,
+                    ) {
+                        Ok(index) => {
+                            self.scene.objects[index]
+                                .components
+                                .push(Box::new(citrus_core::VolumeComponent::default()));
+                            self.selection = Selection::Object(index);
+                        }
+                        Err(e) => tracing::error!("spawning post fx volume: {e:#}"),
                     }
                 }
                 EditorAction::SpawnAudioSource => {
@@ -2318,10 +2343,10 @@ impl EngineApp {
             self.play_scene_switched = false;
             self.play_origin_scene = None;
             self.playing = true;
+            self.play_time = 0.0;
             self.physics = Some(physics::PhysicsWorld::build(&self.scene));
             let mut commands = Vec::new();
-            self.scene
-                .start_components(self.start.elapsed().as_secs_f32(), &mut commands);
+            self.scene.start_components(self.play_time, &mut commands);
             // Start play-on-start audio sources.
             if let Some(audio) = self.audio.as_mut() {
                 let cues = self.scene.gather_audio();
@@ -2360,8 +2385,7 @@ impl EngineApp {
             self.physics = Some(physics::PhysicsWorld::build(&self.scene));
             // Run the new scene's start hooks + audio so play continues there.
             let mut commands = Vec::new();
-            self.scene
-                .start_components(self.start.elapsed().as_secs_f32(), &mut commands);
+            self.scene.start_components(self.play_time, &mut commands);
             if let Some(audio) = self.audio.as_mut() {
                 let cues = self.scene.gather_audio();
                 let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
@@ -3190,6 +3214,10 @@ impl EngineApp {
                 .renderer
                 .as_ref()
                 .and_then(|r| r.camera_preview_texture());
+            let camera_overlay = matches!(
+                self.selection,
+                Selection::Object(i) if self.scene.camera_view_proj_for(i, 1.0).is_some()
+            );
             let mut dock_state = std::mem::replace(&mut self.dock_state, DockState::new(vec![]));
             // The focused code tab drives which file's diagnostics the
             // Inspector shows (kept out of the editor to stop layout shift).
@@ -3222,6 +3250,7 @@ impl EngineApp {
                 shader_list: &shader_list,
                 shader_info: shader_info.as_ref(),
                 camera_preview,
+                camera_overlay,
                 view,
                 proj,
                 looking: self.looking,
@@ -3247,6 +3276,9 @@ impl EngineApp {
             // plain release over a box can't re-apply a stale drag).
             if !ctx.input(|i| i.pointer.any_down()) {
                 ctx.data_mut(|d| d.remove::<usize>(egui::Id::new(citrus_editor::DRAG_OBJECT_KEY)));
+                ctx.data_mut(|d| {
+                    d.remove::<String>(egui::Id::new(citrus_editor::DRAG_FILE_KEY))
+                });
             }
         });
 
@@ -3266,10 +3298,13 @@ impl EngineApp {
         self.pump_lsp();
         let t = self.start.elapsed().as_secs_f32();
         if self.playing && !self.play_paused {
+            // Advance the play clock (pauses with the sim) so time-based
+            // components don't jump across a pause.
+            self.play_time += dt;
             // Component-driven motion must not land in undo history; play
             // edits are restored wholesale on Stop anyway.
             let mut commands = Vec::new();
-            self.scene.update_components(dt, t, &mut commands);
+            self.scene.update_components(dt, self.play_time, &mut commands);
             // Physics: step after component logic, then write the simulated
             // transforms back onto dynamic/kinematic objects.
             if let Some(phys) = self.physics.as_mut()
@@ -3338,23 +3373,27 @@ impl EngineApp {
             ]),
         };
 
-        // Render the main-camera preview only while a Camera tab is open.
+        // Render the camera preview when a Camera tab is open, or when a camera
+        // object is selected (shown as a viewport overlay so its framing can be
+        // tweaked live). A selected camera takes precedence over the main one.
         let camera_tab_open = self
             .dock_state
             .iter_all_tabs()
             .any(|(_, tab)| matches!(tab, Tab::Camera));
-        let camera_preview = if camera_tab_open {
-            // Preview target is a fixed 16:9; match its aspect.
-            self.scene
-                .main_camera_view_proj(16.0 / 9.0)
-                .map(|(view, proj, position)| CameraData {
-                    view,
-                    proj,
-                    position,
-                })
-        } else {
-            None
+        let selected_camera = match self.selection {
+            Selection::Object(i) if self.scene.camera_view_proj_for(i, 1.0).is_some() => Some(i),
+            _ => None,
         };
+        let preview_view = selected_camera
+            .and_then(|i| self.scene.camera_view_proj_for(i, 16.0 / 9.0))
+            .or_else(|| {
+                camera_tab_open.then(|| self.scene.main_camera_view_proj(16.0 / 9.0)).flatten()
+            });
+        let camera_preview = preview_view.map(|(view, proj, position)| CameraData {
+            view,
+            proj,
+            position,
+        });
 
         let shadow_res = env.shadow_resolution.clamp(256, 8192);
         let shadow_pcf_texel = env.shadow_softness.max(0.0) / shadow_res as f32;
@@ -3437,6 +3476,8 @@ struct EditorTabs<'a> {
     /// Main-camera preview (egui texture + pixel size), if the renderer has
     /// rendered one yet.
     camera_preview: Option<(egui::TextureId, [f32; 2])>,
+    /// A camera object is selected → draw its preview as a viewport overlay.
+    camera_overlay: bool,
     view: glam::Mat4,
     proj: glam::Mat4,
     looking: bool,
@@ -3550,6 +3591,10 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         }
                         SpawnKind::LightProbeVolume => {
                             self.actions.push(EditorAction::SpawnProbeVolume);
+                            return;
+                        }
+                        SpawnKind::PostFxVolume => {
+                            self.actions.push(EditorAction::SpawnPostFxVolume);
                             return;
                         }
                         SpawnKind::AudioSource => {
@@ -4425,27 +4470,42 @@ impl EditorTabs<'_> {
                                         }
                                     });
                             });
-                            if gi.mode == citrus_assets::GiMode::Software {
+                            let software = gi.mode == citrus_assets::GiMode::Software;
+                            if software {
                                 ui.label(
                                     RichText::new("Software SDF GI (no RT cores): CPU-marched, \
-                                        coarse preview — soft + low-frequency.")
+                                        coarse preview — soft + low-frequency. The probe grid is \
+                                        spatially denoised, so raise Responsiveness for snappier \
+                                        updates without adding noise.")
                                         .small()
                                         .weak(),
                                 );
                             }
                             ui.horizontal(|ui| {
                                 ui.label("Bounces");
-                                ui.add(egui::Slider::new(&mut gi.bounces, 1..=16))
+                                // Software pays per bounce on the CPU and gains
+                                // little past a couple (albedo falls off fast),
+                                // so cap it lower to keep traces fast.
+                                let max_bounces = if software { 4 } else { 16 };
+                                ui.add(egui::Slider::new(&mut gi.bounces, 1..=max_bounces))
                                     .on_hover_text("Indirect bounces per path");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Quality");
+                                // Software is CPU-bound per ray, so its grid cost
+                                // scales with spp — cap it lower. The denoise keeps
+                                // low spp clean, so high values only cost latency.
+                                let max_spp = if software { 128 } else { 256 };
                                 ui.add(
-                                    egui::Slider::new(&mut gi.samples, 16..=256)
+                                    egui::Slider::new(&mut gi.samples, 16..=max_spp)
                                         .suffix(" spp")
                                         .logarithmic(true),
                                 )
-                                .on_hover_text("Rays per probe — higher = less noise, more cost");
+                                .on_hover_text(
+                                    "Rays per probe — higher = less noise, more cost. The grid \
+                                     is denoised after tracing, so low values (~48-96) stay clean \
+                                     and keep traces fast enough for realtime.",
+                                );
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Intensity");
@@ -4457,20 +4517,23 @@ impl EditorTabs<'_> {
                             ui.horizontal(|ui| {
                                 ui.label("Probe Spacing");
                                 ui.add(
-                                    egui::Slider::new(&mut gi.probe_spacing, 0.5..=8.0)
+                                    egui::Slider::new(&mut gi.probe_spacing, 0.25..=8.0)
                                         .suffix(" m"),
                                 )
                                 .on_hover_text(
                                     "World units between auto-grid probes — smaller = finer GI, \
-                                     more cost",
+                                     more cost. Very small values just hit the per-axis cap and \
+                                     make traces slow (laggy) without looking better.",
                                 );
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Responsiveness");
                                 ui.add(egui::Slider::new(&mut gi.temporal_blend, 0.05..=1.0))
                                     .on_hover_text(
-                                        "Per-update blend toward the new trace — lower = \
-                                         smoother/laggier, higher = snappier/noisier",
+                                        "How fast bounce light tracks MOVING lights/emitters — \
+                                         higher = snappier realtime tracking. Still scenes always \
+                                         settle smoothly (denoised), so raising this does NOT add \
+                                         flicker when nothing is moving.",
                                     );
                             });
                             ui.horizontal(|ui| {
@@ -5468,6 +5531,31 @@ impl EditorTabs<'_> {
                     });
                 });
             });
+
+        // Selected-camera preview (bottom-right): live view through the camera
+        // being edited, so its framing can be tweaked from the viewport.
+        if self.camera_overlay
+            && let Some((texture, size)) = self.camera_preview
+        {
+            let w = 260.0;
+            let h = w / (size[0] / size[1].max(1.0));
+            egui::Area::new(ui.id().with("vp-cam-overlay"))
+                .order(egui::Order::Middle)
+                .pivot(egui::Align2::RIGHT_BOTTOM)
+                .fixed_pos(rect.right_bottom() + egui::vec2(-8.0, -8.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new("📷 Camera").small().weak());
+                        ui.add(
+                            egui::Image::new(egui::load::SizedTexture::new(
+                                texture,
+                                egui::vec2(w, h),
+                            ))
+                            .maintain_aspect_ratio(true),
+                        );
+                    });
+                });
+        }
 
         // Widget filter (top-right): per-billboard visibility + size. The
         // move/rotate/scale gizmos are deliberately absent — they can't be

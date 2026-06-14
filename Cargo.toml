@@ -34,7 +34,6 @@ regex = "1"
 # Randomness for v4 object UUIDs (avoids pulling the whole `uuid` crate).
 getrandom = "0.3"
 anyhow = "1"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -65,7 +64,6 @@ libc = "0.2"
 # internal crates
 citrus-engine = { path = "crates/citrus-engine" }
 citrus-render = { path = "crates/citrus-render" }
-citrus-xr = { path = "crates/citrus-xr" }
 citrus-assets = { path = "crates/citrus-assets" }
 citrus-editor = { path = "crates/citrus-editor" }
 

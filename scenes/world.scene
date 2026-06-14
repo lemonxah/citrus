@@ -101,8 +101,12 @@
                     kind: "Camera",
                     data: "(id:1,fov_deg:60.0,near:0.1,far:100.0)",
                 ),
+                (
+                    kind: "Volume (Post FX)",
+                    data: "(profile:\"\",global:true,priority:0.0,weight:1.0,blend_distance:1.0,half_extents:(5.0,5.0,5.0))",
+                ),
             ],
-            translation: (1.5780416, 1.7030511, 1.09249),
+            translation: (1.5826482, 1.7030511, 1.09249),
             rotation: (-0.19448552, 0.043485317, -0.008630696, 0.97990304),
             scale: (0.99997723, 0.999999, 0.9999754),
         ),
@@ -188,11 +192,11 @@
             components: [
                 (
                     kind: "Light",
-                    data: "(kind:Point,mode:Realtime,color:(1.0,0.98,0.92),intensity:3.0,range:20.0,spot_angle:45.0,spot_blend:0.15,shadow_type:Soft,shadow_bias:0.002,radius:0.1)",
+                    data: "(kind:Point,mode:Realtime,color:(1.0,1.0,1.0),intensity:2.0,range:20.0,spot_angle:45.0,spot_blend:0.15,shadow_type:Soft,shadow_bias:0.002,radius:0.1)",
                 ),
             ],
             translation: (1.1980337, 1.20792, 1.4688884),
-            rotation: (0.0, 0.0, 0.0, 1.0),
+            rotation: (-0.0, -0.0, -0.0, 1.0),
             scale: (1.0, 1.0, 1.0),
         ),
         (
@@ -326,11 +330,11 @@
         realtime_gi: (
             enabled: true,
             mode: Software,
-            bounces: 9,
+            bounces: 6,
             samples: 230,
-            intensity: 20.0,
-            probe_spacing: 1.5,
-            temporal_blend: 0.16,
+            intensity: 4.0,
+            probe_spacing: 0.05,
+            temporal_blend: 0.05,
             update_interval: 0.05,
         ),
     ),

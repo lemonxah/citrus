@@ -105,11 +105,34 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   normal sign, unit-tested) are done. Phase 1c is a CPU **multi-bounce** path march
   (`sw_gi.rs`, honors the Bounces setting, throughput ×albedo per hop) reusing the SDFs,
   **parallelized across cores** on a **background thread** so Play-mode moving objects don't
-  hitch. Each noisy trace is **averaged into the probes (EMA, rate = Responsiveness)** to
-  cancel Monte-Carlo flicker, then a short per-frame ease glides between updates (cheap
-  in-place SSBO rewrite `update_probe_sh`, no GPU stall). Grid up to 16/axis, up to 16
-  bounces. **Emissive materials are area emitters** in both bake (static objects) + realtime GI. Next: surface cache / screen probes for contact-scale GI — probe
-  GI is low-frequency, so tight contact fill (under-object darkening) is still limited.
+  hitch. Each fresh trace is **spatially denoised** first — a separable [1,2,1] blur over the
+  probe SH grid (`sw_gi::blur_probe_grid`) that cancels the blotchy per-probe Monte-Carlo
+  variance with **no temporal lag**, so Responsiveness can run high (snappy updates to moving
+  objects) without trading back into noise. The denoised trace is then blended in with a
+  **motion-aware EMA**: while a light/emitter is *moving* it snaps toward the latest trace (rate
+  = Responsiveness) so the bounce tracks in realtime; when *static* it averages at a fixed gentle
+  rate so residual per-trace variance converges smoothly — so raising Responsiveness never makes
+  a still scene flicker. A short per-frame ease (faster while moving) glides between updates (cheap
+  in-place SSBO rewrite `update_probe_sh`, no GPU stall). The probe grid is **cascaded**
+  (SDFGI-style): the coarsest volume covers the whole padded scene AABB and each finer cascade
+  halves the box (doubling density) around the same center, up to 3 cascades (16/axis each for
+  software, single 32 grid for hardware). The shader picks the finest cascade containing a
+  fragment and **cross-fades into the next coarser one near its boundary** (`sample_volume` +
+  edge fade in `standard.frag`) so the resolution change isn't a visible seam — this is what
+  removes the trilinear "squares" near the action while keeping edges/sky cheap. Each cascade is
+  blurred by its own grid layout. **DDGI-style visibility (leak prevention)**: the march also
+  records the SH-L1 of the directional first-hit distance per probe (`ProbeSh::dist`, packed into
+  the probe SSBO's previously-unused `.w` lanes — no extra buffer). The shader replaces plain
+  trilinear with a DDGI-style weighted 8-corner blend (`sample_volume` in `standard.frag`): each
+  probe's weight is scaled by a soft Chebyshev-lite visibility test (probe→fragment distance vs.
+  the probe's stored seen-distance in that direction) plus a front-facing term, so probes
+  occluded from a fragment (behind a wall, under an object) are down-weighted → light no longer
+  leaks. Bake/hardware paths leave `dist` zero, which disables the test (plain trilinear). **4
+  bounces** cap so a CPU trace finishes inside the update interval; probe-spacing floor 0.25 m so
+  a tiny value can't silently explode the probe count. **Emissive
+  materials are area emitters** in both bake (static objects) + realtime GI. Next: surface cache
+  / screen probes for contact-scale GI — probe GI is low-frequency, so tight contact fill
+  (under-object darkening) is still limited.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
   even cube-face packing) — the seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.
@@ -134,6 +157,13 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   settings are authorable now but only apply once that pass lands).
 
 ### Editor
+- [done] Play / Pause / Stop — Pause freezes components/physics/audio on a play clock that
+  doesn't advance while paused (so time-based motion doesn't jump on resume)
+- [done] Selected-camera preview overlay (bottom-right of the viewport): live view through a
+  selected camera object so its framing can be tweaked while editing its transform
+- [done] Drag a file from the Files panel onto an inspector asset field to assign it
+  (`InspectCtx::file_field`; the browser publishes the dragged file's project-relative path to
+  egui memory — plugin-safe). E.g. drop a `.postfx` onto a Volume's Profile field.
 - [done] Dockable panels (egui_dock): Scene / Inspector / Files / Log / Code / Baker
   around a transparent viewport
 - [done] Transform gizmos: move (W) / rotate (R) / scale (E), pivot/center + global/local,
@@ -144,7 +174,13 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   subtree; shares meshes/materials, fresh ids, not undoable like delete)
 - [done] Ctrl+D in the file browser duplicates the selected file/folder (`<stem>_copy`)
 - [done] Project file browser (Unity-style folder tree + icon grid, rename/cut/copy/paste/
-  drag-move, context menus, F2 inline rename of the selected file/folder)
+  drag-move, context menus, F2 inline rename of the selected file/folder). Per-type icons from
+  the **Phosphor icon font** (`egui-phosphor`, registered via `install_icon_font`): globe
+  (scene), sphere (material), cube (model), image, sparkle (shader), aperture (postfx), map
+  (lightmap), database (lightdata), gear (config), file-text (markdown), orange-slice
+  (.citrus), folder, file (unknown); `.rs` keeps a monochrome Ferris silhouette. Known asset
+  extensions are hidden (the icon conveys the type) and names clip to one line. Folder clicks
+  navigate only — no Inspector selection.
 - [done] Unified Inspector (object transform/mesh/material slots, `.material` editor,
   component list with Add/Remove)
 - [done] Orbit / pan / scroll-dolly editor camera, F to frame, Escape to deselect

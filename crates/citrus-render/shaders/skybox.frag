@@ -12,7 +12,6 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 light_color;
     vec4 ambient;
     vec4 misc;
-    // Post-processing (same layout/order as the standard shader's FrameData).
     vec4 postfx0; // x tonemap mode, y exposure EV, z grade exposure, w contrast
     vec4 postfx1; // x saturation, y temperature, z tint, w grading enabled
     vec4 postfx2; // x vignette enabled, y intensity, z smoothness, w screen width
@@ -35,16 +34,9 @@ layout(location = 0) out vec4 o_color;
 const float PI = 3.14159265359;
 
 vec3 tonemap_aces(vec3 x) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
-
-// Same per-pixel post-processing as the standard shader, so the sky is graded /
-// tonemapped / vignetted consistently with lit surfaces.
 vec3 apply_postfx(vec3 color, vec2 fragcoord) {
     color *= exp2(frame.postfx0.y);
     if (frame.postfx1.w > 0.5) {

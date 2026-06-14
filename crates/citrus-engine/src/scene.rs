@@ -867,9 +867,16 @@ impl LoadedScene {
     /// View, projection, and world position of the main camera for the given
     /// aspect ratio (cameras look down -Z, glTF convention).
     pub fn main_camera_view_proj(&self, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
+        self.camera_view_proj_for(self.main_camera()?, aspect)
+    }
+
+    /// View/proj/position for the camera on object `i` (None if it has no
+    /// CameraComponent). Used for the selected-camera viewport preview.
+    pub fn camera_view_proj_for(&self, i: usize, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
         use citrus_core::CameraComponent;
-        let i = self.main_camera()?;
-        let cam = self.objects[i]
+        let cam = self
+            .objects
+            .get(i)?
             .components
             .iter()
             .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())?;
@@ -1066,6 +1073,8 @@ impl LoadedScene {
                         [p[6], p[7], p[8]],
                         [p[9], p[10], p[11]],
                     ],
+                    // Baked sidecars carry no visibility moments → disabled.
+                    dist: [0.0; 4],
                 })
                 .collect();
         }
@@ -1357,37 +1366,70 @@ impl LoadedScene {
             });
         }
 
-        // Auto probe grid: pad the scene AABB, then one probe per `probe_spacing`
-        // world units, clamped to [2, 8] per axis so even a big scene stays cheap.
+        // Cascaded probe volumes (SDFGI-style), centered on the scene. One grid
+        // over the whole scene is necessarily coarse → visible trilinear "squares"
+        // near the action. Instead we nest grids: the coarsest covers the full
+        // padded AABB, and each finer cascade halves the box (so it doubles the
+        // probe density) around the same center. The shader picks the finest
+        // cascade that contains a fragment (volumes are emitted finest-first), so
+        // the center gets fine GI while the edges/sky stay cheap. Each cascade is
+        // another full grid to march, so the count is capped.
+        let software = self.environment.realtime_gi.mode == citrus_assets::GiMode::Software;
         let spacing = self.environment.realtime_gi.probe_spacing.max(0.25);
-        let pad = ((hi - lo).length() * 0.05).max(0.5);
+        // Margin so geometry (esp. a large floor) sits well inside the outermost
+        // cascade — its edge fades to ambient, so too little pad darkens the rim.
+        let pad = ((hi - lo).length() * 0.08).max(1.0);
         let (lo, hi) = (lo - pad, hi + pad);
         let center = (lo + hi) * 0.5;
-        let size = (hi - lo).max(Vec3::splat(0.1));
-        // Up to 16/axis so a low Probe Spacing actually yields a fine grid
-        // (the parallel CPU march makes the extra probes affordable).
-        let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, 16) as usize;
+        let size = (hi - lo).max(Vec3::splat(0.1)); // coarsest (full-scene) box
+        // Per-axis probe count for every cascade, derived from the full-scene box
+        // and clamped. Software marches on the CPU so it gets a coarser cap; the
+        // grid blur + trilinear keep it smooth. Hardware ray-query is cheap.
+        let max_axis = if software { 16 } else { 32 };
+        let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, max_axis) as usize;
         let counts = [axis_count(size.x), axis_count(size.y), axis_count(size.z)];
 
+        // Number of cascades: enough 2x refinements to bring the coarsest cell
+        // size down toward ~0.3 m near the center, capped (each cascade is a full
+        // extra grid to march). Hardware uses a single fine grid for now.
+        const TARGET_FINE: f32 = 0.3;
+        let coarse_cell = (0..3)
+            .map(|a| size[a] / (counts[a].max(2) - 1) as f32)
+            .fold(0.0f32, f32::max);
+        let cascades = if software {
+            ((coarse_cell / TARGET_FINE).log2().round() as i32 + 1).clamp(1, 3) as usize
+        } else {
+            1
+        };
+
+        // Emit finest-first so the shader's first-containing-volume rule selects
+        // the densest cascade available at each fragment.
         let mut probes = Vec::new();
-        for gz in 0..counts[2] {
-            for gy in 0..counts[1] {
-                for gx in 0..counts[0] {
-                    let f = Vec3::new(
-                        gx as f32 / (counts[0] - 1).max(1) as f32,
-                        gy as f32 / (counts[1] - 1).max(1) as f32,
-                        gz as f32 / (counts[2] - 1).max(1) as f32,
-                    );
-                    probes.push(lo + f * size);
+        let mut probe_volumes = Vec::new();
+        for k in 0..cascades {
+            let scale = 0.5f32.powi((cascades - 1 - k) as i32); // finest..1.0
+            let cs = size * scale;
+            let clo = center - cs * 0.5;
+            let sh_base = probes.len();
+            for gz in 0..counts[2] {
+                for gy in 0..counts[1] {
+                    for gx in 0..counts[0] {
+                        let f = Vec3::new(
+                            gx as f32 / (counts[0] - 1).max(1) as f32,
+                            gy as f32 / (counts[1] - 1).max(1) as f32,
+                            gz as f32 / (counts[2] - 1).max(1) as f32,
+                        );
+                        probes.push(clo + f * cs);
+                    }
                 }
             }
+            probe_volumes.push(ProbeVolumeMeta {
+                world_to_local: Mat4::from_translation(-center),
+                size: cs.to_array(),
+                counts,
+                sh_base,
+            });
         }
-        let probe_volumes = vec![ProbeVolumeMeta {
-            world_to_local: Mat4::from_translation(-center),
-            size: size.to_array(),
-            counts,
-            sh_base: 0,
-        }];
 
         let amb = self.environment.ambient;
         let ai = self.environment.ambient_intensity;
@@ -1524,6 +1566,12 @@ impl LoadedScene {
             vignette_intensity: p.vignette.intensity,
             vignette_smoothness: p.vignette.smoothness,
             vignette_color: p.vignette.color,
+            bloom_enabled: p.bloom.enabled,
+            bloom_threshold: p.bloom.threshold,
+            bloom_intensity: p.bloom.intensity,
+            bloom_radius: p.bloom.radius,
+            ca_enabled: p.chromatic_aberration.enabled,
+            ca_intensity: p.chromatic_aberration.intensity,
         }
     }
 

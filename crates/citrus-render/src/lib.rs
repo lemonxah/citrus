@@ -105,11 +105,24 @@ struct GpuProbeVolume {
 }
 
 /// One probe's SH-L1 in the GPU storage buffer (std430): 4 coefficients, each
-/// an RGB padded to vec4. Matches `ProbeSh` projection in bake_probe.comp.
+/// an RGB in xyz. The previously-unused `w` of each carries the SH-L1 of the
+/// directional distance-to-geometry (`ProbeSh::dist`) for visibility weighting.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct GpuProbe {
     coeffs: [[f32; 4]; 4],
+}
+
+/// Pack a `ProbeSh` into its GPU form: RGB SH in xyz, distance SH in the w lanes.
+fn gpu_probe(p: &ProbeSh) -> GpuProbe {
+    GpuProbe {
+        coeffs: [
+            [p.coeffs[0][0], p.coeffs[0][1], p.coeffs[0][2], p.dist[0]],
+            [p.coeffs[1][0], p.coeffs[1][1], p.coeffs[1][2], p.dist[1]],
+            [p.coeffs[2][0], p.coeffs[2][1], p.coeffs[2][2], p.dist[2]],
+            [p.coeffs[3][0], p.coeffs[3][1], p.coeffs[3][2], p.dist[3]],
+        ],
+    }
 }
 
 #[repr(C)]
@@ -123,16 +136,12 @@ struct FrameUbo {
     light_color: [f32; 4],
     ambient: [f32; 4],
     misc: [f32; 4], // x = time, y = light count, z = shadow spacing, w = probe-volume count
-    // Post-processing (per-pixel effects in the surface shaders). Kept right
-    // after `misc` so the skybox's truncated FrameData prefix can read them too.
-    /// x = tonemap mode, y = tonemap exposure (EV), z = grade exposure, w = contrast.
-    postfx0: [f32; 4],
-    /// x = saturation, y = temperature, z = tint, w = grading enabled (>0.5).
-    postfx1: [f32; 4],
-    /// x = vignette enabled, y = intensity, z = smoothness, w = screen width px.
-    postfx2: [f32; 4],
-    /// xyz = vignette color, w = screen height px.
-    postfx3: [f32; 4],
+    // Post-processing (per-pixel, in the surface shaders). After `misc` so the
+    // skybox's truncated FrameData prefix can read them too.
+    postfx0: [f32; 4], // x tonemap mode, y exposure EV, z grade exposure, w contrast
+    postfx1: [f32; 4], // x saturation, y temperature, z tint, w grading enabled
+    postfx2: [f32; 4], // x vignette enabled, y intensity, z smoothness, w screen w
+    postfx3: [f32; 4], // xyz vignette color, w screen h
     /// Far view-space distance of each directional cascade (xyzw = up to 4).
     cascade_splits: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
@@ -1218,17 +1227,7 @@ impl Renderer {
         let gpu: Vec<GpuProbe> = if probes.is_empty() {
             vec![GpuProbe::default()]
         } else {
-            probes
-                .iter()
-                .map(|p| GpuProbe {
-                    coeffs: [
-                        [p.coeffs[0][0], p.coeffs[0][1], p.coeffs[0][2], 0.0],
-                        [p.coeffs[1][0], p.coeffs[1][1], p.coeffs[1][2], 0.0],
-                        [p.coeffs[2][0], p.coeffs[2][1], p.coeffs[2][2], 0.0],
-                        [p.coeffs[3][0], p.coeffs[3][1], p.coeffs[3][2], 0.0],
-                    ],
-                })
-                .collect()
+            probes.iter().map(gpu_probe).collect()
         };
         self.probe_volumes = volumes
             .iter()
@@ -1291,17 +1290,7 @@ impl Renderer {
         if probes.is_empty() || probes.len() != self.probe_count {
             return false;
         }
-        let gpu: Vec<GpuProbe> = probes
-            .iter()
-            .map(|p| GpuProbe {
-                coeffs: [
-                    [p.coeffs[0][0], p.coeffs[0][1], p.coeffs[0][2], 0.0],
-                    [p.coeffs[1][0], p.coeffs[1][1], p.coeffs[1][2], 0.0],
-                    [p.coeffs[2][0], p.coeffs[2][1], p.coeffs[2][2], 0.0],
-                    [p.coeffs[3][0], p.coeffs[3][1], p.coeffs[3][2], 0.0],
-                ],
-            })
-            .collect();
+        let gpu: Vec<GpuProbe> = probes.iter().map(gpu_probe).collect();
         self.probe_buffer.write(0, bytemuck::cast_slice(&gpu));
         true
     }

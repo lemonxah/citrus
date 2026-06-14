@@ -35,6 +35,10 @@ pub struct RealtimeGiState {
     hash: u64,
     /// Remaining blended re-traces after a change; 0 = converged, skip work.
     settle: u32,
+    /// True while the inputs are actively changing (a light/emitter is moving).
+    /// Drives the snap-to-latest response so bounce light tracks in realtime;
+    /// false lets it settle smoothly toward the converged value.
+    moving: bool,
     /// Monotonic per-trace seed so software-GI samples jitter each update and
     /// temporal accumulation averages out the noise.
     seed: u32,
@@ -90,10 +94,14 @@ impl RealtimeGiState {
             self.timer = gi.update_interval.max(0.05);
             if let Some(gather) = scene.gather_realtime_gi() {
                 let hash = hash_inputs(&gather, &gi);
-                if hash != self.hash || !self.active {
+                let changed = hash != self.hash || !self.active;
+                if changed {
                     self.hash = hash;
                     self.settle = SETTLE_UPDATES;
                 }
+                // Track motion so the ingest below snaps to the latest trace
+                // while things move, then settles smoothly once they stop.
+                self.moving = changed;
                 if self.settle > 0 {
                     self.settle -= 1;
                     self.seed = self.seed.wrapping_add(0x9E37_79B9);
@@ -138,6 +146,22 @@ impl RealtimeGiState {
 
         // 3) Ingest a fresh trace as the new ease target (apply intensity here).
         if let Some((mut probes, vols, counts)) = fresh {
+            // Spatially denoise each cascade's grid first — this cancels the
+            // blotchy per-probe Monte-Carlo variance with no temporal lag, so the
+            // "Responsiveness" EMA below can run snappy without trading back into
+            // noise. The software grids are coarser, so blur harder: a wider
+            // kernel also softens the trilinear cell facets (the "squares"). The
+            // flat probe array is N concatenated cascade grids, so blur each
+            // sub-grid by its own (counts, sh_base) layout.
+            let iters = if gi.mode == citrus_assets::GiMode::Software { 3 } else { 2 };
+            for (_, _, c, base) in &vols {
+                let cnt = [c[0] as usize, c[1] as usize, c[2] as usize];
+                let n = cnt[0] * cnt[1] * cnt[2];
+                let start = *base as usize;
+                if start + n <= probes.len() {
+                    crate::sw_gi::blur_probe_grid(&mut probes[start..start + n], cnt, iters);
+                }
+            }
             let k = gi.intensity.max(0.0);
             if (k - 1.0).abs() > 1e-3 {
                 for p in &mut probes {
@@ -157,18 +181,35 @@ impl RealtimeGiState {
                 renderer.set_baked_probes(&self.accum, &vols);
                 self.active = true;
             } else {
-                // Average each new (noisy) trace into the target — an exponential
-                // moving average. This is what cancels Monte-Carlo flicker: over
-                // several traces the random noise averages out toward the true
-                // value. `Responsiveness` is the EMA rate: low = heavy averaging
-                // (smooth, slightly laggy), high = tracks the latest trace fast
-                // (responsive, but more residual noise).
-                let alpha = gi.temporal_blend.clamp(0.02, 1.0);
+                // Blend each new trace into the target as an exponential moving
+                // average. Two regimes, because noise and motion-tracking want
+                // opposite rates and (now that each trace is spatially denoised)
+                // we no longer need the EMA to fight spatial noise:
+                //   - Moving: a light/emitter is moving, so snap toward the
+                //     latest trace (rate = `Responsiveness`) — the bounce tracks
+                //     in realtime.
+                //   - Static: nothing is moving; average gently at a fixed low
+                //     rate so the residual per-trace variance converges smoothly
+                //     instead of flickering. This is independent of
+                //     `Responsiveness`, so cranking it up never makes a still
+                //     scene shimmer.
+                let alpha = if self.moving {
+                    // Map Responsiveness into a capped range. Even at max we keep
+                    // ~2-trace averaging (alpha 0.5) so a continuously-changing
+                    // scene can never show raw per-trace flicker — a full snap
+                    // (alpha 1.0) means zero temporal smoothing, which is exactly
+                    // the shimmer seen at Responsiveness 1.0.
+                    0.1 + 0.4 * gi.temporal_blend.clamp(0.0, 1.0)
+                } else {
+                    0.08
+                };
                 for (t, f) in self.target.iter_mut().zip(&probes) {
                     for b in 0..4 {
                         for c in 0..3 {
                             t.coeffs[b][c] += (f.coeffs[b][c] - t.coeffs[b][c]) * alpha;
                         }
+                        // Visibility moments blend alongside the radiance SH.
+                        t.dist[b] += (f.dist[b] - t.dist[b]) * alpha;
                     }
                 }
             }
@@ -200,7 +241,8 @@ impl RealtimeGiState {
         if self.target.is_empty() || self.accum.len() != self.target.len() {
             return;
         }
-        let tau = 0.08;
+        // Glide faster while moving (track) than when settling (smooth).
+        let tau = if self.moving { 0.04 } else { 0.08 };
         let f = 1.0 - (-dt / tau).exp();
         let mut max_delta = 0.0f32;
         for (acc, tgt) in self.accum.iter_mut().zip(&self.target) {
@@ -210,6 +252,9 @@ impl RealtimeGiState {
                     acc.coeffs[b][c] += d * f;
                     max_delta = max_delta.max(d.abs());
                 }
+                // Ease the visibility moments too (not counted in max_delta — the
+                // radiance settling already keeps the upload alive while it eases).
+                acc.dist[b] += (tgt.dist[b] - acc.dist[b]) * f;
             }
         }
         // Skip the upload once fully converged + static (nothing to push).

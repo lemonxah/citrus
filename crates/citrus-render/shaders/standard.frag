@@ -71,48 +71,107 @@ vec3 sh_eval(uint i, vec3 n) {
                      + probes[i].c[3].rgb * n.x);
 }
 
-// Sample one probe by integer grid coords (x fastest, then y, then z).
-vec3 probe_at(ProbeVolume v, ivec3 g, ivec3 cnt, vec3 n) {
-    g = clamp(g, ivec3(0), cnt - 1);
-    uint idx = uint(v.size_base.w) + uint(g.x + g.y * cnt.x + g.z * cnt.x * cnt.y);
-    return sh_eval(idx, n);
+// Expected distance to geometry from probe `i` in world direction `dir`,
+// reconstructed from the SH-L1 stored in the coeffs' .w lanes (raw band factors,
+// no cosine convolution). Zero (the bake path) means "no visibility data".
+float dist_at(uint i, vec3 dir) {
+    return probes[i].c[0].w * 0.282095
+         + 0.488603 * (probes[i].c[1].w * dir.y
+                     + probes[i].c[2].w * dir.z
+                     + probes[i].c[3].w * dir.x);
 }
 
-// Trilinearly-interpolated baked irradiance at world_pos for normal n. Returns
-// false when no probe volume contains the point (caller falls back to ambient).
-bool sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
+// Normalized box coords (0..1 across the volume) for a world point.
+vec3 volume_coords(ProbeVolume v, vec3 world_pos) {
+    vec3 local = (v.world_to_local * vec4(world_pos, 1.0)).xyz;
+    vec3 size = max(v.size_base.xyz, vec3(1e-4));
+    return (local + size * 0.5) / size;
+}
+
+// DDGI-style 8-corner blend of probe irradiance within one volume. Each corner's
+// trilinear weight is modulated by:
+//   - visibility: the probe's stored directional distance vs. the actual probe→
+//     fragment distance (a soft Chebyshev-lite test) — a probe occluded from the
+//     fragment (e.g. on the far side of a wall) is down-weighted, killing leaks,
+//   - front-facing: probes roughly behind the surface contribute less.
+// Falls back to plain trilinear where no visibility data exists (bake path).
+vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
+    vec3 t = volume_coords(v, world_pos);
+    ivec3 cnt = ivec3(v.counts.xyz + 0.5);
+    vec3 size = max(v.size_base.xyz, vec3(1e-4));
+    vec3 center = -v.world_to_local[3].xyz; // meta stores translate(-center)
+    vec3 cell = size / max(vec3(cnt - 1), vec3(1.0));
+    float band = max(cell.x, max(cell.y, cell.z));
+    vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
+    ivec3 g0 = ivec3(floor(g));
+    vec3 f = g - vec3(g0);
+
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        ivec3 off = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        ivec3 gc = clamp(g0 + off, ivec3(0), cnt - 1);
+        vec3 tw = mix(vec3(1.0) - f, f, vec3(off));
+        float w = tw.x * tw.y * tw.z;
+        uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
+        // Probe world position from its grid coords.
+        vec3 gn = vec3(gc) / max(vec3(cnt - 1), vec3(1.0));
+        vec3 ppos = center + (gn - 0.5) * size;
+        vec3 to_frag = world_pos - ppos;
+        float pd = length(to_frag);
+        vec3 dir = pd > 1e-5 ? to_frag / pd : n;
+        float md = max(dist_at(idx, dir), 0.0);
+        // Visibility: full until the fragment is past the seen distance, then
+        // fade over ~one cell. md==0 (no data) disables the test.
+        float vis = md > 1e-4 ? clamp(1.0 - max(0.0, pd - md) / max(band, 1e-3), 0.02, 1.0) : 1.0;
+        // Front-facing weight (probe should be on the surface's lit side).
+        float nw = clamp(dot(-dir, n) * 0.5 + 0.5, 0.0, 1.0);
+        nw = nw * nw + 0.15;
+        w *= vis * nw;
+        sum += w * sh_eval(idx, n);
+        wsum += w;
+    }
+    return wsum > 1e-5 ? max(sum / wsum, vec3(0.0)) : vec3(0.0);
+}
+
+// Trilinearly-interpolated baked irradiance at world_pos for normal n, plus a
+// coverage weight in [0,1] for the caller to blend against ambient. Volumes are
+// ordered finest-first (cascades): the first that contains the point wins, but
+//   - near an INNER cascade's boundary we cross-fade into the next (coarser)
+//     cascade so the resolution change isn't a visible seam (coverage stays 1),
+//   - near the OUTERMOST cascade's boundary we instead drop coverage toward 0 so
+//     the GI fades smoothly into ambient rather than hard-stopping at the box.
+float sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
     int vcount = int(frame.misc.w + 0.5);
     for (int vi = 0; vi < vcount && vi < MAX_PROBE_VOLUMES; ++vi) {
         ProbeVolume v = frame.probe_volumes[vi];
-        vec3 local = (v.world_to_local * vec4(world_pos, 1.0)).xyz;
-        vec3 size = max(v.size_base.xyz, vec3(1e-4));
-        vec3 t = (local + size * 0.5) / size; // 0..1 across the box
+        vec3 t = volume_coords(v, world_pos);
         if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) {
             continue;
         }
-        ivec3 cnt = ivec3(v.counts.xyz + 0.5);
-        vec3 g = t * vec3(cnt - 1);
-        ivec3 g0 = ivec3(floor(g));
-        vec3 f = g - vec3(g0);
-        // 8-corner trilinear blend of SH-evaluated irradiance.
-        vec3 c000 = probe_at(v, g0 + ivec3(0,0,0), cnt, n);
-        vec3 c100 = probe_at(v, g0 + ivec3(1,0,0), cnt, n);
-        vec3 c010 = probe_at(v, g0 + ivec3(0,1,0), cnt, n);
-        vec3 c110 = probe_at(v, g0 + ivec3(1,1,0), cnt, n);
-        vec3 c001 = probe_at(v, g0 + ivec3(0,0,1), cnt, n);
-        vec3 c101 = probe_at(v, g0 + ivec3(1,0,1), cnt, n);
-        vec3 c011 = probe_at(v, g0 + ivec3(0,1,1), cnt, n);
-        vec3 c111 = probe_at(v, g0 + ivec3(1,1,1), cnt, n);
-        vec3 x00 = mix(c000, c100, f.x);
-        vec3 x10 = mix(c010, c110, f.x);
-        vec3 x01 = mix(c001, c101, f.x);
-        vec3 x11 = mix(c011, c111, f.x);
-        vec3 y0 = mix(x00, x10, f.y);
-        vec3 y1 = mix(x01, x11, f.y);
-        irradiance = max(mix(y0, y1, f.z), vec3(0.0));
-        return true;
+        vec3 fine = sample_volume(v, world_pos, n);
+        // Distance to the nearest box face in normalized units (0 at the face,
+        // 0.5 at the center).
+        vec3 edge = min(t, vec3(1.0) - t);
+        float e = min(edge.x, min(edge.y, edge.z));
+        bool has_next = (vi + 1 < vcount && vi + 1 < MAX_PROBE_VOLUMES);
+        if (has_next) {
+            // Wide, smooth cross-fade into the coarser cascade hides the band.
+            float inner = smoothstep(0.0, 0.22, e);
+            if (inner < 1.0) {
+                ProbeVolume v2 = frame.probe_volumes[vi + 1];
+                vec3 coarse = sample_volume(v2, world_pos, n);
+                fine = mix(coarse, fine, inner);
+            }
+            irradiance = fine;
+            return 1.0;
+        }
+        // Outermost cascade: narrow fade-to-ambient only at the very edge.
+        irradiance = fine;
+        return smoothstep(0.0, 0.08, e);
     }
-    return false;
+    irradiance = vec3(0.0);
+    return 0.0;
 }
 
 // Returns 1.0 fully lit, 0.0 fully shadowed. `light.spot` packs
@@ -242,37 +301,32 @@ const float PI = 3.14159265359;
 // instead of clipping to flat white. Operates in linear; the sRGB swapchain
 // applies gamma on write.
 vec3 tonemap_aces(vec3 x) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// Per-pixel post-processing from the blended Volume profile (frame.postfx*):
-// exposure → color grading (linear) → tonemap → vignette (display). Chromatic
-// aberration + bloom need a fullscreen pass and aren't applied here.
+// Per-pixel post from the blended Volume profile: exposure → grading → tonemap →
+// vignette. (Chromatic aberration + bloom need a fullscreen pass — follow-up.)
 vec3 apply_postfx(vec3 color, vec2 fragcoord) {
-    color *= exp2(frame.postfx0.y); // tonemap exposure (EV)
-    if (frame.postfx1.w > 0.5) {    // color grading enabled
-        color *= exp2(frame.postfx0.z);                       // grade exposure
-        float temp = frame.postfx1.y, tint = frame.postfx1.z; // white balance
+    color *= exp2(frame.postfx0.y);
+    if (frame.postfx1.w > 0.5) {
+        color *= exp2(frame.postfx0.z);
+        float temp = frame.postfx1.y, tint = frame.postfx1.z;
         color.r *= 1.0 + temp * 0.2 + tint * 0.1;
         color.g *= 1.0 - tint * 0.2;
         color.b *= 1.0 - temp * 0.2 + tint * 0.1;
-        color = (color - 0.18) * frame.postfx0.w + 0.18;      // contrast @ mid-grey
+        color = (color - 0.18) * frame.postfx0.w + 0.18;
         float l = dot(color, vec3(0.2126, 0.7152, 0.0722));
-        color = mix(vec3(l), color, frame.postfx1.x);         // saturation
+        color = mix(vec3(l), color, frame.postfx1.x);
         color = max(color, vec3(0.0));
     }
     int mode = int(frame.postfx0.x + 0.5);
     if (mode == 1) {
-        color = color / (color + vec3(1.0));   // Reinhard
+        color = color / (color + vec3(1.0));
     } else if (mode == 2) {
-        color = tonemap_aces(color);           // ACES
-    }                                          // mode 0 = none
-    if (frame.postfx2.x > 0.5) {               // vignette
+        color = tonemap_aces(color);
+    }
+    if (frame.postfx2.x > 0.5) {
         vec2 uv = fragcoord / vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
         float dist = length(uv - 0.5) * 1.41421356;
         float sm = max(frame.postfx2.z, 1e-3);
@@ -421,8 +475,12 @@ void main() {
     if (pc.params1.w >= 0.0) {
         int layer = int(pc.params1.w + 0.5);
         indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
-    } else if (!sample_probes(v_world_pos, N, indirect)) {
-        indirect = frame.ambient.rgb;
+    } else {
+        // Probe GI where a cascade covers the fragment, fading to flat ambient
+        // at the outermost cascade's edge (coverage < 1) and beyond it (0).
+        vec3 probe_irr;
+        float cov = sample_probes(v_world_pos, N, probe_irr);
+        indirect = mix(frame.ambient.rgb, probe_irr, cov);
     }
     // Energy-conserving ambient diffuse: keep only the non-reflected share.
     vec3 kd_amb = vec3(1.0) - f_schlick_rough(NdotV, f0, roughness);

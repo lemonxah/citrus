@@ -268,10 +268,16 @@ pub struct BakedLightmap {
     pub pixels: Vec<f32>,
 }
 
-/// SH-L1 irradiance for one probe: 4 coefficients × RGB.
+/// SH-L1 irradiance for one probe: 4 coefficients × RGB, plus an SH-L1 of the
+/// directional distance-to-geometry (4 scalar coefficients) used for DDGI-style
+/// visibility weighting at sample time. `dist` left zero (the bake path) disables
+/// the visibility test — the standard shader then weights probes by trilinear
+/// only. The software march fills it so probes occluded from a fragment (e.g.
+/// behind a wall) are down-weighted, killing light leaks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeSh {
     pub coeffs: [[f32; 3]; 4],
+    pub dist: [f32; 4],
 }
 
 /// Result of a bake: a lightmap per instance (same order) and SH per probe.
@@ -353,6 +359,12 @@ pub struct PostFx {
     pub vignette_intensity: f32,
     pub vignette_smoothness: f32,
     pub vignette_color: [f32; 3],
+    pub bloom_enabled: bool,
+    pub bloom_threshold: f32,
+    pub bloom_intensity: f32,
+    pub bloom_radius: f32,
+    pub ca_enabled: bool,
+    pub ca_intensity: f32,
 }
 
 impl Default for PostFx {
@@ -370,6 +382,12 @@ impl Default for PostFx {
             vignette_intensity: 0.4,
             vignette_smoothness: 0.4,
             vignette_color: [0.0, 0.0, 0.0],
+            bloom_enabled: false,
+            bloom_threshold: 1.0,
+            bloom_intensity: 0.5,
+            bloom_radius: 0.5,
+            ca_enabled: false,
+            ca_intensity: 0.3,
         }
     }
 }

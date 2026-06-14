@@ -418,6 +418,7 @@ version = "0.1.0"
 dependencies = [
  "citrus-core",
  "egui",
+ "egui-phosphor",
  "egui_extras",
  "glam 0.30.10",
  "image",
@@ -795,6 +796,15 @@ dependencies = [
  "gpu-allocator",
  "log",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "egui-phosphor"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3b2838620355debaeb7fa3cc331a1d8ab77e6387d40e65686fa468c229dbf63"
+dependencies = [
+ "egui",
 ]
 
 [[package]]
