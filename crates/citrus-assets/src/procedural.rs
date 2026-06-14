@@ -310,7 +310,8 @@ fn cube(size: f32) -> MeshData {
     // each face inset by a gutter so the bake/bilinear filter don't bleed
     // between faces. (uv0 alone can't be a lightmap: all faces would share the
     // same 0..1 region and fight over the same texels.)
-    const M: f32 = 0.04; // per-cell inset (gutter)
+    const M: f32 = 0.06; // per-cell inset (gutter): bigger = wider inter-face gap
+                         // so bilinear filtering doesn't bleed between faces.
     for (f, (normal, tangent, corners)) in faces.into_iter().enumerate() {
         let base = vertices.len() as u32;
         let col = (f % 3) as f32;

@@ -131,6 +131,116 @@ impl GpuTexture {
         })
     }
 
+    /// Upload a single-channel `R32_SFLOAT` 3D volume (one float per voxel,
+    /// x fastest then y then z) — used for per-mesh signed distance fields in
+    /// the software-GI march. Sampled as a `sampler3D`. (Consumed once the SDF
+    /// march pipeline lands; allow dead_code until then.)
+    #[allow(dead_code)]
+    pub fn upload_volume(
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        pool: vk::CommandPool,
+        queue: vk::Queue,
+        voxels: &[f32],
+        dims: [u32; 3],
+    ) -> Result<Self> {
+        let format = vk::Format::R32_SFLOAT;
+        let extent = vk::Extent3D {
+            width: dims[0].max(1),
+            height: dims[1].max(1),
+            depth: dims[2].max(1),
+        };
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_3D)
+            .format(format)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name: "mesh sdf",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+
+        let mut staging = Buffer::new(
+            device,
+            allocator,
+            std::mem::size_of_val(voxels) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+            "sdf staging",
+        )?;
+        staging.write(0, bytemuck::cast_slice(voxels));
+
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        one_time_submit(device, pool, queue, |cb| unsafe {
+            let to_transfer = vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[to_transfer]),
+            );
+            let copy = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(extent);
+            device.cmd_copy_buffer_to_image(
+                cb,
+                staging.handle,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+            let to_sampled = vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[to_sampled]),
+            );
+        })?;
+        staging.destroy(device, allocator);
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_3D)
+            .format(format)
+            .subresource_range(range);
+        let view = unsafe { device.create_image_view(&view_info, None)? };
+        Ok(Self {
+            image,
+            view,
+            allocation: Some(allocation),
+        })
+    }
+
     /// Upload baked lightmaps as a sampled `R32G32B32A32_SFLOAT` 2D array, one
     /// layer per object. Every `layer` must already be `size*size*4` floats
     /// (RGBA32F, resampled to a common size by the caller). Sampled in the

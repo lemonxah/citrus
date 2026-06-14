@@ -63,6 +63,8 @@ pub struct ScenePanelResponse {
     pub spawn: Option<SpawnKind>,
     /// Object index requested for deletion (context menu / Delete key).
     pub delete: Option<usize>,
+    /// (index, new name) inline-rename commit (F2 in the tree).
+    pub rename: Option<(usize, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,6 +147,8 @@ pub struct ScenePanel {
     filter: String,
     collapsed: HashSet<usize>,
     root_collapsed: bool,
+    /// Inline rename in progress: (object index, edit buffer, focus-on-first-frame).
+    renaming: Option<(usize, String, bool)>,
 }
 
 impl ScenePanel {
@@ -165,6 +169,17 @@ impl ScenePanel {
         });
         ui.separator();
         let filter = self.filter.to_lowercase();
+
+        // F2 starts an inline rename of the selected object, unless a text
+        // field is already focused (e.g. the filter box).
+        if self.renaming.is_none()
+            && let Some(i) = *selected
+            && i < rows.len()
+            && ui.input(|inp| inp.key_pressed(egui::Key::F2))
+            && !ui.memory(|m| m.focused().is_some())
+        {
+            self.renaming = Some((i, rows[i].name.clone(), true));
+        }
 
         // children[i] = indices whose parent == i; roots have no parent.
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
@@ -409,6 +424,42 @@ impl ScenePanel {
         let row_data = &rows[index];
         let is_selected = *selected == Some(index);
         let collapsed = self.collapsed.contains(&index);
+
+        // Inline rename editor in place of the normal row.
+        if matches!(&self.renaming, Some((i, _, _)) if *i == index) {
+            let indent = 4.0 + depth as f32 * 14.0;
+            let mut commit = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.add_space(indent);
+                if let Some((_, text, focus)) = &mut self.renaming {
+                    let edit = ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY));
+                    if *focus {
+                        edit.request_focus();
+                        *focus = false;
+                    }
+                    if edit.lost_focus() {
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            cancel = true;
+                        } else {
+                            commit = true;
+                        }
+                    }
+                }
+            });
+            if commit {
+                if let Some((i, text, _)) = self.renaming.take() {
+                    let name = text.trim().to_owned();
+                    if !name.is_empty() && name != rows[i].name {
+                        response.rename = Some((i, name));
+                    }
+                }
+            } else if cancel {
+                self.renaming = None;
+            }
+            return;
+        }
+
         let row = self.row_widget(
             ui,
             row_data.icon,

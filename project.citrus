@@ -3,7 +3,7 @@
     last_scene: Some("scenes/world.scene"),
     boot_scene: None,
     settings: (
-        vsync: true,
+        vsync: false,
         show_stats: true,
         show_stats_overlay: false,
         snap: false,

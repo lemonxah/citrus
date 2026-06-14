@@ -18,7 +18,14 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   indirect term fed by baked lightmaps / probe SH (else flat ambient)
 - [done] Lights: directional / point / spot — color, intensity, range, spot angle/blend
   (up to 16/frame, distance attenuation + spot cones)
-- [partial] Shadow-casting lights (shadow-map array, PCF; needs acne/bias GPU validation)
+- [partial] Shadow-casting lights (shadow-map array, PCF; needs acne/bias GPU validation).
+  Per-light **Shadows** dropdown: No Shadows / Hard Shadows (single depth tap, sharp) /
+  Soft Shadows (5x5 PCF penumbra). The filter mode rides the sign of the light's shadow
+  view-count, so no extra GPU light field is needed.
+- [done] **Baked soft shadows** via a per-light **Radius** (light source size): the bake
+  aims each shadow ray at a random point on a disc of that radius, so shadows get a smooth
+  penumbra that hides the texel stair-stepping at low texel density (instead of a hard,
+  jagged edge). 0 = hard. Realtime shadows are unaffected (they already PCF-soften).
 - [done] Skybox: procedural gradient + equirect LDR image (per-scene)
 - [done] Selection outline (inverted hull, depth-prepass, always-on-top)
 - [done] Error shader (animated swirl for broken/missing/unknown shaders)
@@ -58,12 +65,11 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   environment sun/sky; **Realtime lights are never baked**. Once a bake exists, those
   baked lights (incl. the env sun) drop from the realtime pass to avoid double-counting;
   with no bake they all stay realtime, so an un-baked scene is never dark (baking is
-  opt-in). Default light mode is Realtime. Only objects with **Contribute GI**
-  (the per-object static flag) get lightmaps.
-- [done] Per-object lightmap controls (Unity-style), in the inspector's Mesh section:
-  a **Contribute GI** toggle (object is baked as a lightmapped surface + ray-trace
-  occluder) and a **Scale In Lightmap** multiplier that scales that object's texel
-  density up/down from the scene default (sharper surface or fewer texels).
+  opt-in). Default light mode is Realtime. Only **Static** objects get lightmaps.
+- [done] Per-object lightmap controls (Unity-style): a **Static** toggle in the
+  inspector header (object is baked as a lightmapped surface + ray-trace occluder)
+  and a **Scale In Lightmap** multiplier in the Mesh section that scales that object's
+  texel density up/down from the scene default (sharper surface or fewer texels).
 - [done] Primitive lightmap UVs: a second UV set (`uv1`) — plane/sphere/capsule reuse their
   single non-overlapping `uv0` chart; the **cube packs its 6 faces into a non-overlapping
   3×2 atlas** (with a gutter) so faces don't share lightmap texels. Imported meshes use
@@ -71,14 +77,61 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] **Bake denoise + seam fix**: after the path trace, each lightmap is run through
   an edge-aware **À-Trous denoiser** (CPU; reads back the position+normal gbuffer, weights
   a 5×5 wavelet blur by world-position + normal similarity so it smooths MC grain without
-  crossing shadow/geometry edges or UV-chart seams), then **dilated** (valid texels spread
-  into the gutter) so bilinear sampling at chart edges never reads the black background —
-  fixes the cube-edge seams.
+  crossing shadow/geometry edges or UV-chart seams), then **seam-stitched** (co-located
+  cross-chart texels — the cube's per-face atlas, the sphere's lat-long meridian — are
+  averaged when their normals agree, so the chart boundary stops showing as a line while
+  genuine hard-edge discontinuities are kept), then **dilated** (valid texels spread into
+  the gutter) so bilinear sampling at chart edges never reads the black background.
+- [done] **ACES tonemapping**: the standard + skybox shaders roll HDR highlights off to
+  [0,1] (Narkowicz ACES, in linear before the sRGB swapchain write), so a close point light
+  or stacked ambient + baked bounce shows surface detail instead of clipping to flat white.
+- [done] **Realtime GI**: an Environment-tab setting (serializes with the scene, so it runs
+  in the editor *and* a shipped game) that, while the scene isn't baked, re-traces an auto
+  probe grid from the realtime lights (reuses the ray-query path tracer with `probes_only`),
+  temporally blends the SH, and uploads so surfaces show live indirect bounce. Settings:
+  Enabled, Bounces, Quality (rays/probe), Intensity, Probe Spacing, Responsiveness (temporal
+  blend), Update Interval. Driven by a shared `RealtimeGiState` with **dirty-detection** —
+  it only re-traces when lights/objects/settings change, then settles and goes idle, so a
+  static scene does no work. The **Software (SDF) march runs on a background thread**, so
+  moving objects (Play mode) don't hitch the frame; the main thread blends + uploads when a
+  trace finishes. Hardware (ray-query) mode is still synchronous + rebuilds accel structures
+  each trace — GPU async / resident-accel is the follow-up.
+- [done] Approximate **lumens/lux readout** under a light's Intensity (display only — our
+  intensity stays a radiance multiplier; point = 4π·I, spot = cone solid angle ·I, dir = lux).
+- [wip] **Software GI (Lumen-style, no RT cores / no bake)**: a second realtime-GI **Mode**
+  (Environment tab → Hardware (RT cores) | Software (SDF)) that marches per-mesh signed
+  distance fields instead of the hardware BVH. Phase 1a (mode setting + UI) and 1b (per-mesh
+  CPU SDF generation — `sdf::generate_sdf`, closest-point-on-triangle distance + nearest-tri
+  normal sign, unit-tested) are done. Phase 1c is a CPU **multi-bounce** path march
+  (`sw_gi.rs`, honors the Bounces setting, throughput ×albedo per hop) reusing the SDFs,
+  **parallelized across cores** on a **background thread** so Play-mode moving objects don't
+  hitch. Each noisy trace is **averaged into the probes (EMA, rate = Responsiveness)** to
+  cancel Monte-Carlo flicker, then a short per-frame ease glides between updates (cheap
+  in-place SSBO rewrite `update_probe_sh`, no GPU stall). Grid up to 16/axis, up to 16
+  bounces. **Emissive materials are area emitters** in both bake (static objects) + realtime GI. Next: surface cache / screen probes for contact-scale GI — probe
+  GI is low-frequency, so tight contact fill (under-object darkening) is still limited.
+- [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
+  even cube-face packing) — the seam-stitch hides the seams but the lat-long sphere still
+  wastes texels at the poles.
 - [done] Baker's Man dock tab (texel density 1–1024 /m log, bounces, samples up to 65536,
   max size, Bake/Clear) + a **UV-checker preview** toggle: renders objects as a
   lightmap-UV checkerboard whose cell size tracks each object's would-be texel density
   (big squares = low resolution, stretched = UV distortion; grey = non-static) — live from
   the current bake settings, no re-bake needed.
+
+### Post-processing
+- [partial] **Unity Volume-style post-processing**: a `.postfx` profile asset (RON — tonemap
+  mode/exposure, bloom, color grading, vignette, chromatic aberration) created from the file
+  browser's New Post FX Profile; a **Volume (Post FX)** component (global/local, priority,
+  weight, blend distance, box extents) references one; `LoadedScene::effective_postfx` blends
+  the volumes affecting the camera (priority-ordered, weight × local proximity) into one
+  profile fed to the shaders via the frame UBO. **Applied now (per-pixel, in standard+skybox
+  shaders): exposure, tonemap (None/Reinhard/ACES), color grading (exposure/contrast/
+  saturation/temperature/tint), vignette.** ACES moved out of hardcode into the profile.
+  An in-editor **`.postfx` profile editor** (select the asset → sliders for tonemap, color
+  grading, vignette, bloom, chromatic aberration; saves + live-invalidates the cache).
+  [todo] Chromatic aberration + bloom rendering (need an offscreen-HDR fullscreen pass — the
+  settings are authorable now but only apply once that pass lands).
 
 ### Editor
 - [done] Dockable panels (egui_dock): Scene / Inspector / Files / Log / Code / Baker
@@ -86,9 +139,12 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Transform gizmos: move (W) / rotate (R) / scale (E), pivot/center + global/local,
   snap (grid + 15deg rotation), fat hit areas with orbit priority, hover emphasis
 - [done] Camera-relative axis flipping + orientation cross on move/scale gizmos
-- [done] Scene tree: nested hierarchy, drag-to-reparent, connector lines, Alt-click cascade
+- [done] Scene tree: nested hierarchy, drag-to-reparent, connector lines, Alt-click cascade,
+  F2 inline rename of the selected object, Ctrl+D duplicates the selected object (whole
+  subtree; shares meshes/materials, fresh ids, not undoable like delete)
+- [done] Ctrl+D in the file browser duplicates the selected file/folder (`<stem>_copy`)
 - [done] Project file browser (Unity-style folder tree + icon grid, rename/cut/copy/paste/
-  drag-move, context menus)
+  drag-move, context menus, F2 inline rename of the selected file/folder)
 - [done] Unified Inspector (object transform/mesh/material slots, `.material` editor,
   component list with Add/Remove)
 - [done] Orbit / pan / scroll-dolly editor camera, F to frame, Escape to deselect

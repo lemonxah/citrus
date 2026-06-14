@@ -89,6 +89,7 @@ pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry
         window: None,
         renderer: None,
         physics: None,
+        rt_gi: crate::realtime_gi::RealtimeGiState::default(),
         start: Instant::now(),
         last_frame: Instant::now(),
         init_error: None,
@@ -109,6 +110,8 @@ struct GameApp {
     renderer: Option<Renderer>,
     /// Physics simulation, rebuilt whenever a scene loads. A game always runs it.
     physics: Option<PhysicsWorld>,
+    /// Realtime-GI driver — runs the scene's realtime-GI setting in the game.
+    rt_gi: crate::realtime_gi::RealtimeGiState,
     start: Instant,
     last_frame: Instant,
     /// Set if `init` failed; surfaced after the loop exits.
@@ -206,6 +209,10 @@ impl GameApp {
         }
         self.apply_commands(&mut renderer, commands);
 
+        // Realtime GI (if the scene enables it): live indirect bounce, same as
+        // the editor preview.
+        self.rt_gi.update(&mut renderer, &mut self.scene, dt);
+
         self.scene.sync_draws(None, 0.0);
 
         let (width, height) = self
@@ -241,6 +248,7 @@ impl GameApp {
                 spot_inner_deg: 0.0,
                 spot_outer_deg: 0.0,
                 cast_shadows: true,
+                soft_shadows: true,
                 shadow_bias: 0.003,
             });
         }
@@ -261,6 +269,7 @@ impl GameApp {
         if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
             tracing::error!("setting shadow resolution: {e:#}");
         }
+        let postfx = self.scene.effective_postfx(cam_pos, &self.config.assets_root);
 
         let frame = FrameInput {
             clear_color: [0.016, 0.016, 0.024, 1.0],
@@ -278,6 +287,7 @@ impl GameApp {
             time: t,
             draws: &self.scene.draws,
             lightmap_preview: false,
+            postfx,
             egui: None,
         };
         if let Err(e) = renderer.render(&frame) {

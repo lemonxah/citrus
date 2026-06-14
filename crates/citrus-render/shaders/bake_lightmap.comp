@@ -93,11 +93,12 @@ bool occluded(vec3 origin, vec3 dir, float dist) {
 }
 
 // Direct diffuse irradiance (÷π not applied here — caller multiplies albedo/π).
-vec3 direct_light(vec3 p, vec3 n) {
+vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
     vec3 sum = vec3(0.0);
     for (uint i = 0u; i < pc.light_count; ++i) {
         Light l = lights.data[i];
         uint kind = uint(l.position.w);
+        float radius = max(l.spot.z, 0.0); // source radius for soft shadows
         vec3 to_light;
         float dist;
         float atten = 1.0;
@@ -120,7 +121,31 @@ vec3 direct_light(vec3 p, vec3 n) {
         }
         float ndl = max(dot(n, to_light), 0.0);
         if (ndl <= 0.0 || atten <= 0.0) continue;
-        if (occluded(p + n * 1e-3, to_light, dist)) continue;
+
+        // Soft shadow: aim the shadow ray at a random point on a disc of
+        // `radius` perpendicular to the light direction (directional lights
+        // treat `radius` as an angular spread). Averaged over the texel's
+        // samples this yields a smooth penumbra instead of a hard, texel-
+        // stair-stepped edge.
+        vec3 sdir = to_light;
+        float sdist = dist;
+        if (radius > 1e-5) {
+            vec3 t, b;
+            basis(to_light, t, b);
+            float ang = 2.0 * PI * rnd(rng);
+            float rr = sqrt(rnd(rng)) * radius;
+            vec2 disc = vec2(cos(ang), sin(ang)) * rr;
+            if (kind == 0u) {
+                // Directional: perturb the (infinite-distance) direction.
+                sdir = normalize(to_light + t * disc.x + b * disc.y);
+            } else {
+                vec3 target = l.position.xyz + t * disc.x + b * disc.y;
+                vec3 d = target - p;
+                sdist = length(d);
+                sdir = d / max(sdist, 1e-5);
+            }
+        }
+        if (occluded(p + n * 1e-3, sdir, sdist)) continue;
         sum += l.color.rgb * (ndl * atten);
     }
     return sum;
@@ -171,7 +196,7 @@ void main() {
 
     for (uint s = 0u; s < samples; ++s) {
         // Direct term at the texel surface.
-        vec3 radiance = direct_light(P, N);
+        vec3 radiance = direct_light(P, N, rng);
 
         // Indirect: walk a cosine-weighted path. throughput already folds the
         // cosine/pdf cancellation of a Lambert BRDF (albedo/π · cosθ / pdf,
@@ -195,7 +220,7 @@ void main() {
             if (dot(hn, dir) > 0.0) hn = -hn; // face the incoming ray
             radiance += throughput * hemis;                     // emissive hit
             throughput *= halbedo;
-            radiance += throughput * direct_light(hp, hn);      // direct at hit
+            radiance += throughput * direct_light(hp, hn, rng);  // direct at hit
             ro = hp;
             rn = hn;
             if (max(throughput.r, max(throughput.g, throughput.b)) < 0.01) break;

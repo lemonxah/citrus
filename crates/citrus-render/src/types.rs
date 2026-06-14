@@ -179,6 +179,9 @@ pub struct LightInstance {
     pub spot_outer_deg: f32,
     /// Render shadows for this light (depth map from its POV).
     pub cast_shadows: bool,
+    /// Soft (PCF kernel) vs hard (single tap) shadow edge. Ignored when
+    /// `cast_shadows` is false.
+    pub soft_shadows: bool,
     /// Light-clip-space depth-compare bias.
     pub shadow_bias: f32,
 }
@@ -236,6 +239,8 @@ pub struct BakeLight {
     pub range: f32,
     pub spot_inner_deg: f32,
     pub spot_outer_deg: f32,
+    /// Light source radius (world units) for soft shadows; 0 = hard.
+    pub radius: f32,
 }
 
 /// Everything the GPU bake needs in one renderer-agnostic bundle.
@@ -250,6 +255,10 @@ pub struct BakeInput<'a> {
     pub bounces: u32,
     /// Paths traced per lightmap texel / per probe direction.
     pub samples: u32,
+    /// Skip per-instance lightmap tracing and bake only the probes (the
+    /// instances still act as occluders/bouncers). Used by the realtime-GI
+    /// preview, which only needs probe SH each update.
+    pub probes_only: bool,
 }
 
 /// One baked lightmap: `size`×`size` RGBA32F (rgb = irradiance, a = validity).
@@ -318,5 +327,49 @@ pub struct FrameInput<'a> {
     /// Debug: render objects as a lightmap-UV checkerboard (cell size tracks
     /// each object's lightmap resolution) instead of their material.
     pub lightmap_preview: bool,
+    /// Resolved post-processing parameters (from the camera's blended Volume
+    /// profiles). Per-pixel effects applied in the surface shaders.
+    pub postfx: PostFx,
     pub egui: Option<EguiDraw>,
+}
+
+/// Resolved per-frame post-processing parameters (the blended profile flattened
+/// for the GPU). Per-pixel effects (exposure, tonemap, color grading, vignette)
+/// are applied in the surface shaders; chromatic aberration + bloom need a
+/// fullscreen pass (follow-up).
+#[derive(Clone, Copy, Debug)]
+pub struct PostFx {
+    /// 0 = none, 1 = Reinhard, 2 = ACES.
+    pub tonemap: u32,
+    /// Tonemap exposure in stops (EV); color ×= 2^exposure before the operator.
+    pub exposure: f32,
+    pub grading_enabled: bool,
+    pub grade_exposure: f32,
+    pub contrast: f32,
+    pub saturation: f32,
+    pub temperature: f32,
+    pub tint: f32,
+    pub vignette_enabled: bool,
+    pub vignette_intensity: f32,
+    pub vignette_smoothness: f32,
+    pub vignette_color: [f32; 3],
+}
+
+impl Default for PostFx {
+    fn default() -> Self {
+        Self {
+            tonemap: 2, // ACES — matches the previous hardcoded behavior
+            exposure: 0.0,
+            grading_enabled: false,
+            grade_exposure: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            temperature: 0.0,
+            tint: 0.0,
+            vignette_enabled: false,
+            vignette_intensity: 0.4,
+            vignette_smoothness: 0.4,
+            vignette_color: [0.0, 0.0, 0.0],
+        }
+    }
 }

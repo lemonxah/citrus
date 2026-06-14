@@ -161,7 +161,9 @@ pub fn bake(
     let mut output = BakeOutput::default();
 
     // --- Lightmaps (Phase 3) ----------------------------------------------
-    if let Some(tlas) = &tlas {
+    if let Some(tlas) = &tlas
+        && !input.probes_only
+    {
         let gbuffer = GbufferPipeline::new(ctx)?;
         let lightmap = LightmapPipeline::new(ctx)?;
         for (i, inst) in input.instances.iter().enumerate() {
@@ -239,7 +241,7 @@ fn gpu_light(l: &crate::types::BakeLight) -> GpuLight {
         spot: [
             (l.spot_inner_deg.to_radians() * 0.5).cos(),
             (l.spot_outer_deg.to_radians() * 0.5).cos(),
-            0.0,
+            l.radius.max(0.0), // soft-shadow source radius
             0.0,
         ],
     }
@@ -971,6 +973,80 @@ fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, it
     *pixels = src;
 }
 
+/// Stitch lightmap seams: texels that land on the same world-space point but in
+/// different UV charts (the cube's per-face atlas, the sphere's lat-long
+/// meridian) get different Monte-Carlo results, so the chart boundary shows as a
+/// line. Average co-located texels whose normals agree (so genuine hard-edge
+/// lighting discontinuities, where the normals differ, are left intact). Uses
+/// the gbuffer world position + normal already read back for the denoiser, so
+/// it's mesh-agnostic.
+fn stitch_seams(pixels: &mut [f32], pos: &[f32], nrm: &[f32], size: u32) {
+    let s = size as i32;
+    // World-space AABB of valid texels → a quantization cell ~1.5 texels wide so
+    // points that coincide in 3D share a cell regardless of mesh scale.
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    let mut any = false;
+    for t in 0..(size * size) as usize {
+        if pixels[t * 4 + 3] <= 0.0 {
+            continue;
+        }
+        any = true;
+        for k in 0..3 {
+            lo[k] = lo[k].min(pos[t * 4 + k]);
+            hi[k] = hi[k].max(pos[t * 4 + k]);
+        }
+    }
+    if !any {
+        return;
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let cell = (diag / size as f32 * 1.5).max(1e-5);
+
+    // Bucket valid texels by quantized world cell.
+    let key = |t: usize| -> (i32, i32, i32) {
+        (
+            (pos[t * 4] / cell).floor() as i32,
+            (pos[t * 4 + 1] / cell).floor() as i32,
+            (pos[t * 4 + 2] / cell).floor() as i32,
+        )
+    };
+    let mut buckets: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for y in 0..s {
+        for x in 0..s {
+            let t = (y * size as i32 + x) as usize;
+            if pixels[t * 4 + 3] > 0.0 {
+                buckets.entry(key(t)).or_default().push(t);
+            }
+        }
+    }
+    // Within each multi-texel cell, average the group of texels sharing a normal
+    // direction (dot > 0.9), so only smooth seams are merged.
+    for group in buckets.values() {
+        if group.len() < 2 {
+            continue;
+        }
+        for &a in group {
+            let na = [nrm[a * 4], nrm[a * 4 + 1], nrm[a * 4 + 2]];
+            let mut sum = [0.0f32; 3];
+            let mut n = 0u32;
+            for &b in group {
+                let nb = [nrm[b * 4], nrm[b * 4 + 1], nrm[b * 4 + 2]];
+                if na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2] > 0.9 {
+                    sum[0] += pixels[b * 4];
+                    sum[1] += pixels[b * 4 + 1];
+                    sum[2] += pixels[b * 4 + 2];
+                    n += 1;
+                }
+            }
+            if n > 1 {
+                pixels[a * 4] = sum[0] / n as f32;
+                pixels[a * 4 + 1] = sum[1] / n as f32;
+                pixels[a * 4 + 2] = sum[2] / n as f32;
+            }
+        }
+    }
+}
+
 /// Dilate valid texels outward into invalid (gutter) texels, `iters` rings.
 /// Bilinear sampling at a UV-chart edge then reads the surface colour instead
 /// of the black background — removes lightmap seams.
@@ -1259,7 +1335,10 @@ fn bake_one_lightmap(
     // dilate valid texels into the gutter so bilinear sampling at chart edges
     // never reads the black background (fixes lightmap seams).
     denoise_atrous(&mut pixels, &pos, &nrm, size, 4);
-    dilate_lightmap(&mut pixels, size, 4);
+    // Merge co-located cross-chart texels (cube face-atlas / sphere meridian)
+    // before dilation so the stitched values also bleed into the gutter.
+    stitch_seams(&mut pixels, &pos, &nrm, size);
+    dilate_lightmap(&mut pixels, size, 6);
 
     let mut alloc = allocator.lock().unwrap();
     let mut readback = readback;

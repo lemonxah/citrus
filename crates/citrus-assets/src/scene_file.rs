@@ -152,6 +152,105 @@ pub struct WorldEnvironment {
     /// Lighting-bake settings (Bakery-style: texels-per-meter density).
     #[serde(default)]
     pub bake: BakeSettings,
+    /// Realtime-GI settings: when enabled (and no bake exists) the engine
+    /// continuously re-traces light probes from the realtime lights so surfaces
+    /// show live indirect bounce — in the editor and in a shipped game.
+    #[serde(default, deserialize_with = "de_realtime_gi")]
+    pub realtime_gi: RealtimeGi,
+}
+
+/// Accept both the legacy `realtime_gi: bool` (just the enable toggle) and the
+/// current struct form, so scenes saved before the settings landed still load.
+/// A Visitor (not `#[serde(untagged)]`) is used so the struct path delegates to
+/// the *typed* `RealtimeGi` deserialize — untagged would buffer into a
+/// self-describing `Content`, which can't replay RON enum variants (the `mode`
+/// field), breaking the valid struct form.
+fn de_realtime_gi<'de, D>(d: D) -> Result<RealtimeGi, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = RealtimeGi;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a bool (legacy) or a RealtimeGi struct")
+        }
+        fn visit_bool<E: serde::de::Error>(self, enabled: bool) -> Result<RealtimeGi, E> {
+            Ok(RealtimeGi {
+                enabled,
+                ..Default::default()
+            })
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            map: A,
+        ) -> Result<RealtimeGi, A::Error> {
+            RealtimeGi::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// How the realtime-GI probe trace is computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GiMode {
+    /// Hardware ray-query (RT cores) against the scene BVH — most accurate.
+    #[default]
+    RayQuery,
+    /// Software ray-marching of per-mesh signed distance fields (no RT cores,
+    /// runs anywhere). Lumen-style.
+    Software,
+}
+
+impl GiMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RayQuery => "Hardware (RT cores)",
+            Self::Software => "Software (SDF)",
+        }
+    }
+    pub const ALL: [GiMode; 2] = [Self::RayQuery, Self::Software];
+}
+
+/// Realtime global-illumination (probe) settings. Drives the live probe re-trace
+/// that lets realtime lights cast soft indirect bounce without a bake.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RealtimeGi {
+    pub enabled: bool,
+    /// Tracing backend (hardware ray-query vs software SDF march).
+    pub mode: GiMode,
+    /// Indirect bounces per path (1 = single bounce; more = softer fill).
+    pub bounces: u32,
+    /// Rays traced per probe — higher = less noise, more cost.
+    pub samples: u32,
+    /// GI strength multiplier applied to the probe SH before upload.
+    pub intensity: f32,
+    /// World-units between auto-grid probes (smaller = finer GI, more cost).
+    pub probe_spacing: f32,
+    /// Per-update blend toward the new trace (0..1): lower = smoother/laggier,
+    /// higher = snappier/noisier.
+    pub temporal_blend: f32,
+    /// Seconds between probe re-traces when the scene is changing.
+    pub update_interval: f32,
+}
+
+impl Default for RealtimeGi {
+    fn default() -> Self {
+        // Tuned for the soft, gently-settling Lumen look: low temporal blend so
+        // the GI eases in over ~a second, a coarse probe grid (low-frequency =
+        // soft), 2 bounces for ambient fill.
+        Self {
+            enabled: false,
+            mode: GiMode::RayQuery,
+            bounces: 2,
+            samples: 64,
+            intensity: 1.0,
+            probe_spacing: 2.0,
+            temporal_blend: 0.12,
+            update_interval: 0.2,
+        }
+    }
 }
 
 /// Lighting-bake parameters, authored per scene. Resolution is a texel
@@ -207,6 +306,7 @@ impl Default for WorldEnvironment {
             shadow_softness: default_shadow_softness(),
             shadow_distance: default_shadow_distance(),
             bake: BakeSettings::default(),
+            realtime_gi: RealtimeGi::default(),
         }
     }
 }
@@ -221,6 +321,32 @@ pub struct SceneFile {
     /// Scene environment / world lighting.
     #[serde(default)]
     pub environment: WorldEnvironment,
+}
+
+#[cfg(test)]
+mod rgi_compat_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_bool_and_struct_both_parse() {
+        let legacy: WorldEnvironment =
+            ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:false)")
+                .expect("legacy bool form must parse");
+        assert!(!legacy.realtime_gi.enabled);
+
+        let full: WorldEnvironment =
+            ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:(enabled:true,bounces:3))")
+                .expect("struct form must parse");
+        assert!(full.realtime_gi.enabled);
+        assert_eq!(full.realtime_gi.bounces, 3);
+
+        // The struct form WITH the `mode` enum field — this is what broke the
+        // untagged shim (RON enum can't replay through serde's Content buffer).
+        let with_mode: WorldEnvironment =
+            ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:(enabled:true,mode:Software,bounces:2,samples:64,intensity:1.0,probe_spacing:2.0,temporal_blend:0.12,update_interval:0.2))")
+                .expect("struct form with mode enum must parse");
+        assert_eq!(with_mode.realtime_gi.mode, GiMode::Software);
+    }
 }
 
 pub fn load_scene_file(path: impl AsRef<Path>) -> Result<SceneFile> {

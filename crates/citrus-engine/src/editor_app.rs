@@ -85,6 +85,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         components: ComponentRegistry::with_builtins(),
         editor_components: EditorComponents::with_builtins(),
         playing: false,
+        play_paused: false,
         play_scene_switched: false,
         play_origin_scene: None,
         play_snapshot: None,
@@ -133,6 +134,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         world: hecs::World::new(),
         start: Instant::now(),
         last_frame: Instant::now(),
+        rt_gi: crate::realtime_gi::RealtimeGiState::default(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -233,6 +235,7 @@ enum EditorAction {
     CreateMaterial(PathBuf),
     CreateScene(PathBuf),
     CreateShader(PathBuf),
+    CreatePostFx(PathBuf),
     CreateFolder(PathBuf),
     PickAt(egui::Pos2),
     AssignMaterialAt(egui::Pos2, PathBuf),
@@ -284,6 +287,8 @@ enum EditorAction {
     /// (child, new parent, before-sibling) reorder/move.
     MoveObject(usize, Option<usize>, Option<usize>),
     DeleteObject(usize),
+    DuplicateObject(usize),
+    DuplicateFile(PathBuf),
     DeleteFile(PathBuf),
     SetSkybox(PathBuf),
     ClearSkybox,
@@ -519,6 +524,9 @@ struct EngineApp {
     editor_components: EditorComponents,
     /// Play mode: components run every frame; edits aren't recorded to undo.
     playing: bool,
+    /// Paused while playing: components/physics/audio freeze but the played
+    /// state stays so you can inspect it. Cleared on Stop.
+    play_paused: bool,
     /// Object state captured at Play start, restored at Stop.
     play_snapshot: Option<Vec<ObjectState>>,
     /// Active physics simulation (built on Play, cleared on Stop).
@@ -605,6 +613,13 @@ struct EngineApp {
     world: hecs::World,
     start: Instant,
     last_frame: Instant,
+    /// Realtime-GI preview: temporally-accumulated probe SH from the last few
+    /// updates (blended toward each new probe-only trace), the grid dimensions
+    /// it was built for (a layout change forces a reset), whether RT-GI probes
+    /// are currently uploaded (so we can clear them when it turns off), and a
+    /// throttle timer.
+    /// Realtime-GI driver (continuous probe re-trace from the realtime lights).
+    rt_gi: crate::realtime_gi::RealtimeGiState,
 }
 
 impl EngineApp {
@@ -857,6 +872,7 @@ impl EngineApp {
                     | EditorAction::SpawnBoxCollider
                     | EditorAction::SpawnSphereCollider
                     | EditorAction::DeleteObject(_)
+                    | EditorAction::DuplicateObject(_)
                     | EditorAction::ImportModel(_)
                     | EditorAction::NewScene
                     | EditorAction::ClearSkybox
@@ -939,6 +955,16 @@ impl EngineApp {
                     match std::fs::write(&path, citrus_assets::SHADER_TEMPLATE) {
                         Ok(()) => self.actions.push(EditorAction::SelectFile(path)),
                         Err(e) => tracing::error!("creating shader: {e:#}"),
+                    }
+                }
+                EditorAction::CreatePostFx(dir) => {
+                    let path = unique_path(&dir, "new_postfx", "postfx");
+                    match citrus_assets::save_postfx(
+                        &path,
+                        &citrus_assets::PostFxProfile::default(),
+                    ) {
+                        Ok(()) => self.actions.push(EditorAction::SelectFile(path)),
+                        Err(e) => tracing::error!("creating postfx: {e:#}"),
                     }
                 }
                 EditorAction::CreateFolder(dir) => {
@@ -1382,6 +1408,29 @@ impl EngineApp {
                     self.inspector_lock_target = None;
                     self.inspector.locked = false;
                 }
+                EditorAction::DuplicateObject(index) => {
+                    // Not undoable (like delete). Select the new copy.
+                    if let Some(new_root) =
+                        self.scene.duplicate_object(index, &self.components)
+                    {
+                        self.selection = Selection::Object(new_root);
+                    }
+                }
+                EditorAction::DuplicateFile(path) => {
+                    if let Some(dest) = duplicate_file_path(&path) {
+                        match std::fs::copy(&path, &dest) {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "duplicated {} -> {}",
+                                    path.display(),
+                                    dest.display()
+                                );
+                                self.actions.push(EditorAction::SelectFile(dest));
+                            }
+                            Err(e) => tracing::error!("duplicating file: {e:#}"),
+                        }
+                    }
+                }
                 EditorAction::DeleteFile(path) => {
                     let result = if path.is_dir() {
                         std::fs::remove_dir_all(&path)
@@ -1502,29 +1551,11 @@ impl EngineApp {
                     let path = path
                         .or_else(|| self.current_scene_path.clone())
                         .unwrap_or_else(|| self.project_root.join(&self.scene_name_input));
-                    // Materialize material associations: every material the
-                    // scene's objects reference gets a real `.material` file
-                    // (created under materials/ if missing, refreshed
-                    // otherwise), so the saved scene points at assets.
-                    // Exception: imported materials with embedded textures
-                    // stay inline — a .material file can't carry embedded
-                    // textures yet, and converting them would drop the
-                    // textures on reload.
-                    let mut referenced: Vec<usize> = self
-                        .scene
-                        .objects
-                        .iter()
-                        .filter_map(|o| o.render.map(|r| r.material))
-                        .collect();
-                    referenced.sort_unstable();
-                    referenced.dedup();
-                    for index in referenced {
-                        let entry = &self.scene.materials[index];
-                        if entry.file.is_none() && entry.embedded_textures {
-                            continue;
-                        }
-                        self.save_scene_material(index);
-                    }
+                    // Materials are NOT rewritten on scene save — only manual
+                    // edits persist (tracked in `dirty_materials`, flushed by
+                    // `autosave_materials`, or saved via the material editor).
+                    // A material with an existing `.material` file serializes as
+                    // a file reference; one without stays inline in the scene.
                     let file = self.scene.to_scene_file(&self.project_root, &self.shaders);
                     match citrus_assets::save_scene_file(&path, &file) {
                         Ok(()) => {
@@ -1836,6 +1867,22 @@ impl EngineApp {
                 {
                     self.actions.push(EditorAction::TogglePlay);
                 }
+                // Pause/Resume: freeze components/physics/audio while staying in
+                // Play so the played state can be inspected.
+                if self.playing {
+                    let plabel = if self.play_paused { "▶ Resume" } else { "⏸ Pause" };
+                    if ui
+                        .add(egui::Button::new(plabel).fill(if self.play_paused {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            ui.visuals().widgets.inactive.bg_fill
+                        }))
+                        .on_hover_text("Freeze play to inspect; Resume continues")
+                        .clicked()
+                    {
+                        self.play_paused = !self.play_paused;
+                    }
+                }
 
                 if self.show_stats {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2114,6 +2161,7 @@ impl EngineApp {
             sky_color: gather.sky_color,
             bounces: settings.bounces,
             samples: settings.samples,
+            probes_only: false,
         };
         tracing::info!(
             "baking: {} static instance(s), {} baked light(s), {} probe(s)…",
@@ -2150,6 +2198,16 @@ impl EngineApp {
         self.scene.baked = Some(baked);
         self.upload_baked_probes();
         self.save_bake();
+    }
+
+    /// Realtime-GI preview: while enabled (and the scene isn't baked), re-trace
+    /// the auto probe grid from the realtime lights every ~0.2s, blend toward
+    /// the previous result (temporal smoothing), and upload so un-baked surfaces
+    /// show live indirect bounce. Reuses the bake path tracer (`probes_only`).
+    fn update_realtime_gi(&mut self, dt: f32) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            self.rt_gi.update(renderer, &mut self.scene, dt);
+        }
     }
 
     /// Base path (no extension) for this scene's `.lightmap` / `.lightdata`
@@ -2226,6 +2284,7 @@ impl EngineApp {
     }
 
     fn toggle_play(&mut self) {
+        self.play_paused = false;
         if self.playing {
             self.playing = false;
             self.physics = None;
@@ -3061,6 +3120,7 @@ impl EngineApp {
         self.stats.tick(dt);
         self.update_camera(dt);
         self.refresh_shaders();
+        self.update_realtime_gi(dt);
 
         // If mouse-look just ended, egui's pointer state is stale: window
         // events are withheld while looking, so egui (a) never saw the right
@@ -3205,7 +3265,7 @@ impl EngineApp {
         }
         self.pump_lsp();
         let t = self.start.elapsed().as_secs_f32();
-        if self.playing {
+        if self.playing && !self.play_paused {
             // Component-driven motion must not land in undo history; play
             // edits are restored wholesale on Stop anyway.
             let mut commands = Vec::new();
@@ -3260,6 +3320,7 @@ impl EngineApp {
                 spot_inner_deg: 0.0,
                 spot_outer_deg: 0.0,
                 cast_shadows: true,
+                soft_shadows: true,
                 shadow_bias: 0.003,
             });
         }
@@ -3304,6 +3365,9 @@ impl EngineApp {
         if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
             tracing::error!("setting shadow resolution: {e:#}");
         }
+        let postfx = self
+            .scene
+            .effective_postfx(self.camera.position, &self.project_root);
         let frame = FrameInput {
             clear_color: [0.016, 0.016, 0.024, 1.0],
             camera: CameraData {
@@ -3320,6 +3384,7 @@ impl EngineApp {
             time: t,
             draws: &self.scene.draws,
             lightmap_preview: self.lightmap_preview,
+            postfx,
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
                 primitives,
@@ -3466,6 +3531,13 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 if let Some(index) = response.delete {
                     self.actions.push(EditorAction::DeleteObject(index));
                 }
+                if let Some((index, name)) = response.rename
+                    && index < self.scene.objects.len()
+                {
+                    // Caught by record_edits (dirty flag + undo) since F2 only
+                    // renames the selected object, which is the edit snapshot.
+                    self.scene.objects[index].name = name;
+                }
                 if let Some(kind) = response.spawn {
                     use citrus_assets::{ObjectSource, PrimitiveShape};
                     use citrus_editor::SpawnKind;
@@ -3596,6 +3668,9 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 }
                 if let Some(dir) = response.create_shader_in {
                     self.actions.push(EditorAction::CreateShader(dir));
+                }
+                if let Some(dir) = response.create_postfx_in {
+                    self.actions.push(EditorAction::CreatePostFx(dir));
                 }
                 if let Some(dir) = response.create_folder_in {
                     self.actions.push(EditorAction::CreateFolder(dir));
@@ -4288,6 +4363,8 @@ impl EditorTabs<'_> {
                 ui.separator();
 
                 {
+                    let baked = self.scene.baked.is_some();
+                    let can_bake = self.can_bake;
                     let env = &mut self.scene.environment;
                     ui.label(RichText::new("World Light (Sun / Moon)").strong());
                     ui.checkbox(&mut env.sun_enabled, "Enabled");
@@ -4327,6 +4404,98 @@ impl EditorTabs<'_> {
                                 .range(0.0..=10.0),
                         );
                     });
+
+                    ui.separator();
+                    ui.label(RichText::new("Realtime GI").strong());
+                    let gi = &mut env.realtime_gi;
+                    ui.add_enabled_ui(can_bake && !baked, |ui| {
+                        ui.checkbox(&mut gi.enabled, "Enabled").on_hover_text(
+                            "Continuously trace light probes from the realtime lights so \
+                             surfaces show live indirect bounce (no bake needed). Applies in \
+                             the editor and a shipped game.",
+                        );
+                        ui.add_enabled_ui(gi.enabled, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Mode");
+                                egui::ComboBox::from_id_salt("citrus-gi-mode")
+                                    .selected_text(gi.mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for m in citrus_assets::GiMode::ALL {
+                                            ui.selectable_value(&mut gi.mode, m, m.label());
+                                        }
+                                    });
+                            });
+                            if gi.mode == citrus_assets::GiMode::Software {
+                                ui.label(
+                                    RichText::new("Software SDF GI (no RT cores): CPU-marched, \
+                                        coarse preview — soft + low-frequency.")
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Bounces");
+                                ui.add(egui::Slider::new(&mut gi.bounces, 1..=16))
+                                    .on_hover_text("Indirect bounces per path");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Quality");
+                                ui.add(
+                                    egui::Slider::new(&mut gi.samples, 16..=256)
+                                        .suffix(" spp")
+                                        .logarithmic(true),
+                                )
+                                .on_hover_text("Rays per probe — higher = less noise, more cost");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Intensity");
+                                ui.add(
+                                    DragValue::new(&mut gi.intensity).speed(0.1).range(0.0..=64.0),
+                                )
+                                .on_hover_text("GI strength multiplier");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Probe Spacing");
+                                ui.add(
+                                    egui::Slider::new(&mut gi.probe_spacing, 0.5..=8.0)
+                                        .suffix(" m"),
+                                )
+                                .on_hover_text(
+                                    "World units between auto-grid probes — smaller = finer GI, \
+                                     more cost",
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Responsiveness");
+                                ui.add(egui::Slider::new(&mut gi.temporal_blend, 0.05..=1.0))
+                                    .on_hover_text(
+                                        "Per-update blend toward the new trace — lower = \
+                                         smoother/laggier, higher = snappier/noisier",
+                                    );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Update Interval");
+                                ui.add(
+                                    egui::Slider::new(&mut gi.update_interval, 0.05..=1.0)
+                                        .suffix(" s"),
+                                )
+                                .on_hover_text("Seconds between re-traces while the scene changes");
+                            });
+                        });
+                    });
+                    if baked {
+                        ui.label(
+                            RichText::new("Off while a bake is loaded (Clear it to use Realtime GI).")
+                                .small()
+                                .weak(),
+                        );
+                    } else if !can_bake {
+                        ui.label(
+                            RichText::new("This GPU has no ray-query support.")
+                                .small()
+                                .weak(),
+                        );
+                    }
 
                     ui.separator();
                     ui.label(RichText::new("Shadows").strong());
@@ -5311,7 +5480,7 @@ impl EditorTabs<'_> {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     // Stay open across checkbox/slider clicks so several kinds
                     // can be toggled at once (like the View menu).
-                    egui::containers::menu::MenuButton::new("👁 Widgets")
+                    egui::containers::menu::MenuButton::new("👁 Gizmos")
                         .config(
                             egui::containers::menu::MenuConfig::new()
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
@@ -5623,6 +5792,19 @@ impl EditorTabs<'_> {
                                 self.actions.push(EditorAction::LoadScene(path.clone()));
                             }
                         }
+                        Some("postfx") => {
+                            ui.heading("Post FX Profile");
+                            ui.label(egui::RichText::new(&path_display).small().weak());
+                            ui.separator();
+                            let mut profile = citrus_assets::load_postfx(path).unwrap_or_default();
+                            if postfx_editor_ui(ui, &mut profile) {
+                                if let Err(e) = citrus_assets::save_postfx(path, &profile) {
+                                    tracing::error!("saving postfx: {e:#}");
+                                }
+                                // Volumes pick up the edit live next frame.
+                                self.scene.invalidate_postfx_cache();
+                            }
+                        }
                         Some(ext) if CODE_EXTENSIONS.contains(&ext) => {
                             // Code/text files open in their own dockable editor
                             // tab; the inspector just offers a button to open it.
@@ -5652,6 +5834,107 @@ impl EditorTabs<'_> {
                 }
             });
     }
+}
+
+/// Sliders for a `.postfx` profile (the post-processing asset editor). Returns
+/// true when any value changed (caller saves + invalidates the cache).
+fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> bool {
+    use citrus_assets::TonemapMode;
+    use egui::{DragValue, RichText, Slider};
+    let mut changed = false;
+
+    ui.label(RichText::new("Tonemap").strong());
+    ui.horizontal(|ui| {
+        ui.label("Mode");
+        egui::ComboBox::from_id_salt("postfx-tonemap")
+            .selected_text(p.tonemap.mode.label())
+            .show_ui(ui, |ui| {
+                for m in TonemapMode::ALL {
+                    changed |= ui.selectable_value(&mut p.tonemap.mode, m, m.label()).changed();
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("Exposure (EV)");
+        changed |= ui.add(Slider::new(&mut p.tonemap.exposure, -8.0..=8.0)).changed();
+    });
+
+    ui.separator();
+    changed |= ui.checkbox(&mut p.color_grading.enabled, "Color Grading").changed();
+    ui.add_enabled_ui(p.color_grading.enabled, |ui| {
+        let g = &mut p.color_grading;
+        ui.horizontal(|ui| {
+            ui.label("Post Exposure");
+            changed |= ui.add(Slider::new(&mut g.exposure, -4.0..=4.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Contrast");
+            changed |= ui.add(Slider::new(&mut g.contrast, 0.0..=2.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Saturation");
+            changed |= ui.add(Slider::new(&mut g.saturation, 0.0..=2.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Temperature");
+            changed |= ui.add(Slider::new(&mut g.temperature, -1.0..=1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Tint");
+            changed |= ui.add(Slider::new(&mut g.tint, -1.0..=1.0)).changed();
+        });
+    });
+
+    ui.separator();
+    changed |= ui.checkbox(&mut p.vignette.enabled, "Vignette").changed();
+    ui.add_enabled_ui(p.vignette.enabled, |ui| {
+        let v = &mut p.vignette;
+        ui.horizontal(|ui| {
+            ui.label("Intensity");
+            changed |= ui.add(Slider::new(&mut v.intensity, 0.0..=1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Smoothness");
+            changed |= ui.add(Slider::new(&mut v.smoothness, 0.0..=1.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Color");
+            changed |= ui.color_edit_button_rgb(&mut v.color).changed();
+        });
+    });
+
+    ui.separator();
+    changed |= ui.checkbox(&mut p.bloom.enabled, "Bloom (needs HDR pass)").changed();
+    ui.add_enabled_ui(p.bloom.enabled, |ui| {
+        let b = &mut p.bloom;
+        ui.horizontal(|ui| {
+            ui.label("Threshold");
+            changed |= ui.add(DragValue::new(&mut b.threshold).speed(0.02).range(0.0..=10.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Intensity");
+            changed |= ui.add(Slider::new(&mut b.intensity, 0.0..=3.0)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Radius");
+            changed |= ui.add(Slider::new(&mut b.radius, 0.0..=1.0)).changed();
+        });
+    });
+
+    ui.separator();
+    changed |= ui
+        .checkbox(&mut p.chromatic_aberration.enabled, "Chromatic Aberration (needs HDR pass)")
+        .changed();
+    ui.add_enabled_ui(p.chromatic_aberration.enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Intensity");
+            changed |= ui
+                .add(Slider::new(&mut p.chromatic_aberration.intensity, 0.0..=2.0))
+                .changed();
+        });
+    });
+
+    changed
 }
 
 /// Liang–Barsky: clip a 2D segment to a rect. None = fully outside.
@@ -6104,6 +6387,18 @@ fn hover_text(result: &serde_json::Value) -> String {
     String::new()
 }
 
+/// A unique sibling path for duplicating `src`: `<stem>_copy.<ext>` (numbered
+/// if taken). Works for files and directories.
+fn duplicate_file_path(src: &Path) -> Option<PathBuf> {
+    let dir = src.parent()?;
+    let stem = src.file_stem()?.to_string_lossy();
+    let ext = src
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(unique_path(dir, &format!("{stem}_copy"), &ext))
+}
+
 fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let make = |n: u32| {
         let name = if n == 0 {
@@ -6247,9 +6542,30 @@ impl ApplicationHandler for EngineApp {
                             KeyCode::KeyW if ctrl => {
                                 self.close_focused_code_tab();
                             }
+                            KeyCode::KeyD if ctrl => {
+                                // Duplicate the selected object (scene) or file.
+                                match &self.selection {
+                                    Selection::Object(i) => self
+                                        .actions
+                                        .push(EditorAction::DuplicateObject(*i)),
+                                    Selection::File(p) => self
+                                        .actions
+                                        .push(EditorAction::DuplicateFile(p.clone())),
+                                    Selection::None => {}
+                                }
+                            }
                             KeyCode::Delete => {
-                                if let Selection::Object(i) = self.selection {
-                                    self.actions.push(EditorAction::DeleteObject(i));
+                                // Acts on the current selection: an object in the
+                                // scene, or a file/folder in the browser (same as
+                                // their right-click Delete).
+                                match &self.selection {
+                                    Selection::Object(i) => self
+                                        .actions
+                                        .push(EditorAction::DeleteObject(*i)),
+                                    Selection::File(p) => self
+                                        .actions
+                                        .push(EditorAction::DeleteFile(p.clone())),
+                                    Selection::None => {}
                                 }
                             }
                             _ => {}

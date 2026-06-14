@@ -155,6 +155,52 @@ Legend: `[ ]` open · `[verify]` believed fixed, confirm after a rebuild · `[x]
   UBOs, etc. but not these two. Added `self.lightmaps.destroy()` + `self.probe_buffer
   .destroy()` in `Drop`, inside the same allocator lock, after `device_wait_idle`.
 
+- [x] **Lightmap seam lines on baked cubes/sphere + blown-out highlights** — addressed.
+  Two separate causes. (1) Straight lines along cube edges and a vertical seam down the
+  sphere were **UV-chart seams**: the cube packs its 6 faces into a 3×2 atlas and the sphere
+  uses a lat-long unwrap with a meridian seam, so co-located 3D points land in different
+  charts and get different Monte-Carlo results → a line at the boundary. Added a post-bake
+  `stitch_seams` pass that buckets valid texels by world position (from the gbuffer readback)
+  and averages co-located texels whose normals agree, so smooth seams merge while genuine
+  hard-edge discontinuities are preserved. (2) The "white-washed" cube face / "brighter when
+  baked" was **no tonemapping** — values >1.0 clipped to white after the sRGB write, and a
+  static object's indirect term jumps from flat ambient (un-baked preview) to full baked GI.
+  Added ACES tonemapping to the standard + skybox shaders. (Remaining: the lat-long sphere
+  still wastes texels at the poles — a lower-distortion unwrap is a tracked follow-up.)
+
+- [x] **Scene failed to parse after Realtime GI landed** ("Expected struct `RealtimeGi` but
+  found `false`") — fixed. The `realtime_gi` field changed type from `bool` to a settings
+  struct, so scenes saved with the old `realtime_gi: false` no longer matched. Added a
+  `deserialize_with` shim (untagged `bool | RealtimeGi`) that maps a legacy bool to
+  `RealtimeGi { enabled, ..default }`; both forms now load (unit-tested in `scene_file.rs`).
+
+- [x] **Seam lines on baked primitives (cube edges, atlas borders)** — addressed (re-bake
+  needed). Three causes: (1) the baked lightmap was sampled with the **REPEAT** material
+  sampler, so bilinear filtering at the atlas border wrapped to the opposite edge — added a
+  dedicated **CLAMP_TO_EDGE** lightmap sampler. (2) The cube packs 6 faces in a 3×2 atlas
+  with a 4% gutter, which is **sub-texel at low lightmap sizes**, so bilinear bled between
+  faces — widened the gutter (0.04→0.06), raised the minimum lightmap size to 64 (so a
+  multi-chart atlas keeps ≥2-texel gutters), and dilate 6 rings instead of 4. (3) `gather_bake`
+  wasn't applying the per-object `lightmap_scale`, so "Scale In Lightmap" only affected the
+  preview, not the bake — now applied in both. Existing cube bakes must be re-baked (the
+  cube's lightmap UVs changed).
+
+- [x] **Realtime GI produced zero light (`avg L0 luminance 0.000`, no visible difference)**
+  — fixed. `gather_realtime_gi` only collected lights whose mode was `Realtime`, skipping
+  `Baked`/`Mixed` lights. But realtime GI only runs when there's *no* bake, and in that state
+  every light renders in realtime regardless of mode (see `gather_lights`). So a scene whose
+  point lights had been set to Baked/Mixed (common after experimenting with the baker) handed
+  the GI march *no lights* → probes came out all-zero → no bounce, no difference toggling GI.
+  Fix: `gather_realtime_gi` now includes all active lights (+ the env sun). Confirmed the
+  march itself was correct with a new unit test (`sw_gi::probe_gathers_bounced_light` — a
+  probe over a lit cube gathers non-zero bounce).
+
+- [x] **Panic: "attempt to add with overflow" in the software-GI march** (`sw_gi.rs`) —
+  fixed. The per-probe RNG seed was `pi as u32 * 9277 + seed.wrapping_mul(26699)` with a
+  non-wrapping `*`/`+`; the realtime-GI driver's per-trace seed accumulates (`wrapping_add`
+  0x9E3779B9 each trace) so it grows large, and the plain add overflowed `u32` → debug-build
+  panic across the parallel march threads. Fixed with `wrapping_mul`/`wrapping_add`.
+
 ## Crash / stability
 
 - [x] **SIGSEGV on editor close** — fixed. `Renderer` declared `window: Arc<Window>`

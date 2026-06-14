@@ -12,6 +12,11 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 light_color;
     vec4 ambient;
     vec4 misc;
+    // Post-processing (same layout/order as the standard shader's FrameData).
+    vec4 postfx0; // x tonemap mode, y exposure EV, z grade exposure, w contrast
+    vec4 postfx1; // x saturation, y temperature, z tint, w grading enabled
+    vec4 postfx2; // x vignette enabled, y intensity, z smoothness, w screen width
+    vec4 postfx3; // xyz vignette color, w screen height
 } frame;
 
 layout(set = 1, binding = 0) uniform sampler2D t_sky;
@@ -28,6 +33,46 @@ layout(location = 0) in vec3 v_dir;
 layout(location = 0) out vec4 o_color;
 
 const float PI = 3.14159265359;
+
+vec3 tonemap_aces(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Same per-pixel post-processing as the standard shader, so the sky is graded /
+// tonemapped / vignetted consistently with lit surfaces.
+vec3 apply_postfx(vec3 color, vec2 fragcoord) {
+    color *= exp2(frame.postfx0.y);
+    if (frame.postfx1.w > 0.5) {
+        color *= exp2(frame.postfx0.z);
+        float temp = frame.postfx1.y, tint = frame.postfx1.z;
+        color.r *= 1.0 + temp * 0.2 + tint * 0.1;
+        color.g *= 1.0 - tint * 0.2;
+        color.b *= 1.0 - temp * 0.2 + tint * 0.1;
+        color = (color - 0.18) * frame.postfx0.w + 0.18;
+        float l = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color = mix(vec3(l), color, frame.postfx1.x);
+        color = max(color, vec3(0.0));
+    }
+    int mode = int(frame.postfx0.x + 0.5);
+    if (mode == 1) {
+        color = color / (color + vec3(1.0));
+    } else if (mode == 2) {
+        color = tonemap_aces(color);
+    }
+    if (frame.postfx2.x > 0.5) {
+        vec2 uv = fragcoord / vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
+        float dist = length(uv - 0.5) * 1.41421356;
+        float sm = max(frame.postfx2.z, 1e-3);
+        float mask = clamp((dist - (1.0 - sm)) / sm, 0.0, 1.0) * frame.postfx2.y;
+        color = mix(color, frame.postfx3.xyz, mask);
+    }
+    return color;
+}
 
 void main() {
     vec3 dir = normalize(v_dir);
@@ -47,5 +92,5 @@ void main() {
             color = mix(horizon, ground, clamp(-dir.y * 2.0, 0.0, 1.0));
         }
     }
-    o_color = vec4(color, 1.0);
+    o_color = vec4(apply_postfx(color, gl_FragCoord.xy), 1.0);
 }

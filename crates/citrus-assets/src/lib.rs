@@ -8,6 +8,7 @@ mod bake_file;
 mod fbx_loader;
 mod gltf_loader;
 mod material_file;
+mod post_file;
 mod procedural;
 mod project_file;
 mod scene_file;
@@ -23,13 +24,17 @@ pub use bake_file::{
     LIGHTDATA_EXTENSION, LIGHTMAP_EXTENSION, LightDataFile, LightmapEntry, LightmapFile,
     ProbeVolumeData, load_lightdata, load_lightmaps, save_lightdata, save_lightmaps,
 };
+pub use post_file::{
+    Bloom, ChromaticAberration, ColorGrading, POSTFX_EXTENSION, PostFxProfile, TonemapMode,
+    Vignette, blend_profiles, load_postfx, save_postfx,
+};
 pub use procedural::{primitive_mesh, test_scene};
 pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
 pub use scene_file::{
-    ComponentData, MaterialRef, ObjectSource, PrimitiveShape, SCENE_EXTENSION, SceneEntry,
-    BakeSettings, SceneFile, WorldEnvironment, load_scene_file, save_scene_file,
+    ComponentData, GiMode, MaterialRef, ObjectSource, PrimitiveShape, RealtimeGi, SCENE_EXTENSION,
+    SceneEntry, BakeSettings, SceneFile, WorldEnvironment, load_scene_file, save_scene_file,
 };
 pub use shader_file::{
     SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,

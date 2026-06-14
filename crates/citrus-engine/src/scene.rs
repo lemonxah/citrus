@@ -89,8 +89,9 @@ pub struct MaterialEntry {
     /// Set when this material came from (or was saved to) a `.material` file.
     pub file: Option<PathBuf>,
     /// True for imported-model materials whose textures came embedded in the
-    /// model file: they can't be expressed in a `.material` file (no paths),
-    /// so scene saves keep them inline instead of materializing a file.
+    /// model file: they can't be expressed in a `.material` file (no paths), so
+    /// they stay inline. Retained for a future "convert to asset" path.
+    #[allow(dead_code)]
     pub embedded_textures: bool,
 }
 
@@ -108,6 +109,15 @@ pub struct LoadedScene {
     mesh_handles: Vec<MeshHandle>,
     mesh_infos: Vec<MeshInfo>,
     mesh_bounds: Vec<(Vec3, Vec3)>,
+    /// CPU positions + indices kept per mesh for software-GI SDF generation.
+    mesh_geometry: Vec<(Vec<Vec3>, Vec<u32>)>,
+    /// Lazily-built signed distance field per mesh (software GI). `None` until
+    /// first use; index-parallel to `mesh_handles`. `Arc` so the march can run
+    /// on a background thread sharing the SDFs.
+    mesh_sdf: Vec<Option<std::sync::Arc<citrus_render::sdf::SdfVolume>>>,
+    /// Loaded `.postfx` profiles by project-relative path (Volume references).
+    /// Cached on first use; reload the scene to pick up external edits.
+    postfx_cache: std::collections::HashMap<String, citrus_assets::PostFxProfile>,
     primitive_meshes: HashMap<citrus_assets::PrimitiveShape, usize>,
     default_material: Option<usize>,
     /// model path -> base index of its meshes in the scene arrays
@@ -163,6 +173,9 @@ impl LoadedScene {
             draws: Vec::new(),
             objects: Vec::new(),
             materials: Vec::new(),
+            mesh_geometry: Vec::new(),
+            mesh_sdf: Vec::new(),
+            postfx_cache: std::collections::HashMap::new(),
             mesh_handles: Vec::new(),
             mesh_infos: Vec::new(),
             mesh_bounds: Vec::new(),
@@ -207,7 +220,10 @@ impl LoadedScene {
         let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
         let s = self.environment.bake;
         let density = s.texel_density * self.objects[i].lightmap_scale.max(0.0);
-        ((density * max_extent).round() as u32).clamp(16, s.max_lightmap.max(16))
+        // Floor at 64: multi-chart meshes (the cube's 6-face atlas) need enough
+        // texels that the inter-chart gutter is ≥2 texels, else bilinear bleeds
+        // between charts and shows seam lines.
+        ((density * max_extent).round() as u32).clamp(64, s.max_lightmap.max(64))
     }
 
     /// World transform of an object (walks the parent chain).
@@ -419,6 +435,11 @@ impl LoadedScene {
         }
         let data = citrus_assets::primitive_mesh(shape);
         self.mesh_handles.push(renderer.upload_mesh(&data)?);
+        self.mesh_geometry.push((
+            data.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
+            data.indices.clone(),
+        ));
+        self.mesh_sdf.push(None);
         self.mesh_infos.push(MeshInfo {
             vertices: data.vertices.len() as u32,
             triangles: data.indices.len() as u32 / 3,
@@ -488,6 +509,11 @@ impl LoadedScene {
             .collect::<Result<_>>()?;
         for mesh in &scene.meshes {
             self.mesh_handles.push(renderer.upload_mesh(mesh)?);
+            self.mesh_geometry.push((
+                mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
+                mesh.indices.clone(),
+            ));
+            self.mesh_sdf.push(None);
             self.mesh_infos.push(MeshInfo {
                 vertices: mesh.vertices.len() as u32,
                 triangles: mesh.indices.len() as u32 / 3,
@@ -989,7 +1015,8 @@ impl LoadedScene {
                 range: light.range,
                 spot_inner_deg: light.spot_angle * (1.0 - light.spot_blend),
                 spot_outer_deg: light.spot_angle,
-                cast_shadows: light.cast_shadows,
+                cast_shadows: light.shadow_type.casts(),
+                soft_shadows: light.shadow_type.soft(),
                 shadow_bias: light.shadow_bias,
             });
         }
@@ -1092,8 +1119,10 @@ impl LoadedScene {
             let scale = world.to_scale_rotation_translation().0.abs();
             let extent = (max - min) * scale;
             let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
-            let size = (settings.texel_density * max_extent).round() as u32;
-            let lightmap_size = size.clamp(16, settings.max_lightmap.max(16));
+            let density = settings.texel_density * obj.lightmap_scale.max(0.0);
+            let size = (density * max_extent).round() as u32;
+            // Floor at 64 so multi-chart atlases (cube) keep ≥2-texel gutters.
+            let lightmap_size = size.clamp(64, settings.max_lightmap.max(64));
 
             let model = &self.materials[render.material].model;
             let emission = if model.emission_enabled {
@@ -1154,6 +1183,7 @@ impl LoadedScene {
                 range: light.range,
                 spot_inner_deg: light.spot_angle * (1.0 - light.spot_blend),
                 spot_outer_deg: light.spot_angle,
+                radius: light.radius.max(0.0),
             });
         }
 
@@ -1199,6 +1229,9 @@ impl LoadedScene {
                 range: 0.0,
                 spot_inner_deg: 0.0,
                 spot_outer_deg: 0.0,
+                // Soft edge for the sun (interpreted as angular spread for a
+                // directional light in the bake's shadow sampling).
+                radius: 0.03,
             });
         }
 
@@ -1212,6 +1245,292 @@ impl LoadedScene {
             probe_volumes,
             sky_color: [amb[0] * ai, amb[1] * ai, amb[2] * ai],
         }
+    }
+
+    /// Gather inputs for the realtime-GI preview: every active mesh object as a
+    /// bouncer/occluder, the realtime lights (+ env sun), and an automatic probe
+    /// grid covering the scene bounds. Unlike `gather_bake` this includes
+    /// non-static objects and the realtime lights, so the un-baked scene shows
+    /// live indirect. Returns None when there's nothing to light.
+    pub fn gather_realtime_gi(&self) -> Option<BakeGather> {
+        use citrus_core::{LightComponent, LightKind};
+
+        let mut instances = Vec::new();
+        let mut instance_objects = Vec::new();
+        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(render) = self.objects[i].render else {
+                continue;
+            };
+            let world = self.world_transform(i);
+            let (min, max) = self.mesh_bounds[render.mesh];
+            // Expand the scene AABB by this object's 8 transformed corners.
+            for cx in [min.x, max.x] {
+                for cy in [min.y, max.y] {
+                    for cz in [min.z, max.z] {
+                        let p = world.transform_point3(Vec3::new(cx, cy, cz));
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    }
+                }
+            }
+            let model = &self.materials[render.material].model;
+            let emission = if model.emission_enabled {
+                [
+                    model.emission_color[0] * model.emission_intensity,
+                    model.emission_color[1] * model.emission_intensity,
+                    model.emission_color[2] * model.emission_intensity,
+                ]
+            } else {
+                [0.0; 3]
+            };
+            instances.push(citrus_render::BakeInstance {
+                mesh: self.mesh_handles[render.mesh],
+                transform: world,
+                lightmap_size: 8, // unused: probes_only skips lightmap tracing
+                albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
+                emission,
+            });
+            instance_objects.push(i);
+        }
+        if instances.is_empty() || !lo.is_finite() {
+            return None;
+        }
+
+        // ALL active lights drive the GI (+ env sun below). Realtime GI only
+        // runs when there's no bake — and in that state every light renders in
+        // realtime regardless of its mode (see gather_lights), so the GI must
+        // bounce them all. (Filtering to Realtime-only here was the bug that
+        // left Baked/Mixed point lights out → zero GI.)
+        let mut lights = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(light) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
+            else {
+                continue;
+            };
+            let world = self.world_transform(i);
+            let (_, rotation, position) = world.to_scale_rotation_translation();
+            let kind = match light.kind {
+                LightKind::Directional => citrus_render::LightKind::Directional,
+                LightKind::Point => citrus_render::LightKind::Point,
+                LightKind::Spot => citrus_render::LightKind::Spot,
+            };
+            lights.push(citrus_render::BakeLight {
+                kind,
+                position,
+                direction: rotation * Vec3::NEG_Z,
+                color: [
+                    light.color[0] * light.intensity,
+                    light.color[1] * light.intensity,
+                    light.color[2] * light.intensity,
+                ],
+                range: light.range,
+                spot_inner_deg: light.spot_angle * (1.0 - light.spot_blend),
+                spot_outer_deg: light.spot_angle,
+                radius: light.radius.max(0.0),
+            });
+        }
+        if self.environment.sun_enabled {
+            let dir = Vec3::from(self.environment.sun_direction).normalize_or(Vec3::NEG_Y);
+            let c = self.environment.sun_color;
+            let s = self.environment.sun_intensity;
+            lights.push(citrus_render::BakeLight {
+                kind: citrus_render::LightKind::Directional,
+                position: Vec3::ZERO,
+                direction: dir,
+                color: [c[0] * s, c[1] * s, c[2] * s],
+                range: 0.0,
+                spot_inner_deg: 0.0,
+                spot_outer_deg: 0.0,
+                // Soft edge for the sun (interpreted as angular spread for a
+                // directional light in the bake's shadow sampling).
+                radius: 0.03,
+            });
+        }
+
+        // Auto probe grid: pad the scene AABB, then one probe per `probe_spacing`
+        // world units, clamped to [2, 8] per axis so even a big scene stays cheap.
+        let spacing = self.environment.realtime_gi.probe_spacing.max(0.25);
+        let pad = ((hi - lo).length() * 0.05).max(0.5);
+        let (lo, hi) = (lo - pad, hi + pad);
+        let center = (lo + hi) * 0.5;
+        let size = (hi - lo).max(Vec3::splat(0.1));
+        // Up to 16/axis so a low Probe Spacing actually yields a fine grid
+        // (the parallel CPU march makes the extra probes affordable).
+        let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, 16) as usize;
+        let counts = [axis_count(size.x), axis_count(size.y), axis_count(size.z)];
+
+        let mut probes = Vec::new();
+        for gz in 0..counts[2] {
+            for gy in 0..counts[1] {
+                for gx in 0..counts[0] {
+                    let f = Vec3::new(
+                        gx as f32 / (counts[0] - 1).max(1) as f32,
+                        gy as f32 / (counts[1] - 1).max(1) as f32,
+                        gz as f32 / (counts[2] - 1).max(1) as f32,
+                    );
+                    probes.push(lo + f * size);
+                }
+            }
+        }
+        let probe_volumes = vec![ProbeVolumeMeta {
+            world_to_local: Mat4::from_translation(-center),
+            size: size.to_array(),
+            counts,
+            sh_base: 0,
+        }];
+
+        let amb = self.environment.ambient;
+        let ai = self.environment.ambient_intensity;
+        Some(BakeGather {
+            instances,
+            instance_objects,
+            lights,
+            probes,
+            probe_volumes,
+            sky_color: [amb[0] * ai, amb[1] * ai, amb[2] * ai],
+        })
+    }
+
+    /// Build the owned inputs for a software-GI march: lazily generates+caches
+    /// per-mesh SDFs, then returns marchable instances (sharing the `Arc` SDFs)
+    /// plus the scene size. All `Send`, so the caller can run the march on a
+    /// background thread.
+    pub fn software_gi_inputs(
+        &mut self,
+        gather: &BakeGather,
+    ) -> (Vec<crate::sw_gi::SdfInstance>, f32) {
+        for &obj in &gather.instance_objects {
+            let Some(render) = self.objects[obj].render else {
+                continue;
+            };
+            if self.mesh_sdf[render.mesh].is_none() {
+                let (pos, idx) = &self.mesh_geometry[render.mesh];
+                self.mesh_sdf[render.mesh] =
+                    Some(std::sync::Arc::new(citrus_render::sdf::generate_sdf(pos, idx, 32, 0.1)));
+            }
+        }
+        let mut insts = Vec::with_capacity(gather.instances.len());
+        for (k, &obj) in gather.instance_objects.iter().enumerate() {
+            let Some(render) = self.objects[obj].render else {
+                continue;
+            };
+            let Some(sdf) = self.mesh_sdf[render.mesh].as_ref() else {
+                continue;
+            };
+            let world = gather.instances[k].transform;
+            let scale = (world.x_axis.length() + world.y_axis.length() + world.z_axis.length())
+                / 3.0;
+            insts.push(crate::sw_gi::SdfInstance {
+                inv: world.inverse(),
+                scale: scale.max(1e-4),
+                sdf: sdf.clone(),
+                albedo: gather.instances[k].albedo,
+                emission: gather.instances[k].emission,
+            });
+        }
+        let scene_size = gather
+            .probe_volumes
+            .first()
+            .map(|v| Vec3::from(v.size).length())
+            .unwrap_or(10.0);
+        (insts, scene_size)
+    }
+
+    /// Blend the post-processing Volumes affecting `camera_pos` into the
+    /// effective per-frame parameters (Unity-style: priority-ordered, weight ×
+    /// local proximity). Profiles are loaded from `.postfx` files (cached).
+    /// Empty → neutral defaults (ACES, no grading/vignette).
+    pub fn effective_postfx(
+        &mut self,
+        camera_pos: Vec3,
+        project_root: &std::path::Path,
+    ) -> citrus_render::PostFx {
+        use citrus_core::VolumeComponent;
+
+        // (priority, weighted profile) for each contributing volume.
+        let mut stack: Vec<(f32, citrus_assets::PostFxProfile, f32)> = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(vol) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<VolumeComponent>())
+            else {
+                continue;
+            };
+            if vol.profile.trim().is_empty() || vol.weight <= 0.0 {
+                continue;
+            }
+            // Weight: global = full; local = fade by distance to the box.
+            let weight = if vol.global {
+                vol.weight
+            } else {
+                let center = self.world_transform(i).w_axis.truncate();
+                let half = Vec3::from(vol.half_extents).abs();
+                let d = (camera_pos - center).abs() - half;
+                let outside = d.max(Vec3::ZERO).length();
+                if outside <= 0.0 {
+                    vol.weight
+                } else if outside < vol.blend_distance.max(1e-3) {
+                    vol.weight * (1.0 - outside / vol.blend_distance.max(1e-3))
+                } else {
+                    0.0
+                }
+            };
+            if weight <= 0.0 {
+                continue;
+            }
+            // Load + cache the profile.
+            if !self.postfx_cache.contains_key(&vol.profile) {
+                let path = project_root.join(&vol.profile);
+                let profile = citrus_assets::load_postfx(&path).unwrap_or_default();
+                self.postfx_cache.insert(vol.profile.clone(), profile);
+            }
+            let profile = self.postfx_cache[&vol.profile];
+            stack.push((vol.priority, profile, weight.clamp(0.0, 1.0)));
+        }
+
+        stack.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let blend: Vec<_> = stack.into_iter().map(|(_, p, w)| (p, w)).collect();
+        let p = citrus_assets::blend_profiles(&blend);
+
+        let tonemap = match p.tonemap.mode {
+            citrus_assets::TonemapMode::None => 0,
+            citrus_assets::TonemapMode::Reinhard => 1,
+            citrus_assets::TonemapMode::Aces => 2,
+        };
+        citrus_render::PostFx {
+            tonemap,
+            exposure: p.tonemap.exposure,
+            grading_enabled: p.color_grading.enabled,
+            grade_exposure: p.color_grading.exposure,
+            contrast: p.color_grading.contrast,
+            saturation: p.color_grading.saturation,
+            temperature: p.color_grading.temperature,
+            tint: p.color_grading.tint,
+            vignette_enabled: p.vignette.enabled,
+            vignette_intensity: p.vignette.intensity,
+            vignette_smoothness: p.vignette.smoothness,
+            vignette_color: p.vignette.color,
+        }
+    }
+
+    /// Drop cached `.postfx` profiles so an edit to a profile file is picked up
+    /// live by the volumes that reference it.
+    pub fn invalidate_postfx_cache(&mut self) {
+        self.postfx_cache.clear();
     }
 
     /// Object-space AABB (min, max) of an object's render mesh, for the mesh
@@ -1342,6 +1661,75 @@ impl LoadedScene {
         for object in &mut self.objects {
             object.parent = object.parent.and_then(|p| remap.get(p).copied().flatten());
         }
+    }
+
+    /// Duplicate an object and its whole subtree. Clones each object's
+    /// transform/source/render (mesh + material are shared, not copied) and its
+    /// components (via save→load through the registry), assigns fresh ids, and
+    /// re-parents the copies among themselves; the duplicated root becomes a
+    /// sibling of the original. Returns the new root index. Not undoable (like
+    /// object deletion).
+    pub fn duplicate_object(
+        &mut self,
+        index: usize,
+        registry: &ComponentRegistry,
+    ) -> Option<usize> {
+        if index >= self.objects.len() {
+            return None;
+        }
+        // Subtree = the object + all descendants (breadth-first).
+        let mut subtree = vec![index];
+        let mut i = 0;
+        while i < subtree.len() {
+            let parent = subtree[i];
+            for c in 0..self.objects.len() {
+                if self.objects[c].parent == Some(parent) && !subtree.contains(&c) {
+                    subtree.push(c);
+                }
+            }
+            i += 1;
+        }
+        let base = self.objects.len();
+        let remap: std::collections::HashMap<usize, usize> = subtree
+            .iter()
+            .enumerate()
+            .map(|(k, &old)| (old, base + k))
+            .collect();
+
+        let mut clones = Vec::with_capacity(subtree.len());
+        for &old in &subtree {
+            let src = &self.objects[old];
+            let saved = src.save_components();
+            // Root stays a sibling (keep original parent); descendants re-link
+            // to the cloned parent.
+            let parent = if old == index {
+                src.parent
+            } else {
+                src.parent.and_then(|p| remap.get(&p).copied())
+            };
+            let mut obj = SceneObject {
+                id: ObjectId::new(),
+                name: if old == index {
+                    format!("{} Copy", src.name)
+                } else {
+                    src.name.clone()
+                },
+                render: src.render,
+                source: src.source.clone(),
+                enabled: src.enabled,
+                static_geometry: src.static_geometry,
+                lightmap_scale: src.lightmap_scale,
+                parent,
+                translation: src.translation,
+                rotation: src.rotation,
+                scale: src.scale,
+                components: Vec::new(),
+            };
+            obj.load_components(&saved, registry);
+            clones.push(obj);
+        }
+        self.objects.extend(clones);
+        Some(base)
     }
 
     /// Ray-pick the closest object (ray vs object-space AABB).

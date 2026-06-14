@@ -3,8 +3,8 @@
     shader: "standard",
     params: (
         base_color: (0.038780928, 0.022637427, 0.9091133, 1.0),
-        emission_color: (0.083155915, 0.00777106, 0.08269116),
-        emission_intensity: 0.5,
+        emission_color: (1.0, 0.0, 0.993835),
+        emission_intensity: 0.1,
         metallic: 0.0,
         roughness: 0.7,
         toon_steps: 6.0,

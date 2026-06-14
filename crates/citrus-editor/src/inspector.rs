@@ -242,13 +242,13 @@ impl InspectorPanel {
             {
                 response.object_changed = true;
             }
+            ui.label(RichText::new(info.kind).small().weak());
             if ui.text_edit_singleline(&mut info.name).changed() {
                 response.object_changed = true;
             }
-            ui.label(RichText::new(info.kind).small().weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .checkbox(&mut info.static_geometry, "Contribute GI")
+                    .checkbox(&mut info.static_geometry, "Static")
                     .on_hover_text(
                         "Non-moving: included in the lighting bake (lightmapped + occluder)",
                     )

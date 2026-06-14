@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use citrus_core::{
     AudioListener, AudioRolloff, AudioSource, Bob, BodyKind, BoxCollider, CameraComponent,
     Component, ComponentRegistry, LightComponent, LightKind, LightMode, LightProbeVolume,
-    MeshCollider, ObjectId, ObjectRef, RigidBody, Spin, SphereCollider, TypedComponent,
+    MeshCollider, ObjectId, ObjectRef, RigidBody, ShadowType, Spin, SphereCollider, TypedComponent,
+    VolumeComponent,
     COLLISION_LAYERS,
 };
 use egui::collapsing_header::{CollapsingState, paint_default_icon};
@@ -146,6 +147,7 @@ impl EditorComponents {
         e.register::<Spin>();
         e.register::<Bob>();
         e.register::<RigidBody>();
+        e.register::<VolumeComponent>();
         e
     }
 
@@ -430,6 +432,14 @@ impl Inspect for LightComponent {
         property_row(ui, "Intensity", &mut changed, |ui| {
             ui.add(DragValue::new(&mut self.intensity).speed(0.05).range(0.0..=100.0))
         });
+        let (lm, unit) = self.approx_photometric();
+        ui.horizontal(|ui| {
+            ui.label("");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("≈ {lm:.0} {unit}")).weak().small())
+                    .on_hover_text("Approximate photometric output (display only)");
+            });
+        });
         if self.kind != LightKind::Directional {
             property_row(ui, "Range", &mut changed, |ui| {
                 ui.add(DragValue::new(&mut self.range).speed(0.1).range(0.01..=10000.0))
@@ -443,10 +453,21 @@ impl Inspect for LightComponent {
                 ui.add(egui::Slider::new(&mut self.spot_blend, 0.0..=1.0))
             });
         }
-        property_row(ui, "Cast Shadows", &mut changed, |ui| {
-            ui.checkbox(&mut self.cast_shadows, "")
+        ui.horizontal(|ui| {
+            ui.label("Shadows");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt("citrus-light-shadow")
+                    .selected_text(self.shadow_type.label())
+                    .show_ui(ui, |ui| {
+                        for st in ShadowType::ALL {
+                            changed |= ui
+                                .selectable_value(&mut self.shadow_type, st, st.label())
+                                .changed();
+                        }
+                    });
+            });
         });
-        if self.cast_shadows {
+        if self.shadow_type.casts() {
             property_row(ui, "Shadow Bias", &mut changed, |ui| {
                 ui.add(
                     DragValue::new(&mut self.shadow_bias)
@@ -455,11 +476,51 @@ impl Inspect for LightComponent {
                         .max_decimals(4),
                 )
             });
+            property_row(ui, "Radius (soft)", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.radius).speed(0.02).range(0.0..=5.0))
+                    .on_hover_text(
+                        "Light source size for baked soft shadows — larger = softer \
+                         penumbra (smooths jagged shadows at low texel density). 0 = hard.",
+                    )
+            });
         }
         changed
     }
 }
 impl Gizmo for LightComponent {}
+
+impl Inspect for VolumeComponent {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Profile", &mut changed, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.profile)
+                    .hint_text("post/cinematic.postfx"),
+            )
+            .on_hover_text("Project-relative path to a .postfx profile")
+        });
+        property_row(ui, "Global", &mut changed, |ui| {
+            ui.checkbox(&mut self.global, "")
+                .on_hover_text("Affects the whole scene (else only within the box bounds)")
+        });
+        property_row(ui, "Priority", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.priority).speed(0.1))
+                .on_hover_text("Higher blends last / wins ties")
+        });
+        property_row(ui, "Weight", &mut changed, |ui| {
+            ui.add(egui::Slider::new(&mut self.weight, 0.0..=1.0))
+        });
+        if !self.global {
+            property_row(ui, "Blend Distance", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.blend_distance).speed(0.05).range(0.0..=100.0))
+                    .on_hover_text("World-units the effect fades in over, approaching the box")
+            });
+            axis_row(ui, "Half Extents", &mut self.half_extents, &mut changed);
+        }
+        changed
+    }
+}
+impl Gizmo for VolumeComponent {}
 
 impl Inspect for Spin {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {

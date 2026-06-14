@@ -49,6 +49,7 @@ pub struct FileBrowserResponse {
     pub activated: Option<PathBuf>,
     /// Create a new asset inside this directory.
     pub create_material_in: Option<PathBuf>,
+    pub create_postfx_in: Option<PathBuf>,
     pub create_scene_in: Option<PathBuf>,
     pub create_shader_in: Option<PathBuf>,
     pub create_folder_in: Option<PathBuf>,
@@ -128,6 +129,17 @@ impl FileBrowser {
         let mut response = FileBrowserResponse::default();
         // Refresh the per-frame diagnostics snapshot for the badge helpers.
         self.diags = diags.clone();
+
+        // F2 starts an inline rename of the selected file/folder (matches the
+        // right-click Rename). Gated on no text field already focused so it
+        // doesn't fire mid-edit elsewhere.
+        if self.renaming.is_none()
+            && let Some(path) = selected
+            && ui.input(|i| i.key_pressed(egui::Key::F2))
+            && !ui.memory(|m| m.focused().is_some())
+        {
+            self.begin_rename(path);
+        }
         if !self.current_dir.starts_with(&self.root) || !self.current_dir.is_dir() {
             self.current_dir = self.root.clone();
         }
@@ -524,6 +536,10 @@ impl FileBrowser {
             response.create_shader_in = Some(dir.to_owned());
             ui.close();
         }
+        if ui.button("New Post FX Profile").clicked() {
+            response.create_postfx_in = Some(dir.to_owned());
+            ui.close();
+        }
         if ui.button("New Component (Rust)").clicked() {
             response.create_component = true;
             ui.close();
@@ -534,17 +550,22 @@ impl FileBrowser {
         }
     }
 
+    /// Start an inline rename of `path` (seeded with its current file name).
+    fn begin_rename(&mut self, path: &Path) {
+        self.renaming = Some(Renaming {
+            path: path.to_owned(),
+            text: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            focus: true,
+        });
+    }
+
     /// Rename / Cut / Copy / Delete items for one file or folder.
     fn item_ops_menu(&mut self, ui: &mut Ui, path: &Path, response: &mut FileBrowserResponse) {
         if ui.button("Rename").clicked() {
-            self.renaming = Some(Renaming {
-                path: path.to_owned(),
-                text: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                focus: true,
-            });
+            self.begin_rename(path);
             ui.close();
         }
         if ui.button("Cut").clicked() {

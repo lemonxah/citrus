@@ -362,6 +362,7 @@ impl ComponentRegistry {
         registry.register::<LightProbeVolume>();
         registry.register::<AudioSource>();
         registry.register::<AudioListener>();
+        registry.register::<VolumeComponent>();
         registry.register::<BoxCollider>();
         registry.register::<SphereCollider>();
         registry.register::<MeshCollider>();
@@ -483,6 +484,35 @@ impl LightMode {
     pub const ALL: [LightMode; 3] = [Self::Realtime, Self::Baked, Self::Mixed];
 }
 
+/// How a light renders its shadows. `None` skips the shadow map entirely; `Hard`
+/// does a single depth comparison (sharp, aliased edge); `Soft` runs the PCF
+/// kernel for a smooth penumbra.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum ShadowType {
+    None,
+    Hard,
+    Soft,
+}
+
+impl ShadowType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "No Shadows",
+            Self::Hard => "Hard Shadows",
+            Self::Soft => "Soft Shadows",
+        }
+    }
+    pub const ALL: [ShadowType; 3] = [Self::None, Self::Hard, Self::Soft];
+    /// Whether a shadow map should be allocated/rendered for this light.
+    pub fn casts(self) -> bool {
+        !matches!(self, Self::None)
+    }
+    /// Whether the PCF kernel runs (soft penumbra) vs a single hard tap.
+    pub fn soft(self) -> bool {
+        matches!(self, Self::Soft)
+    }
+}
+
 /// A scene light. The object's transform places/orients it; the engine gathers
 /// every `LightComponent` each frame and feeds the renderer's multi-light path.
 #[derive(Serialize, Deserialize)]
@@ -498,20 +528,28 @@ pub struct LightComponent {
     pub spot_angle: f32,
     /// 0 = hard cone edge, 1 = soft falloff.
     pub spot_blend: f32,
-    #[serde(default = "default_true_light")]
-    pub cast_shadows: bool,
+    #[serde(default = "default_shadow_type", alias = "cast_shadows")]
+    pub shadow_type: ShadowType,
     #[serde(default = "default_shadow_bias")]
     pub shadow_bias: f32,
+    /// Light source radius (world units) for baked soft shadows: the bake
+    /// samples the shadow ray over a disc of this radius, so a larger value
+    /// gives a wider, softer penumbra. 0 = hard shadow.
+    #[serde(default = "default_light_radius")]
+    pub radius: f32,
 }
 
 fn default_light_mode() -> LightMode {
     LightMode::Realtime
 }
-fn default_true_light() -> bool {
-    true
+fn default_shadow_type() -> ShadowType {
+    ShadowType::Soft
 }
 fn default_shadow_bias() -> f32 {
     0.002
+}
+fn default_light_radius() -> f32 {
+    0.1
 }
 
 impl Default for LightComponent {
@@ -524,8 +562,30 @@ impl Default for LightComponent {
             range: 10.0,
             spot_angle: 45.0,
             spot_blend: 0.15,
-            cast_shadows: true,
+            shadow_type: ShadowType::Soft,
             shadow_bias: 0.002,
+            radius: default_light_radius(),
+        }
+    }
+}
+
+impl LightComponent {
+    /// Approximate photometric readout for the inspector. Our `intensity` isn't
+    /// a physical unit (it's a radiance multiplier with a non-inverse-square
+    /// falloff), so this treats `intensity` as candela-equivalent and converts
+    /// to luminous flux the textbook way: point = 4π·I over the full sphere,
+    /// spot = the cone's solid angle 2π(1-cos θ)·I. Directional has no flux
+    /// (it's an infinite source) so it reports illuminance (lux ≈ intensity).
+    /// Returns (value, unit) for display only — nothing reads it back.
+    pub fn approx_photometric(&self) -> (f32, &'static str) {
+        match self.kind {
+            LightKind::Directional => (self.intensity, "lx"),
+            LightKind::Point => (self.intensity * 4.0 * std::f32::consts::PI, "lm"),
+            LightKind::Spot => {
+                let half = (self.spot_angle * 0.5).to_radians();
+                let solid = 2.0 * std::f32::consts::PI * (1.0 - half.cos());
+                (self.intensity * solid, "lm")
+            }
         }
     }
 }
@@ -708,6 +768,43 @@ impl Default for AudioSource {
 
 impl TypedComponent for AudioSource {
     const NAME: &'static str = "Audio Source";
+}
+
+/// A post-processing Volume (Unity-style): references a `.postfx` profile and
+/// applies it globally or within a local box, blended by priority/weight. The
+/// camera blends every volume affecting it into one effective profile.
+#[derive(Serialize, Deserialize)]
+pub struct VolumeComponent {
+    /// Project-relative path to the `.postfx` profile this volume applies.
+    pub profile: String,
+    /// Global affects the whole scene; local only within the box (object
+    /// transform + `half_extents`), faded in over `blend_distance`.
+    pub global: bool,
+    /// Higher priority blends last (wins ties).
+    pub priority: f32,
+    /// Maximum contribution, 0..1.
+    pub weight: f32,
+    /// Local: world-units over which the effect fades in approaching the box.
+    pub blend_distance: f32,
+    /// Local box half-size (object-local units).
+    pub half_extents: [f32; 3],
+}
+
+impl Default for VolumeComponent {
+    fn default() -> Self {
+        Self {
+            profile: String::new(),
+            global: true,
+            priority: 0.0,
+            weight: 1.0,
+            blend_distance: 1.0,
+            half_extents: [5.0, 5.0, 5.0],
+        }
+    }
+}
+
+impl TypedComponent for VolumeComponent {
+    const NAME: &'static str = "Volume (Post FX)";
 }
 
 /// Marks the object whose transform is the "ears" for spatial audio.

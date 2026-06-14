@@ -9,6 +9,7 @@ mod bake;
 mod context;
 mod frame;
 mod pipeline;
+pub mod sdf;
 mod swapchain;
 mod texture;
 mod types;
@@ -122,6 +123,16 @@ struct FrameUbo {
     light_color: [f32; 4],
     ambient: [f32; 4],
     misc: [f32; 4], // x = time, y = light count, z = shadow spacing, w = probe-volume count
+    // Post-processing (per-pixel effects in the surface shaders). Kept right
+    // after `misc` so the skybox's truncated FrameData prefix can read them too.
+    /// x = tonemap mode, y = tonemap exposure (EV), z = grade exposure, w = contrast.
+    postfx0: [f32; 4],
+    /// x = saturation, y = temperature, z = tint, w = grading enabled (>0.5).
+    postfx1: [f32; 4],
+    /// x = vignette enabled, y = intensity, z = smoothness, w = screen width px.
+    postfx2: [f32; 4],
+    /// xyz = vignette color, w = screen height px.
+    postfx3: [f32; 4],
     /// Far view-space distance of each directional cascade (xyzw = up to 4).
     cascade_splits: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
@@ -263,7 +274,10 @@ fn plan_shadows(
         }
         lights[li].spot[1] = base as f32;
         lights[li].spot[2] = l.shadow_bias;
-        lights[li].spot[3] = needed as f32;
+        // View count in spot.w; its sign carries the filter mode (positive =
+        // soft/PCF, negative = hard/single-tap), so no extra GPU field is
+        // needed. The shader reads abs() for the count.
+        lights[li].spot[3] = if l.soft_shadows { needed as f32 } else { -(needed as f32) };
         next_layer += needed;
     }
     (views, shadow_vp, cascade_splits)
@@ -824,6 +838,10 @@ pub struct Renderer {
     frame_ubos: Vec<Buffer>,
     frame_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
+    /// Linear CLAMP_TO_EDGE sampler for baked lightmaps — the material `sampler`
+    /// is REPEAT (tiling), which wraps at the atlas border and bleeds chart
+    /// edges into the opposite side.
+    lightmap_sampler: vk::Sampler,
     default_textures: Vec<GpuTexture>, // [albedo, normal, orm, emission]
     /// Fullscreen skybox: descriptor set (set 1) + optional equirect texture.
     /// When `skybox_has_texture` is false the shader draws a procedural sky.
@@ -846,6 +864,9 @@ pub struct Renderer {
     /// Baked light-probe SH (set-0 binding 2). A 1-probe zero buffer until a
     /// bake is loaded, so the binding is always valid.
     probe_buffer: Buffer,
+    /// Number of probes the `probe_buffer` is sized for — lets `update_probe_sh`
+    /// rewrite it in place (cheap, no realloc/stall) when the count is unchanged.
+    probe_count: usize,
     /// Probe-volume metadata mirrored into each frame's FrameUbo (count drives
     /// `misc.w`). Empty = fall back to flat ambient.
     probe_volumes: Vec<GpuProbeVolume>,
@@ -990,6 +1011,20 @@ impl Renderer {
             .max_lod(vk::LOD_CLAMP_NONE);
         let sampler = unsafe { ctx.device.create_sampler(&sampler_info, None)? };
 
+        // Lightmaps are a packed UV atlas — clamp (not tile) so bilinear filtering
+        // at the atlas border doesn't wrap to the opposite edge (a seam line).
+        let lightmap_sampler = unsafe {
+            ctx.device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?
+        };
+
         // Shadow atlas + wire its array view into every frame set (binding 1).
         let shadow_atlas = ShadowAtlas::new(&ctx, &mut allocator.lock().unwrap(), SHADOW_DIM)?;
         for &set in &frame_sets {
@@ -1045,7 +1080,7 @@ impl Renderer {
         )?;
         for &set in &frame_sets {
             let info = [vk::DescriptorImageInfo::default()
-                .sampler(sampler)
+                .sampler(lightmap_sampler)
                 .image_view(lightmaps.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let write = vk::WriteDescriptorSet::default()
@@ -1148,6 +1183,7 @@ impl Renderer {
             frame_ubos,
             frame_sets,
             sampler,
+            lightmap_sampler,
             default_textures,
             skybox_set,
             skybox_texture: None,
@@ -1160,6 +1196,7 @@ impl Renderer {
             egui_free_queue: VecDeque::new(),
             camera_preview: None,
             probe_buffer,
+            probe_count: 1, // default buffer holds one probe
             probe_volumes: Vec::new(),
             lightmaps,
             last_stats: RenderStats::default(),
@@ -1240,6 +1277,33 @@ impl Renderer {
         }
         let mut old = std::mem::replace(&mut self.probe_buffer, buf);
         old.destroy(&self.ctx.device, &mut alloc.lock().unwrap());
+        self.probe_count = gpu.len();
+    }
+
+    /// Cheap per-frame rewrite of the probe SH SSBO **in place** — no realloc,
+    /// no `device_wait_idle`, no descriptor rewrite. Used to smoothly ease the
+    /// realtime-GI probes toward each new trace every frame. Returns false when
+    /// the probe count differs from the current buffer (caller must then use
+    /// `set_baked_probes` to resize). The write is unsynchronized w.r.t. the GPU,
+    /// which is fine for low-frequency, temporally-smoothed GI (a rare torn read
+    /// is invisible) and avoids a full pipeline stall.
+    pub fn update_probe_sh(&mut self, probes: &[ProbeSh]) -> bool {
+        if probes.is_empty() || probes.len() != self.probe_count {
+            return false;
+        }
+        let gpu: Vec<GpuProbe> = probes
+            .iter()
+            .map(|p| GpuProbe {
+                coeffs: [
+                    [p.coeffs[0][0], p.coeffs[0][1], p.coeffs[0][2], 0.0],
+                    [p.coeffs[1][0], p.coeffs[1][1], p.coeffs[1][2], 0.0],
+                    [p.coeffs[2][0], p.coeffs[2][1], p.coeffs[2][2], 0.0],
+                    [p.coeffs[3][0], p.coeffs[3][1], p.coeffs[3][2], 0.0],
+                ],
+            })
+            .collect();
+        self.probe_buffer.write(0, bytemuck::cast_slice(&gpu));
+        true
     }
 
     /// Upload baked lightmaps (set-0 binding 3) as a 2D array, one layer per
@@ -1291,7 +1355,7 @@ impl Renderer {
         }
         for set in sets {
             let info = [vk::DescriptorImageInfo::default()
-                .sampler(self.sampler)
+                .sampler(self.lightmap_sampler)
                 .image_view(tex.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let write = vk::WriteDescriptorSet::default()
@@ -1746,6 +1810,7 @@ impl Renderer {
                 spot_inner_deg: 0.0,
                 spot_outer_deg: 0.0,
                 cast_shadows: false,
+                soft_shadows: true,
                 shadow_bias: 0.0,
             });
             count = 1;
@@ -1763,6 +1828,10 @@ impl Renderer {
             shadow_vp,
             cascade_splits,
             &self.probe_volumes,
+            [
+                self.swapchain.extent.width as f32,
+                self.swapchain.extent.height as f32,
+            ],
         );
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
 
@@ -1783,7 +1852,7 @@ impl Renderer {
                         self.shadow_atlas.sampler,
                         self.probe_buffer.handle,
                         self.lightmaps.view,
-                        self.sampler,
+                        self.lightmap_sampler,
                         self.egui.as_mut().unwrap(),
                     )?;
                     self.camera_preview = Some(preview);
@@ -1798,6 +1867,7 @@ impl Renderer {
                     shadow_vp,
                     cascade_splits,
                     &self.probe_volumes,
+                    [preview.extent.width as f32, preview.extent.height as f32],
                 );
                 preview.ubos[self.frame_index].write(0, bytemuck::bytes_of(&cam_ubo));
             }
@@ -2193,6 +2263,7 @@ fn frame_ubo(
     shadow_vp: [[[f32; 4]; 4]; MAX_SHADOW_VIEWS],
     cascade_splits: [f32; 4],
     probe_volumes: &[GpuProbeVolume],
+    screen: [f32; 2],
 ) -> FrameUbo {
     let mut volumes = [GpuProbeVolume::default(); MAX_PROBE_VOLUMES];
     let nv = probe_volumes.len().min(MAX_PROBE_VOLUMES);
@@ -2221,6 +2292,30 @@ fn frame_ubo(
         shadow_vp,
         probe_volumes: volumes,
         debug: [if input.lightmap_preview { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        postfx0: [
+            input.postfx.tonemap as f32,
+            input.postfx.exposure,
+            input.postfx.grade_exposure,
+            input.postfx.contrast,
+        ],
+        postfx1: [
+            input.postfx.saturation,
+            input.postfx.temperature,
+            input.postfx.tint,
+            if input.postfx.grading_enabled { 1.0 } else { 0.0 },
+        ],
+        postfx2: [
+            if input.postfx.vignette_enabled { 1.0 } else { 0.0 },
+            input.postfx.vignette_intensity,
+            input.postfx.vignette_smoothness,
+            screen[0],
+        ],
+        postfx3: [
+            input.postfx.vignette_color[0],
+            input.postfx.vignette_color[1],
+            input.postfx.vignette_color[2],
+            screen[1],
+        ],
     }
 }
 
@@ -2669,6 +2764,7 @@ impl Drop for Renderer {
 
         unsafe {
             device.destroy_sampler(self.sampler, None);
+            device.destroy_sampler(self.lightmap_sampler, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_pool(self.material_pool, None);
         }
