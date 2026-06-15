@@ -524,12 +524,27 @@ impl Default for WidgetSetting {
 /// Viewport billboard-widget filter (top-right overlay). Only billboard icons
 /// are filtered; the move/rotate/scale gizmos are never hidden. A filtered-
 /// off billboard still draws when its object is the current selection.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct WidgetFilter {
+    /// Master toggle (the eye button): when false, no gizmos/widgets/billboards
+    /// are shown at all (transform handles included).
+    enabled: bool,
     lights: WidgetSetting,
     cameras: WidgetSetting,
     probes: WidgetSetting,
     audio: WidgetSetting,
+}
+
+impl Default for WidgetFilter {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lights: WidgetSetting::default(),
+            cameras: WidgetSetting::default(),
+            probes: WidgetSetting::default(),
+            audio: WidgetSetting::default(),
+        }
+    }
 }
 
 struct EngineApp {
@@ -936,19 +951,16 @@ impl EngineApp {
         }
     }
 
-    /// Cursor position (egui points) → world ray.
+    /// Cursor position (egui points) → world ray. NDC is relative to the viewport
+    /// tab rect, since the scene renders into a texture filling that rect (RTT).
     fn cursor_ray(&self, pos: egui::Pos2) -> Option<(Vec3, Vec3)> {
-        let window = self.window.as_ref()?;
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
+        let rect = self.viewport_rect;
+        if !rect.is_finite() || rect.width() < 1.0 || rect.height() < 1.0 {
             return None;
         }
-        let ppp = self.egui_ctx.pixels_per_point();
-        let px = pos.x * ppp;
-        let py = pos.y * ppp;
-        let ndc_x = 2.0 * (px / size.width as f32) - 1.0;
-        let ndc_y = 1.0 - 2.0 * (py / size.height as f32);
-        let aspect = size.width as f32 / size.height as f32;
+        let ndc_x = 2.0 * ((pos.x - rect.left()) / rect.width()) - 1.0;
+        let ndc_y = 1.0 - 2.0 * ((pos.y - rect.top()) / rect.height());
+        let aspect = rect.width() / rect.height();
         let inv = (self.camera.proj(aspect) * self.camera.view()).inverse();
         let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
         let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
@@ -3742,9 +3754,26 @@ impl EngineApp {
             });
         }
         let size = window.inner_size();
-        let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+        // The editor viewport renders to an offscreen texture sized to the dock
+        // rect (RTT), so the camera aspect comes from that rect, not the window.
+        let ppp = self.egui_ctx.pixels_per_point();
+        let vrect = self.viewport_rect;
+        let (vw, vh) = (
+            (vrect.width() * ppp).round().max(1.0) as u32,
+            (vrect.height() * ppp).round().max(1.0) as u32,
+        );
+        let aspect = if vrect.is_finite() && vrect.height() > 1.0 {
+            vrect.width() / vrect.height()
+        } else {
+            size.width.max(1) as f32 / size.height.max(1) as f32
+        };
         let view = self.camera.view();
         let proj = self.camera.proj(aspect);
+        let viewport_extent = if self.viewport_visible && vrect.is_finite() {
+            Some([vw, vh])
+        } else {
+            None
+        };
 
         let render_stats = self
             .renderer
@@ -3780,6 +3809,10 @@ impl EngineApp {
                 .renderer
                 .as_ref()
                 .and_then(|r| r.camera_preview_texture());
+            let viewport_texture = self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.viewport_texture());
             let camera_overlay = matches!(
                 self.selection,
                 Selection::Object(i) if self.scene.camera_view_proj_for(i, 1.0).is_some()
@@ -3818,6 +3851,9 @@ impl EngineApp {
                 widget_filter: &mut self.widget_filter,
                 gizmo_drag: &mut self.gizmo_drag,
                 orbit_armed: &mut self.orbit_armed,
+                // An orbit is genuinely in progress (locked pivot) — used to ignore
+                // all viewport widgets/gizmos while the camera is rotating.
+                orbiting: self.orbit_pivot.is_some(),
                 pointer_in_viewport,
                 actions: &mut self.actions,
                 viewport_rect: &mut self.viewport_rect,
@@ -3825,6 +3861,7 @@ impl EngineApp {
                 shader_list: &shader_list,
                 shader_info: shader_info.as_ref(),
                 camera_preview,
+                viewport_texture,
                 camera_overlay,
                 view,
                 proj,
@@ -4051,9 +4088,10 @@ impl EngineApp {
             draws: &self.scene.draws,
             lightmap_preview: self.lightmap_preview,
             gi_debug: self.gi_debug,
-            render_viewport: self.viewport_visible,
-            // Wired in the final RTT step; None keeps the current swapchain path.
-            viewport_extent: None,
+            // The editor renders the scene into the viewport texture (RTT), never
+            // the swapchain — so the swapchain pass is clear + egui only.
+            render_viewport: false,
+            viewport_extent,
             postfx,
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
@@ -4113,6 +4151,9 @@ struct EditorTabs<'a> {
     widget_filter: &'a mut WidgetFilter,
     gizmo_drag: &'a mut bool,
     orbit_armed: &'a mut bool,
+    /// True while the camera is actively orbiting (locked pivot); viewport
+    /// widgets/gizmos are ignored so a rotate gesture can't grab a handle.
+    orbiting: bool,
     /// Winit-based "pointer is over the viewport" (robust after cursor-grab).
     pointer_in_viewport: bool,
     actions: &'a mut Vec<EditorAction>,
@@ -4123,6 +4164,8 @@ struct EditorTabs<'a> {
     /// Main-camera preview (egui texture + pixel size), if the renderer has
     /// rendered one yet.
     camera_preview: Option<(egui::TextureId, [f32; 2])>,
+    /// The editor viewport's offscreen render (RTT), painted to fill the tab.
+    viewport_texture: Option<(egui::TextureId, [f32; 2])>,
     /// A camera object is selected → draw its preview as a viewport overlay.
     camera_overlay: bool,
     view: glam::Mat4,
@@ -4485,7 +4528,7 @@ impl EditorTabs<'_> {
         if !src.spatial {
             return;
         }
-        let full_rect = response.ctx.viewport_rect();
+        let full_rect = *self.viewport_rect;
         let origin = self.scene.world_transform(i).w_axis.truncate();
         let right = self.camera_right();
         let mut best: Option<(f32, AudioDrag)> = None;
@@ -4586,7 +4629,7 @@ impl EditorTabs<'_> {
         if self.gizmo.pick_preview(press) {
             return;
         }
-        let full_rect = response.ctx.viewport_rect();
+        let full_rect = *self.viewport_rect;
         let world = self.scene.world_transform(i);
         let (w_scale, _, _) = world.to_scale_rotation_translation();
 
@@ -4676,7 +4719,7 @@ impl EditorTabs<'_> {
         cursor: Option<egui::Pos2>,
         alt: bool,
     ) {
-        let full_rect = response.ctx.viewport_rect();
+        let full_rect = *self.viewport_rect;
 
         // Continue / end an in-progress drag.
         if let Some(drag) = self.probe_drag.as_ref() {
@@ -5312,6 +5355,16 @@ impl EditorTabs<'_> {
         *self.viewport_visible = true;
         let rect = ui.max_rect();
         *self.viewport_rect = rect;
+        // Paint the editor viewport's offscreen render (RTT) filling the tab; the
+        // gizmo + billboards draw on top. (One frame old, like any egui texture.)
+        if let Some((tex, _)) = self.viewport_texture {
+            ui.painter().image(
+                tex,
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
         let response = ui.interact(
             rect,
             ui.id().with("viewport-interact"),
@@ -5374,20 +5427,25 @@ impl EditorTabs<'_> {
             *self.orbit_armed = false;
         }
 
-        // Light Probe Volume box-resize: dragging a face handle changes the
-        // volume's size along that axis, keeping the opposite face fixed. Run
-        // before the transform gizmo so a grabbed handle wins the drag; the
-        // gizmo still moves/rotates the object when no handle is grabbed.
-        self.probe_resize_interaction(&response, cursor, alt);
-        // AudioSource min/max range spheres resize the same way.
-        self.audio_range_interaction(&response, cursor, alt);
-        // Box/Sphere collider handles too.
-        self.collider_interaction(&response, cursor, alt);
+        // While the camera is actively orbiting, ignore every viewport widget so
+        // a rotate gesture can't grab a probe/collider/audio handle or the gizmo
+        // as the cursor sweeps across them.
+        if !self.orbiting && self.widget_filter.enabled {
+            // Light Probe Volume box-resize: dragging a face handle changes the
+            // volume's size along that axis, keeping the opposite face fixed. Run
+            // before the transform gizmo so a grabbed handle wins the drag; the
+            // gizmo still moves/rotates the object when no handle is grabbed.
+            self.probe_resize_interaction(&response, cursor, alt);
+            // AudioSource min/max range spheres resize the same way.
+            self.audio_range_interaction(&response, cursor, alt);
+            // Box/Sphere collider handles too.
+            self.collider_interaction(&response, cursor, alt);
+        }
         let probe_active = self.probe_drag.is_some()
             || self.audio_drag.is_some()
             || self.collider_drag.is_some();
 
-        if !probe_active && let Selection::Object(i) = *self.selection {
+        if !self.orbiting && self.widget_filter.enabled && !probe_active && let Selection::Object(i) = *self.selection {
             {
                 let pivot_local = match (self.gizmo.pivot, self.scene.objects[i].render) {
                     (gizmo::PivotMode::Center, Some(render)) => {
@@ -5401,13 +5459,11 @@ impl EditorTabs<'_> {
                 // back to parent-local afterwards.
                 let world = self.scene.world_transform(i);
                 let (mut w_scale, mut w_rot, mut w_trans) = world.to_scale_rotation_translation();
-                // The scene fills the whole window (panels just occlude it),
-                // so the gizmo's NDC mapping must use the full screen rect;
-                // the painter still clips to this tab.
+                // The scene now renders into the viewport texture that fills this
+                // tab (RTT), so the gizmo's NDC mapping uses the tab rect.
                 gizmo_changed = self.gizmo.interact(
                     ui,
-                    // Full window: matches the swapchain the scene renders to.
-                    ui.ctx().viewport_rect(),
+                    rect,
                     self.view,
                     self.proj,
                     (&mut w_trans, &mut w_rot, &mut w_scale),
@@ -5433,13 +5489,13 @@ impl EditorTabs<'_> {
 
         // Camera frustum widget: only the selected camera shows its
         // orientation, FOV and framing (near/far rects + up-marker).
-        {
+        if self.widget_filter.enabled {
             let selected = match self.selection {
                 Selection::Object(i) => Some(*i),
                 _ => None,
             };
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let painter = ui.painter();
             let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
                 let ndc = clip.truncate() / clip.w;
@@ -5529,7 +5585,7 @@ impl EditorTabs<'_> {
                 _ => None,
             };
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let painter = ui.painter();
             let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
                 let ndc = clip.truncate() / clip.w;
@@ -5657,7 +5713,7 @@ impl EditorTabs<'_> {
         let mut billboards: Vec<(egui::Pos2, usize)> = Vec::new();
         {
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let painter = ui.painter();
             for (i, object) in self.scene.objects.iter().enumerate() {
                 if !self.scene.is_active(i) {
@@ -5706,8 +5762,9 @@ impl EditorTabs<'_> {
                 } else {
                     self.widget_filter.cameras
                 };
-                // Filtered-off billboards still show for the selected object.
-                if !setting.visible && !selected {
+                // Master eye off hides everything; otherwise filtered-off
+                // billboards still show for the selected object.
+                if !self.widget_filter.enabled || (!setting.visible && !selected) {
                     continue;
                 }
                 if is_light {
@@ -5735,7 +5792,7 @@ impl EditorTabs<'_> {
         {
             use citrus_core::LightKind;
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let painter = ui.painter();
             let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 226, 120));
             let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
@@ -5831,7 +5888,7 @@ impl EditorTabs<'_> {
                 .map(|s| (s.min_distance, s.max_distance))
         {
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let origin = self.scene.world_transform(i).w_axis.truncate();
             let right = self.camera_right();
             let painter = ui.painter();
@@ -5908,7 +5965,7 @@ impl EditorTabs<'_> {
             const YELLOW: egui::Color32 = egui::Color32::from_rgb(240, 220, 70);
             let world = self.scene.world_transform(i);
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let right = self.camera_right();
             let painter = ui.painter();
             let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
@@ -6081,7 +6138,7 @@ impl EditorTabs<'_> {
             // steady on-screen size).
             let len = ((origin - cam).length() * 0.12).clamp(0.05, 50.0);
             let view_proj = self.proj * self.view;
-            let full_rect = ui.ctx().viewport_rect();
+            let full_rect = *self.viewport_rect;
             let painter = ui.painter();
             let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
                 let ndc = clip.truncate() / clip.w;
@@ -6213,9 +6270,19 @@ impl EditorTabs<'_> {
             .fixed_pos(rect.right_top() + egui::vec2(-8.0, 8.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    // Stay open across checkbox/slider clicks so several kinds
-                    // can be toggled at once (like the View menu).
-                    egui::containers::menu::MenuButton::new("👁 Gizmos")
+                    ui.horizontal(|ui| {
+                    // Eye = master toggle for ALL viewport gizmos/widgets.
+                    let eye = if self.widget_filter.enabled { "👁" } else { "🙈" };
+                    if ui
+                        .selectable_label(self.widget_filter.enabled, eye)
+                        .on_hover_text("Toggle all gizmos")
+                        .clicked()
+                    {
+                        self.widget_filter.enabled = !self.widget_filter.enabled;
+                    }
+                    // Dropdown = per-kind filter. Stay open across clicks so
+                    // several kinds can be toggled at once (like the View menu).
+                    egui::containers::menu::MenuButton::new("Gizmos ▾")
                         .config(
                             egui::containers::menu::MenuConfig::new()
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
@@ -6246,6 +6313,7 @@ impl EditorTabs<'_> {
                                     .weak(),
                             );
                         });
+                    });
                 });
             });
         egui::Area::new(ui.id().with("vp-pivot"))

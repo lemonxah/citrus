@@ -2269,6 +2269,9 @@ impl Renderer {
             texture.destroy(&self.ctx.device, &mut alloc);
         }
         self.textures.clear();
+        for material in &mut self.materials {
+            material.fx_ubo.destroy(&self.ctx.device, &mut alloc);
+        }
         self.materials.clear();
         unsafe {
             self.ctx
@@ -2425,6 +2428,14 @@ impl Renderer {
         // before building the UBOs that carry the shadow matrices.
         let (shadow_views, shadow_vp, cascade_splits) = plan_shadows(input, &mut lights, count);
 
+        // Screen size for the frame UBO = the render target the main camera draws
+        // into: the viewport rect under editor RTT, else the swapchain. The Flux
+        // upsample samples by gl_FragCoord / this size, so it must match or the GI
+        // lands in the wrong place.
+        let main_extent = input.viewport_extent.unwrap_or([
+            self.swapchain.extent.width,
+            self.swapchain.extent.height,
+        ]);
         let mut ubo = frame_ubo(
             &input.camera,
             input,
@@ -2433,10 +2444,7 @@ impl Renderer {
             shadow_vp,
             cascade_splits,
             &self.probe_volumes,
-            [
-                self.swapchain.extent.width as f32,
-                self.swapchain.extent.height as f32,
-            ],
+            [main_extent[0] as f32, main_extent[1] as f32],
         );
         // debug.z = screen-GI active, so the forward shader samples the gather
         // instead of the coarse world-probe grid.
@@ -2556,6 +2564,35 @@ impl Renderer {
             }
         }
 
+        // Editor RTT: (re)create the offscreen viewport target at the requested
+        // dock-rect size. None (game) leaves it absent → renders to swapchain.
+        if let Some([vw, vh]) = input.viewport_extent {
+            let vw = vw.max(1);
+            let vh = vh.max(1);
+            let need = self
+                .viewport_target
+                .as_ref()
+                .map_or(true, |t| t.extent.width != vw || t.extent.height != vh);
+            if need && let Some(allocator) = self.allocator.clone() {
+                unsafe {
+                    let _ = self.ctx.device.device_wait_idle();
+                }
+                let mut alloc = allocator.lock().unwrap();
+                if let Some(mut old) = self.viewport_target.take() {
+                    old.destroy(&self.ctx.device, &mut alloc);
+                }
+                let fmt = self.swapchain.format.format;
+                self.viewport_target = Some(ViewportTarget::new(
+                    &self.ctx,
+                    &mut alloc,
+                    fmt,
+                    self.sampler,
+                    vk::Extent2D { width: vw, height: vh },
+                    self.egui.as_mut().unwrap(),
+                )?);
+            }
+        }
+
         let cb = command_buffer;
         let image = self.swapchain.images[image_index as usize];
         let color_view = self.swapchain.views[image_index as usize];
@@ -2612,6 +2649,15 @@ impl Renderer {
             // can sample the result this frame.
             if render_camera_preview && self.camera_preview.is_some() {
                 self.record_camera_preview(&device, cb, &order, input, input.clear_color)?;
+            }
+
+            // Editor RTT: render the viewport 3D into its offscreen texture (the
+            // swapchain pass below skips the scene because the editor sets
+            // render_viewport=false, and egui shows this texture).
+            if input.viewport_extent.is_some() && self.viewport_target.is_some() {
+                if let Err(e) = self.record_viewport_scene(&device, cb, &order, input) {
+                    tracing::warn!("viewport RTT failed: {e:#}");
+                }
             }
 
             // Color: undefined -> color attachment.
@@ -3771,6 +3817,158 @@ impl Renderer {
                 [p.extent.width as f32, p.extent.height as f32],
             )
         })
+    }
+
+    /// egui texture for the editor viewport's offscreen render (RTT), if active.
+    pub fn viewport_texture(&self) -> Option<(egui::TextureId, [f32; 2])> {
+        self.viewport_target.as_ref().map(|t| {
+            (t.texture_id, [t.extent.width as f32, t.extent.height as f32])
+        })
+    }
+
+    /// Editor RTT: render the viewport 3D (Flux trace + skybox + scene) into the
+    /// viewport target's offscreen color/depth at the dock-rect resolution, then
+    /// transition the color to SHADER_READ so egui can show it. Uses the editor
+    /// (main) camera + its sgi temporal state, but the target's own rect-sized
+    /// sgi/color/depth. Only called by the editor; the game renders to swapchain.
+    fn record_viewport_scene(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        order: &[usize],
+        input: &FrameInput,
+    ) -> Result<()> {
+        let (col_img, col_view, dep_img, dep_view, ext, s_depth_img, s_depth_view, s_probe, s_img, s_view) = {
+            let vt = self.viewport_target.as_ref().unwrap();
+            (
+                vt.color, vt.color_view, vt.depth, vt.depth_view, vt.extent,
+                vt.sgi.depth_image, vt.sgi.depth_view, vt.sgi.probe_extent,
+                vt.sgi.gi_image, vt.sgi.gi_view,
+            )
+        };
+        let frame_set = self.frame_sets[self.frame_index];
+
+        // 1) Flux trace (editor camera -> the viewport target's sgi), reusing the
+        //    main-camera temporal state.
+        if self.gi_has_gdf() {
+            let dp = self.pipeline_cache.get(device, PipelineKey::shadow())?;
+            let view_proj = input.camera.proj * input.camera.view;
+            let camera_moved = self.sgi_last_view_proj != Some(view_proj);
+            if camera_moved {
+                self.sgi_still_frames = 0;
+            } else {
+                self.sgi_still_frames = self.sgi_still_frames.saturating_add(1);
+            }
+            const CF: u32 = 48;
+            if camera_moved || self.sgi_still_frames < CF {
+                self.sgi_frame = self.sgi_frame.wrapping_add(1);
+                let hist_valid = self.sgi_history_valid;
+                let cur = self.sgi_parity & 1;
+                let prev_vp = self.sgi_last_view_proj.unwrap_or(view_proj);
+                let prev_cam = if self.sgi_last_view_proj.is_some() {
+                    self.sgi_last_cam
+                } else {
+                    input.camera.position
+                };
+                let s = self.flux_settings.smoothing.clamp(0.0, 1.0);
+                let alpha = if !hist_valid {
+                    1.0
+                } else if camera_moved {
+                    0.5 - 0.4 * s
+                } else {
+                    0.12 - 0.10 * s
+                };
+                let seed = self.sgi_frame;
+                let flip = self.screen_gi_flip_y;
+                let t = self.record_flux_trace(
+                    device, cb, dp, input, &input.camera, s_depth_img, s_depth_view, s_probe,
+                    s_img[cur], s_view[cur], s_view[cur ^ 1], ext, hist_valid, prev_vp, prev_cam,
+                    alpha, seed, flip,
+                )?;
+                if let Some(t) = t {
+                    self.sgi_transients[self.frame_index] = Some(t);
+                }
+                self.sgi_history_valid = true;
+                self.sgi_last_view_proj = Some(view_proj);
+                self.sgi_last_cam = input.camera.position;
+                self.sgi_parity ^= 1;
+            }
+            let cur = (self.sgi_parity ^ 1) & 1;
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(self.lightmap_sampler)
+                .image_view(s_view[cur])
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(frame_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { device.update_descriptor_sets(&[write], &[]) };
+        }
+
+        // 2) Scene color pass into the viewport target.
+        unsafe {
+            image_barrier(
+                device, cb, col_img, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            );
+            image_barrier(
+                device, cb, dep_img, vk::ImageAspectFlags::DEPTH,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            );
+            let color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(col_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.016, 0.016, 0.024, 1.0] },
+                });
+            let depth_att = vk::RenderingAttachmentInfo::default()
+                .image_view(dep_view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                });
+            let color_atts = [color_att];
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext })
+                .layer_count(1)
+                .color_attachments(&color_atts)
+                .depth_attachment(&depth_att);
+            device.cmd_begin_rendering(cb, &info);
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: ext.height as f32,
+                width: ext.width as f32,
+                height: -(ext.height as f32),
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            device.cmd_set_viewport(cb, 0, &[viewport]);
+            device.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }]);
+        }
+        if input.draw_skybox {
+            self.record_skybox(device, cb, frame_set)?;
+        }
+        self.record_scene_draws(device, cb, order, input, frame_set)?;
+        unsafe {
+            device.cmd_end_rendering(cb);
+            image_barrier(
+                device, cb, col_img, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
+        }
+        Ok(())
     }
 }
 

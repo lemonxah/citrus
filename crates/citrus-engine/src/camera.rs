@@ -25,7 +25,10 @@ impl FlyCamera {
             position,
             yaw: dir.z.atan2(dir.x),
             pitch: dir.y.asin(),
-            fov_y: 60f32.to_radians(),
+            // 50 deg vertical (~80 deg horizontal at 16:9): wide enough to frame a
+            // scene, narrow enough that objects near the edges aren't stretched by
+            // perspective the way a 60+ deg FOV does.
+            fov_y: 50f32.to_radians(),
         }
     }
 
