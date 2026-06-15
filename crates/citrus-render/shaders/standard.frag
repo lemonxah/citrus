@@ -517,15 +517,17 @@ vec4 trace_ssr(vec3 P, vec3 Nv) {
     vec2 uv0 = ssr_project(P, flipY);
     vec2 uv1 = ssr_project(endP, flipY);
 
-    // Uniform SCREEN-SPACE march with a CONSTANT step count. Marching in screen
-    // space (not world distance) keeps it stable regardless of camera distance;
-    // a constant count (not derived from the ray's screen length) keeps adjacent
-    // pixels marching identically — a per-ray step count made neighbours sample
-    // different points and dithered into speckle (worst on the round sphere).
-    // Depth along the ray is perspective-correct via linear 1/z interpolation.
-    const int steps = 64;
+    // SCREEN-SPACE march at a FIXED pixel stride. The sampling density near the
+    // surface is constant — max distance only caps how far the ray reaches
+    // (t > 1 = endpoint), so changing max distance no longer warps the near
+    // reflection. A continuous stride in UV (not i/N) keeps every pixel sampling
+    // at the same screen cadence, so neighbours don't dither. Depth along the ray
+    // is perspective-correct via linear 1/z interpolation.
     float invz0 = 1.0 / P.z;
     float invz1 = 1.0 / endP.z;
+    float segPx = max(length((uv1 - uv0) * screen), 1.0);
+    float strideFrac = 2.0 / segPx; // ~2 px per step, regardless of ray length
+    const int MAX_STEPS = 256;
 
     float prevT = 0.0;
     // Track whether the ray is in FRONT of the depth buffer. A hit is a sign
@@ -533,8 +535,9 @@ vec4 trace_ssr(vec3 P, vec3 Nv) {
     // the first step self-hit the originating floor and reflect it dark (the dark
     // band at the contact). The ray starts in front of any reflected geometry.
     bool wasInFront = true;
-    for (int i = 1; i <= steps; ++i) {
-        float t = float(i) / float(steps);
+    for (int i = 1; i <= MAX_STEPS; ++i) {
+        float t = float(i) * strideFrac;
+        if (t > 1.0) break; // reached the max-distance endpoint
         vec2 uv = mix(uv0, uv1, t);
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
         float rayZ = 1.0 / mix(invz0, invz1, t); // perspective-correct ray depth
@@ -559,15 +562,20 @@ vec4 trace_ssr(vec3 P, vec3 Nv) {
             vec2 hitUv = mix(uv0, uv1, hi);
             float hrz = 1.0 / mix(invz0, invz1, hi);
             float residual = abs(ssr_scene_z(hitUv, flipY) - hrz);
-            // Converged onto a real surface? (Not a silhouette/background gap.)
-            if (residual < max(0.08 * abs(hrz), 0.05)) {
+            // Confidence = how cleanly the refine landed ON the surface. A SMOOTH
+            // fade (not a hard reject) so silhouette grazes fade into the env
+            // instead of cutting a thin dark line between an object and its
+            // reflection; near-zero residual = a solid hit.
+            float conf = 1.0 - smoothstep(max(0.04 * abs(hrz), 0.04),
+                                          max(0.16 * abs(hrz), 0.16), residual);
+            if (conf > 0.01) {
                 // Fade near the screen edges (off-screen geometry is unavailable;
                 // the reflection probe / env cube fills those — see spec_env).
                 vec2 e = smoothstep(vec2(0.0), vec2(0.1), hitUv)
                        * (1.0 - smoothstep(vec2(0.9), vec2(1.0), hitUv));
-                return vec4(texture(u_prev_color, hitUv).rgb, e.x * e.y);
+                return vec4(texture(u_prev_color, hitUv).rgb, e.x * e.y * conf);
             }
-            // Silhouette graze: not a valid reflection — keep marching.
+            // Far-off graze: keep marching (might cross a real surface later).
         }
         wasInFront = dz <= 0.0; // in front of (or on) the surface this step
         prevT = t;
@@ -748,9 +756,10 @@ void main() {
         R = hit - frame.refl_center.xyz;
     }
     float env_scale = probe_intensity > 0.0 ? probe_intensity : 1.0;
-    vec3 env = textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * env_scale;
-    float env_lum = dot(env, vec3(0.299, 0.587, 0.114));
-    vec3 spec_env = env_lum > 0.001 ? env : indirect;
+    // The env cube ALWAYS carries the environment (skybox texture/cube, or the
+    // procedural sky when none is set), so this is the reflection's base at any
+    // angle — never the dark diffuse-GI stand-in. SSR refines it on-screen.
+    vec3 spec_env = textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * env_scale;
     if (frame.ssr.x > 0.5 && roughness <= frame.ssr.w) {
         vec3 Nv = normalize(mat3(frame.view) * N);
         vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;

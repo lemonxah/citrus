@@ -2,10 +2,10 @@
     name: "Default",
     shader: "standard",
     params: (
-        base_color: (0.0, 0.0, 0.0, 1.0),
+        base_color: (1.0, 1.0, 1.0, 1.0),
         emission_color: (0.0, 0.0, 0.0),
         emission_intensity: 1.0,
-        metallic: 0.0,
+        metallic: 1.0,
         roughness: 0.0,
         toon_steps: 3.0,
         pbr_toon_blend: 1.0,

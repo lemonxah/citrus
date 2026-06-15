@@ -873,19 +873,43 @@ impl ReflectionEnv {
     }
 
     /// A 1×1 neutral (black) cube so the binding is valid before a skybox loads.
+    /// The default reflection environment when no skybox texture is set: the
+    /// procedural sky gradient (matching `skybox.frag`), so reflective surfaces
+    /// always reflect the sky instead of black.
     fn neutral(
         device: &ash::Device,
         allocator: &mut Allocator,
         command_pool: vk::CommandPool,
         queue: vk::Queue,
     ) -> Result<Self> {
-        let black = TextureData {
-            width: 1,
-            height: 1,
-            pixels: vec![0, 0, 0, 255],
-            srgb: true,
-        };
-        Self::from_equirect(device, allocator, command_pool, queue, &black)
+        Self::build_cube(device, allocator, command_pool, queue, 64, |face, size| {
+            let mut out = vec![0u8; (size * size * 4) as usize];
+            let mix = |a: f32, b: f32, t: f32| a + (b - a) * t.clamp(0.0, 1.0);
+            // Matches the procedural sky in skybox.frag.
+            let horizon = [0.52f32, 0.60, 0.72];
+            let zenith = [0.10f32, 0.16, 0.34];
+            let ground = [0.06f32, 0.06, 0.08];
+            for y in 0..size {
+                for x in 0..size {
+                    let fx = (x as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                    let fy = (y as f32 + 0.5) / size as f32 * 2.0 - 1.0;
+                    let d = Self::face_dir(face, fx, fy);
+                    let c = if d[1] >= 0.0 {
+                        let t = d[1];
+                        [mix(horizon[0], zenith[0], t), mix(horizon[1], zenith[1], t), mix(horizon[2], zenith[2], t)]
+                    } else {
+                        let t = -d[1] * 2.0;
+                        [mix(horizon[0], ground[0], t), mix(horizon[1], ground[1], t), mix(horizon[2], ground[2], t)]
+                    };
+                    let o = ((y * size + x) * 4) as usize;
+                    out[o] = (c[0] * 255.0) as u8;
+                    out[o + 1] = (c[1] * 255.0) as u8;
+                    out[o + 2] = (c[2] * 255.0) as u8;
+                    out[o + 3] = 255;
+                }
+            }
+            out
+        })
     }
 
     fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
