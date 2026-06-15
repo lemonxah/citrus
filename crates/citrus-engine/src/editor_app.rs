@@ -108,6 +108,13 @@ pub fn run(config: AppConfig) -> Result<()> {
         panning: false,
         look_delta: (0.0, 0.0),
         keys: HashSet::new(),
+        input: crate::input_engine::InputManager::default(),
+        net: None,
+        voice: None,
+        net_addr: "127.0.0.1:9000".to_string(),
+        show_bindings: false,
+        show_network: false,
+        rebinding: None,
         last_cursor: None,
         viewport_rect: egui::Rect::EVERYTHING,
         project_root,
@@ -578,6 +585,22 @@ struct EngineApp {
     /// Raw mouse deltas accumulated while looking.
     look_delta: (f64, f64),
     keys: HashSet<KeyCode>,
+    /// Input binding system (2C): drives Play-mode components from the active
+    /// control scheme; editable in the Bindings window.
+    input: crate::input_engine::InputManager,
+    /// Active networking session (2G) when hosting/joined from the Network panel.
+    net: Option<crate::net::NetSession>,
+    /// Voice comms (task 8), created lazily once networking is active.
+    voice: Option<crate::voice::VoiceChat>,
+    /// Address entered in the Network panel for Join.
+    net_addr: String,
+    /// Bindings editor window open.
+    show_bindings: bool,
+    /// Network panel open.
+    show_network: bool,
+    /// Action currently being rebound in the Bindings window (scheme, action,
+    /// slot) — the next key/mouse press is captured into it.
+    rebinding: Option<(usize, String)>,
     last_cursor: Option<(f64, f64)>,
     /// Viewport tab rect in egui points (updated每 frame by the tab).
     viewport_rect: egui::Rect,
@@ -696,6 +719,8 @@ impl EngineApp {
             }
         }
         window.set_title(&format!("{} — citrus", self.project.name));
+        // Load the project's input bindings (2C) into the live input manager.
+        self.input.bindings = self.project.bindings.clone();
         renderer.set_vsync(self.project.settings.vsync);
         self.show_stats = self.project.settings.show_stats;
         self.show_stats_overlay = self.project.settings.show_stats_overlay;
@@ -1773,6 +1798,15 @@ impl EngineApp {
                         }
                     }
                     ui.separator();
+                    if ui.button("Input Bindings…").clicked() {
+                        self.show_bindings = true;
+                        ui.close();
+                    }
+                    if ui.button("Network…").clicked() {
+                        self.show_network = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     let has_plugins = plugins::PluginHost::any_plugins(&self.project_root);
                     if !has_plugins && ui.button("Create Component Plugin").clicked() {
                         self.actions.push(EditorAction::CreatePluginCrate);
@@ -2313,6 +2347,8 @@ impl EngineApp {
         if self.playing {
             self.playing = false;
             self.physics = None;
+            // Pawn camera possession is play-only; revert to the default camera.
+            self.scene.active_camera_override = None;
             if let Some(audio) = self.audio.as_mut() {
                 audio.stop_all();
             }
@@ -2346,7 +2382,9 @@ impl EngineApp {
             self.play_time = 0.0;
             self.physics = Some(physics::PhysicsWorld::build(&self.scene));
             let mut commands = Vec::new();
-            self.scene.start_components(self.play_time, &mut commands);
+            let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+            self.scene
+                .start_components(self.play_time, self.input.state(), &net_view, &mut commands);
             // Start play-on-start audio sources.
             if let Some(audio) = self.audio.as_mut() {
                 let cues = self.scene.gather_audio();
@@ -2365,12 +2403,54 @@ impl EngineApp {
     /// last `LoadScene` wins (loading once); a switch during play continues
     /// playing in the new scene.
     fn apply_component_commands(&mut self, commands: Vec<ComponentCommand>) {
-        let load = commands
-            .into_iter()
-            .rev()
-            .find_map(|c| match c {
-                ComponentCommand::LoadScene(rel) => Some(rel),
-            });
+        let mut load = None;
+        for c in commands {
+            match c {
+                ComponentCommand::LoadScene(rel) => load = Some(rel),
+                ComponentCommand::SetActiveCamera(id) => self.scene.set_active_camera(id),
+                ComponentCommand::SetLocalTransform {
+                    id,
+                    translation,
+                    rotation,
+                    scale,
+                } => self.scene.set_local_transform(id, translation, rotation, scale),
+                ComponentCommand::RequestOwnership(id) => {
+                    if let Some(net) = self.net.as_mut() {
+                        net.request_ownership(id);
+                    }
+                }
+                ComponentCommand::ReleaseOwnership(id) => {
+                    if let Some(net) = self.net.as_mut() {
+                        net.release_ownership(id);
+                    }
+                }
+                ComponentCommand::SetResolution(w, h) => {
+                    if let Some(window) = self.window.as_ref() {
+                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                    }
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.resize();
+                    }
+                }
+                ComponentCommand::SetVsync(on) => {
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.set_vsync(on);
+                    }
+                }
+                ComponentCommand::SetShadowResolution(res) => {
+                    if let Some(r) = self.renderer.as_mut()
+                        && let Err(e) = r.set_shadow_resolution(res.clamp(256, 8192))
+                    {
+                        tracing::warn!("set shadow resolution: {e:#}");
+                    }
+                }
+                ComponentCommand::NetMessage { to, text } => {
+                    if let Some(net) = self.net.as_mut() {
+                        net.send_message(to, &text);
+                    }
+                }
+            }
+        }
         let Some(rel) = load else {
             return;
         };
@@ -2385,7 +2465,9 @@ impl EngineApp {
             self.physics = Some(physics::PhysicsWorld::build(&self.scene));
             // Run the new scene's start hooks + audio so play continues there.
             let mut commands = Vec::new();
-            self.scene.start_components(self.play_time, &mut commands);
+            let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+            self.scene
+                .start_components(self.play_time, self.input.state(), &net_view, &mut commands);
             if let Some(audio) = self.audio.as_mut() {
                 let cues = self.scene.gather_audio();
                 let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
@@ -2398,6 +2480,167 @@ impl EngineApp {
 
     /// Load a scene by absolute path, replacing the current one. Used by
     /// runtime (play-mode) scene switches and Stop-restore. Does not run start
+    /// Input Bindings window (2C): pick the active control scheme, view/clear
+    /// each action's bindings, and rebind by capturing the next key/mouse press.
+    /// Saves to `project.citrus` on every change.
+    fn bindings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_bindings;
+        let mut dirty = false;
+        let mut cancel_rebind = false;
+        egui::Window::new("Input Bindings")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                let b = &mut self.input.bindings;
+                ui.horizontal(|ui| {
+                    ui.label("Scheme");
+                    let cur = b.active_scheme().map(|s| s.name.clone()).unwrap_or_default();
+                    egui::ComboBox::from_id_salt("citrus-scheme")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for i in 0..b.schemes.len() {
+                                let name = b.schemes[i].name.clone();
+                                if ui.selectable_label(b.active == i, name).clicked() {
+                                    b.active = i;
+                                    dirty = true;
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+                if let Some(rb) = &self.rebinding {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("Press a key/mouse button for \"{}\" (Esc cancels)", rb.1),
+                    );
+                }
+                let active = b.active;
+                if let Some(scheme) = b.schemes.get_mut(active) {
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for (ai, act) in scheme.actions.iter_mut().enumerate() {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(&act.name);
+                                    ui.label(
+                                        egui::RichText::new(format!("{:?}", act.kind)).weak().small(),
+                                    );
+                                });
+                                dirty |= binding_slot_row(ui, "Buttons", &mut act.buttons, ai, "button", &mut self.rebinding);
+                                if matches!(act.kind, citrus_core::ActionKind::Axis1 | citrus_core::ActionKind::Axis2) {
+                                    dirty |= binding_slot_row(ui, "+X", &mut act.pos_x, ai, "pos_x", &mut self.rebinding);
+                                    dirty |= binding_slot_row(ui, "-X", &mut act.neg_x, ai, "neg_x", &mut self.rebinding);
+                                }
+                                if matches!(act.kind, citrus_core::ActionKind::Axis2) {
+                                    dirty |= binding_slot_row(ui, "+Y", &mut act.pos_y, ai, "pos_y", &mut self.rebinding);
+                                    dirty |= binding_slot_row(ui, "-Y", &mut act.neg_y, ai, "neg_y", &mut self.rebinding);
+                                }
+                                if let Some(a) = &act.analog_x {
+                                    ui.label(egui::RichText::new(format!("analog X: {}", a.label())).weak().small());
+                                }
+                                if let Some(a) = &act.analog_y {
+                                    ui.label(egui::RichText::new(format!("analog Y: {}", a.label())).weak().small());
+                                }
+                            });
+                        }
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Reset to defaults").clicked() {
+                        self.input.bindings = citrus_core::Bindings::default();
+                        dirty = true;
+                    }
+                    if self.rebinding.is_some() && ui.button("Cancel rebind").clicked() {
+                        cancel_rebind = true;
+                    }
+                });
+            });
+        if cancel_rebind {
+            self.rebinding = None;
+        }
+        self.show_bindings = open;
+        if dirty {
+            self.project.bindings = self.input.bindings.clone();
+            self.save_project();
+        }
+    }
+
+    /// Network panel (2G): host or join a session, see status, disconnect.
+    fn network_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_network;
+        // Defer mutations that conflict with the &self.net borrow in the closure.
+        enum NetAct {
+            None,
+            Host(u16),
+            Join(String),
+            Disconnect,
+        }
+        let mut act = NetAct::None;
+        let addr = &mut self.net_addr;
+        let net = self.net.as_ref();
+        egui::Window::new("Network")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(300.0)
+            .show(ctx, |ui| match net {
+                Some(net) => {
+                    ui.label(format!(
+                        "{} — peer {}",
+                        if net.is_host() { "Hosting" } else { "Client" },
+                        net.local_peer()
+                    ));
+                    ui.label(format!("Peers: {}", net.peer_count()));
+                    if let Some(a) = net.local_addr() {
+                        ui.label(egui::RichText::new(format!("Local: {a}")).weak().small());
+                    }
+                    if ui.button("Disconnect").clicked() {
+                        act = NetAct::Disconnect;
+                    }
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.label("Address");
+                        ui.text_edit_singleline(addr);
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Host").clicked() {
+                            let port = addr
+                                .rsplit(':')
+                                .next()
+                                .and_then(|p| p.parse::<u16>().ok())
+                                .unwrap_or(9000);
+                            act = NetAct::Host(port);
+                        }
+                        if ui.button("Join").clicked() {
+                            act = NetAct::Join(addr.clone());
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Host binds the port; Join connects to a host. Objects with a \
+                             Sync component replicate while playing.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
+        self.show_network = open;
+        match act {
+            NetAct::None => {}
+            NetAct::Disconnect => self.net = None,
+            NetAct::Host(port) => match crate::net::NetSession::host(port) {
+                Ok(s) => self.net = Some(s),
+                Err(e) => self.set_status(format!("Host failed: {e}"), false),
+            },
+            NetAct::Join(a) => match crate::net::NetSession::join(&a) {
+                Ok(s) => self.net = Some(s),
+                Err(e) => self.set_status(format!("Join failed: {e}"), false),
+            },
+        }
+    }
+
     /// hooks (the caller decides) and does not persist to project.citrus.
     /// New Project + Project Settings modal windows.
     fn project_windows(&mut self, ctx: &egui::Context) {
@@ -2706,6 +2949,31 @@ impl EngineApp {
     /// Set the global status-bar message (`spinner` shows a busy indicator).
     fn set_status(&mut self, msg: impl Into<String>, spinner: bool) {
         self.status = Some((msg.into(), Instant::now(), spinner));
+    }
+
+    /// Apply a captured input to the slot/action currently being rebound (2C),
+    /// then persist bindings. Called from the window-event handler.
+    fn apply_rebind(&mut self, src: citrus_core::InputSource) {
+        let Some((ai, slot)) = self.rebinding.take() else {
+            return;
+        };
+        if let Some(scheme) = self.input.bindings.active_scheme_mut()
+            && let Some(act) = scheme.actions.get_mut(ai)
+        {
+            let list = match slot.as_str() {
+                "button" => &mut act.buttons,
+                "pos_x" => &mut act.pos_x,
+                "neg_x" => &mut act.neg_x,
+                "pos_y" => &mut act.pos_y,
+                "neg_y" => &mut act.neg_y,
+                _ => return,
+            };
+            if !list.contains(&src) {
+                list.push(src);
+            }
+        }
+        self.project.bindings = self.input.bindings.clone();
+        self.save_project();
     }
 
     /// Build + reload the component plugins (blocking cargo build), then
@@ -3205,6 +3473,8 @@ impl EngineApp {
         let output = egui_ctx.run(raw_input, |ctx| {
             self.menu_bar(ctx);
             self.project_windows(ctx);
+            self.bindings_window(ctx);
+            self.network_window(ctx);
             self.status_bar(ctx);
             if self.show_stats_overlay {
                 self.stats_overlay(ctx, render_stats);
@@ -3301,10 +3571,17 @@ impl EngineApp {
             // Advance the play clock (pauses with the sim) so time-based
             // components don't jump across a pause.
             self.play_time += dt;
-            // Component-driven motion must not land in undo history; play
-            // edits are restored wholesale on Stop anyway.
+            // Resolve input + networking view for this frame, then drive
+            // components. Component-driven motion must not land in undo history;
+            // play edits are restored wholesale on Stop anyway.
+            if let Some(net) = self.net.as_mut() {
+                net.pump();
+            }
+            let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+            self.input.resolve_frame();
             let mut commands = Vec::new();
-            self.scene.update_components(dt, self.play_time, &mut commands);
+            self.scene
+                .update_components(dt, self.play_time, self.input.state(), &net_view, &mut commands);
             // Physics: step after component logic, then write the simulated
             // transforms back onto dynamic/kinematic objects.
             if let Some(phys) = self.physics.as_mut()
@@ -3322,6 +3599,26 @@ impl EngineApp {
             // Apply deferred requests (e.g. ctx.load_scene) after the update
             // pass so the scene isn't swapped mid-iteration.
             self.apply_component_commands(commands);
+            // Replicate networked objects (2G): owner sends, others apply.
+            if let Some(net) = self.net.as_mut() {
+                self.scene.network_sync(net, dt);
+            }
+            // Voice comms (task 8): push-to-talk capture + spatial playback.
+            if self.net.is_some() {
+                if self.voice.is_none() {
+                    self.voice = crate::voice::VoiceChat::new();
+                }
+                let transmit = self.input.state().down("Voice");
+                let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
+                if let (Some(voice), Some(net)) = (self.voice.as_mut(), self.net.as_mut()) {
+                    voice.capture_and_send(net, transmit);
+                    let owners = net.owners_snapshot();
+                    let packets = net.take_voice();
+                    let positions = self.scene.peer_voice_positions(&owners);
+                    voice.receive(packets, &positions);
+                    voice.update(listener, 25.0);
+                }
+            }
         } else {
             self.record_edits(pre_edit);
         }
@@ -6531,11 +6828,16 @@ impl ApplicationHandler for EngineApp {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if let DeviceEvent::MouseMotion { delta } = event
-            && self.looking
-        {
-            self.look_delta.0 += delta.0;
-            self.look_delta.1 += delta.1;
+        if let DeviceEvent::MouseMotion { delta } = event {
+            // Feed the binding system (2C) so Play-mode mouselook works; the
+            // editor fly-cam still uses look_delta gated on `looking`.
+            if self.playing {
+                self.input.mouse_motion(delta.0, delta.1);
+            }
+            if self.looking {
+                self.look_delta.0 += delta.0;
+                self.look_delta.1 += delta.1;
+            }
         }
     }
 
@@ -6560,6 +6862,43 @@ impl ApplicationHandler for EngineApp {
             } else {
                 false
             };
+
+        // Rebind capture (2C): while a binding slot is armed, the next key /
+        // mouse-button press is captured into it (Esc cancels). Highest priority
+        // so it pre-empts editor shortcuts and egui focus.
+        if self.rebinding.is_some() {
+            match &event {
+                WindowEvent::KeyboardInput {
+                    event:
+                        KeyEvent {
+                            physical_key: PhysicalKey::Code(code),
+                            state: ElementState::Pressed,
+                            ..
+                        },
+                    ..
+                } => {
+                    if *code == KeyCode::Escape {
+                        self.rebinding = None;
+                    } else {
+                        self.apply_rebind(citrus_core::InputSource::Key(
+                            crate::input_engine::map_key(*code),
+                        ));
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button,
+                    ..
+                } => {
+                    if let Some(b) = crate::input_engine::map_mouse(*button) {
+                        self.apply_rebind(citrus_core::InputSource::Mouse(b));
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -6602,9 +6941,11 @@ impl ApplicationHandler for EngineApp {
             } => match state {
                 ElementState::Released => {
                     self.keys.remove(&code);
+                    self.input.key(code, false);
                 }
                 ElementState::Pressed if !egui_wants => {
                     self.keys.insert(code);
+                    self.input.key(code, true);
                     let ctrl = self.keys.contains(&KeyCode::ControlLeft)
                         || self.keys.contains(&KeyCode::ControlRight);
                     if !self.looking {
@@ -6691,6 +7032,9 @@ impl ApplicationHandler for EngineApp {
             }
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressed = state == ElementState::Pressed;
+                if self.playing {
+                    self.input.mouse_button(button, pressed);
+                }
                 match button {
                     MouseButton::Right
                         // Look starts from the viewport tab widget (see
@@ -6735,4 +7079,40 @@ impl ApplicationHandler for EngineApp {
             window.request_redraw();
         }
     }
+}
+
+/// One binding-slot row in the Input Bindings window: shows the slot's bound
+/// inputs as removable chips plus a capture (＋) button that arms a rebind.
+/// Returns true if a binding was removed. The actual key/mouse capture happens
+/// in the window-event handler when `rebinding` is set.
+fn binding_slot_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    list: &mut Vec<citrus_core::InputSource>,
+    action_index: usize,
+    slot: &str,
+    rebinding: &mut Option<(usize, String)>,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([42.0, 16.0], egui::Label::new(egui::RichText::new(label).small()));
+        let mut remove = None;
+        for (i, src) in list.iter().enumerate() {
+            if ui.small_button(format!("{} ✕", src.label())).clicked() {
+                remove = Some(i);
+            }
+        }
+        if let Some(i) = remove {
+            list.remove(i);
+            changed = true;
+        }
+        let waiting = rebinding
+            .as_ref()
+            .map(|(a, s)| *a == action_index && s == slot)
+            .unwrap_or(false);
+        if ui.small_button(if waiting { "…" } else { "＋" }).clicked() {
+            *rebinding = Some((action_index, slot.to_string()));
+        }
+    });
+    changed
 }

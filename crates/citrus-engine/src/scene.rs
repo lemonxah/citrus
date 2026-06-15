@@ -132,6 +132,9 @@ pub struct LoadedScene {
     /// Baked lighting result (None until a bake runs). Re-uploaded to the
     /// renderer for runtime sampling.
     pub baked: Option<BakedData>,
+    /// Camera a possessed pawn activated this play session (2A). Overrides the
+    /// default "smallest camera id" selection while set. Cleared on Stop.
+    pub active_camera_override: Option<ObjectId>,
 }
 
 /// One probe volume's runtime metadata: where it sits and which SH range it
@@ -187,6 +190,7 @@ impl LoadedScene {
             skybox: None,
             environment: citrus_assets::WorldEnvironment::default(),
             baked: None,
+            active_camera_override: None,
         }
     }
 
@@ -850,6 +854,14 @@ impl LoadedScene {
     /// has an id.
     pub fn main_camera(&self) -> Option<usize> {
         use citrus_core::CameraComponent;
+        // A pawn-activated camera (2A) wins while set and still present.
+        if let Some(id) = self.active_camera_override
+            && let Some(i) = self.objects.iter().position(|o| {
+                o.id == id && o.components.iter().any(|c| c.as_any().is::<CameraComponent>())
+            })
+        {
+            return Some(i);
+        }
         let mut best: Option<(usize, u32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
             if let Some(cam) = object
@@ -893,10 +905,13 @@ impl LoadedScene {
 
     /// Call one lifecycle hook on every component. Deferred engine requests
     /// (e.g. load-scene) are appended to `commands` for the caller to drain.
+    #[allow(clippy::too_many_arguments)]
     fn each_component(
         &mut self,
         dt: f32,
         time: f32,
+        input: &citrus_core::InputState,
+        net: &citrus_core::NetView,
         commands: &mut Vec<citrus_core::ComponentCommand>,
         mut call: impl FnMut(&mut Box<dyn citrus_core::Component>, &mut ComponentCtx),
     ) {
@@ -907,6 +922,19 @@ impl LoadedScene {
             (0..self.objects.len()).map(|i| self.world_transform(i)).collect();
         let object_names: Vec<String> = self.objects.iter().map(|o| o.name.clone()).collect();
         let object_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
+        // Spawn points (2 — spawn points): object index + tag for every object
+        // carrying a SpawnPoint component, so a pawn can teleport to one.
+        let spawn_points: Vec<(usize, String)> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                o.components
+                    .iter()
+                    .find_map(|c| c.as_any().downcast_ref::<citrus_core::SpawnPoint>())
+                    .map(|sp| (i, sp.tag.clone()))
+            })
+            .collect();
         for (index, object) in self.objects.iter_mut().enumerate() {
             let parent_world = object.parent.and_then(|p| world_transforms.get(p).copied());
             let SceneObject {
@@ -931,6 +959,9 @@ impl LoadedScene {
                         object_ids: &object_ids,
                         self_index: index,
                         parent_world,
+                        input,
+                        net,
+                        spawn_points: &spawn_points,
                     },
                 );
             }
@@ -941,9 +972,11 @@ impl LoadedScene {
     pub fn start_components(
         &mut self,
         time: f32,
+        input: &citrus_core::InputState,
+        net: &citrus_core::NetView,
         commands: &mut Vec<citrus_core::ComponentCommand>,
     ) {
-        self.each_component(0.0, time, commands, |c, ctx| c.start(ctx));
+        self.each_component(0.0, time, input, net, commands, |c, ctx| c.start(ctx));
     }
 
     /// Run all components for one frame (Play mode): all `update`s, then
@@ -952,10 +985,87 @@ impl LoadedScene {
         &mut self,
         dt: f32,
         time: f32,
+        input: &citrus_core::InputState,
+        net: &citrus_core::NetView,
         commands: &mut Vec<citrus_core::ComponentCommand>,
     ) {
-        self.each_component(dt, time, commands, |c, ctx| c.update(ctx));
-        self.each_component(dt, time, commands, |c, ctx| c.late_update(ctx));
+        self.each_component(dt, time, input, net, commands, |c, ctx| c.update(ctx));
+        self.each_component(dt, time, input, net, commands, |c, ctx| c.late_update(ctx));
+    }
+
+    /// Apply `ComponentCommand::SetActiveCamera` (2A): make the camera object the
+    /// active render camera while playing.
+    pub fn set_active_camera(&mut self, id: ObjectId) {
+        self.active_camera_override = Some(id);
+    }
+
+    /// Map each owning peer to the world position of the object it owns, so a
+    /// remote peer's voice plays from where their avatar is (spatial voice).
+    pub fn peer_voice_positions(
+        &self,
+        owners: &[(ObjectId, u64)],
+    ) -> std::collections::HashMap<u64, Vec3> {
+        let mut m = std::collections::HashMap::new();
+        for (id, peer) in owners {
+            if let Some(i) = self.objects.iter().position(|o| o.id == *id) {
+                m.insert(*peer, self.world_transform(i).w_axis.truncate());
+            }
+        }
+        m
+    }
+
+    /// Apply `ComponentCommand::SetLocalTransform`: write another object's local
+    /// TRS (used by pawns driving a child camera).
+    pub fn set_local_transform(
+        &mut self,
+        id: ObjectId,
+        translation: Option<Vec3>,
+        rotation: Option<Quat>,
+        scale: Option<Vec3>,
+    ) {
+        if let Some(o) = self.objects.iter_mut().find(|o| o.id == id) {
+            if let Some(t) = translation {
+                o.translation = t;
+            }
+            if let Some(r) = rotation {
+                o.rotation = r;
+            }
+            if let Some(s) = scale {
+                o.scale = s;
+            }
+        }
+    }
+
+    /// Replicate networked objects (2G): for each object with a [`Sync`]
+    /// component, the local owner broadcasts its transform; everyone else applies
+    /// the latest received transform (snapped or smoothed).
+    pub fn network_sync(&mut self, session: &mut crate::net::NetSession, dt: f32) {
+        use citrus_core::Sync as SyncComp;
+        for object in &mut self.objects {
+            let Some(smoothing) = object
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<SyncComp>())
+                .map(|s| s.smoothing)
+            else {
+                continue;
+            };
+            let id = object.id;
+            if session.owns(id) {
+                session.send_transform(id, object.translation, object.rotation, object.scale);
+            } else if let Some(rt) = session.remote_transform(id) {
+                if smoothing > 0.0 {
+                    let a = (smoothing * dt).clamp(0.0, 1.0);
+                    object.translation = object.translation.lerp(rt.translation, a);
+                    object.rotation = object.rotation.slerp(rt.rotation, a);
+                    object.scale = object.scale.lerp(rt.scale, a);
+                } else {
+                    object.translation = rt.translation;
+                    object.rotation = rt.rotation;
+                    object.scale = rt.scale;
+                }
+            }
+        }
     }
 
     /// True if the object and all of its ancestors are enabled (a disabled

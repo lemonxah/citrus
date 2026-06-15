@@ -409,7 +409,11 @@ void main() {
     }
 
     vec3 orm = texture(t_orm, v_uv).rgb;
-    float ao = mix(1.0, orm.r, pc.params1.z);
+    // params1.z is occlusion strength for the Standard (PBR) shader; the Toon
+    // shader reinterprets it as the rim-light strength (toon surfaces rarely need
+    // texture-AO scaling), so the two PBR variants share one param block.
+    float ao = FEAT_TOON ? orm.r : mix(1.0, orm.r, pc.params1.z);
+    float rim_strength = FEAT_TOON ? pc.params1.z : 0.0;
     float roughness = clamp(orm.g * pc.params0.y, 0.045, 1.0);
     float metallic = clamp(orm.b * pc.params0.x, 0.0, 1.0);
 
@@ -471,10 +475,17 @@ void main() {
         vec3 lit = (kd * diffuse_color / PI + spec) * NdotL;
 
         if (FEAT_TOON) {
+            // Cel ramp: quantize N·L into `steps` bands with a soft edge at each
+            // boundary (a clean toon terminator without hard aliasing). `steps`
+            // controls band count, params0.w blends toon<->smooth-PBR.
             float steps = max(pc.params0.z, 2.0);
-            float banded = floor(clamp(NdotL, 0.0, 0.999) * steps) / (steps - 1.0);
+            float scaled = clamp(NdotL, 0.0, 1.0) * steps;
+            float lower = floor(scaled);
+            float edge = smoothstep(0.42, 0.58, scaled - lower);
+            float banded = (lower + edge) / steps;
+            // Specular as a crisp toon highlight, only on lit bands.
             vec3 lit_toon = (kd * diffuse_color / PI) * banded
-                + spec * NdotL * step(0.001, banded);
+                + spec * smoothstep(0.0, 0.02, banded);
             lit = mix(lit, lit_toon, clamp(pc.params0.w, 0.0, 1.0));
         }
 
@@ -502,6 +513,14 @@ void main() {
 
     if (FEAT_EMISSION) {
         color += texture(t_emission, v_uv).rgb * pc.emission.rgb;
+    }
+
+    // Toon rim light (Poiyomi-style): a Fresnel edge glow tinted by the scene's
+    // key light + ambient, so silhouettes pop. Strength = params1.z (Rim Light).
+    if (FEAT_TOON && rim_strength > 0.0) {
+        float rim = pow(1.0 - NdotV, 4.0);
+        vec3 rim_col = frame.light_color.rgb + frame.ambient.rgb;
+        color += rim * rim_strength * rim_col;
     }
 
     color = apply_postfx(color, gl_FragCoord.xy);

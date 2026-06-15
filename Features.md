@@ -270,9 +270,17 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 
 ## 2. Goals — to be implemented
 
-### 2A. Pawns & camera possession [todo]
+### 2A. Pawns & camera possession [partial]
 A **Pawn** is a controllable entity that a controller can "possess"; it owns movement
 state and can drive which scene camera is active.
+
+**Implemented** (`Pawn` component in `citrus-core`, FP/TP/TopDown/Strategy modes): a possessed
+pawn reads the action snapshot, moves itself (transform-based on a flat floor; physics-driven
+movement is the follow-up), yaws the body + pitches a child camera, and **activates its camera**
+via `ComponentCommand::SetActiveCamera` (a `LoadedScene::active_camera_override` honored by
+`main_camera`, cleared on Stop). The pawn drives a child camera through a new
+`ComponentCommand::SetLocalTransform`. Params editable in the inspector (`Inspect for Pawn`).
+Remaining: RigidBody-driven movement, spring-arm collision, camera-follow rigs as a separate type.
 
 - [todo] `Pawn` component: identity + movement params (mass, gravity, jump power, move
   power per-direction, max speed, accel/decel, ground friction, air control) editable
@@ -287,10 +295,21 @@ state and can drive which scene camera is active.
   (physics engine), not direct transform writes, when a body is present
 - [todo] Serialize Pawn params in `.scene`; restore on Stop like other play state
 
-### 2B. Player controllers [todo]
+### 2B. Player controllers [partial]
 Controllers translate **bindings** (abstract actions) into Pawn movement. Shared
 `Controller` interface; concrete movement per type. All support the basic verbs the
 controller needs (move fwd/back/left/right, jump, look, etc.).
+
+**Implemented** as `Pawn` control **modes** (combined pawn+controller for simplicity):
+**FirstPerson** (WASD + mouselook, jump, camera at eye height), **ThirdPerson** (WASD relative to
+facing, orbit camera on an arm), **TopDown** (world-plane WASD, body faces movement, fixed high
+camera), **Strategy** (camera-only pan). Movement reads the action snapshot (device-agnostic) and
+camera placement is per-mode. A dedicated `Controller` trait + spring-arm collision + click-to-move
+navmesh pathing remain follow-ups.
+
+**Spawn points** (separate goal): a `SpawnPoint` component (tag + index) marks locations; a `Pawn`
+with a matching `spawn_tag` teleports there on Play start, and game code queries them via
+`ctx.spawn_point(tag)`. The engine surfaces them in `ComponentCtx.spawn_points`.
 
 - [todo] `Controller` trait/interface: consumes an action snapshot from the binding system,
   produces movement intent for the possessed Pawn (decoupled from raw input devices)
@@ -308,9 +327,17 @@ controller needs (move fwd/back/left/right, jump, look, etc.).
   RigidBody — controllers stay device- and physics-agnostic
 - [todo] Inspector: pick controller type per Pawn; expose its tunables
 
-### 2C. Input binding system [todo]
+### 2C. Input binding system [done]
 Control schemes that are **independent of the controller** but share one interface, so
 each game can mix keyboard+mouse and/or gamepad freely.
+
+**Implemented** (`citrus-core::input` + `citrus-engine::input_engine`): named **actions**
+(Button / Axis1 / Axis2), **bindings** (composite WASD→2D axis, analog sticks, deadzone/scale),
+**control schemes** (default KB+Mouse and Gamepad), gamepad via **gilrs**, the per-frame
+`InputState` snapshot read through `ComponentCtx` (`ctx.input.axis2("Move")`,
+`ctx.input.pressed("Jump")`). Schemes **serialize to `project.citrus`** (`ProjectFile.bindings`)
+and are editable in the editor **Tools → Input Bindings** window (rebind by capturing the next
+key/mouse press) and at runtime via the same `Bindings` API. Tested in `input.rs`.
 
 - [todo] **Action** abstraction: named actions (e.g. `MoveX`, `MoveY`, `Jump`, `Look`,
   `Fire`) typed as button / 1D axis / 2D axis
@@ -363,7 +390,13 @@ game.
   - [todo] **Shaders / materials**: set material properties + shader params at runtime
     (the pragma-declared props), swap materials
   - [todo] **Colliders**: toggle, resize, change layer at runtime
-  - [todo] **Camera control**: set active camera, set FOV/post params (ties to 2A)
+  - [partial] **Camera control**: `ctx.set_active_camera(cam_ref)` (done, 2A); set
+    FOV/post params still todo
+  - [done] **Graphics settings (runtime)**: `ctx.set_resolution(w, h)`, `ctx.set_vsync(on)`,
+    `ctx.set_shadow_resolution(res)` — applied immediately in editor Play + a shipped game, so an
+    in-game settings menu can change resolution/quality live
+  - [done] **Networked messaging**: `ctx.broadcast(text)` / `ctx.send_to(peer, text)` +
+    `ctx.messages()` (2G)
   - [todo] **Audio**: play/stop one-shots, change volume/pitch, spatial params
   - [todo] **Lights**: color/intensity/range/enabled at runtime
   - [partial] **Time / scene**: time scale, pause, app quit [todo]; **load/switch scene
@@ -461,10 +494,33 @@ Editor authoring
 - [todo] Screen-space canvas previewed at reference resolution; world-space canvas edited
   in 3D like any object.
 
-### 2G. Networking & multiplayer [todo]
+### 2G. Networking & multiplayer [partial]
 Built-in networking so games can be multiplayer, supporting **both** topologies:
 **client-server** (an authoritative server, dedicated or player-hosted) and
 **peer-to-peer**. One replication/API surface; the topology is a choice per game.
+
+**Implemented** (`citrus-engine::net`): a UDP **star-relay** session (`NetSession::host`/`join`) —
+one peer hosts (dedicated server or player-host), others join, all traffic relayed through the
+host, so one path serves client-server and P2P on a LAN. **Ownership-based replication**: the
+`Sync` component marks an object networked; whoever **grabs** it (presses the grab action) claims
+authority (host-arbitrated, last-claim-wins), broadcasts its transform to everyone else (who apply
+it snapped/smoothed), and releases it for others — exactly the "move it, let go, someone else takes
+it" model. Exposed through `ComponentCtx` (`net.owns`, `request_ownership`, `release_ownership`) +
+`NetView`. Driven from the editor **Tools → Network** panel or a game's `CITRUS_HOST`/`CITRUS_JOIN`
+env vars. Wire format is a compact hand-rolled binary (no extra deps).
+
+**Messaging** (public/private): `ctx.broadcast(text)` and `ctx.send_to(peer, text)`; received
+messages arrive via `ctx.messages()` (`(from_peer, is_private, text)` each frame), host-routed.
+
+**Spatial voice comms** (`citrus-engine::voice`, push-to-talk on the `Voice` action): mic captured
+via **cpal**, downmixed to mono 16 kHz, sent as PCM frames over the transport, and played back per
+peer through a **jitter buffer** (≈120 ms pre-buffer + seq reordering) so it never sounds laggy —
+late/lost packets become brief silence, not time-stretched "lag." Playback is **spatial**: each
+peer's voice sink volume falls off with distance (positioned at the object that peer owns), mirroring
+the `AudioEngine`'s distance model. Latency-agnostic by construction (network arrival is decoupled
+from playback). LAN-grade raw PCM; Opus + packet-loss concealment are follow-ups.
+
+Remaining: NAT traversal, reliability/delta-compression, client prediction/reconciliation, lockstep.
 
 Transport & connection
 - [todo] **Transport layer** abstraction over reliable + unreliable channels (candidate:

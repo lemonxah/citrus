@@ -8,11 +8,18 @@
 //! [`ComponentCommand`]s, and the built-in component data. Editor-only concerns
 //! (inspector UI, viewport gizmos) are separate traits in `citrus-editor`.
 
+use std::collections::HashMap;
+
 use glam::{Mat4, Quat, Vec3};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+mod input;
 mod models;
+pub use input::{
+    ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
+    MouseAxis, MouseButton, PadAxis, PadButton, RawInput, resolve,
+};
 pub use models::{AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};
 
 // ------------------------------------------------------------------ object id
@@ -41,6 +48,16 @@ impl ObjectId {
 
     pub fn is_nil(&self) -> bool {
         self.0 == 0
+    }
+
+    /// Raw 128-bit value — for wire encoding (networking).
+    pub fn raw(&self) -> u128 {
+        self.0
+    }
+
+    /// Reconstruct from a raw 128-bit value (networking).
+    pub fn from_raw(v: u128) -> Self {
+        ObjectId(v)
     }
 }
 
@@ -169,6 +186,56 @@ pub enum ComponentCommand {
     /// Switch to another scene (level change, menu -> game). Path is
     /// project-relative, e.g. "scenes/level2.scene". Replaces the current scene.
     LoadScene(String),
+    /// Make this camera object the active render camera (2A).
+    SetActiveCamera(ObjectId),
+    /// Write another object's LOCAL transform (each field optional). Lets a pawn
+    /// drive a child camera (pitch / spring-arm) without owning its component.
+    SetLocalTransform {
+        id: ObjectId,
+        translation: Option<Vec3>,
+        rotation: Option<Quat>,
+        scale: Option<Vec3>,
+    },
+    /// Local peer requests authority over a networked object (2G). Granted +
+    /// broadcast by the engine's network system; the owner replicates its
+    /// transform to everyone else.
+    RequestOwnership(ObjectId),
+    /// Local peer relinquishes authority over a networked object, so another peer
+    /// can claim it.
+    ReleaseOwnership(ObjectId),
+    /// Change the window/render resolution at runtime (graphics settings).
+    SetResolution(u32, u32),
+    /// Toggle vsync at runtime.
+    SetVsync(bool),
+    /// Set shadow-map resolution (256..=8192) at runtime.
+    SetShadowResolution(u32),
+    /// Send a networked text message (None target = broadcast / public).
+    NetMessage { to: Option<u64>, text: String },
+}
+
+/// Read-only networking view handed to components each frame. Filled by the
+/// engine's network system; empty/disconnected in single-player.
+#[derive(Default, Clone)]
+pub struct NetView {
+    pub connected: bool,
+    pub is_server: bool,
+    /// This machine's peer id (0 when offline).
+    pub local_peer: u64,
+    /// Per-object current authority (only objects that are owned appear).
+    pub owners: HashMap<ObjectId, u64>,
+    /// Text messages received this frame: `(from_peer, is_private, text)`.
+    pub messages: Vec<(u64, bool, String)>,
+}
+
+impl NetView {
+    /// Current owner of an object, if any peer holds authority.
+    pub fn owner(&self, id: ObjectId) -> Option<u64> {
+        self.owners.get(&id).copied()
+    }
+    /// Whether the local peer holds authority over an object.
+    pub fn owns(&self, id: ObjectId) -> bool {
+        self.connected && self.owner(id) == Some(self.local_peer)
+    }
 }
 
 /// Per-frame update context handed to components in Play mode. Transform
@@ -197,6 +264,14 @@ pub struct ComponentCtx<'a> {
     /// convert a desired world position/transform back into the local TRS that
     /// the `translation`/`rotation`/`scale` fields hold.
     pub parent_world: Option<Mat4>,
+    /// Resolved input action snapshot for this frame (2C). Read with
+    /// `ctx.input.axis2("Move")`, `ctx.input.pressed("Jump")`, etc.
+    pub input: &'a InputState,
+    /// Networking view (2G): ownership + local peer. Empty when offline.
+    pub net: &'a NetView,
+    /// Spawn points this frame as `(object index, tag)`, from objects carrying a
+    /// [`SpawnPoint`] component. Resolve a transform via `spawn_point(tag)`.
+    pub spawn_points: &'a [(usize, String)],
 }
 
 impl ComponentCtx<'_> {
@@ -280,6 +355,114 @@ impl ComponentCtx<'_> {
     /// World position of a referenced object.
     pub fn position_of(&self, target: ObjectRef) -> Option<Vec3> {
         self.object_position(self.resolve(target)?)
+    }
+
+    // ---- camera possession (2A) ----
+
+    /// Make a referenced camera object the active render camera (deferred).
+    pub fn set_active_camera(&mut self, target: ObjectRef) {
+        if let Some(id) = target.id() {
+            self.commands.push(ComponentCommand::SetActiveCamera(id));
+        }
+    }
+
+    /// Write another object's local transform (any subset of fields).
+    pub fn set_local_transform(
+        &mut self,
+        target: ObjectRef,
+        translation: Option<Vec3>,
+        rotation: Option<Quat>,
+        scale: Option<Vec3>,
+    ) {
+        if let Some(id) = target.id() {
+            self.commands.push(ComponentCommand::SetLocalTransform {
+                id,
+                translation,
+                rotation,
+                scale,
+            });
+        }
+    }
+
+    // ---- networking (2G) ----
+
+    /// Whether the local peer currently has authority over the owning object.
+    pub fn owns_self(&self) -> bool {
+        self.net.owns(self.self_id())
+    }
+
+    /// Whether the local peer has authority over a referenced object.
+    pub fn owns(&self, target: ObjectRef) -> bool {
+        target.id().map(|id| self.net.owns(id)).unwrap_or(false)
+    }
+
+    /// Request authority over the owning object (e.g. on grab). The engine grants
+    /// + broadcasts it; once owned, the object's transform replicates to peers.
+    pub fn request_ownership(&mut self) {
+        self.commands
+            .push(ComponentCommand::RequestOwnership(self.self_id()));
+    }
+
+    /// Release authority over the owning object so another peer can claim it.
+    pub fn release_ownership(&mut self) {
+        self.commands
+            .push(ComponentCommand::ReleaseOwnership(self.self_id()));
+    }
+
+    /// Request authority over a referenced networked object.
+    pub fn request_ownership_of(&mut self, target: ObjectRef) {
+        if let Some(id) = target.id() {
+            self.commands.push(ComponentCommand::RequestOwnership(id));
+        }
+    }
+
+    // ---- graphics settings (runtime) ----
+
+    /// Change the game resolution at runtime.
+    pub fn set_resolution(&mut self, width: u32, height: u32) {
+        self.commands
+            .push(ComponentCommand::SetResolution(width, height));
+    }
+    /// Toggle vsync at runtime.
+    pub fn set_vsync(&mut self, on: bool) {
+        self.commands.push(ComponentCommand::SetVsync(on));
+    }
+    /// Set shadow-map resolution at runtime (256..=8192).
+    pub fn set_shadow_resolution(&mut self, res: u32) {
+        self.commands
+            .push(ComponentCommand::SetShadowResolution(res));
+    }
+
+    // ---- networked messaging (2G) ----
+
+    /// Broadcast a public text message to all peers.
+    pub fn broadcast(&mut self, text: impl Into<String>) {
+        self.commands.push(ComponentCommand::NetMessage {
+            to: None,
+            text: text.into(),
+        });
+    }
+    /// Send a private text message to one peer.
+    pub fn send_to(&mut self, peer: u64, text: impl Into<String>) {
+        self.commands.push(ComponentCommand::NetMessage {
+            to: Some(peer),
+            text: text.into(),
+        });
+    }
+    /// Text messages received this frame: `(from_peer, is_private, text)`.
+    pub fn messages(&self) -> &[(u64, bool, String)] {
+        &self.net.messages
+    }
+
+    /// World [`Transform`] of the first spawn point with this tag (2 — spawn
+    /// points). `None` if no matching [`SpawnPoint`] exists.
+    pub fn spawn_point(&self, tag: &str) -> Option<Transform> {
+        let idx = self
+            .spawn_points
+            .iter()
+            .find(|(_, t)| t == tag)
+            .map(|(i, _)| *i)?;
+        self.object_transform(idx)
     }
 }
 
@@ -369,6 +552,9 @@ impl ComponentRegistry {
         registry.register::<Spin>();
         registry.register::<Bob>();
         registry.register::<RigidBody>();
+        registry.register::<Pawn>();
+        registry.register::<SpawnPoint>();
+        registry.register::<Sync>();
         registry
     }
 
@@ -940,4 +1126,296 @@ impl Default for RigidBody {
 
 impl TypedComponent for RigidBody {
     const NAME: &'static str = "Rigid Body";
+}
+
+// -------------------------------------------------- pawns & controllers (2A/2B)
+
+/// How a [`Pawn`] reads input and places its camera.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum ControlMode {
+    /// WASD + mouselook; camera at eye height, body yaws, camera pitches.
+    FirstPerson,
+    /// WASD relative to facing; orbit camera on a spring arm behind the body.
+    ThirdPerson,
+    /// WASD in world plane; body faces movement; fixed high camera angle.
+    TopDown,
+    /// Camera-only: WASD pans, wheel zooms; no body movement.
+    Strategy,
+}
+
+impl ControlMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FirstPerson => "First Person",
+            Self::ThirdPerson => "Third Person",
+            Self::TopDown => "Top Down",
+            Self::Strategy => "Strategy",
+        }
+    }
+    pub const ALL: [ControlMode; 4] = [
+        Self::FirstPerson,
+        Self::ThirdPerson,
+        Self::TopDown,
+        Self::Strategy,
+    ];
+}
+
+/// A controllable entity (pawn + player-controller combined). When `possessed`,
+/// it reads the action snapshot, moves itself, drives + activates its camera, and
+/// (FP/TP) writes the child camera's pitch / spring-arm. Movement is transform-
+/// based on a flat floor for now; RigidBody-driven movement is a follow-up.
+#[derive(Serialize, Deserialize)]
+pub struct Pawn {
+    pub mode: ControlMode,
+    /// The local player controls this pawn (it receives input + owns the view).
+    pub possessed: bool,
+    /// Camera object this pawn drives/activates. For FP/TP make it a CHILD of the
+    /// pawn so body yaw rotates it; the pawn writes its local pitch / arm offset.
+    pub camera: ObjectRef,
+    /// If set, the pawn teleports to a matching [`SpawnPoint`] on Play start.
+    #[serde(default)]
+    pub spawn_tag: String,
+    pub move_speed: f32,
+    pub accel: f32,
+    pub decel: f32,
+    pub jump_power: f32,
+    pub gravity: f32,
+    pub look_sensitivity: f32,
+    pub eye_height: f32,
+    /// Third-person / top-down camera distance.
+    pub arm_length: f32,
+    pub min_pitch: f32,
+    pub max_pitch: f32,
+    #[serde(skip)]
+    vel: Vec3,
+    #[serde(skip)]
+    yaw: f32,
+    #[serde(skip)]
+    pitch: f32,
+    #[serde(skip)]
+    floor_y: f32,
+    #[serde(skip)]
+    grounded: bool,
+    #[serde(skip)]
+    started: bool,
+}
+
+impl Default for Pawn {
+    fn default() -> Self {
+        Self {
+            mode: ControlMode::FirstPerson,
+            possessed: true,
+            camera: ObjectRef::NONE,
+            spawn_tag: String::new(),
+            move_speed: 6.0,
+            accel: 40.0,
+            decel: 30.0,
+            jump_power: 6.0,
+            gravity: 18.0,
+            look_sensitivity: 0.15,
+            eye_height: 1.6,
+            arm_length: 5.0,
+            min_pitch: -85.0,
+            max_pitch: 85.0,
+            vel: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: -15.0,
+            floor_y: 0.0,
+            grounded: true,
+            started: false,
+        }
+    }
+}
+
+impl Pawn {
+    fn place_camera(&self, ctx: &mut ComponentCtx) {
+        let (trans, rot) = match self.mode {
+            ControlMode::FirstPerson => (
+                Vec3::new(0.0, self.eye_height, 0.0),
+                Quat::from_rotation_x(self.pitch.to_radians()),
+            ),
+            ControlMode::ThirdPerson => (
+                Vec3::new(0.0, self.eye_height, self.arm_length),
+                Quat::from_rotation_x(self.pitch.to_radians()),
+            ),
+            ControlMode::TopDown | ControlMode::Strategy => (
+                Vec3::new(0.0, self.arm_length, self.arm_length * 0.6),
+                Quat::from_rotation_x((-60.0_f32).to_radians()),
+            ),
+        };
+        ctx.set_local_transform(self.camera, Some(trans), Some(rot), None);
+    }
+}
+
+impl TypedComponent for Pawn {
+    const NAME: &'static str = "Pawn";
+
+    fn start(&mut self, ctx: &mut ComponentCtx) {
+        self.vel = Vec3::ZERO;
+        self.floor_y = ctx.self_transform().translation.y;
+        // Spawn-point placement (2 — spawn points).
+        if !self.spawn_tag.is_empty()
+            && let Some(t) = ctx.spawn_point(&self.spawn_tag)
+        {
+            ctx.set_world_position(t.translation);
+            self.floor_y = t.translation.y;
+            self.yaw = t.rotation.to_euler(glam::EulerRot::YXZ).0.to_degrees();
+        }
+        if self.possessed {
+            ctx.set_active_camera(self.camera);
+        }
+        *ctx.rotation = Quat::from_rotation_y(self.yaw.to_radians());
+        self.place_camera(ctx);
+        self.started = true;
+    }
+
+    fn update(&mut self, ctx: &mut ComponentCtx) {
+        if !self.possessed {
+            return;
+        }
+        if !self.started {
+            TypedComponent::start(self, ctx);
+        }
+        let dt = ctx.dt.min(0.1);
+        let look = ctx.input.axis2("Look");
+        let mv = ctx.input.axis2("Move");
+
+        // Look: mouse delta is per-frame (no dt); analog sticks pre-scaled.
+        self.yaw -= look.x * self.look_sensitivity;
+        if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
+            self.pitch = (self.pitch - look.y * self.look_sensitivity)
+                .clamp(self.min_pitch, self.max_pitch);
+        }
+
+        // Movement direction per mode.
+        let yaw_rot = Quat::from_rotation_y(self.yaw.to_radians());
+        let (dir, face_move) = match self.mode {
+            ControlMode::FirstPerson | ControlMode::ThirdPerson => {
+                let fwd = yaw_rot * Vec3::NEG_Z;
+                let right = yaw_rot * Vec3::X;
+                (right * mv.x + fwd * mv.y, false)
+            }
+            // World-plane movement; body faces the move direction.
+            ControlMode::TopDown | ControlMode::Strategy => {
+                (Vec3::new(mv.x, 0.0, -mv.y), true)
+            }
+        };
+        let dir = dir.normalize_or_zero();
+
+        let mut pos = *ctx.translation;
+        let horizontal = if dir.length_squared() > 1e-4 {
+            let target = dir * self.move_speed;
+            let cur = Vec3::new(self.vel.x, 0.0, self.vel.z);
+            let next = cur.lerp(target, (self.accel * dt).min(1.0));
+            if face_move && self.mode == ControlMode::TopDown {
+                self.yaw = (-dir.x).atan2(-dir.z).to_degrees();
+            }
+            next
+        } else {
+            let cur = Vec3::new(self.vel.x, 0.0, self.vel.z);
+            cur.lerp(Vec3::ZERO, (self.decel * dt).min(1.0))
+        };
+        self.vel.x = horizontal.x;
+        self.vel.z = horizontal.z;
+
+        if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
+            // Gravity + jump on a flat floor.
+            if self.grounded && ctx.input.pressed("Jump") {
+                self.vel.y = self.jump_power;
+                self.grounded = false;
+            }
+            self.vel.y -= self.gravity * dt;
+        } else {
+            self.vel.y = 0.0;
+        }
+
+        pos += self.vel * dt;
+        if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson)
+            && pos.y <= self.floor_y
+        {
+            pos.y = self.floor_y;
+            self.vel.y = 0.0;
+            self.grounded = true;
+        }
+        *ctx.translation = pos;
+
+        if !matches!(self.mode, ControlMode::Strategy) {
+            *ctx.rotation = Quat::from_rotation_y(self.yaw.to_radians());
+        }
+        // Strategy zoom on the wheel via the Look.y / wheel channel is omitted;
+        // arm_length stays as authored.
+        self.place_camera(ctx);
+    }
+}
+
+/// Marks an object as a spawn location. Pawns with a matching `spawn_tag` teleport
+/// here on Play start; game code finds them via `ctx.spawn_point(tag)`.
+#[derive(Serialize, Deserialize)]
+pub struct SpawnPoint {
+    /// Group this point belongs to: "player", "npc", a team name, etc.
+    pub tag: String,
+    /// Ordering hint within the tag (round-robin / slot index).
+    #[serde(default)]
+    pub index: u32,
+}
+
+impl Default for SpawnPoint {
+    fn default() -> Self {
+        Self {
+            tag: "player".to_string(),
+            index: 0,
+        }
+    }
+}
+
+impl TypedComponent for SpawnPoint {
+    const NAME: &'static str = "Spawn Point";
+}
+
+// ------------------------------------------------------------- networking (2G)
+
+/// Replicates the owning object's transform over the network. Whoever has
+/// authority (see [`NetView`]) broadcasts its transform; everyone else receives +
+/// applies it (optionally smoothed). `grabbable` lets the local player take
+/// ownership by pressing `grab_action`, move it, and release it for others.
+#[derive(Serialize, Deserialize)]
+pub struct Sync {
+    /// Any peer can grab authority by pressing `grab_action`.
+    pub grabbable: bool,
+    /// Action that toggles local ownership when `grabbable`.
+    pub grab_action: String,
+    /// Remote-update smoothing rate (0 = snap; higher = snappier lerp).
+    pub smoothing: f32,
+    #[serde(skip)]
+    started: bool,
+}
+
+impl Default for Sync {
+    fn default() -> Self {
+        Self {
+            grabbable: true,
+            grab_action: "Grab".to_string(),
+            smoothing: 12.0,
+            started: false,
+        }
+    }
+}
+
+impl TypedComponent for Sync {
+    const NAME: &'static str = "Sync";
+
+    fn update(&mut self, ctx: &mut ComponentCtx) {
+        self.started = true;
+        if !ctx.net.connected || !self.grabbable || self.grab_action.is_empty() {
+            return;
+        }
+        // Toggle authority on grab: take it if we don't own it, else release.
+        if ctx.input.pressed(&self.grab_action) {
+            if ctx.owns_self() {
+                ctx.release_ownership();
+            } else {
+                ctx.request_ownership();
+            }
+        }
+    }
 }

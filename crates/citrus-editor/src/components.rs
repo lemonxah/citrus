@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 use citrus_core::{
     AudioListener, AudioRolloff, AudioSource, Bob, BodyKind, BoxCollider, CameraComponent,
-    Component, ComponentRegistry, LightComponent, LightKind, LightMode, LightProbeVolume,
-    MeshCollider, ObjectId, ObjectRef, RigidBody, ShadowType, Spin, SphereCollider, TypedComponent,
-    VolumeComponent,
+    Component, ComponentRegistry, ControlMode, LightComponent, LightKind, LightMode,
+    LightProbeVolume, MeshCollider, ObjectId, ObjectRef, Pawn, RigidBody, ShadowType, Spin,
+    SpawnPoint, SphereCollider, Sync, TypedComponent, VolumeComponent,
     COLLISION_LAYERS,
 };
 use egui::collapsing_header::{CollapsingState, paint_default_icon};
@@ -203,6 +203,9 @@ impl EditorComponents {
         e.register::<Bob>();
         e.register::<RigidBody>();
         e.register::<VolumeComponent>();
+        e.register::<Pawn>();
+        e.register::<SpawnPoint>();
+        e.register::<Sync>();
         e
     }
 
@@ -782,3 +785,95 @@ impl Inspect for MeshCollider {
     }
 }
 impl Gizmo for MeshCollider {}
+
+impl Inspect for Pawn {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ComboBox::from_id_salt("citrus-pawn-mode")
+                    .selected_text(self.mode.label())
+                    .show_ui(ui, |ui| {
+                        for m in ControlMode::ALL {
+                            changed |= ui.selectable_value(&mut self.mode, m, m.label()).changed();
+                        }
+                    });
+            });
+        });
+        property_row(ui, "Possessed", &mut changed, |ui| {
+            ui.checkbox(&mut self.possessed, "")
+                .on_hover_text("The local player controls this pawn (receives input)")
+        });
+        changed |= ctx.object_ref(ui, "Camera", &mut self.camera);
+        property_row(ui, "Spawn Tag", &mut changed, |ui| {
+            ui.text_edit_singleline(&mut self.spawn_tag)
+                .on_hover_text("Teleport to a SpawnPoint with this tag on Play start")
+        });
+        property_row(ui, "Move Speed", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.move_speed).speed(0.1).range(0.0..=100.0))
+        });
+        property_row(ui, "Accel", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.accel).speed(0.5).range(0.1..=500.0))
+        });
+        property_row(ui, "Decel", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.decel).speed(0.5).range(0.1..=500.0))
+        });
+        property_row(ui, "Jump Power", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.jump_power).speed(0.1).range(0.0..=50.0))
+        });
+        property_row(ui, "Gravity", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.gravity).speed(0.1).range(0.0..=100.0))
+        });
+        property_row(ui, "Look Sensitivity", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.look_sensitivity).speed(0.005).range(0.0..=5.0))
+        });
+        property_row(ui, "Eye Height", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.eye_height).speed(0.05).range(0.0..=10.0))
+        });
+        property_row(ui, "Arm Length", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.arm_length).speed(0.1).range(0.0..=50.0))
+        });
+        changed
+    }
+}
+impl Gizmo for Pawn {}
+
+impl Inspect for SpawnPoint {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Tag", &mut changed, |ui| {
+            ui.text_edit_singleline(&mut self.tag)
+                .on_hover_text("Group: \"player\", \"npc\", a team name…")
+        });
+        property_row(ui, "Index", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.index).range(0..=4096))
+        });
+        changed
+    }
+}
+impl Gizmo for SpawnPoint {}
+
+impl Inspect for Sync {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Grabbable", &mut changed, |ui| {
+            ui.checkbox(&mut self.grabbable, "")
+                .on_hover_text("Any peer can take ownership by pressing the grab action")
+        });
+        property_row(ui, "Grab Action", &mut changed, |ui| {
+            ui.text_edit_singleline(&mut self.grab_action)
+        });
+        property_row(ui, "Smoothing", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.smoothing).speed(0.5).range(0.0..=60.0))
+                .on_hover_text("Remote-update lerp rate (0 = snap)")
+        });
+        ui.label(
+            RichText::new("Replicates this object's transform; the owner sends, others receive.")
+                .small()
+                .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for Sync {}

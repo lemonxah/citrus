@@ -308,7 +308,9 @@ lives.
 - [ ] MSAA / TAA decision for the editor viewport
 - [ ] 16-bit / float glTF image formats (currently unsupported)
 - [ ] Removing meshes/textures leaks GPU memory until scene reset (slot reuse / GC)
-- [ ] Inverse-transpose normal matrix for non-uniform scale (shader TODO)
+- [x] Inverse-transpose normal matrix for non-uniform scale — `standard.vert` now uses
+      `transpose(inverse(mat3(model)))` for normals (tangents keep the plain basis), so
+      non-uniformly-scaled objects light correctly.
 - [ ] Async pipeline-variant compilation (avoid first-use hitch; spec'd in docs/shaders.md)
 
 ## Milestones (see README)

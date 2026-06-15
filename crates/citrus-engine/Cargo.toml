@@ -45,3 +45,7 @@ image = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 rapier3d = "0.33.0"
+# Gamepad input for the binding system (2C). Networking (2G) uses std::net.
+gilrs = "0.11"
+# Microphone capture for voice comms (matches rodio's cpal).
+cpal = "0.15"

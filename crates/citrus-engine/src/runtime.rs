@@ -13,13 +13,16 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use glam::{Mat4, Vec3};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 use citrus_core::{ComponentCommand, ComponentRegistry};
 use citrus_render::{CameraData, FrameInput, LightData, Renderer};
 
+use crate::input_engine::InputManager;
+use crate::net::NetSession;
 use crate::physics::PhysicsWorld;
 use crate::scene::LoadedScene;
 use crate::shaders::ShaderLibrary;
@@ -35,6 +38,9 @@ pub struct GameConfig {
     pub title: String,
     pub width: f64,
     pub height: f64,
+    /// Input control schemes (2C). Loaded from `project.citrus` by
+    /// [`GameConfig::from_project_dir`]; defaults to KB+Mouse / Gamepad.
+    pub bindings: citrus_core::Bindings,
 }
 
 impl Default for GameConfig {
@@ -45,6 +51,7 @@ impl Default for GameConfig {
             title: "citrus game".into(),
             width: 1280.0,
             height: 720.0,
+            bindings: citrus_core::Bindings::default(),
         }
     }
 }
@@ -66,6 +73,7 @@ impl GameConfig {
             assets_root,
             boot_scene,
             title: project.name,
+            bindings: project.bindings,
             ..Default::default()
         })
     }
@@ -78,6 +86,7 @@ impl GameConfig {
 pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
     let mut registry = ComponentRegistry::with_builtins();
     register(&mut registry);
+    let config_bindings = config.bindings.clone();
 
     let event_loop = EventLoop::new().context("creating event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -90,6 +99,10 @@ pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry
         renderer: None,
         physics: None,
         rt_gi: crate::realtime_gi::RealtimeGiState::default(),
+        input: InputManager::new(config_bindings),
+        // Optional networking via env vars: CITRUS_HOST=<port> or CITRUS_JOIN=<addr>.
+        net: start_net_from_env(),
+        voice: None,
         start: Instant::now(),
         last_frame: Instant::now(),
         init_error: None,
@@ -112,6 +125,12 @@ struct GameApp {
     physics: Option<PhysicsWorld>,
     /// Realtime-GI driver — runs the scene's realtime-GI setting in the game.
     rt_gi: crate::realtime_gi::RealtimeGiState,
+    /// Input binding system (2C): keyboard/mouse/gamepad → action snapshot.
+    input: InputManager,
+    /// Active networking session (2G), if hosting/joined.
+    net: Option<NetSession>,
+    /// Voice comms (task 8), created lazily once networking is active.
+    voice: Option<crate::voice::VoiceChat>,
     start: Instant,
     last_frame: Instant,
     /// Set if `init` failed; surfaced after the loop exits.
@@ -168,19 +187,62 @@ impl GameApp {
         // A game is always "playing": build physics + start every component.
         self.physics = Some(PhysicsWorld::build(&self.scene));
         let mut commands = Vec::new();
-        self.scene
-            .start_components(self.start.elapsed().as_secs_f32(), &mut commands);
+        let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+        self.scene.start_components(
+            self.start.elapsed().as_secs_f32(),
+            self.input.state(),
+            &net_view,
+            &mut commands,
+        );
         self.apply_commands(renderer, commands);
         Ok(())
     }
 
     /// Apply deferred component requests after an update pass. Only the last
-    /// `LoadScene` wins (mirrors the editor); a switch re-fires `start`.
+    /// `LoadScene` wins (mirrors the editor); a switch re-fires `start`. Camera /
+    /// transform / ownership commands apply immediately.
     fn apply_commands(&mut self, renderer: &mut Renderer, commands: Vec<ComponentCommand>) {
-        let next = commands.into_iter().rev().find_map(|c| match c {
-            ComponentCommand::LoadScene(rel) => Some(rel),
-        });
-        if let Some(rel) = next
+        let mut next_scene = None;
+        for c in commands {
+            match c {
+                ComponentCommand::LoadScene(rel) => next_scene = Some(rel),
+                ComponentCommand::SetActiveCamera(id) => self.scene.set_active_camera(id),
+                ComponentCommand::SetLocalTransform {
+                    id,
+                    translation,
+                    rotation,
+                    scale,
+                } => self.scene.set_local_transform(id, translation, rotation, scale),
+                ComponentCommand::RequestOwnership(id) => {
+                    if let Some(net) = self.net.as_mut() {
+                        net.request_ownership(id);
+                    }
+                }
+                ComponentCommand::ReleaseOwnership(id) => {
+                    if let Some(net) = self.net.as_mut() {
+                        net.release_ownership(id);
+                    }
+                }
+                ComponentCommand::SetResolution(w, h) => {
+                    if let Some(window) = self.window.as_ref() {
+                        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                    }
+                    renderer.resize();
+                }
+                ComponentCommand::SetVsync(on) => renderer.set_vsync(on),
+                ComponentCommand::SetShadowResolution(res) => {
+                    if let Err(e) = renderer.set_shadow_resolution(res.clamp(256, 8192)) {
+                        tracing::warn!("set shadow resolution: {e:#}");
+                    }
+                }
+                ComponentCommand::NetMessage { to, text } => {
+                    if let Some(net) = self.net.as_mut() {
+                        net.send_message(to, &text);
+                    }
+                }
+            }
+        }
+        if let Some(rel) = next_scene
             && let Err(e) = self.load_scene(renderer, &rel)
         {
             tracing::error!("switching to scene {rel:?}: {e:#}");
@@ -197,9 +259,16 @@ impl GameApp {
             return;
         };
 
-        // Drive components, then apply any scene switch they requested.
+        // Resolve input (keyboard/mouse accumulated + gamepad poll) and the
+        // networking view for this frame, then drive components.
+        if let Some(net) = self.net.as_mut() {
+            net.pump();
+        }
+        let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+        self.input.resolve_frame();
         let mut commands = Vec::new();
-        self.scene.update_components(dt, t, &mut commands);
+        self.scene
+            .update_components(dt, t, self.input.state(), &net_view, &mut commands);
         // Step physics + write simulated transforms back.
         if let Some(phys) = self.physics.as_mut()
             && !phys.is_empty()
@@ -208,6 +277,10 @@ impl GameApp {
             phys.sync_back(&mut self.scene);
         }
         self.apply_commands(&mut renderer, commands);
+        // Replicate networked objects (owner sends, others apply).
+        if let Some(net) = self.net.as_mut() {
+            self.scene.network_sync(net, dt);
+        }
 
         // Realtime GI (if the scene enables it): live indirect bounce, same as
         // the editor preview.
@@ -232,6 +305,23 @@ impl GameApp {
             let proj = Mat4::perspective_rh(60f32.to_radians(), aspect.max(0.01), 0.05, 500.0);
             (view, proj, position)
         });
+
+        // Voice comms (task 8): capture mic on push-to-talk, play remote peers
+        // back spatially (positioned at the object each peer owns).
+        if self.net.is_some() {
+            if self.voice.is_none() {
+                self.voice = crate::voice::VoiceChat::new();
+            }
+            let transmit = self.input.state().down("Voice");
+            if let (Some(voice), Some(net)) = (self.voice.as_mut(), self.net.as_mut()) {
+                voice.capture_and_send(net, transmit);
+                let owners = net.owners_snapshot();
+                let packets = net.take_voice();
+                let positions = self.scene.peer_voice_positions(&owners);
+                voice.receive(packets, &positions);
+                voice.update(cam_pos, 25.0);
+            }
+        }
 
         let env = self.scene.environment.clone();
         // Baked scene → the environment sun is in the bake, not realtime.
@@ -352,6 +442,27 @@ fn apply_skybox(renderer: &mut Renderer, scene: &LoadedScene, assets_root: &Path
     }
 }
 
+/// Optionally start networking from env vars so a built game can host/join
+/// without code: `CITRUS_HOST=9000` hosts on a port; `CITRUS_JOIN=1.2.3.4:9000`
+/// joins a host.
+fn start_net_from_env() -> Option<NetSession> {
+    if let Ok(port) = std::env::var("CITRUS_HOST") {
+        match port.parse::<u16>().map_err(|e| e.to_string()).and_then(|p| {
+            NetSession::host(p).map_err(|e| e.to_string())
+        }) {
+            Ok(s) => return Some(s),
+            Err(e) => tracing::error!("CITRUS_HOST failed: {e}"),
+        }
+    }
+    if let Ok(addr) = std::env::var("CITRUS_JOIN") {
+        match NetSession::join(&addr) {
+            Ok(s) => return Some(s),
+            Err(e) => tracing::error!("CITRUS_JOIN failed: {e}"),
+        }
+    }
+    None
+}
+
 impl ApplicationHandler for GameApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -372,8 +483,31 @@ impl ApplicationHandler for GameApp {
                     renderer.resize();
                 }
             }
+            // Feed the binding system (2C).
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.input.key(code, event.state.is_pressed());
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.input.mouse_button(button, state == ElementState::Pressed);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                };
+                self.input.wheel(dy);
+            }
+            WindowEvent::Focused(false) => self.input.clear_held(),
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            self.input.mouse_motion(delta.0, delta.1);
         }
     }
 

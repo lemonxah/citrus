@@ -37,10 +37,14 @@ layout(location = 5) out vec2 v_uv1;
 void main() {
     vec4 world = pc.model * vec4(a_position, 1.0);
     v_world_pos = world.xyz;
-    // TODO: inverse-transpose for non-uniform scale
-    mat3 normal_mat = mat3(pc.model);
+    // Normals need the inverse-transpose of the model's 3x3 so they stay correct
+    // under non-uniform scale (plain mat3(model) skews them); it equals
+    // mat3(model) for uniform scale/rotation. Tangents transform like directions,
+    // so they use the plain basis.
+    mat3 model3 = mat3(pc.model);
+    mat3 normal_mat = transpose(inverse(model3));
     v_normal = normalize(normal_mat * a_normal);
-    v_tangent = vec4(normalize(normal_mat * a_tangent.xyz), a_tangent.w);
+    v_tangent = vec4(normalize(model3 * a_tangent.xyz), a_tangent.w);
     v_uv = a_uv;
     v_uv1 = a_uv1;
     v_color = a_color;

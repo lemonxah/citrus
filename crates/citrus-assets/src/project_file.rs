@@ -23,6 +23,10 @@ pub struct ProjectFile {
     #[serde(default)]
     pub boot_scene: Option<String>,
     pub settings: ProjectSettings,
+    /// Input control schemes (2C): rebindable in the editor and at runtime,
+    /// shared by the editor Play mode and a shipped game.
+    #[serde(default)]
+    pub bindings: citrus_core::Bindings,
 }
 
 impl Default for ProjectFile {
@@ -32,6 +36,7 @@ impl Default for ProjectFile {
             last_scene: None,
             boot_scene: None,
             settings: ProjectSettings::default(),
+            bindings: citrus_core::Bindings::default(),
         }
     }
 }
