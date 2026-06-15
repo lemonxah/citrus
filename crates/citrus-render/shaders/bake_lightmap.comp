@@ -1,5 +1,5 @@
 #version 460
-// Lightmap bake — per-texel path tracer (ray query). For every covered
+// Lightmap bake: per-texel path tracer (ray query). For every covered
 // lightmap texel (from the gbuffer) it estimates outgoing diffuse irradiance:
 // direct lighting from the bake's lights (with shadow rays) plus
 // hemisphere-sampled multi-bounce indirect against the scene TLAS, with sky
@@ -92,7 +92,7 @@ bool occluded(vec3 origin, vec3 dir, float dist) {
         != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-// Direct diffuse irradiance (÷π not applied here — caller multiplies albedo/π).
+// Direct diffuse irradiance (÷π not applied here; caller multiplies albedo/π).
 vec3 direct_light(vec3 p, vec3 n, inout uint rng) {
     vec3 sum = vec3(0.0);
     for (uint i = 0u; i < pc.light_count; ++i) {

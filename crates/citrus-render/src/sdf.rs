@@ -3,8 +3,8 @@
 //! the signed distance to the nearest triangle (negative inside). The software
 //! GI marches these instead of a hardware BVH, so it needs no RT cores.
 //!
-//! Sign is taken from the nearest triangle's geometric normal — robust for the
-//! face-dominant primitives we ship; thin shells / sharp edges on imported
+//! Sign is taken from the nearest triangle's geometric normal. That works for
+//! the face-dominant primitives we ship; thin shells / sharp edges on imported
 //! meshes can mis-sign a few voxels (a generalized-winding-number sign is the
 //! follow-up).
 //!
@@ -186,7 +186,7 @@ pub fn generate_sdf(positions: &[Vec3], indices: &[u32], res: u32, pad: f32) -> 
 mod tests {
     use super::*;
 
-    // A unit cube (centered) voxelized: center is inside (negative ≈ -0.5),
+    // A unit cube (centered) voxelized: center is inside (negative ~ -0.5),
     // a point well outside is positive.
     fn unit_cube() -> (Vec<Vec3>, Vec<u32>) {
         let h = 0.5;

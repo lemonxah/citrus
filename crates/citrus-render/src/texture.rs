@@ -1,4 +1,4 @@
-//! GPU texture upload (RGBA8, no mipmaps yet — M3 adds mip generation).
+//! GPU texture upload (RGBA8, no mipmaps yet; M3 adds mip generation).
 
 use anyhow::Result;
 use ash::vk;
@@ -132,7 +132,7 @@ impl GpuTexture {
     }
 
     /// Upload a single-channel `R32_SFLOAT` 3D volume (one float per voxel,
-    /// x fastest then y then z) — used for per-mesh signed distance fields in
+    /// x fastest then y then z), used for per-mesh signed distance fields in
     /// the software-GI march. Sampled as a `sampler3D`. (Consumed once the SDF
     /// march pipeline lands; allow dead_code until then.)
     #[allow(dead_code)]

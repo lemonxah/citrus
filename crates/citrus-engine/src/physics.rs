@@ -2,7 +2,7 @@
 //! rigid bodies when Play starts, step it under gravity each frame, and write
 //! the simulated transforms back onto dynamic/kinematic objects.
 //!
-//! Scope (foundational slice): one collider per object (Box -> cuboid, Sphere ->
+//! Scope: one collider per object (Box -> cuboid, Sphere ->
 //! ball, Mesh -> its AABB as a cuboid). Objects with a `RigidBody` component use
 //! its body kind; a collider with no `RigidBody` becomes a fixed (static)
 //! collider, so level geometry catches falling dynamics. Transforms are written

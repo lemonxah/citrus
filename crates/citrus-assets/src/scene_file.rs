@@ -162,7 +162,7 @@ pub struct WorldEnvironment {
     /// PCF kernel softness multiplier (1.0 = one texel spacing).
     #[serde(default = "default_shadow_softness")]
     pub shadow_softness: f32,
-    /// Directional shadow coverage (world units) — the ortho box is fit to
+    /// Directional shadow coverage (world units). The ortho box is fit to
     /// this size ahead of the camera. Smaller = sharper, less coverage.
     #[serde(default = "default_shadow_distance")]
     pub shadow_distance: f32,
@@ -171,15 +171,15 @@ pub struct WorldEnvironment {
     pub bake: BakeSettings,
     /// Realtime-GI settings: when enabled (and no bake exists) the engine
     /// continuously re-traces light probes from the realtime lights so surfaces
-    /// show live indirect bounce — in the editor and in a shipped game.
+    /// show live indirect bounce, both in the editor and in a shipped game.
     #[serde(default, deserialize_with = "de_realtime_gi")]
     pub realtime_gi: RealtimeGi,
 }
 
 /// Accept both the legacy `realtime_gi: bool` (just the enable toggle) and the
 /// current struct form, so scenes saved before the settings landed still load.
-/// A Visitor (not `#[serde(untagged)]`) is used so the struct path delegates to
-/// the *typed* `RealtimeGi` deserialize — untagged would buffer into a
+/// Uses a Visitor instead of `#[serde(untagged)]` so the struct path delegates
+/// to the typed `RealtimeGi` deserialize. Untagged would buffer into a
 /// self-describing `Content`, which can't replay RON enum variants (the `mode`
 /// field), breaking the valid struct form.
 fn de_realtime_gi<'de, D>(d: D) -> Result<RealtimeGi, D::Error>
@@ -211,7 +211,7 @@ where
 /// How the realtime-GI probe trace is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum GiMode {
-    /// Hardware ray-query (RT cores) against the scene BVH — most accurate.
+    /// Hardware ray-query (RT cores) against the scene BVH. Most accurate.
     #[default]
     RayQuery,
     /// Software ray-marching of per-mesh signed distance fields (no RT cores,
@@ -234,12 +234,12 @@ impl GiMode {
 /// once settled. Probe density (screen-probe spacing) is fixed for now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum FluxQuality {
-    /// Fewest rays — cheapest, slightly noisier while moving.
+    /// Fewest rays: cheapest, slightly noisier while moving.
     Performance,
     #[default]
     Balanced,
     High,
-    /// Most rays — sharpest contact GI, highest cost.
+    /// Most rays: sharpest contact GI, highest cost.
     Ultra,
 }
 
@@ -267,7 +267,7 @@ impl FluxQuality {
 
 /// World-probe fallback policy. Flux drives the main view; the legacy world-probe
 /// DDGI grid only feeds the in-game camera + off-screen fallback, so it doesn't
-/// need to re-march every frame (that was the redundant ~6ms CPU cost).
+/// need to re-march every frame (that was a redundant ~6ms CPU cost).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ProbeFallback {
     /// No world-probe march while Flux is active (lowest CPU).
@@ -307,7 +307,7 @@ pub struct RealtimeGi {
     pub gdf_resolution: u32,
     /// Max trace distance in world units (0 = auto from scene size).
     pub march_distance: f32,
-    /// Firefly clamp on bounce samples — caps bright outliers (lower = calmer).
+    /// Firefly clamp on bounce samples; caps bright outliers (lower = calmer).
     pub firefly_clamp: f32,
     /// World-probe fallback policy for the in-game camera / off-screen surfaces.
     pub probe_fallback: ProbeFallback,
@@ -439,7 +439,7 @@ mod rgi_compat_tests {
         assert!(full.realtime_gi.enabled);
         assert_eq!(full.realtime_gi.bounces, 3);
 
-        // The struct form WITH the `mode` enum field — this is what broke the
+        // The struct form with the `mode` enum field. This is what broke the
         // untagged shim (RON enum can't replay through serde's Content buffer).
         let with_mode: WorldEnvironment =
             ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:(enabled:true,mode:Software,bounces:2,samples:64,intensity:1.0,probe_spacing:2.0,temporal_blend:0.12,update_interval:0.2))")

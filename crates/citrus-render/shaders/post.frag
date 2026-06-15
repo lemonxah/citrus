@@ -1,6 +1,6 @@
 #version 450
 // Post-processing fullscreen pass: samples the linear-HDR scene-color target and
-// applies the camera's blended Volume profile — chromatic aberration + bloom
+// applies the camera's blended Volume profile. Chromatic aberration and bloom
 // (which need to read the rendered frame), then exposure, color grading,
 // tonemap, and vignette. Writes display-space color to the swapchain.
 
@@ -38,7 +38,7 @@ void main() {
     }
 
     // Cheap single-pass bloom: blur the over-threshold part in a ring around the
-    // pixel and add it back. (A mip-chain bloom is the higher-quality follow-up.)
+    // pixel and add it back. A mip-chain bloom is the higher-quality follow-up.
     if (pc.p4.x > 0.5) {
         float thr = pc.p4.y;
         float r = max(pc.p4.w, 0.0) * 0.04;

@@ -1,5 +1,5 @@
 #version 450
-// citrus standard shader — vertex stage (phase 1)
+// citrus standard shader, vertex stage (phase 1)
 
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;

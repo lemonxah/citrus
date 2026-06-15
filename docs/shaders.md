@@ -1,7 +1,7 @@
 # citrus standard shader
 
 The single default shader used by every world and avatar, on PC and mobile.
-Inspired by Poiyomi: one heavily configurable **uber-shader** rather than many
+Inspired by Poiyomi: one heavily configurable **uber-shader** instead of many
 small shaders, so creators toggle features instead of writing GLSL.
 
 ## Why an uber-shader
@@ -49,23 +49,23 @@ that with **SPIR-V specialization constants + compile-time variant flags**:
 | Transparency | Full | Cutout strongly preferred |
 | Target | Desktop Vulkan 1.3 | Quest-class (Vulkan 1.1, tiled GPU) |
 
-Same material asset, two compilation targets: the mobile tier compiles the
+Same material asset, two compilation targets. The mobile tier compiles the
 same source with `TIER_MOBILE` set, which forces cheap fallbacks for features
 out of budget (matcap→off, PBR→simplified BRDF, etc.). Creators see one
 material; the publisher emits both variants and validates mobile budget.
 
 ## Material inspector GUI
 
-The shader is only as good as its inspector — creators interact with the GUI,
+The shader is only as good as its inspector. Creators interact with the GUI,
 not the SPIR-V. The egui material inspector (citrus-editor) is a first-class
 part of the shader spec:
 
 - **Collapsible feature sections**, each with a master enable toggle in the
   header (toggle off = section collapses, variant bit clears, GPU cost gone).
-  Disabled sections render dimmed, never hidden — discoverability matters.
+  Disabled sections render dimmed, never hidden, for discoverability.
 - **Search/filter bar** across all property names ("rim" jumps you to rim
   lighting), like Poiyomi's ctrl+F workflow.
-- **Live preview**: edits apply to the running scene immediately — no
+- **Live preview**: edits apply to the running scene immediately, with no
   apply button. Variant recompiles happen async with the old pipeline kept
   until the new one is ready (no hitching).
 - **Texture slots** as thumbnail widgets: click to assign, right-click to
@@ -80,16 +80,16 @@ part of the shader spec:
 - **Tier preview toggle** in the inspector header: PC ⇄ Mobile, showing
   exactly what the mobile tier degrades, plus a live mobile-budget meter
   (texture memory, variant cost) so creators see Quest problems *while*
-  authoring, not at publish time.
+  authoring rather than at publish time.
 - **Reset-to-default** per property (right-click) and per section.
 
 Build order: a minimal version of this inspector ships **with M2** (phase 1
-features need it for testing) and grows with each shader phase — the
+features need it for testing) and grows with each shader phase. The
 inspector and the shader are one deliverable, not two.
 
 ## Implementation notes
 
-- Source language: **Slang** or GLSL with includes — decided at milestone M2.
+- Source language: **Slang** or GLSL with includes, decided at milestone M2.
   Compiled to SPIR-V at build time (`glslc`/`slangc`), variants via
   specialization constants where possible, preprocessor defines where not
   (e.g. texture binding presence).
@@ -105,7 +105,7 @@ inspector and the shader are one deliverable, not two.
 User-authored GLSL fragment shaders: any `.frag` file in the project appears
 in the material Shader picker. The engine prepends a fixed preamble and
 compiles via `glslc` at runtime, with hot reload (~2s file polling) and the
-error swirl + compiler output in the Inspector on failure.
+error swirl plus compiler output in the Inspector on failure.
 Files → Create → New Shader writes a commented starter.
 
 The shader body is the fragment stage only (standard vertex stage). Do not

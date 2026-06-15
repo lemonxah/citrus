@@ -1,9 +1,9 @@
 //! GPU software-GI probe march. Runs `sw_gi.comp` over the merged Global
-//! Distance Field (a 3D distance texture + a nearest-instance index texture)
-//! to produce SH-L1 radiance + directional-distance probes — the same packed
+//! Distance Field (a 3D distance texture plus a nearest-instance index texture)
+//! to produce SH-L1 radiance + directional-distance probes, the same packed
 //! layout the standard shader samples.
 //!
-//! The GDF (distance + index textures + per-instance materials) is **cached** and
+//! The GDF (distance + index textures + per-instance materials) is cached and
 //! only rebuilt/re-uploaded via `set_gdf` when geometry moves; `march` then runs
 //! every trace against the cached GDF, creating only the small per-trace buffers
 //! (lights/probes/output). That lets a static scene keep a high-resolution GDF
@@ -47,7 +47,7 @@ pub struct ScreenGiParams {
 /// Per-frame Flux trace resources that must outlive the command-buffer recording
 /// (the descriptor pool + the host SSBOs/UBO the dispatch reads). When the trace
 /// is folded into the main frame command buffer there is no fence wait to bound
-/// their lifetime, so the caller holds these and frees them one frame later —
+/// their lifetime, so the caller holds these and frees them one frame later,
 /// after the frame fence that consumed them has signalled.
 pub struct ScreenGiTransient {
     desc_pool: vk::DescriptorPool,
@@ -83,8 +83,8 @@ pub struct GpuGiEmitter {
     pub emission: [f32; 3],
 }
 
-/// Per-trace march inputs (lights/probes/params — change every trace; the GDF is
-/// cached separately via `set_gdf`).
+/// Per-trace march inputs (lights/probes/params that change every trace; the GDF
+/// is cached separately via `set_gdf`).
 pub struct GpuGiMarch<'a> {
     pub lights: &'a [BakeLight],
     pub emitters: &'a [GpuGiEmitter],
@@ -165,7 +165,7 @@ impl CachedGdf {
 
 /// An async march submitted to the GPU but not yet read back. Its buffers must
 /// stay alive until the fence signals; polled each frame so the trace never
-/// blocks the main thread (Lumen-style: decouple GI work from the frame).
+/// blocks the main thread (Lumen-style, GI work decoupled from the frame).
 struct InFlight {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
@@ -353,8 +353,8 @@ impl GpuGi {
         })
     }
 
-    /// (Re)upload the GDF — distance + index 3D textures and per-instance
-    /// materials — replacing any cached one. Call only when geometry changes.
+    /// (Re)upload the GDF (distance + index 3D textures and per-instance
+    /// materials), replacing any cached one. Call only when geometry changes.
     #[allow(clippy::too_many_arguments)]
     pub fn set_gdf(
         &mut self,
@@ -606,7 +606,7 @@ impl GpuGi {
 
     /// Screen-space GI final gather: per-pixel GDF trace into `out_view` (a
     /// STORAGE image). Reads `depth_view` (must already be SHADER_READ_ONLY).
-    /// Synchronous (blocks) for now — correctness first; async is a follow-up.
+    /// Synchronous (blocks) for now; async is a follow-up.
     /// Leaves `out` in SHADER_READ_ONLY_OPTIMAL for the forward pass to sample.
     /// Record the Flux gather dispatch into an externally-owned command buffer
     /// (the main frame cb) instead of submitting + blocking on its own fence.
@@ -665,7 +665,7 @@ impl GpuGi {
         params.counts[3] = emitters.len() as u32;
         params.misc[1] = extent.width;
         params.misc[2] = extent.height;
-        // params.march[2] (temporal alpha) is set by the caller — motion-aware:
+        // params.march[2] (temporal alpha) is set by the caller, motion-aware:
         // snap when fresh, trust the new trace more while moving, converge gently
         // when still. (history_valid only gates the descriptor sanity below.)
         let _ = history_valid;
@@ -728,7 +728,7 @@ impl GpuGi {
         write_ssbo(device, set, 3, light_buf.handle);
         write_ssbo(device, set, 4, emitter_buf.handle);
         self.write_image(device, set, 5, depth_sampler, depth_view);
-        // Storage image (binding 6) — GENERAL layout for compute write.
+        // Storage image (binding 6): GENERAL layout for compute write.
         let img_info = [vk::DescriptorImageInfo::default()
             .image_view(out_view)
             .image_layout(vk::ImageLayout::GENERAL)];
@@ -762,8 +762,8 @@ impl GpuGi {
         let groups_x = extent.width.div_ceil(8);
         let groups_y = extent.height.div_ceil(8);
         unsafe {
-            // Output is a fresh (ping-pong) image fully overwritten this trace —
-            // discard its old contents. History is the OTHER image (read-only).
+            // Output is a fresh (ping-pong) image fully overwritten this trace,
+            // so discard its old contents. History is the other image (read-only).
             let to_general = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)

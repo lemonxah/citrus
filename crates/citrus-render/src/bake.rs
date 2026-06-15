@@ -879,8 +879,8 @@ fn texel(x: i32, y: i32, size: i32) -> usize {
     ((y * size + x) as usize) * 4
 }
 
-/// Largest world-space spacing to a valid axis neighbor `step` away — the local
-/// texel size, used to scale the denoise position weight (scale-invariant).
+/// Largest world-space spacing to a valid axis neighbor `step` away. This is the
+/// local texel size, used to scale the denoise position weight (scale-invariant).
 fn neighbor_spacing(pos: &[f32], px: &[f32], x: i32, y: i32, step: i32, s: i32) -> f32 {
     let ci = texel(x, y, s);
     let p0 = [pos[ci], pos[ci + 1], pos[ci + 2]];
@@ -948,7 +948,7 @@ fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, it
                             (nrm[ni] * n0[0] + nrm[ni + 1] * n0[1] + nrm[ni + 2] * n0[2]).max(0.0);
                         // Luminance edge-stop (relative, scale-invariant): smooths
                         // similar-brightness noise but preserves lighting edges
-                        // (shadow boundaries, falloff) on flat surfaces — without
+                        // (shadow boundaries, falloff) on flat surfaces. Without
                         // this the denoiser washes shadows/gradients away.
                         let wl = (-(lum(ni) - l0).abs() / (0.6 * (l0 + 0.02))).exp();
                         let w = wk * wp * ndot.powf(32.0) * wl;
@@ -982,8 +982,8 @@ fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, it
 /// it's mesh-agnostic.
 fn stitch_seams(pixels: &mut [f32], pos: &[f32], nrm: &[f32], size: u32) {
     let s = size as i32;
-    // World-space AABB of valid texels → a quantization cell ~1.5 texels wide so
-    // points that coincide in 3D share a cell regardless of mesh scale.
+    // World-space AABB of valid texels, giving a quantization cell ~1.5 texels
+    // wide so points that coincide in 3D share a cell regardless of mesh scale.
     let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
     let mut any = false;
     for t in 0..(size * size) as usize {
@@ -1049,7 +1049,7 @@ fn stitch_seams(pixels: &mut [f32], pos: &[f32], nrm: &[f32], size: u32) {
 
 /// Dilate valid texels outward into invalid (gutter) texels, `iters` rings.
 /// Bilinear sampling at a UV-chart edge then reads the surface colour instead
-/// of the black background — removes lightmap seams.
+/// of the black background, which removes lightmap seams.
 fn dilate_lightmap(pixels: &mut [f32], size: u32, iters: u32) {
     let s = size as i32;
     for _ in 0..iters {
@@ -1354,8 +1354,8 @@ fn bake_one_lightmap(
     unsafe { device.destroy_descriptor_pool(pool, None) };
 
     // Diagnostic: brightness range of the baked lightmap. A near-flat range
-    // (min ≈ max) means the bake produced uniform light (no shadow/spot detail)
-    // — distinguishes a bake problem from a resolution/display one.
+    // (min ≈ max) means the bake produced uniform light (no shadow/spot detail),
+    // which distinguishes a bake problem from a resolution/display one.
     {
         let lum = |i: usize| 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
         let (mut lo, mut hi, mut acc) = (f32::INFINITY, 0.0f32, 0.0f64);

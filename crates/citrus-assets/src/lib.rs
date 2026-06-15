@@ -126,7 +126,7 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
 }
 
 /// Load a model applying its `.meta` sidecar import settings if the sidecar
-/// exists (read-only — safe in a shipped game; the editor creates/edits the meta
+/// exists (read-only, safe in a shipped game; the editor creates/edits the meta
 /// separately). FBX honours the settings; glTF uses defaults for now.
 pub fn load_model_with_meta(path: impl AsRef<Path>) -> Result<Scene> {
     let path = path.as_ref();

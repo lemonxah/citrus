@@ -174,7 +174,7 @@ lives.
   stripping, `GameState` blackboard + savegame persistence. Rust-native (Bevy single-exe +
   assets) model, not Unity/Godot data-pack. Full breakdown in Features.md 2I.
 
-- **Game UI system (runtime UI)** — **developer's choice per project, both first-class:**
+- **Game UI system (runtime UI)** — **developer's choice per project, both supported:**
   (A) the citrus-native **retained scene-graph UI** (Unity uGUI-style, screen + world-space
   VR, visually authored: UICanvas + UIRect + widgets as scene objects, 2D batched renderer
   + font subsystem in citrus-render, pointer/key events via the in-game API), and (B)
@@ -201,7 +201,7 @@ lives.
 - Log console tab (`Tab::Log`): tracing ring (5000), level filters + substring search,
   follow + clear, line wrap with timestamp offset, concrete event timestamps. Plugin
   cargo + glslc errors route in via tracing.
-- First-class code editor + LSP: code/text files in dockable `Tab::Code` (multiple,
+- Code editor + LSP: code/text files in dockable `Tab::Code` (multiple,
   close/rearrange/split), syntect highlighting, per-tab dirty + debounced auto-save
   (`.frag` hot-reloads). rust-analyzer on demand: diagnostics, completion (Ctrl+Space),
   hover (Ctrl+hover). Follow-ups: go-to-def, gutter markers, signature help, GLSL server.

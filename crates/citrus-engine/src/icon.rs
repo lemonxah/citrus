@@ -1,8 +1,9 @@
-//! Procedural app icon (a citrus slice) + desktop integration.
+//! Procedural app icon (a citrus slice) plus desktop integration.
 //!
 //! X11/Windows take the icon directly from winit. Wayland compositors look
-//! it up via the window's `app_id` → a `.desktop` file, so we install
-//! `citrus.desktop` + the icon into the user's XDG data dirs on first run.
+//! it up via the window's `app_id`, which points to a `.desktop` file, so we
+//! install `citrus.desktop` and the icon into the user's XDG data dirs on
+//! first run.
 
 use std::path::PathBuf;
 
@@ -61,7 +62,7 @@ pub fn rgba() -> (u32, u32, Vec<u8>) {
     (SIZE, SIZE, pixels)
 }
 
-/// Install `citrus.desktop` + icon into XDG data dirs if missing, so
+/// Install `citrus.desktop` and the icon into XDG data dirs if missing, so
 /// Wayland compositors (which resolve icons by `app_id`) show ours.
 /// Best-effort: failures only log.
 pub fn install_desktop_entry() {

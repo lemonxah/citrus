@@ -60,7 +60,7 @@ impl TypedComponent for Spin {
 ```
 
 `NAME` is the stable identity used in the inspector, the `.scene` file, and the
-registry — renaming it orphans saved data, so treat it as permanent.
+registry. Renaming it orphans saved data, so treat it as permanent.
 
 ### Lifecycle
 
@@ -99,13 +99,13 @@ ctx.time    // seconds since engine start
 ```
 
 `translation`/`rotation`/`scale` are the object's **local** TRS (relative to its
-parent) — the exact fields the engine reads back. Writing them directly is fine
+parent), the exact fields the engine reads back. Writing them directly is fine
 for self-relative motion (spin, bob).
 
 ### World-space writes
 
 When the value you want to assign is a **world** coordinate (e.g. another
-object's position), do not write `*ctx.translation` directly — that's a local
+object's position), do not write `*ctx.translation` directly. That's a local
 field, so for a parented object the engine would re-apply the parent transform
 and the object lands in the wrong place. Use:
 
@@ -119,7 +119,7 @@ matrix so the object ends up exactly there. (World-space rotation/scale writes
 are not exposed yet.)
 
 **Smoothed / lerped moves (planned).** Today `set_world_position` snaps to the
-target. A planned addition lets a transform change *ease* instead, so motion
+target. A planned addition lets a transform change ease instead, so motion
 looks nicer without per-component hand-rolled smoothing:
 
 ```rust
@@ -166,7 +166,7 @@ let id  = ctx.self_id();          // owner's ObjectId
 `Transform` carries `translation` / `rotation` / `scale` plus
 `forward()` / `right()` / `up()` / `matrix()`. The snapshot is taken once at the
 start of the update pass, so reads are stable-by-one-frame for objects already
-ticked this frame — fine for references.
+ticked this frame, which is fine for references.
 
 ### Deferred commands
 
@@ -201,7 +201,7 @@ Scene tree onto the box to set it; the ✕ clears it. At runtime, resolve it eac
 frame with `ctx.transform_of(self.target)` (returns `None` if unset or the
 target was deleted — handle that case).
 
-Worked example — orbit a target, correct at any depth in the hierarchy:
+Worked example, orbit a target, correct at any depth in the hierarchy:
 
 ```rust
 fn update(&mut self, ctx: &mut ComponentCtx) {
@@ -308,14 +308,14 @@ pub fn citrus_register_editor(editor: &mut EditorComponents) {
 }
 ```
 
-Registering a `NAME` that already exists **replaces** the old entry — that's how
+Registering a `NAME` that already exists **replaces** the old entry; that's how
 hot-reload supersedes a previous build.
 
 ### The cdylib egui boundary
 
 A plugin statically links its own copy of egui, so egui's `TypeId`s differ from
-the host's. Any egui API backed by a **context plugin keyed by TypeId** — drag
-and drop (`dnd_*`), selectable labels — panics (SIGABRT, uncatchable) when called
+the host's. Any egui API backed by a **context plugin keyed by TypeId** (drag
+and drop (`dnd_*`), selectable labels) panics (SIGABRT, uncatchable) when called
 from plugin code. Avoid those in `Inspect`/`Gizmo`:
 
 - Don't call egui dnd; use `InspectCtx::object_ref` (it detects drops via raw

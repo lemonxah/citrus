@@ -1,7 +1,7 @@
 //! Egui-free data models shared by the runtime (scene/shader handling) and the
 //! editor inspector. These describe material and shader state as plain data;
 //! the editor builds its egui UI on top of them, the runtime reads them when
-//! loading scenes — neither needs the other's crate.
+//! loading scenes. Neither needs the other's crate.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AlphaModeModel {
@@ -149,7 +149,7 @@ pub struct MaterialModel {
     pub normal_map_enabled: bool,
     pub normal_strength: f32,
     pub double_sided: bool,
-    // Extended "FX" params (per-material UBO) — Toon rim + animated emission.
+    // Extended "FX" params (per-material UBO): Toon rim + animated emission.
     pub rim_color: [f32; 3],
     pub rim_power: f32,
     pub rim_strength: f32,

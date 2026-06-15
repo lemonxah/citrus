@@ -1,8 +1,8 @@
 #version 450
 // Software (Lumen-style) GI probe march on the GPU. One invocation per probe:
 // uniform-sphere Monte-Carlo with multi-bounce diffuse paths, sphere-marched
-// against the merged Global Distance Field (one 3D distance texture + a nearest-
-// instance index texture for material lookup) instead of looping per-mesh SDFs.
+// against the merged Global Distance Field (one 3D distance texture plus a
+// nearest-instance index texture for material lookup) instead of looping per-mesh SDFs.
 // Mirrors the CPU `sw_gi.rs` march and writes the same packed probe layout the
 // standard shader samples (RGB SH in xyz, directional distance SH in w).
 
@@ -77,8 +77,8 @@ vec3 cosine_hemisphere(vec3 n, inout uint s) {
 }
 
 // Signed distance to the merged scene. Outside the GDF box, return the distance
-// to the box (conservative — lets the march advance instead of stalling on the
-// clamped border value).
+// to the box. This is conservative and lets the march advance instead of stalling
+// on the clamped border value.
 float scene_distance(vec3 p) {
     vec3 q = clamp(p, pc.gdf_min.xyz, pc.gdf_max.xyz);
     float outside = length(p - q);
@@ -135,7 +135,7 @@ float sphere_solid_angle(float radius, float dist) {
 
 // NEE: irradiance at surface (p,n) from every visible emitter sphere. Caller
 // folds in albedo/PI. Zero-variance replacement for catching emitters by random
-// bounce hits — this is what removes the blotchy fill around emissive objects.
+// bounce hits. Removes the blotchy fill around emissive objects.
 vec3 emitter_light(vec3 p, vec3 n, float eps) {
     vec3 sum = vec3(0.0);
     uint ec = pc.misc.y;
@@ -206,7 +206,7 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
         if (dot(n, rd) > 0.0) n = -n;
         vec3 albedo = insts[who].albedo.rgb;
         // Emitters are sampled via NEE (emitter_light), not added on random hit,
-        // so an emissive surface contributes no emission here — kills the firefly
+        // so an emissive surface contributes no emission here. Avoids the firefly
         // variance that shows as blotchy fill around emitters.
         radiance += throughput * (albedo / PI) * (direct_light(hp, n, eps) + emitter_light(hp, n, eps));
         throughput *= albedo;
@@ -244,8 +244,8 @@ void main() {
     float wgt = (4.0 * PI) / float(samples);
     sh0 *= wgt; sh1 *= wgt; sh2 *= wgt; sh3 *= wgt;
     // Analytic NEE: add the probe's DIRECT view of each visible emitter straight
-    // into the SH (radiance L over the solid angle Omega in its direction l) — a
-    // zero-variance term, so the bright fill around an emitter is smooth in one
+    // into the SH (radiance L over the solid angle Omega in its direction l). This
+    // is a zero-variance term, so the bright fill around an emitter is smooth in one
     // trace instead of needing many to average the random hits out.
     uint ec = pc.misc.y;
     for (uint i = 0u; i < ec; ++i) {

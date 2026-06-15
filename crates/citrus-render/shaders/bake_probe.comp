@@ -1,5 +1,5 @@
 #version 460
-// Probe bake — one invocation per light probe. Traces rays over the full
+// Probe bake. One invocation per light probe. Traces rays over the full
 // sphere (ray query), gathers incoming radiance (sky on miss; emission +
 // direct + one cheap bounce on hit), and projects it onto an SH-L1 basis.
 // Dynamic objects trilinearly interpolate these probes at runtime.

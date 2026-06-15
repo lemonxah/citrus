@@ -1,5 +1,5 @@
 #version 450
-// Lightmap bake — gbuffer pass. Rasterizes a mesh into its lightmap (uv1)
+// Lightmap bake, gbuffer pass. Rasterizes a mesh into its lightmap (uv1)
 // space: the second UV set becomes the clip-space position, so each lightmap
 // texel is filled with the world position + normal of the surface that maps
 // there. The compute pass then traces lighting per texel.

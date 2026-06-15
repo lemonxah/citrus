@@ -25,7 +25,7 @@ use egui::{DragValue, Label, RichText, ScrollArea, Sense, Ui};
 /// plugin/egui dylib boundary). `ObjectRef` drop targets read it.
 pub const DRAG_OBJECT_KEY: &str = "citrus-drag-object";
 /// egui-memory key holding the project-relative path of the file currently
-/// dragged from the file browser (a `String`, shared across the dylib boundary —
+/// dragged from the file browser (a `String`, shared across the dylib boundary;
 /// same plugin-safe pattern as [`DRAG_OBJECT_KEY`]). Drop targets read it.
 pub const DRAG_FILE_KEY: &str = "citrus-drag-file";
 
@@ -37,13 +37,13 @@ pub struct InspectCtx<'a> {
 }
 
 impl InspectCtx<'_> {
-    /// Draw an object-reference row as a **drop target**: drag an object from
+    /// Draw an object-reference row as a drop target: drag an object from
     /// the Scene tree onto the box to set it; the ✕ clears it. Returns true if
     /// the reference changed.
     ///
     /// Deliberately avoids egui's drag-and-drop API: that goes through egui's
     /// `DragAndDrop` context plugin, which panics when called from a plugin's
-    /// own (separately-linked) egui — same `TypeId`-mismatch class as the
+    /// own (separately-linked) egui. Same `TypeId`-mismatch class as the
     /// label-selection crash. Instead the Scene tree publishes the dragged
     /// object index into egui memory as a `usize` (a std type, so its slot is
     /// shared across the dylib boundary), and we detect the drop with raw
@@ -100,7 +100,7 @@ impl InspectCtx<'_> {
         changed
     }
 
-    /// An asset-path field that's also a **drop target**: drag a file from the
+    /// An asset-path field that's also a drop target: drag a file from the
     /// file browser onto it to set `value` to that file's project-relative path.
     /// `exts` (lowercase, no dot) restricts which files are accepted; empty =
     /// any. Returns true if the value changed. Uses the same plugin-safe memory

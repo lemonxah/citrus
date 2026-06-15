@@ -44,7 +44,7 @@ pub struct FileBrowser {
 pub struct FileBrowserResponse {
     /// File single-clicked: select / show in Inspector.
     pub clicked: Option<PathBuf>,
-    /// File double-clicked: open it (the engine picks the action by type —
+    /// File double-clicked: open it (the engine picks the action by type:
     /// import model, open code editor, etc.).
     pub activated: Option<PathBuf>,
     /// Create a new asset inside this directory.
@@ -115,8 +115,8 @@ impl FileBrowser {
                     .to_rgba8();
                 let size = [image.width() as usize, image.height() as usize];
                 // Monochrome silhouette: white RGB + original alpha, so drawing
-                // it with a tint colours the whole crab one flat colour (matches
-                // the rest of the file icons).
+                // it with a tint colours the whole crab one flat colour, matching
+                // the rest of the file icons.
                 let mono: Vec<u8> = image.pixels().flat_map(|p| [255, 255, 255, p[3]]).collect();
                 let color = egui::ColorImage::from_rgba_unmultiplied(size, &mono);
                 ctx.load_texture("citrus-ferris", color, egui::TextureOptions::LINEAR)
@@ -209,8 +209,8 @@ impl FileBrowser {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // The whole grid container senses clicks (tiles keep
-                    // priority), so right-click works in any empty spot —
-                    // beside the last tile of a row included.
+                    // priority), so right-click works in any empty spot,
+                    // including beside the last tile of a row.
                     let dir = self.current_dir.clone();
                     let scope =
                         ui.scope_builder(egui::UiBuilder::new().sense(Sense::click()), |ui| {
@@ -308,7 +308,7 @@ impl FileBrowser {
                 if on_arrow && !subdirs.is_empty() {
                     self.toggle_open(dir);
                 } else {
-                    // Single click only navigates the grid — folders aren't
+                    // Single click only navigates the grid. Folders aren't
                     // inspectable assets, so it doesn't change the selection.
                     self.current_dir = dir.to_owned();
                 }
@@ -496,7 +496,7 @@ impl FileBrowser {
         if tile.dragged() {
             // Also publish the dragged file's project-relative path into egui
             // memory (a String) so inspector drop-fields can read it across the
-            // plugin egui boundary — same pattern as the scene tree's
+            // plugin egui boundary. Same pattern as the scene tree's
             // dragged-object key.
             if !is_dir {
                 let rel = path

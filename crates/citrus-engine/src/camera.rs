@@ -44,9 +44,9 @@ impl FlyCamera {
         self.pitch = (self.pitch - dy * 0.0035).clamp(-1.55, 1.55);
     }
 
-    /// Classic turntable orbit around `pivot` (left drag): the camera
-    /// revolves around the pivot, looking at it. The pivot is locked for the
-    /// whole drag (see engine), so the rotation is stable.
+    /// Turntable orbit around `pivot` (left drag): the camera revolves around
+    /// the pivot, looking at it. The pivot is locked for the whole drag (see
+    /// engine), so the rotation is stable.
     pub fn orbit(&mut self, pivot: Vec3, dx: f32, dy: f32) {
         let offset = self.position - pivot;
         let distance = offset.length().max(0.05);

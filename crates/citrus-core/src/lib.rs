@@ -3,7 +3,7 @@
 //! without pulling in any editor code.
 //!
 //! Holds the component/behaviour system: the [`Component`]/[`TypedComponent`]
-//! traits (lifecycle hooks only — no UI), [`ComponentCtx`] (the in-game API
+//! traits (lifecycle hooks only, no UI), [`ComponentCtx`] (the in-game API
 //! surface), [`ComponentRegistry`], [`Transform`], the deferred
 //! [`ComponentCommand`]s, and the built-in component data. Editor-only concerns
 //! (inspector UI, viewport gizmos) are separate traits in `citrus-editor`.
@@ -53,7 +53,7 @@ impl ObjectId {
         self.0 == 0
     }
 
-    /// Raw 128-bit value — for wire encoding (networking).
+    /// Raw 128-bit value for wire encoding (networking).
     pub fn raw(&self) -> u128 {
         self.0
     }
@@ -135,7 +135,7 @@ impl ObjectRef {
 
 // ------------------------------------------------------------------ transform
 
-/// A decomposed transform (translation / rotation / scale) — the gameplay-side
+/// A decomposed transform (translation / rotation / scale). The gameplay-side
 /// view of any object. The in-game API resolves object references into this.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
@@ -259,7 +259,7 @@ pub struct ComponentCtx<'a> {
     /// Object names, parallel to `world_transforms`.
     pub object_names: &'a [String],
     /// Stable object ids, parallel to `world_transforms`. The preferred way to
-    /// reference objects (names are cosmetic and may collide / be empty).
+    /// reference objects (names are cosmetic and may collide or be empty).
     pub object_ids: &'a [ObjectId],
     /// Index of the object that owns the component being updated.
     pub self_index: usize,
@@ -285,12 +285,12 @@ impl ComponentCtx<'_> {
     }
 
     /// Find an object by name; returns its index for the lookups below. Names
-    /// aren't guaranteed unique — the first match wins.
+    /// aren't guaranteed unique, so the first match wins.
     pub fn find_object(&self, name: &str) -> Option<usize> {
         self.object_names.iter().position(|n| n == name)
     }
 
-    /// World [`Transform`] (translation/rotation/scale) of an object — the
+    /// World [`Transform`] (translation/rotation/scale) of an object: the
     /// gameplay view of any object reference (snapshot at frame start).
     pub fn object_transform(&self, index: usize) -> Option<Transform> {
         self.world_transforms
@@ -349,7 +349,7 @@ impl ComponentCtx<'_> {
         self.index_of(target.id()?)
     }
 
-    /// World [`Transform`] of a referenced object — the preferred way to read
+    /// World [`Transform`] of a referenced object. The preferred way to read
     /// another object you hold a reference to.
     pub fn transform_of(&self, target: ObjectRef) -> Option<Transform> {
         self.object_transform(self.resolve(target)?)
@@ -457,7 +457,7 @@ impl ComponentCtx<'_> {
         &self.net.messages
     }
 
-    /// World [`Transform`] of the first spawn point with this tag (2 — spawn
+    /// World [`Transform`] of the first spawn point with this tag (2, spawn
     /// points). `None` if no matching [`SpawnPoint`] exists.
     pub fn spawn_point(&self, tag: &str) -> Option<Transform> {
         let idx = self
@@ -561,7 +561,7 @@ impl ComponentRegistry {
         registry
     }
 
-    /// Register a component type. Re-registering a name replaces the entry —
+    /// Register a component type. Re-registering a name replaces the entry;
     /// that's how hot-reloaded plugin components supersede their old build.
     pub fn register<T: TypedComponent>(&mut self) {
         let info = ComponentInfo {
@@ -765,7 +765,7 @@ impl LightComponent {
     /// to luminous flux the textbook way: point = 4π·I over the full sphere,
     /// spot = the cone's solid angle 2π(1-cos θ)·I. Directional has no flux
     /// (it's an infinite source) so it reports illuminance (lux ≈ intensity).
-    /// Returns (value, unit) for display only — nothing reads it back.
+    /// Returns (value, unit) for display only; nothing reads it back.
     pub fn approx_photometric(&self) -> (f32, &'static str) {
         match self.kind {
             LightKind::Directional => (self.intensity, "lx"),
@@ -1378,8 +1378,8 @@ impl TypedComponent for SpawnPoint {
 // ------------------------------------------------------------- networking (2G)
 
 /// Replicates the owning object's transform over the network. Whoever has
-/// authority (see [`NetView`]) broadcasts its transform; everyone else receives +
-/// applies it (optionally smoothed). `grabbable` lets the local player take
+/// authority (see [`NetView`]) broadcasts its transform; everyone else receives
+/// and applies it (optionally smoothed). `grabbable` lets the local player take
 /// ownership by pressing `grab_action`, move it, and release it for others.
 #[derive(Serialize, Deserialize)]
 pub struct Sync {

@@ -2,7 +2,7 @@
 
 Tracks engine capabilities: **what we already support** vs **what we still want to
 build**. Working bug/backlog list lives in [TODO.md](TODO.md); high-level milestones
-in [README.md](README.md). This file is the feature-level map — update it when a
+in [README.md](README.md). This file is the feature-level map. Update it when a
 capability lands or a new goal is set.
 
 Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo]` not started
@@ -13,10 +13,10 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 
 ### Rendering
 - [done] Vulkan 1.3 renderer (ash 0.38, dynamic rendering, sync2)
-- [done] PBR standard shader (metal/rough, base/normal/emission), multi-light frag loop —
+- [done] PBR standard shader (metal/rough, base/normal/emission), multi-light frag loop:
   energy-conserving Cook-Torrance (Fresnel kS / diffuse kD = 1-F) + roughness-aware ambient
-  **diffuse + specular** (indirect split so metals/smooth surfaces pick up environment colour,
-  not flat black; reflection probes are a follow-up); indirect term fed by baked lightmaps /
+  **diffuse + specular** (indirect split so metals/smooth surfaces pick up environment colour
+  instead of flat black; reflection probes are a follow-up); indirect term fed by baked lightmaps /
   probe SH (else flat ambient). Normals use the inverse-transpose model matrix (correct under
   non-uniform scale). **Two PBR variants share this pipeline (so both get GI + baked maps):**
   - **Standard** (Mochie-like): the full PBR path above.
@@ -28,7 +28,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
     and **3 matcaps + 3 matcap masks**. Matcaps are view-space sphere-mapped, masked, and added
     with per-layer strength (FX UBO); opacity drives alpha; the emission mask gates the glow.
     `.material` files carry all slots (`MaterialTextures`, `#[serde(default)]` back-compatible).
-    All 12 slots are assignable in the inspector, placed in the section they belong to: **Base**
+    All 12 slots are assignable in the inspector, placed in the section they belong to. **Base**
     (albedo, normal map + strength, ORM, opacity), **Emission** (emission map, emission mask), and
     **Matcaps** (each of the 3 layers is its own sub-section: matcap texture, blend mode, strength,
     mask). Drag an image from the file browser onto a slot; per-slot clear. `apply_material` rebinds
@@ -40,27 +40,27 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
     Replace (`MatcapBlend`), carried in the FX UBO (`fx.matcap_blend`) and applied by `blend_matcap`
     in the shader. Per-layer strength + mask still apply.
   - **Per-material FX uniform buffer** (set 1, binding 4): the 128-byte push block is full (and
-    AMD-capped), so extended params live in a small per-material UBO instead — rim colour/power/
+    AMD-capped), so extended params live in a small per-material UBO instead: rim colour/power/
     strength, ramp smoothness, and **animated UV scroll + emission pulse** (Poiyomi-style). The
     UBO is host-visible and rewritten on edit (`Renderer::upload_material_fx`); materials are static
     at runtime so there's no in-flight hazard. `.material` files stay back-compatible (the new
-    `MaterialParams` fields are `#[serde(default)]`). This is the unlock for richer built-in shader
+    `MaterialParams` fields are `#[serde(default)]`). This enables richer built-in shader
     options without a custom shader.
 - [done] **Custom-shader pipeline exposes the full scene**: the preamble now declares the complete
   frame UBO (lights array, shadows `u_shadow`, probe SH `probes`, baked `u_lightmap`, post settings)
-  plus ready-to-call helpers — `citrus_gi(world_pos, n)` (probe-SH baked GI with ambient fallback),
-  `citrus_direct_diffuse(world_pos, n)` (all scene lights with attenuation/spot cones), and
-  `citrus_sh(...)` — so custom shaders integrate with lighting/GI the same way the built-ins do.
-- [done] Lights: directional / point / spot — color, intensity, range, spot angle/blend
-  (up to 16/frame, distance attenuation + spot cones)
+  plus ready-to-call helpers (`citrus_gi(world_pos, n)` for probe-SH baked GI with ambient fallback,
+  `citrus_direct_diffuse(world_pos, n)` for all scene lights with attenuation/spot cones, and
+  `citrus_sh(...)`), so custom shaders integrate with lighting/GI the same way the built-ins do.
+- [done] Lights: directional / point / spot (color, intensity, range, spot angle/blend,
+  up to 16/frame, distance attenuation + spot cones)
 - [partial] Shadow-casting lights (shadow-map array, PCF; needs acne/bias GPU validation).
   Per-light **Shadows** dropdown: No Shadows / Hard Shadows (single depth tap, sharp) /
   Soft Shadows (5x5 PCF penumbra). The filter mode rides the sign of the light's shadow
   view-count, so no extra GPU light field is needed.
 - [done] **Baked soft shadows** via a per-light **Radius** (light source size): the bake
   aims each shadow ray at a random point on a disc of that radius, so shadows get a smooth
-  penumbra that hides the texel stair-stepping at low texel density (instead of a hard,
-  jagged edge). 0 = hard. Realtime shadows are unaffected (they already PCF-soften).
+  penumbra that hides the texel stair-stepping at low texel density instead of a hard,
+  jagged edge. 0 = hard. Realtime shadows are unaffected (they already PCF-soften).
 - [done] Skybox: procedural gradient + equirect LDR image (per-scene)
 - [done] Selection outline (inverted hull, depth-prepass, always-on-top)
 - [done] Error shader (animated swirl for broken/missing/unknown shaders)
@@ -92,17 +92,17 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [partial] GPU light bake (Vulkan ray query): BLAS/TLAS, lightmap path tracer (direct +
   shadow + multi-bounce indirect), light-probe SH-L1 bake. Built, needs GPU visual
   validation. **Runtime sampling**: 5a flat probe-average ambient (done); **5b
-  per-fragment probe SH** (done) — probes uploaded to a set-0 storage buffer (binding 2)
+  per-fragment probe SH** (done): probes uploaded to a set-0 storage buffer (binding 2)
   + volume metadata in the frame UBO; `standard.frag` finds the containing volume,
   trilinearly blends 8 probes, evaluates SH-L1 in the surface normal, and uses it as the
   indirect term (flat ambient fallback outside any volume). Active in **both** the editor
-  viewport and the **game runtime** — `run_game` loads the scene's `.lightmap`/`.lightdata`
+  viewport and the **game runtime**: `run_game` loads the scene's `.lightmap`/`.lightdata`
   sidecars (shared `LoadedScene::load_bake_sidecars`) and uploads the probes. The sidecars
   bundle automatically (they live in `scenes/`, copied with the scene). **5c
   per-object lightmaps (done)**: baked lightmaps upload as a `R32G32B32A32_SFLOAT` 2D array
   (one layer per static object, resampled to a common size; set-0 binding 3), `uv1` is
   forwarded through the vertex pipeline, and `standard.frag` samples the layer (per-object
-  index in the push constant) for static-object GI — lightmap takes priority, else probes,
+  index in the push constant) for static-object GI. Lightmap takes priority, else probes,
   else flat ambient. Active in editor + game. Bake output still needs visual validation.
 - [done] **Bake light policy**: the bake captures **Baked + Mixed** lights *and* the
   environment sun/sky; **Realtime lights are never baked**. Once a bake exists, those
@@ -113,7 +113,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   inspector header (object is baked as a lightmapped surface + ray-trace occluder)
   and a **Scale In Lightmap** multiplier in the Mesh section that scales that object's
   texel density up/down from the scene default (sharper surface or fewer texels).
-- [done] Primitive lightmap UVs: a second UV set (`uv1`) — plane/sphere/capsule reuse their
+- [done] Primitive lightmap UVs: a second UV set (`uv1`). Plane/sphere/capsule reuse their
   single non-overlapping `uv0` chart; the **cube packs its 6 faces into a non-overlapping
   3×2 atlas** (with a gutter) so faces don't share lightmap texels. Imported meshes use
   their 2nd UV set, or `uv0` (glTF) / a planar unwrap (FBX) when absent.
@@ -121,57 +121,57 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   an edge-aware **À-Trous denoiser** (CPU; reads back the position+normal gbuffer, weights
   a 5×5 wavelet blur by world-position + normal similarity so it smooths MC grain without
   crossing shadow/geometry edges or UV-chart seams), then **seam-stitched** (co-located
-  cross-chart texels — the cube's per-face atlas, the sphere's lat-long meridian — are
+  cross-chart texels (the cube's per-face atlas, the sphere's lat-long meridian) are
   averaged when their normals agree, so the chart boundary stops showing as a line while
   genuine hard-edge discontinuities are kept), then **dilated** (valid texels spread into
   the gutter) so bilinear sampling at chart edges never reads the black background.
 - [done] **ACES tonemapping**: the standard + skybox shaders roll HDR highlights off to
   [0,1] (Narkowicz ACES, in linear before the sRGB swapchain write), so a close point light
-  or stacked ambient + baked bounce shows surface detail instead of clipping to flat white.
+  or stacked ambient + baked bounce shows surface detail rather than clipping to flat white.
 - [done] **Realtime GI**: an Environment-tab setting (serializes with the scene, so it runs
   in the editor *and* a shipped game) that, while the scene isn't baked, re-traces an auto
   probe grid from the realtime lights (reuses the ray-query path tracer with `probes_only`),
   temporally blends the SH, and uploads so surfaces show live indirect bounce. Settings:
   Enabled, Bounces, Quality (rays/probe), Intensity, Probe Spacing, Responsiveness (temporal
-  blend), Update Interval. Driven by a shared `RealtimeGiState` with **dirty-detection** —
+  blend), Update Interval. Driven by a shared `RealtimeGiState` with **dirty-detection**:
   it only re-traces when lights/objects/settings change, then settles and goes idle, so a
   static scene does no work. The **Software (SDF) march runs on a background thread**, so
   moving objects (Play mode) don't hitch the frame; the main thread blends + uploads when a
   trace finishes. Hardware (ray-query) mode is still synchronous + rebuilds accel structures
-  each trace — GPU async / resident-accel is the follow-up.
-- [done] Approximate **lumens/lux readout** under a light's Intensity (display only — our
+  each trace; GPU async / resident-accel is the follow-up.
+- [done] Approximate **lumens/lux readout** under a light's Intensity (display only; our
   intensity stays a radiance multiplier; point = 4π·I, spot = cone solid angle ·I, dir = lux).
 - [wip] **Software GI (Lumen-style, no RT cores / no bake)**: a second realtime-GI **Mode**
   (Environment tab → Hardware (RT cores) | Software (SDF)) that marches per-mesh signed
   distance fields instead of the hardware BVH. Phase 1a (mode setting + UI) and 1b (per-mesh
-  CPU SDF generation — `sdf::generate_sdf`, closest-point-on-triangle distance + nearest-tri
+  CPU SDF generation: `sdf::generate_sdf`, closest-point-on-triangle distance + nearest-tri
   normal sign, unit-tested) are done. Phase 1c is a CPU **multi-bounce** path march
   (`sw_gi.rs`, honors the Bounces setting, throughput ×albedo per hop) reusing the SDFs,
   **parallelized across cores** on a **background thread** (now the CPU fallback). The default
   path is a **GPU compute march** (`sw_gi.comp` + `gpu_gi.rs`): the per-mesh SDFs are merged
   CPU-side into one **Global Distance Field** (`sw_gi::build_gdf` → a 3D distance texture +
   nearest-instance index texture), and a compute shader marches that single field per probe (one
-  texture sample per step instead of looping meshes), writing the packed probe layout directly —
-  far cheaper than the CPU march, so it runs synchronously per re-trace. The GDF is **cached on the
+  texture sample per step instead of looping meshes), writing the packed probe layout directly.
+  This is far cheaper than the CPU march, so it runs synchronously per re-trace. The GDF is **cached on the
   GPU** (`Renderer::gi_set_gdf`) and re-uploaded only when a geometry/materials/bounds hash
   (`hash_gdf_inputs`) changes, so a static scene keeps a high-res field for free while lights and
   emitters move; `Renderer::gi_march` then runs each trace against the cached field.
-  `gi_gpu_available()` gates the whole path — when compute init failed it returns false and the
+  `gi_gpu_available()` gates the whole path: when compute init failed it returns false and the
   driver builds nothing, marching on the CPU thread instead. Each fresh trace is **spatially denoised**
-  first — a separable [1,2,1] blur over the
+  first: a separable [1,2,1] blur over the
   probe SH grid (`sw_gi::blur_probe_grid`) that cancels the blotchy per-probe Monte-Carlo
   variance with **no temporal lag**, so Responsiveness can run high (snappy updates to moving
   objects) without trading back into noise. The denoised trace is then blended in with a
   **motion-aware EMA**: while a light/emitter is *moving* it snaps toward the latest trace (rate
   = Responsiveness) so the bounce tracks in realtime; when *static* it averages at a fixed gentle
-  rate so residual per-trace variance converges smoothly — so raising Responsiveness never makes
+  rate so residual per-trace variance converges smoothly, so raising Responsiveness never makes
   a still scene flicker. A short per-frame ease (faster while moving) glides between updates (cheap
   in-place SSBO rewrite `update_probe_sh`, no GPU stall). The probe grid is **cascaded**
   (SDFGI-style): the coarsest volume covers the whole padded scene AABB and each finer cascade
   halves the box (doubling density) around the same center, up to 3 cascades (16/axis each for
   software, single 32 grid for hardware). The shader picks the finest cascade containing a
   fragment and **cross-fades into the next coarser one near its boundary** (`sample_volume` +
-  edge fade in `standard.frag`) so the resolution change isn't a visible seam — this is what
+  edge fade in `standard.frag`) so the resolution change isn't a visible seam. This is what
   removes the trilinear "squares" near the action while keeping edges/sky cheap. The 8-corner
   blend also **smoothsteps the trilinear factor** (Hermite, C1-continuous across cell boundaries),
   so the per-cell gradient kink that reads as faceting/banding on smooth falloff is gone without a
@@ -180,25 +180,25 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   Each cascade is
   blurred by its own grid layout. **DDGI-style visibility (leak prevention)**: the march also
   records the SH-L1 of the directional first-hit distance per probe (`ProbeSh::dist`, packed into
-  the probe SSBO's previously-unused `.w` lanes — no extra buffer). The shader replaces plain
+  the probe SSBO's previously-unused `.w` lanes, no extra buffer). The shader replaces plain
   trilinear with a DDGI-style weighted 8-corner blend (`sample_volume` in `standard.frag`): each
   probe's weight is scaled by a soft Chebyshev-lite visibility test (probe→fragment distance vs.
   the probe's stored seen-distance in that direction) plus a front-facing term, so probes
-  occluded from a fragment (behind a wall, under an object) are down-weighted → light no longer
+  occluded from a fragment (behind a wall, under an object) are down-weighted, so light no longer
   leaks. Bake/hardware paths leave `dist` zero, which disables the test (plain trilinear). **4
   bounces** cap so a CPU trace finishes inside the update interval; probe-spacing floor 0.25 m so
   a tiny value can't silently explode the probe count. **Emissive
   materials are area emitters** in both bake (static objects) + realtime GI, sampled by
   **next-event estimation (NEE)**: each emissive instance is reduced to a sphere area-light
-  (`sw_gi::emitter_spheres`) the march samples *directly* — both the probe's direct view (added
-  analytically to the SH) and at every bounce surface — instead of relying on random rays to hit a
+  (`sw_gi::emitter_spheres`) the march samples *directly* (both the probe's direct view, added
+  analytically to the SH, and at every bounce surface) instead of relying on random rays to hit a
   small bright surface. This removes the blotchy Monte-Carlo fill that otherwise rings an emitter
   (the dominant direct term is variance-free in a single trace; the dim indirect residual is cleaned
   by the temporal accumulation + grid blur). Implemented in both the CPU march and the GPU
   `sw_gi.comp` (emitter SSBO, binding 6). The headless `cargo run --example gi_preview` renders a
   minimal plane+emissive-sphere scene through the real march to a PNG for tuning without the editor.
   Next: surface cache
-  / screen probes for contact-scale GI — probe GI is low-frequency, so tight contact fill
+  / screen probes for contact-scale GI. Probe GI is low-frequency, so tight contact fill
   (under-object darkening) is still limited.
 - [wip] **Screen-space probe GI (Lumen-style realtime)**: a per-pixel-resolution dynamic GI
   path layered over the world probes for contact-scale, view-dependent indirect. A depth
@@ -208,7 +208,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   the analytic emitter **NEE** pool. Results **temporally accumulate with reprojection**
   (ping-pong image pair, prev-frame view-proj + camera-distance disocclusion) and are
   **depth-aware bilaterally upsampled** in `standard.frag` (binding 4). Emissive objects are
-  **excluded from the GDF entirely** (static or not) — their light comes from the variance-free
+  **excluded from the GDF entirely** (static or not): their light comes from the variance-free
   NEE spheres, while their coarse padded SDF box in the field only stamped a square halo +
   voxel banding on the bounce; keeping them out makes a static emitter look identical to a
   dynamic one. The trace RNG is **seeded per frame** (`sgi_frame` → `misc.x`) so each frame
@@ -223,27 +223,27 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   surfaces ARE in it, so they sample their own GI and receive bounce additively on top of their
   emission. Probe normals are reconstructed from the depth neighbour CLOSER in depth per axis,
   so the tangent never spans a silhouette (which left a dark no-GI outline around objects).
-  **Emitter NEE falloff**: a soft cosine terminator (`dot(n,l)+0.3` clamped) — emission fades
+  **Emitter NEE falloff**: a soft cosine terminator (`dot(n,l)+0.3` clamped). Emission fades
   smoothly past the horizon but a surface facing clearly away gets nothing (no bleed onto a
   box's back face). NO occlusion test on the direct emitter NEE: GDF-based occlusion blotches
   against the coarse field, and a screen-space occlusion trace false-shadowed whenever the
-  emitter was on-screen (the ray grazes the receiver floor) — both looked worse than the leak.
+  emitter was on-screen (the ray grazes the receiver floor); both looked worse than the leak.
   The hemisphere bounce still occludes via the GDF march. (A solid object can leak an emitter's
   *direct* glow; the proper fix is the surface/radiance cache below, where occlusion is intrinsic
   to the trace.)
   Next: surface/radiance cache for cheap multi-bounce + intrinsic occlusion; masked depth-prepass
   for alpha-test cutout holes; per-camera trace for the in-game camera.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
-  even cube-face packing) — the seam-stitch hides the seams but the lat-long sphere still
+  even cube-face packing). The seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.
 - [done] Baker's Man dock tab (texel density 1–1024 /m log, bounces, samples up to 65536,
   max size, Bake/Clear) + a **UV-checker preview** toggle: renders objects as a
   lightmap-UV checkerboard whose cell size tracks each object's would-be texel density
-  (big squares = low resolution, stretched = UV distortion; grey = non-static) — live from
+  (big squares = low resolution, stretched = UV distortion; grey = non-static), live from
   the current bake settings, no re-bake needed.
 
 ### Post-processing
-- [partial] **Unity Volume-style post-processing**: a `.postfx` profile asset (RON — tonemap
+- [partial] **Unity Volume-style post-processing**: a `.postfx` profile asset (RON: tonemap
   mode/exposure, bloom, color grading, vignette, chromatic aberration) created from the file
   browser's New Post FX Profile; a **Volume (Post FX)** component (global/local, priority,
   weight, blend distance, box extents) references one; `LoadedScene::effective_postfx` blends
@@ -253,17 +253,17 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   saturation/temperature/tint), vignette.** ACES moved out of hardcode into the profile.
   An in-editor **`.postfx` profile editor** (select the asset → sliders for tonemap, color
   grading, vignette, bloom, chromatic aberration; saves + live-invalidates the cache).
-  [todo] Chromatic aberration + bloom rendering (need an offscreen-HDR fullscreen pass — the
+  [todo] Chromatic aberration + bloom rendering (need an offscreen-HDR fullscreen pass; the
   settings are authorable now but only apply once that pass lands).
 
 ### Editor
-- [done] Play / Pause / Stop — Pause freezes components/physics/audio on a play clock that
+- [done] Play / Pause / Stop. Pause freezes components/physics/audio on a play clock that
   doesn't advance while paused (so time-based motion doesn't jump on resume)
 - [done] Selected-camera preview overlay (bottom-right of the viewport): live view through a
   selected camera object so its framing can be tweaked while editing its transform
 - [done] Drag a file from the Files panel onto an inspector asset field to assign it
   (`InspectCtx::file_field`; the browser publishes the dragged file's project-relative path to
-  egui memory — plugin-safe). E.g. drop a `.postfx` onto a Volume's Profile field.
+  egui memory; plugin-safe). E.g. drop a `.postfx` onto a Volume's Profile field.
 - [done] Dockable panels (egui_dock): Scene / Inspector / Files / Log / Code / Baker
   around a transparent viewport
 - [done] Transform gizmos: move (W) / rotate (R) / scale (E), pivot/center + global/local,
@@ -280,7 +280,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (lightmap), database (lightdata), gear (config), file-text (markdown), orange-slice
   (.citrus), folder, file (unknown); `.rs` keeps a monochrome Ferris silhouette. Known asset
   extensions are hidden (the icon conveys the type) and names clip to one line. Folder clicks
-  navigate only — no Inspector selection.
+  navigate only, with no Inspector selection.
 - [done] Unified Inspector (object transform/mesh/material slots, `.material` editor,
   component list with Add/Remove)
 - [done] Orbit / pan / scroll-dolly editor camera, F to frame, Escape to deselect
@@ -298,7 +298,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   background, purple-leaning palette, borderless text box); line-number gutter; fills the
   dock; debounced auto-save; bottom status line (mode / file / language / line:col /
   unsaved, folds in the vim `:` command line); caret stays solid while moving. Minimal
-  header (problem counts + hint) — the tab name carries the filename
+  header (problem counts + hint); the tab name carries the filename
 - [done] Vim mode (toggle in **Edit menu**, persisted in `project.citrus`; per-file
   mode): Normal / Insert /
   Visual / Visual-line / Command. Motions h j k l w b e 0 ^ $ gg {n}gg G {n}G (counts);
@@ -306,8 +306,8 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   redo (per-file snapshot stack, an insert session = one undo); `gd` go-to-definition,
   `gr` references (picker popup). Command line (`:`): `:w` write, `:q`/`:wq`/`:x` close,
   `:{n}` goto line, `[%]s/pat/rep/[g]` regex substitution (`$1`/`${name}` capture refs)
-  with **live preview** — matches/replacements highlight as you type and revert on
-  Escape, commit on Enter. Core subset — `f`/`t`, `/` search, `.` repeat can follow
+  with **live preview**: matches/replacements highlight as you type and revert on
+  Escape, commit on Enter. Core subset; `f`/`t`, `/` search, `.` repeat can follow
 - [partial] rust-analyzer LSP (diagnostics, completion, hover, go-to-definition,
   find-references on `.rs`); file browser badges files (and aggregates onto folders)
   with red/yellow problem dots, and live-updates as files change on disk
@@ -323,7 +323,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   `citrus_register`, hot reload)
 - [done] Runtime scene switching: `ComponentCtx::load_scene(path)` lets gameplay
   components change levels / go menu -> game during Play (first slice of the in-game API,
-  2D); editor Open/New/Save Scene already covered authoring
+  2D); editor Open/New/Save Scene already covers authoring
 - [done] Custom GLSL shaders v1 (runtime glslc, pragma-declared properties reflected into
   Inspector, hot reload)
 
@@ -336,9 +336,9 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   standalone or as components, yellow editable viewport widgets
 - [partial] Physics simulation (rapier3d): a `RigidBody` component (Dynamic / Kinematic /
   Fixed, mass, restitution, friction, gravity scale). On Play (editor) and scene load
-  (game) the engine builds a rapier world — colliders become cuboid/ball shapes (Mesh ->
+  (game) the engine builds a rapier world: colliders become cuboid/ball shapes (Mesh ->
   AABB cuboid), `RigidBody` objects get that body kind, collider-only objects become fixed
-  (static) bodies — steps it under gravity each frame, and writes the simulated transforms
+  (static) bodies, steps it under gravity each frame, and writes the simulated transforms
   back. Foundational slice; still todo: joints, layer-collision matrix, queries
   (raycast/overlap), trigger events, CCD tuning, parented-body world↔local conversion.
 
@@ -347,7 +347,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 ## 2. Goals — to be implemented
 
 ### 2A. Pawns & camera possession [partial]
-A **Pawn** is a controllable entity that a controller can "possess"; it owns movement
+A **Pawn** is a controllable entity that a controller can "possess". It owns movement
 state and can drive which scene camera is active.
 
 **Implemented** (`Pawn` component in `citrus-core`, FP/TP/TopDown/Strategy modes): a possessed
@@ -364,8 +364,7 @@ Remaining: RigidBody-driven movement, spring-arm collision, camera-follow rigs a
 - [todo] Possession model: a controller possesses/unpossesses a Pawn; only the possessed
   Pawn receives input
 - [todo] Active-camera registry: scene cameras enumerable by id/name; API to set the active
-  render camera at runtime (`set_active_camera(cam)`), independent of which Pawn is
-  possessed
+  render camera at runtime (`set_active_camera(cam)`), independent of which Pawn is possessed
 - [todo] Camera-follow modes wired to the controller type (rig per controller below)
 - [todo] Pawn / physics binding: movement applies forces/velocity through the RigidBody
   (physics engine), not direct transform writes, when a body is present
@@ -383,7 +382,7 @@ camera), **Strategy** (camera-only pan). Movement reads the action snapshot (dev
 camera placement is per-mode. A dedicated `Controller` trait + spring-arm collision + click-to-move
 navmesh pathing remain follow-ups.
 
-**Spawn points** (separate goal): a `SpawnPoint` component (tag + index) marks locations; a `Pawn`
+**Spawn points** (separate goal): a `SpawnPoint` component (tag + index) marks locations. A `Pawn`
 with a matching `spawn_tag` teleports there on Play start, and game code queries them via
 `ctx.spawn_point(tag)`. The engine surfaces them in `ComponentCtx.spawn_points`.
 
@@ -393,14 +392,14 @@ with a matching `spawn_tag` teleports there on Play start, and game code queries
   camera at eye position
 - [todo] **Third-person** controller: WASD relative to camera, orbit camera rig with
   collision spring-arm, jump
-- [todo] **Isometric / top-down** controller — two modes:
+- [todo] **Isometric / top-down** controller, two modes:
   - [todo] click-to-move (navmesh/raycast-to-ground pathing)
   - [todo] WASD direct movement in iso space
   - [todo] fixed isometric camera rig
 - [todo] **Strategy** controller: edge/WASD camera pan, zoom, rotate; no possessed body
   (camera-only) or unit selection later
 - [todo] Movement params read from the Pawn (jump power, move power, etc.), physics from the
-  RigidBody — controllers stay device- and physics-agnostic
+  RigidBody, so controllers stay device- and physics-agnostic
 - [todo] Inspector: pick controller type per Pawn; expose its tunables
 
 ### 2C. Input binding system [done]
@@ -424,7 +423,7 @@ key/mouse press) and at runtime via the same `Bindings` API. Tested in `input.rs
   scheme switchable, auto-switch on last-used device
 - [todo] Device backends: keyboard + mouse (winit) now, **gamepad** via `gilrs`
 - [todo] Per-frame action snapshot the controller reads (`ctx.input.action("Jump").pressed()`,
-  `.axis2("Move")`) — exposed through the in-game API
+  `.axis2("Move")`), exposed through the in-game API
 - [todo] Serialize schemes/bindings to a project asset (`.bindings` or in `project.citrus`);
   editor UI to author them (rebinding screen pattern)
 - [todo] Runtime rebinding API (for in-game key-remap menus)
@@ -437,7 +436,7 @@ game.
 
 - [todo] Expand `ComponentCtx` (or a new `World`/`Api` handle) with:
   - [partial] **Self transform**: local read/write (done); `self_transform()` world read
-    (done); `set_world_position(world)` world-space *write* (done — converts through the
+    (done); `set_world_position(world)` world-space *write* (done; converts through the
     parent chain via `parent_world`, so a nested object lands at the right world spot);
     world-space rotation/scale write still todo
   - [todo] **Smoothed / lerped transform moves**: instead of snapping when a component
@@ -469,20 +468,20 @@ game.
   - [partial] **Camera control**: `ctx.set_active_camera(cam_ref)` (done, 2A); set
     FOV/post params still todo
   - [done] **Graphics settings (runtime)**: `ctx.set_resolution(w, h)`, `ctx.set_vsync(on)`,
-    `ctx.set_shadow_resolution(res)` — applied immediately in editor Play + a shipped game, so an
+    `ctx.set_shadow_resolution(res)`, applied immediately in editor Play + a shipped game, so an
     in-game settings menu can change resolution/quality live
   - [done] **Networked messaging**: `ctx.broadcast(text)` / `ctx.send_to(peer, text)` +
     `ctx.messages()` (2G)
   - [todo] **Audio**: play/stop one-shots, change volume/pitch, spatial params
   - [todo] **Lights**: color/intensity/range/enabled at runtime
   - [partial] **Time / scene**: time scale, pause, app quit [todo]; **load/switch scene
-    is done** — `ComponentCtx::load_scene(path)` (the first in-game-API slice) queues a
+    is done**: `ComponentCtx::load_scene(path)` (the first in-game-API slice) queues a
     `ComponentCommand` the engine applies after the update pass; switches levels / menu
     -> game during Play, continues playing in the new scene, and Stop returns to the
     pre-play scene.
   - [todo] **Events / messaging**: component-to-component messages or a simple event bus
 - [todo] Stable, safe surface usable from plugin components (not just built-ins) without
-  reaching into editor internals — likely a `citrus-api` crate both editor and plugins
+  reaching into editor internals; likely a `citrus-api` crate both editor and plugins
   depend on
 
 ### 2E. Editor-only vs gameplay components [todo]
@@ -499,27 +498,27 @@ shipped game.
   serialization + the future game-build path strip editor-only behavior cleanly
 
 ### 2F. Game UI system (runtime UI) [todo]
-In-game menus / inventory / HUD. **The developer picks the approach per project** —
+In-game menus / inventory / HUD. **The developer picks the approach per project**;
 both are first-class and can coexist (e.g. egui debug overlay on top of a retained HUD):
 
-- **A. Retained scene-graph UI** (the citrus-native system, below) — Unity uGUI-style:
+- **A. Retained scene-graph UI** (the citrus-native system, below), Unity uGUI-style:
   widgets are scene objects under a `UICanvas`, **visually authored** in the editor and
   serialized into `.scene`, **screen-space + world-space** (world-space for VR
   controller-ray interaction). Best for polished, designer-authored, VR, and
   shipped-game UI. This is the default and the larger build.
-- **B. Immediate-mode UI (egui)** — opt-in, code-driven. The same egui the editor uses,
+- **B. Immediate-mode UI (egui)**, opt-in, code-driven. The same egui the editor uses,
   exposed to gameplay so a component builds its UI each frame in Rust. Best for debug
   HUDs, dev tools, prototypes, and devs who already know egui. Lighter to author (no
   scene wiring), but not visually authored and weaker for world-space/VR.
 
 How the choice works in a build:
-- [todo] egui (option B) is always **available** — `citrus-render` keeps the egui pass in
-  every build (~1.5M; not worth gating out). To use it a game just opts in at the API
+- [todo] egui (option B) is always **available**: `citrus-render` keeps the egui pass in
+  every build (~1.5M; not worth gating out). To use it a game opts in at the API
   level: `run_game` hands each frame's egui `Context` to a game callback, and
   `FrameInput.egui` carries the tessellated output exactly as the editor's path does (the
   plumbing already exists; a default game leaves it `None`).
 - [todo] The retained system (A) never requires egui; egui (B) never requires the
-  retained system. A project can use both — retained HUD + an egui debug panel.
+  retained system. A project can use both: retained HUD + an egui debug panel.
 - [todo] Editor authoring (visual rect editing, inspector wiring) applies to the retained
   system only; egui UI is authored in code.
 
@@ -531,14 +530,14 @@ Foundations
   **World-space** (a quad in the scene at the object's transform, sized in world units).
 - [todo] `UIRect` (RectTransform-style) on every UI widget: anchors (min/max), pivot,
   offsets/size; parent rect resolved top-down each frame so children lay out relative to
-  the parent. Replaces/augments the normal Transform for UI objects.
+  the parent. Replaces or augments the normal Transform for UI objects.
 - [todo] **2D UI renderer** in citrus-render: batched quads (panels/images, solid color
   or texture, optional 9-slice), per-canvas clip/mask rects. Screen-space drawn as an
   overlay pass after the scene; world-space drawn as scene geometry (so it depth-sorts
   and is hittable by a 3D ray).
 - [todo] **Text rendering**: font atlas / glyph cache (candidate: `fontdue` or `ab_glyph`
   for raster, `cosmic-text` if shaping/i18n needed), SDF optional for crisp scaling;
-  alignment, wrapping, color. New subsystem — the editor's egui fonts don't carry over.
+  alignment, wrapping, color. New subsystem; the editor's egui fonts don't carry over.
 
 Widgets (UI components)
 - [todo] `UIText` — string, font, size, color, alignment, wrap
@@ -553,7 +552,7 @@ Widgets (UI components)
 
 Event system
 - [todo] Per-frame UI hit-test: screen-space against the 2D cursor; world-space against
-  the canvas quad via a 3D ray (mouse ray now, **VR controller ray** when VR lands —
+  the canvas quad via a 3D ray (mouse ray now, **VR controller ray** when VR lands;
   same widget/event path, only the ray source differs).
 - [todo] Pointer events: **PointerEnter/Exit (hover)**, **PointerDown**, **PointerUp**,
   **Click**, drag (for sliders). Focus model + **KeyDown/KeyUp** to the focused widget.
@@ -575,12 +574,12 @@ Built-in networking so games can be multiplayer, supporting **both** topologies:
 **client-server** (an authoritative server, dedicated or player-hosted) and
 **peer-to-peer**. One replication/API surface; the topology is a choice per game.
 
-**Implemented** (`citrus-engine::net`): a UDP **star-relay** session (`NetSession::host`/`join`) —
-one peer hosts (dedicated server or player-host), others join, all traffic relayed through the
+**Implemented** (`citrus-engine::net`): a UDP **star-relay** session (`NetSession::host`/`join`).
+One peer hosts (dedicated server or player-host), others join, all traffic relayed through the
 host, so one path serves client-server and P2P on a LAN. **Ownership-based replication**: the
 `Sync` component marks an object networked; whoever **grabs** it (presses the grab action) claims
 authority (host-arbitrated, last-claim-wins), broadcasts its transform to everyone else (who apply
-it snapped/smoothed), and releases it for others — exactly the "move it, let go, someone else takes
+it snapped/smoothed), and releases it for others, exactly the "move it, let go, someone else takes
 it" model. Exposed through `ComponentCtx` (`net.owns`, `request_ownership`, `release_ownership`) +
 `NetView`. Driven from the editor **Tools → Network** panel or a game's `CITRUS_HOST`/`CITRUS_JOIN`
 env vars. Wire format is a compact hand-rolled binary (no extra deps).
@@ -590,7 +589,7 @@ messages arrive via `ctx.messages()` (`(from_peer, is_private, text)` each frame
 
 **Spatial voice comms** (`citrus-engine::voice`, push-to-talk on the `Voice` action): mic captured
 via **cpal**, downmixed to mono 16 kHz, sent as PCM frames over the transport, and played back per
-peer through a **jitter buffer** (≈120 ms pre-buffer + seq reordering) so it never sounds laggy —
+peer through a **jitter buffer** (≈120 ms pre-buffer + seq reordering) so it never sounds laggy:
 late/lost packets become brief silence, not time-stretched "lag." Playback is **spatial**: each
 peer's voice sink volume falls off with distance (positioned at the object that peer owns), mirroring
 the `AudioEngine`'s distance model. Latency-agnostic by construction (network arrival is decoupled
@@ -612,7 +611,7 @@ Topologies
   receive state. Includes client-side **prediction + reconciliation** and **interpolation**
   so movement is smooth under latency, and server authority to resist cheating.
 - [todo] **Peer-to-peer**: shared/host authority or deterministic **lockstep** (input-only
-  sync — pairs with a deterministic physics step, see #26). Trust model documented.
+  sync, pairs with a deterministic physics step, see #26). Trust model documented.
 
 Replication
 - [todo] **Networked objects + ownership**: mark which objects/components replicate and who
@@ -625,7 +624,7 @@ Replication
 
 Integration
 - [todo] **In-game API surface** (2D): `is_server` / `is_client` / `local_player`, object
-  ownership queries, `spawn_networked`, send/receive RPCs — so components write
+  ownership queries, `spawn_networked`, send/receive RPCs, so components write
   network-aware logic without touching the transport.
 - [todo] **Voice chat** (VR-first: spatial voice) + **IK pose replication** for avatars
   (folds in the existing M6 milestone scope).
@@ -634,29 +633,29 @@ Integration
 
 ### 2H. Render-to-texture cameras (camera output as a material input) [todo]
 Let a `Camera` render the scene from its viewpoint into an offscreen texture that a
-material can sample, so a plane + that material becomes an in-world screen — a CCTV
+material can sample, so a plane + that material becomes an in-world screen: a CCTV
 monitor, a TV showing a moveable camera, a mirror, a portal, a minimap, or
 picture-in-picture. The camera is an ordinary scene object, so moving it (or
 possessing it, 2A) updates the screen live.
 
 Foundation already in place: the renderer's `CameraPreview` (`citrus-render`) is
-exactly a render-to-texture pass — an offscreen color+depth target with per-frame
+already a render-to-texture pass, an offscreen color+depth target with per-frame
 camera UBOs, rendered by the scene pass and exposed to egui as a user texture. This
 feature generalizes that single editor-only target into a reusable, material-sampled
 resource.
 
 - [todo] **`RenderTexture` GPU resource**: an offscreen target = color image (+ its own
   depth), a sampler, and per-frame-in-flight descriptor wiring. Configurable extent and
-  format — `rgba8 srgb` (LDR / UI), `rgba16f` linear (HDR, feeds bloom/tonemap), optional
+  format: `rgba8 srgb` (LDR / UI), `rgba16f` linear (HDR, feeds bloom/tonemap), optional
   mip chain for minified screens. Managed in a pool keyed by a handle; created/resized/
   destroyed as cameras opt in or change size.
-- [todo] **Camera output mode**: extend `CameraComponent` with an output target —
+- [todo] **Camera output mode**: extend `CameraComponent` with an output target,
   `Display` (default: the main swapchain pass) vs `RenderTexture { handle, width, height,
   format, clear_color, update: EveryFrame | OnDemand | Hz(n) }`. A camera in
   `RenderTexture` mode is excluded from the main display pass.
 - [todo] **Material texture source**: today `MaterialTextures` slots are project-relative
   file paths bound into set 1 (`t_albedo`/`t_normal`/`t_orm`/`t_emission`, combined image
-  samplers). Make a slot a typed source — `FilePath(path)` | `RenderTarget(camera ref)` —
+  samplers). Make a slot a typed source (`FilePath(path)` | `RenderTarget(camera ref)`),
   serialized in `.material`. At bind time a `RenderTarget` slot points the descriptor at
   the live `RenderTexture` image view instead of a disk-loaded image; an emissive TV uses
   `t_emission`/`t_albedo`. References the source camera by `ObjectId` (survives reload /
@@ -667,25 +666,25 @@ resource.
   and any pass that samples it. Build a per-frame dependency order (camera A's target is
   sampled by a material camera B renders → A before B).
 - [todo] **Feedback / recursion guard**: a camera filming a screen that shows its own
-  feed is a cycle. Bound it — render each `RenderTexture` at most once per frame and let a
+  feed is a cycle. Bound it: render each `RenderTexture` at most once per frame and let a
   cyclic sampler read *last frame's* result (one-frame latency), or drop the camera's own
   target from its view. No unbounded recursion.
 - [todo] **Mirror / portal variant**: a mirror is an RTT camera whose view matrix is the
   main camera reflected across the screen plane, with an oblique near-plane clip at the
-  mirror surface; a portal pairs two cameras. Same resource, different view derivation —
+  mirror surface; a portal pairs two cameras. Same resource, different view derivation;
   list as a follow-on once the basic RTT path works.
 - [todo] **Editor**: Camera inspector picks output (Display / Render Texture + size +
   format); a Render Texture shows in the file browser / material texture slots as a
   droppable source (drag onto a slot, like a file). Drop it on a plane's material and you
   have a working TV whose picture tracks the camera.
 - [todo] **Performance & culling**: each active RTT camera is an extra scene pass per
-  frame — skip rendering a target no visible material samples (or whose screen is
+  frame. Skip rendering a target no visible material samples (or whose screen is
   off-camera / too small in screen space), throttle via the `Hz`/`OnDemand` update mode,
   cap resolution, and share the shadow map with the main pass. Document the per-target
   cost.
 
-Ties to camera control in the in-game API (2D — set active camera, FOV) and to camera
-possession (2A — the moveable camera can be a possessed pawn). HDR targets feed the
+Ties to camera control in the in-game API (2D: set active camera, FOV) and to camera
+possession (2A: the moveable camera can be a possessed pawn). HDR targets feed the
 existing tonemap/bloom path.
 
 ### 2I. Build & bundle (game export) [in progress]
@@ -699,46 +698,46 @@ the components *are* Rust code compiled into the binary, so a build is fundament
 `cargo build --release` of a thin runtime binary + an assets folder resolved relative to
 the executable. Unity (player exe + `_Data/` with managed DLLs) and Godot (export-template
 binary + a `.pck` data pack) ship scripts *as data* because they're interpreted/managed;
-citrus does not. An optional packed-archive step (Godot-style `.pck`) is a later add — v1
+citrus does not. An optional packed-archive step (Godot-style `.pck`) is a later add; v1
 emits a folder.
 
 **Boot-scene decision:** both a project setting *and* an editable entry file. The
 generated `src/main.rs` is real, editable Rust that by default reads `boot_scene` from the
-project config and calls `run_game` — beginners never touch it (Godot "Main Scene"
+project config and calls `run_game`. Beginners never touch it (Godot "Main Scene"
 convention), advanced users edit it for custom startup (splash, save-driven scene choice;
 Bevy "main.rs is code"). The setting is the default; `main.rs` is the override.
 
 Landed so far:
-- [done] **Runtime game loop** — `citrus_engine::run_game(GameConfig, register)` (in
+- [done] **Runtime game loop**: `citrus_engine::run_game(GameConfig, register)` (in
   `citrus-engine/src/runtime.rs`): opens a window, creates the renderer, loads the boot
   scene, fires `start`, then runs `update`/`late_update` + render each frame with
   `FrameInput.egui = None` and `camera_preview = None` (no editor code on the path). Drains
   `ComponentCommand::LoadScene` to switch scenes. Uses the scene's `Camera` component for
   view/proj (fixed fallback if none). `GameConfig::from_project_dir` reads `boot_scene` +
   title from `project.citrus`.
-- [done] **Static component linking** — the project's component crate builds as both
+- [done] **Static component linking**: the project's component crate builds as both
   `cdylib` (editor hot-load) and `rlib` (`crate-type = ["cdylib", "rlib"]`); a game binary
   depends on it as a normal crate (editor feature off) and calls `citrus_register`
-  directly — no shipped dylib, no `libloading`.
-- [done] **`New Project`** (File menu + `citrus --new-project <parent> <name>`) —
+  directly, with no shipped dylib and no `libloading`.
+- [done] **`New Project`** (File menu + `citrus --new-project <parent> <name>`):
   `bundle::scaffold_project` writes a standalone cargo workspace: root `Cargo.toml` (game
   bin + `[workspace.dependencies]` path-pointing at the citrus checkout, found via
   `bundle::citrus_root`), editable `src/main.rs`, `plugins/components` (cdylib+rlib),
   `scenes/ materials/ shaders/ textures/`, a starter scene (camera + lit cube on a plane),
   and `project.citrus` with `boot_scene`. The editor then switches to the new project
   (reloads project file, file browser, plugins, boot scene).
-- [done] **Project Settings UI** (File -> Project Settings…) — edits `project.citrus`:
+- [done] **Project Settings UI** (File -> Project Settings…): edits `project.citrus`:
   name + a **Starting scene** picker (boot scene), with a Build Game button. Saves on
   change.
-- [done] **Build Game** (File menu + `citrus --build [dir]`) — `bundle::build_game` runs
+- [done] **Build Game** (File menu + `citrus --build [dir]`): `bundle::build_game` runs
   `cargo build --release --bin <game>`, then assembles `build/<game>` + `build/assets/`
   (the asset dirs + `project.citrus`, copied so paths resolve exe-relative). Verified
   end-to-end: a scaffolded project builds and the bundled executable runs standalone
   (window + Vulkan + scene render confirmed).
-- [done] **Editor-free runtime path proven** — `examples/sample-game` (detached package)
+- [done] **Editor-free runtime path proven**: `examples/sample-game` (detached package)
   links `citrus-engine` + a components crate and runs a scene.
 
-- [done] **Editor stripped from a build** — `citrus-engine` now has a default-on `editor`
+- [done] **Editor stripped from a build**: `citrus-engine` now has a default-on `editor`
   cargo feature. The `EngineApp` moved into a gated `editor_app` module; `citrus-editor`,
   `egui`, `egui_dock`, `egui-winit`, `transform-gizmo-egui`, `hecs`, `image`, `serde_json`,
   `libc` and the editor-only modules (gizmo/lsp/undo/camera/icon/crash) are optional, and
@@ -751,38 +750,38 @@ Landed so far:
   game both build; the game still runs.
 
 Also landed:
-- [done] **Lean release profile** — the scaffold's generated `Cargo.toml` sets
+- [done] **Lean release profile**: the scaffold's generated `Cargo.toml` sets
   `[profile.release]` with `lto`, `codegen-units = 1`, `strip`, `panic = "abort"`. A
   sample game shrank 9.6M (default release) → 5.8M with no behaviour change. Editor is
   unaffected (the profile lives in the generated project).
 
 Still to do:
-- **egui stays in the render path** (decided) — `citrus-render` always links
+- **egui stays in the render path** (decided): `citrus-render` always links
   `egui`/`egui-ash-renderer` for its overlay. That adds ~1.5M to a game binary, which is
   acceptable, so it is *not* gated out. Upside: **immediate-mode egui game UI** (2F option
-  B) needs no feature flag — it's just a matter of `run_game` handing the per-frame egui
+  B) needs no feature flag; it's a matter of `run_game` handing the per-frame egui
   `Context` to a game callback (the egui render pass is already there). The default game
   links egui but never invokes it (`FrameInput.egui = None`).
-- [todo] **Shader precompilation** — shaders compile via `glslc` at runtime today; the
+- [todo] **Shader precompilation**: shaders compile via `glslc` at runtime today; the
   bundler compiles every material/custom shader to **SPIR-V** ahead of time and ships the
   `.spv`, so the player's machine needs no `shaderc`/`glslc`.
-- [todo] **Asset collection** — walk the scenes reachable from the boot scene (and their
+- [todo] **Asset collection**: walk the scenes reachable from the boot scene (and their
   materials → textures → meshes → audio → bake sidecars `.lightmap`/`.lightdata`) and copy
   only what's referenced into `build/assets/`. Path resolution switches from
   project-relative to **exe-relative** at runtime (`GameConfig.assets_root` already drives
   this). Dead-asset stripping; a "copy everything" fallback for the first cut. Skip / warn
   on missing assets rather than aborting.
-- [todo] **`GameState` (global runtime state / blackboard)** — a project-defined,
+- [todo] **`GameState` (global runtime state / blackboard)**: a project-defined,
   serializable type the runtime owns **outside any scene**, so it survives scene swaps
   (player health, inventory, score, progression, which level is next). Exposed through the
   in-game API (2D) so components read/write it; lives in the project's component crate.
-  This is the persistent layer beneath the scene flow — scenes come and go via
+  This is the persistent layer beneath the scene flow: scenes come and go via
   `ComponentCtx::load_scene` (already implemented), `GameState` does not. Distinguish two
   concerns that are *separate*: (a) this in-memory global state, and (b) **savegame
-  persistence** — serialize `GameState` (+ optionally live scene object/component state) to
-  a save file under an OS user-data dir and restore it, so a player can quit and resume.
+  persistence**, serializing `GameState` (+ optionally live scene object/component state) to
+  a save file under an OS user-data dir and restoring it, so a player can quit and resume.
   Save/load is its own in-game API slice.
-- [todo] **Remaining build polish** — window icon/size from project config into the
+- [todo] **Remaining build polish**: window icon/size from project config into the
   generated entry; cross-compilation to other targets; an optional packed-archive
   (`.pck`-style) instead of a loose `build/assets/` folder. (Core Build Game action +
   `build/<game>` + `build/assets/` output already land above.)
@@ -806,13 +805,13 @@ physics engine (#26) --+                              |
 ```
 
 - **Physics engine (TODO #26)** is a prerequisite for proper Pawn movement (forces,
-  jump, gravity) and for the API's physics queries — land it first or stub a kinematic
+  jump, gravity) and for the API's physics queries. Land it first or stub a kinematic
   fallback.
-- **Binding system (2C)** has no hard deps — buildable now; controllers consume it, and
+- **Binding system (2C)** has no hard deps; buildable now; controllers consume it, and
   game UI (2F) uses it for keyboard/gamepad navigation.
 - **In-game API (2D)** is the backbone; controllers/pawns are its first real clients,
   so grow the API and the Pawn together rather than big-bang.
-- **Editor/gameplay split (2E)** is small and unblocks a correct game-build path; do it
+- **Editor/gameplay split (2E)** is small and unblocks a correct game-build path. Do it
   early so new components declare their kind from the start.
 - **Game UI (2F)** depends on the in-game API (2D) for event delivery and the binding
   system (2C) for navigation; its 2D renderer + text subsystem are independent and can
@@ -828,12 +827,12 @@ physics engine (#26) --+                              |
 
 ## 4. Other tracked goals (see TODO.md for detail)
 
-- [partial] 3D physics engine (rapier3d) — rigid bodies + gravity step + transform
+- [partial] 3D physics engine (rapier3d): rigid bodies + gravity step + transform
   writeback done (see Physics/collision); joints, layer matrix, queries, triggers todo
-- [done] Phase 5 runtime sampling — 5a flat ambient, 5b per-fragment probe SH, 5c
+- [done] Phase 5 runtime sampling: 5a flat ambient, 5b per-fragment probe SH, 5c
   per-object lightmaps; all sampled in the standard shader (editor + game), sidecars
   bundled. Pending: visual validation of the GPU bake output.
-- [partial] Global illumination in the standard shader — probe SH-L1 sampled per fragment
+- [partial] Global illumination in the standard shader: probe SH-L1 sampled per fragment
   (done); baked lightmap sampling for static objects still todo
 - [todo] HDR skybox + IBL
 - [todo] VR rendering (OpenXR) + VR editing

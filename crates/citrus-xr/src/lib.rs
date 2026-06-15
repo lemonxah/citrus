@@ -7,6 +7,6 @@
 //!   (one per eye or multiview), frame wait/begin/end loop.
 //! - `XrInput`: action sets for hands/controllers, mapped into engine input.
 //!
-//! Runtime targets: Monado and SteamVR's OpenXR runtime. No OpenVR path —
-//! native OpenXR only (xrizer is for running OpenVR apps on OpenXR, which
+//! Runtime targets: Monado and SteamVR's OpenXR runtime. Native OpenXR
+//! only, no OpenVR path (xrizer is for running OpenVR apps on OpenXR, which
 //! we don't need).

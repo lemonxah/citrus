@@ -3,7 +3,7 @@
 //! Syntax highlighting via egui_extras (syntect), plus an LSP-driven
 //! completion popup and hover tooltip. The widget renders the popups and
 //! applies completion edits locally; the engine feeds it items/hover text and
-//! relays completion/hover *requests* to the language server.
+//! relays completion/hover requests to the language server.
 
 use std::path::Path;
 
@@ -99,8 +99,8 @@ impl CodeEditor {
         let edit_id = ui.make_persistent_id(("citrus-code-edit", path));
 
         // Per-file vim modal state (kept in egui memory). The enable flag is
-        // passed in (project setting); the file name lives in the tab + the
-        // bottom status line, so the header is just problem counts + a hint.
+        // passed in (project setting); the file name lives in the tab and the
+        // bottom status line, so the header is just problem counts and a hint.
         let vstate_id = ui.make_persistent_id(("citrus-vim-state", path));
         let mut vstate: VimState = ui.data(|d| d.get_temp(vstate_id).unwrap_or_default());
 
@@ -176,7 +176,7 @@ impl CodeEditor {
         // Treat the editor as focused if it was focused last frame too: egui can
         // surrender a TextEdit's focus on the Escape press before we get to run,
         // and we still want to intercept that Escape (vim Insert -> Normal) and
-        // re-grab focus rather than let it deselect the buffer.
+        // re-grab focus so it doesn't deselect the buffer.
         let focus_id = ui.make_persistent_id(("citrus-code-focus", path));
         let has_focus_now = ui.memory(|m| m.has_focus(edit_id));
         let was_focused: bool = ui.data(|d| d.get_temp(focus_id).unwrap_or(false));
@@ -191,8 +191,8 @@ impl CodeEditor {
         // isn't a frame stale after a motion).
         let mut shown_cursor: Option<usize> = None;
         // Keep the caret solid (no blink) for a moment after any vim keystroke
-        // so it stays visible while moving — egui only resets the blink on its
-        // own edits, not on our programmatic cursor moves.
+        // so it stays visible while moving. egui only resets the blink on its
+        // own edits, so it won't reset on our programmatic cursor moves.
         let now = ui.input(|i| i.time);
         let active_id = ui.make_persistent_id(("citrus-caret-active", path));
         if vim_enabled && editor_focused && completion.is_none() {
@@ -315,7 +315,7 @@ impl CodeEditor {
         // The editor scrolls so long files (and go-to-definition jumps) work.
         let goto_target = goto.take();
         // Caret stays solid for ~0.6s after the last vim keystroke so it's
-        // easy to follow while moving; egui resumes blinking when idle.
+        // easy to follow while moving; egui resumes blinking once idle.
         let last_active: f64 = ui.data(|d| d.get_temp(active_id).unwrap_or(f64::NEG_INFINITY));
         if now - last_active < 0.6 {
             ui.style_mut().visuals.text_cursor.blink = false;
@@ -933,7 +933,7 @@ fn draw_diagnostics(
         };
         squiggle(&painter, x0, x1.max(x0 + 6.0), y, color);
 
-        // Hover over the row → tooltip with the message.
+        // Hover over the row shows a tooltip with the message.
         if let Some(p) = hover_pos {
             let row_top = output.galley_pos.y + start_rect.top();
             let row_bot = output.galley_pos.y + start_rect.bottom();

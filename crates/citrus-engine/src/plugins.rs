@@ -3,7 +3,7 @@
 //! (`cargo build -p <name>`) and hot-loaded as dylibs.
 //!
 //! Plugins are workspace members, so their dependency versions are pinned by
-//! the same Cargo.lock as the editor — that (plus the same rustc) is what
+//! the same Cargo.lock as the editor. That (plus the same rustc) is what
 //! makes sharing `dyn Component` across the dylib boundary safe in practice.
 //! Each plugin exports `citrus_register(&mut ComponentRegistry)`.
 //!
@@ -172,7 +172,7 @@ impl PluginHost {
             // RTLD_NOW: resolve every symbol at load time. With the default
             // lazy binding a missing/incompatible symbol becomes a deferred
             // null-pointer call (a segfault from inside ld.so on first use,
-            // hard to trace) — RTLD_NOW turns that into a clean load error.
+            // hard to trace). RTLD_NOW turns that into a clean load error.
             // RTLD_LOCAL keeps the plugin's symbols out of the global scope.
             #[cfg(unix)]
             let lib: libloading::Library = {
@@ -188,7 +188,7 @@ impl PluginHost {
                 .get(b"citrus_register")
                 .context("plugin has no `citrus_register` export")?;
             register(registry);
-            // Editor-only inspector/gizmo registration (optional — a runtime
+            // Editor-only inspector/gizmo registration (optional; a runtime
             // game build of a plugin won't export it).
             if let Ok(register_editor) =
                 lib.get::<fn(&mut EditorComponents)>(b"citrus_register_editor")

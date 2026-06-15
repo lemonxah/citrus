@@ -28,12 +28,12 @@ pub struct RenderInfo {
 
 pub struct SceneObject {
     /// Stable unique identity (assigned at creation, serialized in `.scene`).
-    /// Cross-object references use this, not the name or array index.
+    /// Cross-object references use this rather than the name or array index.
     pub id: ObjectId,
     pub name: String,
     pub render: Option<RenderInfo>,
     /// Additional render slots beyond `render` (slot 0). Each is its own
-    /// (mesh, material) drawn at the same transform — lets one imported mesh
+    /// (mesh, material) drawn at the same transform, so one imported mesh can
     /// expose multiple material slots. Empty for single-material objects.
     pub extra_render: Vec<RenderInfo>,
     pub source: ObjectSource,
@@ -232,7 +232,7 @@ impl LoadedScene {
         (min + max) * 0.5
     }
 
-    /// Object-space AABB (min, max) of a mesh — used by physics to fit a
+    /// Object-space AABB (min, max) of a mesh, used by physics to fit a
     /// collider to a mesh's extents.
     pub fn mesh_aabb(&self, mesh: usize) -> (Vec3, Vec3) {
         self.mesh_bounds[mesh]
@@ -606,7 +606,7 @@ impl LoadedScene {
 
         // Group all of the model's objects under a single root (named after the
         // file), so an imported model is one entry in the Scene tree you can move
-        // as a unit — and the loaders' per-material mesh split stays tidy.
+        // as a unit, and the loaders' per-material mesh split stays tidy.
         let root_index = self.objects.len();
         let root_name = source_path
             .and_then(|p| p.file_stem())
@@ -795,7 +795,7 @@ impl LoadedScene {
         }
         // File-backed materials are driven entirely by `model.textures` (so a
         // slot can be cleared); no embedded fallback. The bindings created above
-        // get re-resolved from the same paths by apply_material below — record
+        // get re-resolved from the same paths by apply_material below. Record
         // them so that resolve matches and apply_material skips a redundant
         // (GPU-stalling) rebind.
         let bound_textures = [
@@ -1112,7 +1112,7 @@ impl LoadedScene {
     }
 
     /// View, projection, and world position of the main camera for the given
-    /// aspect ratio (cameras look down -Z, glTF convention).
+    /// aspect ratio (cameras look down -Z, the glTF convention).
     pub fn main_camera_view_proj(&self, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
         self.camera_view_proj_for(self.main_camera()?, aspect)
     }
@@ -1157,7 +1157,7 @@ impl LoadedScene {
             (0..self.objects.len()).map(|i| self.world_transform(i)).collect();
         let object_names: Vec<String> = self.objects.iter().map(|o| o.name.clone()).collect();
         let object_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
-        // Spawn points (2 — spawn points): object index + tag for every object
+        // Spawn points (2, spawn points): object index + tag for every object
         // carrying a SpawnPoint component, so a pawn can teleport to one.
         let spawn_points: Vec<(usize, String)> = self
             .objects
@@ -1418,7 +1418,7 @@ impl LoadedScene {
                         [p[6], p[7], p[8]],
                         [p[9], p[10], p[11]],
                     ],
-                    // Baked sidecars carry no visibility moments → disabled.
+                    // Baked sidecars carry no visibility moments, so disabled.
                     dist: [0.0; 4],
                 })
                 .collect();
@@ -1447,7 +1447,7 @@ impl LoadedScene {
                 *a += c;
             }
         }
-        // SH L0 basis Y0 = 0.282095 → average constant radiance term.
+        // SH L0 basis Y0 = 0.282095 gives the average constant radiance term.
         const Y0: f32 = 0.282_094_8;
         Some([acc[0] / n * Y0, acc[1] / n * Y0, acc[2] / n * Y0])
     }
@@ -1499,7 +1499,7 @@ impl LoadedScene {
         }
 
         // Bake captures Baked + Mixed lights (+ the environment sun below);
-        // Realtime lights are never baked — they stay purely in the realtime
+        // Realtime lights are never baked, they stay purely in the realtime
         // path. (Baked/Mixed are dropped from realtime once a bake exists; see
         // gather_lights.)
         let mut lights = Vec::new();
@@ -1663,10 +1663,10 @@ impl LoadedScene {
         }
 
         // ALL active lights drive the GI (+ env sun below). Realtime GI only
-        // runs when there's no bake — and in that state every light renders in
+        // runs when there's no bake, and in that state every light renders in
         // realtime regardless of its mode (see gather_lights), so the GI must
-        // bounce them all. (Filtering to Realtime-only here was the bug that
-        // left Baked/Mixed point lights out → zero GI.)
+        // bounce them all. (Filtering to Realtime-only here left Baked/Mixed
+        // point lights out, giving zero GI.)
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -1720,8 +1720,8 @@ impl LoadedScene {
         }
 
         // Cascaded probe volumes (SDFGI-style), centered on the scene. One grid
-        // over the whole scene is necessarily coarse → visible trilinear "squares"
-        // near the action. Instead we nest grids: the coarsest covers the full
+        // over the whole scene is necessarily coarse, giving visible trilinear
+        // "squares" near the action. So we nest grids: the coarsest covers the full
         // padded AABB, and each finer cascade halves the box (so it doubles the
         // probe density) around the same center. The shader picks the finest
         // cascade that contains a fragment (volumes are emitted finest-first), so
@@ -1730,7 +1730,7 @@ impl LoadedScene {
         let software = self.environment.realtime_gi.mode == citrus_assets::GiMode::Software;
         let spacing = self.environment.realtime_gi.probe_spacing.max(0.25);
         // Margin so geometry (esp. a large floor) sits well inside the outermost
-        // cascade — its edge fades to ambient, so too little pad lands that fade
+        // cascade. Its edge fades to ambient, so too little pad lands that fade
         // ring on the visible floor as a hard line. Generous pad pushes the box
         // boundary off the geometry; it also enlarges the coarsest box, which
         // auto-raises the cascade count below, so the center stays dense.
@@ -1741,12 +1741,12 @@ impl LoadedScene {
         // Per-axis probe count for every cascade, derived from the full-scene box
         // and clamped. Kept at 32: pushing it higher makes the coarse cell fine
         // enough that the cascade-count formula below collapses to a single grid,
-        // which paradoxically coarsens the (off-center) emitter region — the
+        // which paradoxically coarsens the (off-center) emitter region. The
         // multi-cascade nest at 32 keeps the center denser. Grid-cell structure is
         // smoothed by the probe-grid denoise blur, not by raw count alone.
         // Software uses nested cascades (small boxes) so a 32-cap stays cheap on
         // the GPU march. RayQuery bakes a single grid *synchronously*, so 32³ =
-        // 32768 probes is ~9ms/trace — cap it to 24³ (~13k) for realtime; the
+        // 32768 probes is ~9ms/trace; cap it to 24³ (~13k) for realtime; the
         // probe-grid blur keeps the soft look at the lower resolution.
         let max_axis = if software { 32 } else { 24 };
         let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, max_axis) as usize;
@@ -1866,7 +1866,7 @@ impl LoadedScene {
     /// Blend the post-processing Volumes affecting `camera_pos` into the
     /// effective per-frame parameters (Unity-style: priority-ordered, weight ×
     /// local proximity). Profiles are loaded from `.postfx` files (cached).
-    /// Empty → neutral defaults (ACES, no grading/vignette).
+    /// With no volumes, returns neutral defaults (ACES, no grading/vignette).
     pub fn effective_postfx(
         &mut self,
         camera_pos: Vec3,

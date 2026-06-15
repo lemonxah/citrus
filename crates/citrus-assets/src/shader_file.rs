@@ -2,7 +2,7 @@
 //! compiled to SPIR-V at runtime via `glslc` and reflected into inspector
 //! properties.
 //!
-//! A custom shader is a fragment-stage *body* — the engine prepends a
+//! A custom shader is a fragment-stage *body*. The engine prepends a
 //! preamble declaring the frame UBO, the material's four texture slots,
 //! vertex inputs, the output, and a 16-float push-constant block that
 //! properties pack into. Properties are declared in `//!` pragma comments:
@@ -33,7 +33,7 @@ use anyhow::{Context as _, Result, bail};
 pub const SHADER_EXTENSION: &str = "frag";
 
 /// Push-constant floats available to custom-shader properties. The block is
-/// 4 × vec4 = 16 floats, but the last lane (`d3.w`) is reserved for the baked-
+/// 4 × vec4 = 16 floats, but the last lane (`d3.w`) is reserved for the baked
 /// lightmap layer so custom shaders integrate with static GI (see the preamble's
 /// `citrus_baked_gi`), leaving 15 for properties.
 pub const SHADER_PROP_FLOATS: usize = 15;

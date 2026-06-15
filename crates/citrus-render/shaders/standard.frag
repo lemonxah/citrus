@@ -1,5 +1,5 @@
 #version 450
-// citrus standard shader — fragment stage (phase 1: PBR/toon hybrid core).
+// citrus standard shader, fragment stage (phase 1: PBR/toon hybrid core).
 // Feature toggles are specialization constants: each material's enabled
 // feature set selects a pipeline variant; disabled features compile out.
 
@@ -69,7 +69,7 @@ const float SGI_DIV = 4.0;
 // Bilateral spatial filter + depth-aware upsample of the sparse screen probes:
 // a wide (5×5 probe) edge-aware gather. Each probe is weighted by a spatial
 // Gaussian (distance to the pixel in probe space) AND by how close its stored
-// camera distance is to this fragment's — so it smooths the few-ray noise
+// camera distance is to this fragment's, so it smooths the few-ray noise
 // (Lumen's screen-probe spatial filter) while rejecting probes across a depth
 // edge (no bleed/blockiness). This is the main grain reduction.
 vec3 screen_gi_upsample(vec2 suv, float frag_dist) {
@@ -90,7 +90,7 @@ vec3 screen_gi_upsample(vec2 suv, float frag_dist) {
             // RELATIVE depth difference: same-surface neighbours (small relative
             // delta) are kept so probes blend smoothly; only true depth edges
             // (large relative delta) are rejected. An absolute threshold wrongly
-            // rejected neighbours on slanted surfaces → blocky "big pixels".
+            // rejected neighbours on slanted surfaces, giving blocky "big pixels".
             float dd = abs(s.a - frag_dist) / max(frag_dist, 0.5);
             float dw = exp(-dd * 6.0);                      // depth-edge reject
             float w = sw * dw + 1e-6;
@@ -134,7 +134,7 @@ vec3 volume_coords(ProbeVolume v, vec3 world_pos) {
 // DDGI-style 8-corner blend of probe irradiance within one volume. Each corner's
 // trilinear weight is modulated by:
 //   - visibility: the probe's stored directional distance vs. the actual probe→
-//     fragment distance (a soft Chebyshev-lite test) — a probe occluded from the
+//     fragment distance (a soft Chebyshev-lite test). A probe occluded from the
 //     fragment (e.g. on the far side of a wall) is down-weighted, killing leaks,
 //   - front-facing: probes roughly behind the surface contribute less.
 // Falls back to plain trilinear where no visibility data exists (bake path).
@@ -179,7 +179,7 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
         float vis = md > 1e-4 ? clamp(1.0 - max(0.0, pd - md) / max(band, 1e-3), 0.25, 1.0) : 1.0;
         // Front-facing weight (probe should be on the surface's lit side). Kept
         // gentle + a generous floor so shadowed/back faces still gather soft fill
-        // from surrounding probes instead of crushing to black — leak prevention
+        // from surrounding probes instead of crushing to black. Leak prevention
         // is the visibility term's job, not this one.
         float nw = clamp(dot(-dir, n) * 0.5 + 0.5, 0.0, 1.0);
         nw = nw * 0.65 + 0.35;
@@ -312,7 +312,7 @@ float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
     if (!soft) {
         return texture(u_shadow, vec4(clamp(uv, vec2(0.0), vec2(1.0)), float(layer), ref));
     }
-    // Soft shadows — 5x5 PCF: average many hardware-PCF taps to soften the
+    // Soft shadows, 5x5 PCF: average many hardware-PCF taps to soften the
     // shadow edge. Tap spacing (softness / shadow_resolution) comes from the
     // CPU so it tracks the runtime shadow resolution + softness setting.
     float spacing = frame.misc.z;
@@ -390,7 +390,7 @@ vec3 blend_matcap(vec3 base, vec3 mc, float t, float mode) {
 }
 
 // Per-pixel post from the blended Volume profile: exposure → grading → tonemap →
-// vignette. (Chromatic aberration + bloom need a fullscreen pass — follow-up.)
+// vignette. (Chromatic aberration + bloom need a fullscreen pass; follow-up.)
 vec3 apply_postfx(vec3 color, vec2 fragcoord) {
     color *= exp2(frame.postfx0.y);
     if (frame.postfx1.w > 0.5) {
@@ -590,7 +590,7 @@ void main() {
     // Energy-conserving ambient: split indirect into diffuse (non-reflected) and
     // a cheap specular share so metals/smooth surfaces pick up environment colour
     // instead of reading flat. Uses the probe/lightmap irradiance as a stand-in
-    // for environment radiance (no reflection probes yet) — approximate but it
+    // for environment radiance (no reflection probes yet). Approximate, but it
     // keeps metals lively. Smoother surfaces concentrate the spec response.
     vec3 F_amb = f_schlick_rough(NdotV, f0, roughness);
     vec3 kd_amb = vec3(1.0) - F_amb;

@@ -85,7 +85,7 @@ pub struct ChromaticAberration {
     pub intensity: f32,
 }
 
-/// A complete post-processing profile — one of every effect's settings.
+/// A complete post-processing profile: one of every effect's settings.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PostFxProfile {

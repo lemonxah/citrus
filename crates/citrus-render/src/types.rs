@@ -82,7 +82,7 @@ pub struct MaterialParams {
     pub normal_strength: f32,
     pub occlusion_strength: f32,
     // --- extended "FX" params, delivered via a per-material UBO (set 1, binding
-    // 4) so the built-in Standard/Toon shaders can have rich options beyond the
+    // 4) so the built-in Standard/Toon shaders can have options beyond the
     // full 128-byte push block. ---
     /// Toon rim-light colour.
     pub rim_color: [f32; 3],
@@ -132,7 +132,7 @@ impl Default for MaterialParams {
     }
 }
 
-/// Per-material "FX" uniform block (std140) — the GPU layout of the extended
+/// Per-material "FX" uniform block (std140); the GPU layout of the extended
 /// [`MaterialParams`] fields. Five vec4s = 80 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -255,9 +255,9 @@ pub struct LightInstance {
     pub intensity: f32,
     /// Distance at which point/spot reach zero.
     pub range: f32,
-    /// Spot inner cone full angle (degrees) — full brightness inside it.
+    /// Spot inner cone full angle (degrees); full brightness inside it.
     pub spot_inner_deg: f32,
-    /// Spot outer cone full angle (degrees) — zero brightness outside it.
+    /// Spot outer cone full angle (degrees); zero brightness outside it.
     pub spot_outer_deg: f32,
     /// Render shadows for this light (depth map from its POV).
     pub cast_shadows: bool,
@@ -304,7 +304,7 @@ pub struct BakeInstance {
     pub lightmap_size: u32,
     /// Diffuse albedo for indirect bounces (material base color, linear).
     pub albedo: [f32; 3],
-    /// Emitted radiance (color × intensity, linear) — surfaces glow into GI.
+    /// Emitted radiance (color × intensity, linear); surfaces glow into GI.
     pub emission: [f32; 3],
 }
 
@@ -353,7 +353,7 @@ pub struct BakedLightmap {
 /// SH-L1 irradiance for one probe: 4 coefficients × RGB, plus an SH-L1 of the
 /// directional distance-to-geometry (4 scalar coefficients) used for DDGI-style
 /// visibility weighting at sample time. `dist` left zero (the bake path) disables
-/// the visibility test — the standard shader then weights probes by trilinear
+/// the visibility test; the standard shader then weights probes by trilinear
 /// only. The software march fills it so probes occluded from a fragment (e.g.
 /// behind a wall) are down-weighted, killing light leaks.
 #[derive(Clone, Copy, Debug, Default)]
@@ -427,7 +427,7 @@ pub struct FrameInput<'a> {
 /// Resolved per-frame post-processing parameters (the blended profile flattened
 /// for the GPU). Per-pixel effects (exposure, tonemap, color grading, vignette)
 /// are applied in the surface shaders; chromatic aberration + bloom need a
-/// fullscreen pass (follow-up).
+/// a fullscreen pass (follow-up).
 #[derive(Clone, Copy, Debug)]
 pub struct PostFx {
     /// 0 = none, 1 = Reinhard, 2 = ACES.
@@ -455,7 +455,7 @@ pub struct PostFx {
 impl Default for PostFx {
     fn default() -> Self {
         Self {
-            tonemap: 2, // ACES — matches the previous hardcoded behavior
+            tonemap: 2, // ACES, matches the previous hardcoded behavior
             exposure: 0.0,
             grading_enabled: false,
             grade_exposure: 0.0,

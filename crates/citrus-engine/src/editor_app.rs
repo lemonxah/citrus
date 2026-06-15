@@ -388,7 +388,7 @@ fn default_layout() -> DockState<Tab> {
     // Inspector node.
     let mut state = DockState::new(vec![Tab::Viewport, Tab::Camera]);
     let tree = state.main_surface_mut();
-    // Right (Inspector) node a touch wider — ~30px at the 1600px default —
+    // Right (Inspector) node a touch wider (~30px at the 1600px default)
     // so the inspector's rows fit without clipping.
     let [viewport, _right] = tree.split_right(
         NodeIndex::root(),
@@ -520,7 +520,7 @@ impl Default for WidgetSetting {
 }
 
 /// Viewport billboard-widget filter (top-right overlay). Only billboard icons
-/// are filtered — the move/rotate/scale gizmos are never hidden. A filtered-
+/// are filtered; the move/rotate/scale gizmos are never hidden. A filtered-
 /// off billboard still draws when its object is the current selection.
 #[derive(Clone, Default)]
 struct WidgetFilter {
@@ -581,7 +581,7 @@ struct EngineApp {
     /// Paused while playing: components/physics/audio freeze but the played
     /// state stays so you can inspect it. Cleared on Stop.
     play_paused: bool,
-    /// Play clock (seconds) — advances only while playing and not paused, so
+    /// Play clock (seconds). Advances only while playing and not paused, so
     /// time-based components don't jump across a pause. Reset on Play start.
     play_time: f32,
     /// Object state captured at Play start, restored at Stop.
@@ -628,7 +628,7 @@ struct EngineApp {
     looking: bool,
     /// Set the frame mouse-look ends: egui's pointer was frozen during look
     /// (it never saw window events), so the next frame injects a PointerMoved
-    /// to resync it — otherwise the first click is hit-tested at the stale
+    /// to resync it, otherwise the first click is hit-tested at the stale
     /// position and the orbit-arm edge is missed (orbit dead until a 2nd click).
     look_just_ended: bool,
     /// Middle mouse held: pan.
@@ -650,7 +650,7 @@ struct EngineApp {
     /// Network panel open.
     show_network: bool,
     /// Action currently being rebound in the Bindings window (scheme, action,
-    /// slot) — the next key/mouse press is captured into it.
+    /// slot). The next key/mouse press is captured into it.
     rebinding: Option<(usize, String)>,
     last_cursor: Option<(f64, f64)>,
     /// Viewport tab rect in egui points (updated每 frame by the tab).
@@ -1766,7 +1766,7 @@ impl EngineApp {
                     let path = path
                         .or_else(|| self.current_scene_path.clone())
                         .unwrap_or_else(|| self.project_root.join(&self.scene_name_input));
-                    // Materials are NOT rewritten on scene save — only manual
+                    // Materials are NOT rewritten on scene save; only manual
                     // edits persist (tracked in `dirty_materials`, flushed by
                     // `autosave_materials`, or saved via the material editor).
                     // A material with an existing `.material` file serializes as
@@ -2216,7 +2216,7 @@ impl EngineApp {
         }
     }
 
-    /// True when the active/focused dock tab is a code editor — used to keep
+    /// True when the active/focused dock tab is a code editor. Used to keep
     /// Escape from doing the global deselect while editing (Escape is the vim
     /// Insert -> Normal key there).
     fn code_tab_focused(&mut self) -> bool {
@@ -2486,7 +2486,7 @@ impl EngineApp {
         };
         let base = self.bake_base_path();
 
-        // .lightmap — static GI, one entry per lit object.
+        // .lightmap: static GI, one entry per lit object.
         let mut lm = citrus_assets::LightmapFile::default();
         for (&object, &layer) in &baked.object_lightmap {
             if let Some(map) = baked.lightmaps.get(layer) {
@@ -2501,7 +2501,7 @@ impl EngineApp {
             tracing::error!("saving .lightmap: {e:#}");
         }
 
-        // .lightdata — probe volumes + SH for dynamic objects.
+        // .lightdata: probe volumes + SH for dynamic objects.
         let ld = citrus_assets::LightDataFile {
             volumes: baked
                 .probe_volumes
@@ -2556,7 +2556,7 @@ impl EngineApp {
             if self.play_scene_switched {
                 // A component switched scenes during play; the snapshot indices
                 // no longer match the loaded scene. Return to the scene we
-                // started from (reloaded from disk — unsaved pre-play edits are
+                // started from (reloaded from disk; unsaved pre-play edits are
                 // lost, a known v1 limitation).
                 self.play_scene_switched = false;
                 self.play_snapshot = None;
@@ -3194,7 +3194,7 @@ impl EngineApp {
     /// On window-focus regain: if any project asset changed in another app since
     /// the last check, reload the current scene (which reimports models/textures/
     /// materials/shaders fresh). Skips while playing or with unsaved scene edits
-    /// (those would be clobbered) — surfacing a hint instead.
+    /// (those would be clobbered), surfacing a hint instead.
     fn reload_changed_assets(&mut self) {
         let now = std::time::SystemTime::now();
         // First focus just establishes a baseline (don't reload on startup).
@@ -3449,7 +3449,7 @@ impl EngineApp {
     /// without a backing file get one created under `materials/`.
     fn autosave_materials(&mut self) {
         // Code editors: save each 1s after its last keystroke (saving .frag
-        // files also triggers shader hot reload — live shader editing).
+        // files also triggers shader hot reload, for live shader editing).
         let to_save: Vec<PathBuf> = self
             .open_editors
             .iter()
@@ -3482,7 +3482,7 @@ impl EngineApp {
         }
     }
 
-    /// Persist one scene material to its `.material` file — **only if it already
+    /// Persist one scene material to its `.material` file, **only if it already
     /// has one**. Embedded (imported) materials have no backing file and are
     /// read-only until the user extracts them ([`extract_material`]); we never
     /// auto-create a phantom `.material` for them.
@@ -3525,8 +3525,8 @@ impl EngineApp {
     }
 
     /// Extract an embedded (imported) material to a real `.material` file under
-    /// `materials/`, assign it back to the material slot, and persist it — after
-    /// which it's a normal editable asset. No-op if it already has a file.
+    /// `materials/`, assign it back to the material slot, and persist it. After
+    /// that it's a normal editable asset. No-op if it already has a file.
     fn extract_material(&mut self, index: usize) {
         if index >= self.scene.materials.len() || self.scene.materials[index].file.is_some() {
             return;
@@ -3701,9 +3701,9 @@ impl EngineApp {
 
         // If mouse-look just ended, egui's pointer state is stale: window
         // events are withheld while looking, so egui (a) never saw the right
-        // button RELEASE — it still thinks Secondary is held, which keeps
+        // button RELEASE, so it still thinks Secondary is held, which keeps
         // `press_origin` pinned and breaks drag detection for the next gesture
-        // (a click still registers, but orbit/gizmo/widget drags don't) — and
+        // (a click still registers, but orbit/gizmo/widget drags don't), and
         // (b) has a frozen pointer position. Inject both a Secondary release
         // and a move at the true cursor so the next press starts a clean drag.
         let resync_pos = if std::mem::take(&mut self.look_just_ended) {
@@ -4792,7 +4792,7 @@ impl EditorTabs<'_> {
         // rendering. Each entry is one (color, full-message) pair; when wrap is
         // off the messages are flattened to one row per physical line so the
         // virtualized list keeps a uniform row height.
-        // (color, timestamp, rest) — split so wrapped lines can hang-indent
+        // (color, timestamp, rest): split so wrapped lines can hang-indent
         // past the timestamp column.
         let mut entries: Vec<(egui::Color32, String, String)> = Vec::new();
         {
@@ -4904,7 +4904,7 @@ impl EditorTabs<'_> {
     }
 
     /// The Environment tab: world sun, ambient, and skybox setup.
-    /// "Baker's Man" — lighting-bake settings + Bake / Clear actions.
+    /// "Baker's Man": lighting-bake settings + Bake / Clear actions.
     fn baker_ui(&mut self, ui: &mut egui::Ui) {
         use egui::{DragValue, RichText, Slider};
         ui.heading("Baker's Man");
@@ -5284,7 +5284,7 @@ impl EditorTabs<'_> {
         );
 
         // Right mouse over the viewport starts mouse-look. Detected through
-        // this widget (not raw winit) so egui's hit-testing decides — clicks
+        // this widget (not raw winit) so egui's hit-testing decides; clicks
         // on panels, tab bars, or resize handles never reach us.
         if response.hovered()
             && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary))
@@ -5295,7 +5295,7 @@ impl EditorTabs<'_> {
         // Scroll dollies the camera only while the pointer is over the viewport
         // AND the viewport widget actually has the pointer (not occluded by a
         // floating window). The winit rect test alone let scroll bleed through
-        // windows sitting over the viewport — `contains_pointer()` is
+        // windows sitting over the viewport; `contains_pointer()` is
         // occlusion-aware (same reason clicks use `hovered()` above), so a window
         // over the cursor now swallows the wheel like it swallows clicks.
         if self.pointer_in_viewport && response.contains_pointer() {
@@ -5306,7 +5306,7 @@ impl EditorTabs<'_> {
         }
 
         // Left drag orbits (around the selection, or whatever sits at the
-        // viewport center) — unless the gizmo grabbed the drag. Alt forces
+        // viewport center) unless the gizmo grabbed the drag. Alt forces
         // the orbit even when starting on a gizmo handle.
         let alt = ui.input(|i| i.modifiers.alt);
         // `hover_pos()` is None while a drag is in progress, which would make
@@ -5367,7 +5367,7 @@ impl EditorTabs<'_> {
                 let world = self.scene.world_transform(i);
                 let (mut w_scale, mut w_rot, mut w_trans) = world.to_scale_rotation_translation();
                 // The scene fills the whole window (panels just occlude it),
-                // so the gizmo's NDC mapping must use the full screen rect —
+                // so the gizmo's NDC mapping must use the full screen rect;
                 // the painter still clips to this tab.
                 gizmo_changed = self.gizmo.interact(
                     ui,
@@ -5449,7 +5449,7 @@ impl EditorTabs<'_> {
                 let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(110, 255, 140));
                 // Lines are clipped against the editor camera's near plane
                 // in clip space (partially-behind segments draw instead of
-                // vanishing), then against the screen rect — near-plane
+                // vanishing), then against the screen rect; near-plane
                 // clipping can yield million-pixel endpoints that the
                 // tessellator won't rasterize reliably.
                 let line = |a: Vec3, b: Vec3| {
@@ -6170,7 +6170,7 @@ impl EditorTabs<'_> {
         }
 
         // Widget filter (top-right): per-billboard visibility + size. The
-        // move/rotate/scale gizmos are deliberately absent — they can't be
+        // move/rotate/scale gizmos are deliberately absent; they can't be
         // hidden. Selected objects always show their billboard regardless.
         egui::Area::new(ui.id().with("vp-widgets"))
             .order(egui::Order::Middle)
@@ -6350,7 +6350,7 @@ impl EditorTabs<'_> {
         } else {
             self.selection.clone()
         };
-        // Pinned header — stays put while the body scrolls. For an object it's the
+        // Pinned header, stays put while the body scrolls. For an object it's the
         // single flex row [enabled][name (grows)][static][lock]; otherwise just
         // the lock toggle.
         match &effective {
@@ -6445,7 +6445,7 @@ impl EditorTabs<'_> {
                     }
                     let slot = *self.selected_material_slot;
                     let material_index = slots.get(slot).map(|r| r.material);
-                    // Object list (id + name) for ObjectRef pickers — built as an
+                    // Object list (id + name) for ObjectRef pickers, built as an
                     // owned Vec before the mutable component borrow so it doesn't
                     // alias scene.objects.
                     let objects: Vec<(ObjectId, String)> = self
@@ -6454,7 +6454,7 @@ impl EditorTabs<'_> {
                         .iter()
                         .map(|o| (o.id, o.name.clone()))
                         .collect();
-                    // Imported (embedded) materials have no backing file — they're
+                    // Imported (embedded) materials have no backing file; they're
                     // read-only until extracted, so don't hand them to the editor.
                     let embedded = material_index
                         .map(|m| self.scene.materials[m].file.is_none())
@@ -7531,7 +7531,7 @@ impl ApplicationHandler for EngineApp {
                 }
                 ElementState::Pressed => {
                     // egui consumed the press (e.g. a focused text field), but
-                    // still track modifier keys so `self.keys` doesn't desync —
+                    // still track modifier keys so `self.keys` doesn't desync,
                     // otherwise a Ctrl press swallowed here leaves `ctrl` false
                     // for a later viewport shortcut (Ctrl+Z undo, etc.).
                     if matches!(

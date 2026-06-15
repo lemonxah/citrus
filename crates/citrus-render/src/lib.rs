@@ -109,8 +109,8 @@ struct GpuProbeVolume {
 }
 
 /// One probe's SH-L1 in the GPU storage buffer (std430): 4 coefficients, each
-/// an RGB in xyz. The previously-unused `w` of each carries the SH-L1 of the
-/// directional distance-to-geometry (`ProbeSh::dist`) for visibility weighting.
+/// an RGB in xyz. The `w` of each carries the SH-L1 of the directional
+/// distance-to-geometry (`ProbeSh::dist`) for visibility weighting.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct GpuProbe {
@@ -262,8 +262,8 @@ fn plan_shadows(
             // Point: 6 cube faces (+X,-X,+Y,-Y,+Z,-Z), matching the shader's
             // face pick. The FOV is a touch wider than 90° so neighbouring
             // faces overlap: a fragment near a face boundary then still has
-            // valid depth in its selected face's map, instead of the shader's
-            // PCF taps spilling into the atlas border and showing a bright
+            // valid depth in its selected face's map. Without the overlap the
+            // shader's PCF taps spill into the atlas border and show a bright
             // seam between faces.
             let faces = [
                 (Vec3::X, Vec3::NEG_Y),
@@ -519,7 +519,7 @@ fn create_view(
 /// Screen-probe tile size: one screen-space GI probe is traced per
 /// `SCREEN_PROBE_DIV × SCREEN_PROBE_DIV` block of pixels, then bilinearly
 /// upsampled to full resolution in the forward shader (Lumen screen-probe
-/// scheme). Larger = cheaper/softer; smaller = sharper/more rays.
+/// scheme). Larger is cheaper and softer; smaller is sharper and uses more rays.
 const SCREEN_PROBE_DIV: u32 = 4;
 
 /// Runtime-tunable Flux (screen-space GI) parameters, set from the Environment
@@ -535,7 +535,7 @@ pub struct FluxSettings {
     pub march_distance: f32,
     /// Per-sample firefly clamp on the bounce term (caps bright outliers).
     pub firefly_clamp: f32,
-    /// Temporal smoothing 0..1: higher = smoother/more lag, lower = sharper/noisier.
+    /// Temporal smoothing 0..1: higher is smoother with more lag, lower is sharper and noisier.
     pub smoothing: f32,
     /// Indirect strength multiplier (applied before temporal accumulation).
     pub intensity: f32,
@@ -556,7 +556,7 @@ impl Default for FluxSettings {
 }
 
 /// Screen-space GI targets: a full-res sampleable camera depth prepass + a
-/// reduced-resolution **screen-probe** radiance buffer (one probe per
+/// reduced-resolution screen-probe radiance buffer (one probe per
 /// `SCREEN_PROBE_DIV²` pixels), bilinearly upsampled by the forward shader.
 struct ScreenGiTargets {
     /// Probe-grid resolution (screen extent / SCREEN_PROBE_DIV).
@@ -993,14 +993,15 @@ pub struct Renderer {
     /// Whether the screen-GI image holds a valid previous-frame result (for
     /// temporal accumulation). False on the first frame + after a resize.
     sgi_history_valid: bool,
-    /// Emissive sphere area-lights for the screen-GI gather (analytic NEE —
-    /// smooth emitter bounce, no coarse-GDF footprint). Set by the realtime-GI
-    /// driver alongside the GDF.
+    /// Emissive sphere area-lights for the screen-GI gather (analytic NEE, so
+    /// the emitter bounce stays smooth without the coarse-GDF footprint). Set by
+    /// the realtime-GI driver alongside the GDF.
     gi_emitters: Vec<gpu_gi::GpuGiEmitter>,
     /// Runtime Flux trace parameters (Environment tab → Flux GI).
     flux_settings: FluxSettings,
     /// Last camera view-proj the screen-GI was traced for; while unchanged the
-    /// gather is skipped and the converged result reused (idle costs nothing).
+    /// gather is skipped and the converged result reused (a still camera costs
+    /// nothing).
     sgi_last_view_proj: Option<glam::Mat4>,
     /// Consecutive still frames — keep tracing (temporal accumulation) until the
     /// result has converged, then idle. Reset when the camera moves.
@@ -1011,7 +1012,7 @@ pub struct Renderer {
     /// Monotonic trace counter feeding the trace RNG seed. Without per-frame
     /// variation every frame samples the identical random directions, so the
     /// Monte Carlo noise is fixed-pattern and temporal accumulation can never
-    /// average it out — the source of the static blotches.
+    /// average it out; that was the source of the static blotches.
     sgi_frame: u32,
     /// Per-frame-in-flight Flux trace resources (descriptor pool + host buffers)
     /// kept alive after the trace is recorded into the main cb, freed one frame
@@ -1033,7 +1034,7 @@ pub struct Renderer {
     frame_ubos: Vec<Buffer>,
     frame_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
-    /// Linear CLAMP_TO_EDGE sampler for baked lightmaps — the material `sampler`
+    /// Linear CLAMP_TO_EDGE sampler for baked lightmaps. The material `sampler`
     /// is REPEAT (tiling), which wraps at the atlas border and bleeds chart
     /// edges into the opposite side.
     lightmap_sampler: vk::Sampler,
@@ -1059,7 +1060,7 @@ pub struct Renderer {
     /// Baked light-probe SH (set-0 binding 2). A 1-probe zero buffer until a
     /// bake is loaded, so the binding is always valid.
     probe_buffer: Buffer,
-    /// Number of probes the `probe_buffer` is sized for — lets `update_probe_sh`
+    /// Number of probes the `probe_buffer` is sized for; lets `update_probe_sh`
     /// rewrite it in place (cheap, no realloc/stall) when the count is unchanged.
     probe_count: usize,
     /// Probe-volume metadata mirrored into each frame's FrameUbo (count drives
@@ -1076,9 +1077,9 @@ pub struct Renderer {
     /// Declared last so it drops last: `GpuContext::drop` destroys the Vulkan
     /// surface, which must happen while the underlying winit window still
     /// exists. EngineApp drops its own `Arc<Window>` clone before the renderer,
-    /// so this field can be the final strong reference — keeping it last means
-    /// the window outlives `ctx`/`surface` teardown (NVIDIA/Wayland segfaults
-    /// on exit otherwise).
+    /// so this field can be the final strong reference. Keeping it last means
+    /// the window outlives `ctx`/`surface` teardown; otherwise NVIDIA/Wayland
+    /// segfaults on exit.
     window: Arc<Window>,
 }
 
@@ -1542,8 +1543,8 @@ impl Renderer {
         self.probe_count = gpu.len();
     }
 
-    /// Cheap per-frame rewrite of the probe SH SSBO **in place** — no realloc,
-    /// no `device_wait_idle`, no descriptor rewrite. Used to smoothly ease the
+    /// Cheap per-frame rewrite of the probe SH SSBO in place: no realloc, no
+    /// `device_wait_idle`, no descriptor rewrite. Used to smoothly ease the
     /// realtime-GI probes toward each new trace every frame. Returns false when
     /// the probe count differs from the current buffer (caller must then use
     /// `set_baked_probes` to resize). The write is unsynchronized w.r.t. the GPU,
@@ -1565,9 +1566,9 @@ impl Renderer {
     pub fn set_baked_lightmaps(&mut self, lightmaps: &[BakedLightmap]) {
         // All layers share the largest baked size (texture-array requirement),
         // so a big surface (e.g. the floor) keeps full resolution. Capped at
-        // 4096 (matches the max_lightmap dropdown). Note: every object's layer is
-        // padded to this size, so a uniform 4096² array costs 256 MB *per
-        // object* — the follow-up per-object atlas removes that padding.
+        // 4096 (matches the max_lightmap dropdown). Every object's layer is
+        // padded to this size, so a uniform 4096² array costs 256 MB per
+        // object; the follow-up per-object atlas removes that padding.
         let size = lightmaps
             .iter()
             .map(|l| l.size)
@@ -1734,7 +1735,7 @@ impl Renderer {
         self.gpu_gi.as_ref().is_some_and(|g| g.is_marching())
     }
 
-    /// True once a GDF is uploaded — screen-space GI can run its gather.
+    /// True once a GDF is uploaded, so screen-space GI can run its gather.
     pub fn gi_has_gdf(&self) -> bool {
         self.gpu_gi.as_ref().is_some_and(|g| g.has_gdf())
     }
@@ -1743,7 +1744,7 @@ impl Renderer {
     /// A changed emitter set also invalidates the idle-skip so it re-traces.
     pub fn gi_set_emitters(&mut self, emitters: &[GpuGiEmitter]) {
         if self.gi_emitters.len() != emitters.len() {
-            self.sgi_last_view_proj = None; // emitter count changed → re-trace
+            self.sgi_last_view_proj = None; // emitter count changed, re-trace
         }
         self.gi_emitters.clear();
         self.gi_emitters.extend_from_slice(emitters);
@@ -1957,7 +1958,7 @@ impl Renderer {
 
     /// Set (or clear) the equirectangular skybox texture. `None` reverts to
     /// the procedural gradient sky. The old texture is dropped after the GPU
-    /// goes idle to stay safe.
+    /// goes idle.
     pub fn set_skybox(&mut self, data: Option<&TextureData>) -> Result<()> {
         match data {
             Some(data) => {
@@ -2311,7 +2312,7 @@ impl Renderer {
                 self.swapchain.extent.height as f32,
             ],
         );
-        // debug.z = screen-GI active → the forward shader samples the gather
+        // debug.z = screen-GI active, so the forward shader samples the gather
         // instead of the coarse world-probe grid.
         ubo.debug[2] = if sgi_active { 1.0 } else { 0.0 };
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
@@ -2325,7 +2326,7 @@ impl Renderer {
             // Temporal reprojection means we can keep accumulating while the
             // camera moves (the gather reprojects the previous result). Trace
             // while moving, and for a few frames after stopping so it fully
-            // converges, then idle (reuse the converged image — a still camera
+            // converges, then idle (reuse the converged image; a still camera
             // costs nothing). gi_set_emitters resets sgi_last_view_proj.
             let view_proj = input.camera.proj * input.camera.view;
             let camera_moved = self.sgi_last_view_proj != Some(view_proj);
@@ -2341,9 +2342,9 @@ impl Renderer {
                 self.sgi_frame = self.sgi_frame.wrapping_add(1);
                 let hist_valid = self.sgi_history_valid;
                 let cur = self.sgi_parity & 1; // ping-pong slot written this frame
-                // Capture the PREVIOUS camera before advancing it, so the gather
+                // Capture the previous camera before advancing it, so the gather
                 // reprojects history from where the surface actually was last
-                // frame (advancing first would make reprojection identity → smear).
+                // frame (advancing first would make reprojection identity and smear).
                 let prev_vp = self.sgi_last_view_proj.unwrap_or(view_proj);
                 let prev_cam = if self.sgi_last_view_proj.is_some() {
                     self.sgi_last_cam
@@ -2351,9 +2352,9 @@ impl Renderer {
                     input.camera.position
                 };
                 // Motion-aware temporal blend, scaled by the Flux smoothing
-                // setting (0 = responsive/sharper, 1 = smooth/more lag): snap on
-                // the first frame, trust the fresh trace more while moving (cuts
-                // reprojection-residual smear), converge gently when still.
+                // setting (0 = responsive and sharper, 1 = smooth with more lag):
+                // snap on the first frame, trust the fresh trace more while moving
+                // (cuts reprojection-residual smear), converge gently when still.
                 let s = self.flux_settings.smoothing.clamp(0.0, 1.0);
                 let alpha = if !hist_valid {
                     1.0
@@ -2371,7 +2372,7 @@ impl Renderer {
                 self.sgi_parity ^= 1;
             }
             // After the swap, gi[parity ^ 1] is the slot written this frame (or
-            // the last-written one on a skip frame) — sample that.
+            // the last-written one on a skip frame); sample that.
             let cur = (self.sgi_parity ^ 1) & 1;
             let cur_view = self.sgi.gi_view[cur];
             let info = [vk::DescriptorImageInfo::default()
@@ -3050,8 +3051,8 @@ impl Renderer {
         // alpha is the motion-aware temporal blend the caller chose.
         // Runtime Flux params (Environment tab → Flux GI). Samples/bounces drive
         // the trace; temporal accumulation smooths low per-frame sample counts.
-        // march[1] (max trace distance) of 0 = auto: screen_resolve_record fills
-        // it from the GDF diagonal. sky.w carries the indirect intensity;
+        // march[1] (max trace distance) of 0 means auto: screen_resolve_record
+        // fills it from the GDF diagonal. sky.w carries the indirect intensity;
         // march.w the firefly clamp.
         let fs = self.flux_settings;
         let params = gpu_gi::ScreenGiParams {

@@ -1,15 +1,15 @@
-//! Built-in networking (2G): a UDP **star-relay** session. One peer *hosts*
-//! (acts as a dedicated server or a player-host); others *join* it. All traffic
-//! flows through the host, which relays to the other peers — one code path serves
-//! both client-server and peer-to-peer use on a LAN.
+//! Built-in networking (2G): a UDP star-relay session. One peer hosts
+//! (acts as a dedicated server or a player-host); others join it. All traffic
+//! flows through the host, which relays to the other peers, so one code path
+//! serves both client-server and peer-to-peer use on a LAN.
 //!
-//! Replicated state: per-object **ownership** (whoever grabs an object becomes
-//! its authority) and the owner's **transform**, broadcast to everyone else. The
+//! Replicated state: per-object ownership (whoever grabs an object becomes
+//! its authority) and the owner's transform, broadcast to everyone else. The
 //! host arbitrates ownership (last-claim-wins) so it stays consistent.
 //!
-//! Wire format is a compact hand-rolled binary (no serde/bincode dependency, so
-//! the runtime stays lean). LAN-focused; NAT traversal / reliability / delta
-//! compression are documented follow-ups.
+//! Wire format is a compact hand-rolled binary, with no serde/bincode
+//! dependency. LAN-focused; NAT traversal / reliability / delta compression
+//! are documented follow-ups.
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -136,7 +136,7 @@ impl NetSession {
         self.local_peer != 0 && self.owner_of(id) == self.local_peer
     }
 
-    /// Non-draining `(object, owner)` snapshot — used to position remote peers'
+    /// Non-draining `(object, owner)` snapshot, used to position remote peers'
     /// voices at the object they own (spatial voice).
     pub fn owners_snapshot(&self) -> Vec<(ObjectId, u64)> {
         self.owners

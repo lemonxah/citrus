@@ -272,7 +272,7 @@ impl PipelineCache {
         // Texture samplers at bindings 0-3 (albedo/normal/orm/emission) and 5-12
         // (opacity, emission mask, 3 matcaps + 3 matcap masks). Binding 4 is the
         // FX uniform block. Every material set writes all of these (create_material
-        // + the skybox set), so they're always valid.
+        // and the skybox set), so they're always valid.
         let sampler_bindings: [u32; 12] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
         let mut tex_bindings: Vec<_> = sampler_bindings
             .iter()
@@ -285,7 +285,8 @@ impl PipelineCache {
             })
             .collect();
         // Binding 4: per-material "FX" uniform block (rim, animated emission,
-        // matcap strengths — extended params beyond the 128-byte push block).
+        // matcap strengths). Holds the extended params beyond the 128-byte
+        // push block.
         tex_bindings.push(
             vk::DescriptorSetLayoutBinding::default()
                 .binding(4)
@@ -465,7 +466,7 @@ impl PipelineCache {
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: 48,
             },
-            // uv1 (lightmap UVs), offset 64 — after tangent.
+            // uv1 (lightmap UVs), offset 64, after tangent.
             vk::VertexInputAttributeDescription {
                 location: 5,
                 binding: 0,

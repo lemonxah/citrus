@@ -18,7 +18,7 @@ pub fn primitive_mesh(shape: PrimitiveShape) -> MeshData {
 }
 
 /// Build a `MeshData`, using the primary (clean, non-overlapping) UVs as the
-/// lightmap UV set too — primitives need no separate unwrap.
+/// lightmap UV set too. Primitives need no separate unwrap.
 fn mesh_with_lightmap(mut vertices: Vec<Vertex>, indices: Vec<u32>) -> MeshData {
     for v in &mut vertices {
         v.uv1 = v.uv;
@@ -298,7 +298,7 @@ fn cube(size: f32) -> MeshData {
     let mut vertices = Vec::with_capacity(24);
     let mut indices = Vec::with_capacity(36);
     // uv0 is per-face 0..1 (texture mapping, tiles/overlaps across faces); uv1
-    // is a non-overlapping lightmap atlas — the 6 faces packed into a 3x2 grid,
+    // is a non-overlapping lightmap atlas: the 6 faces packed into a 3x2 grid,
     // each face inset by a gutter so the bake/bilinear filter don't bleed
     // between faces. (uv0 alone can't be a lightmap: all faces would share the
     // same 0..1 region and fight over the same texels.)

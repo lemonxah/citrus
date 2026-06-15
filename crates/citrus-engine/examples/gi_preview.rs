@@ -1,8 +1,8 @@
 //! Headless GI preview: a minimal scene (one ground plane + one emissive sphere,
 //! no lights) marched with the REAL `sw_gi` probe code, then the resulting probe
 //! SH grid is sampled per-pixel on the CPU (mirroring the shader's smoothstepped
-//! trilinear + SH-L1 eval) and written to PNGs. Lets us SEE the GI — including
-//! the blotchy emitter fill — and compare denoising strategies without the editor.
+//! trilinear + SH-L1 eval) and written to PNGs. Lets us see the GI, including
+//! the blotchy emitter fill, and compare denoising strategies without the editor.
 //!
 //! Run: cargo run --example gi_preview --release
 
@@ -14,7 +14,7 @@ use citrus_render::ProbeSh;
 use citrus_render::sdf::generate_sdf;
 use glam::{Mat4, Vec3};
 
-// Probe grid bounds + resolution (x fastest, then y, then z — matches sw_gi).
+// Probe grid bounds + resolution (x fastest, then y, then z; matches sw_gi).
 const BMIN: Vec3 = Vec3::new(-6.0, -0.5, -6.0);
 const BMAX: Vec3 = Vec3::new(6.0, 4.0, 6.0);
 const COUNTS: [usize; 3] = [40, 16, 40];
@@ -80,8 +80,8 @@ fn probe_positions() -> Vec<Vec3> {
     out
 }
 
-/// Average `traces` independent-seed marches (the temporal accumulation the
-/// runtime does over time, collapsed into one offline result).
+/// Average `traces` independent-seed marches. This is the temporal accumulation
+/// the runtime does over time, collapsed into one offline result.
 fn march_accumulated(insts: &[SdfInstance], probes: &[Vec3], samples: u32, bounces: u32, traces: u32) -> Vec<ProbeSh> {
     let scene_size = (BMAX - BMIN).length();
     let mut acc = vec![ProbeSh::default(); probes.len()];

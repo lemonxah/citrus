@@ -1,11 +1,11 @@
 //! Spatial voice comms (task 8). Captures the mic, sends mono PCM frames over the
-//! net transport, and plays each remote peer back through a **jitter buffer** so
+//! net transport, and plays each remote peer back through a jitter buffer so
 //! it never sounds laggy (late/reordered packets are absorbed by a small
-//! pre-buffer; underruns play silence, not stutter). Playback is **spatial**:
+//! pre-buffer; underruns play silence). Playback is spatial:
 //! each peer's voice sink volume falls off with distance from the listener, like
-//! the `AudioEngine` does for `AudioSource`s — walk away and you hear them less.
+//! the `AudioEngine` does for `AudioSource`s, so walking away makes them quieter.
 //!
-//! Latency-agnostic by design: the jitter buffer decouples network arrival from
+//! The jitter buffer decouples network arrival from
 //! playback, and missing audio is silence rather than time-stretched "lag" sound.
 //! LAN-grade (raw PCM, no codec); Opus + packet-loss concealment are follow-ups.
 
@@ -61,7 +61,7 @@ impl Iterator for JitterSource {
         match b.pop_front() {
             Some(s) => Some(s as f32 / 32768.0),
             None => {
-                // Underrun: re-arm the pre-buffer so we don't dribble.
+                // Underrun: re-arm the pre-buffer so playback doesn't dribble.
                 self.playing.store(false, Ordering::Relaxed);
                 Some(0.0)
             }

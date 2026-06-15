@@ -1,7 +1,7 @@
 # citrus
 
 A Rust + Vulkan game engine with a dockable in-engine editor, built VR-first
-(OpenXR). Powers [vrsh](../vrsh), a social-VR platform — but citrus itself is
+(OpenXR). Powers [vrsh](../vrsh), a social-VR platform. citrus itself is
 general-purpose: scenes, materials, FBX/glTF import, components and Rust
 plugins, custom shaders, lighting + GPU bake, audio, physics (rapier3d), and a
 growing editor that builds standalone games.
@@ -87,7 +87,7 @@ project (`scenes/ materials/ shaders/ textures/ src/main.rs` + a `plugins/compon
 crate + `project.citrus`) that builds and runs immediately; **File → Project Settings**
 sets the starting (boot) scene; **File → Build Game** (or `citrus --build`) compiles a
 **standalone executable + bundled `assets/`** under `build/`. A shipped game links the
-runtime only — `citrus-engine` with the editor cargo feature off, so no editor/egui_dock
+runtime only (`citrus-engine` with the editor cargo feature off), so no editor/egui_dock
 in the binary; the boot scene comes from `project.citrus` and is overridable in the
 editable `src/main.rs`. Unsaved-changes prompt on exit.
 
@@ -97,7 +97,7 @@ attenuation, driven in play mode.
 **Physics / collision** — Box / Sphere / Mesh colliders with editable viewport
 widgets, plus a `RigidBody` component driving a rapier3d simulation (gravity,
 collisions, transform writeback) in both the editor's Play mode and a built game.
-Foundational slice — joints, queries, and trigger events are still to come.
+A foundational slice; joints, queries, and trigger events are still to come.
 
 **Lighting bake — IN TESTING, NOT YET VERIFIED.** A GPU lightmap + light-probe
 bake (Vulkan ray query: BLAS/TLAS, path-traced direct + soft shadows +

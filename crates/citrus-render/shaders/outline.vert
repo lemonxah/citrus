@@ -30,7 +30,7 @@ layout(push_constant) uniform Push {
 void main() {
     // Inflate radially from the mesh center: the direction depends only on
     // position, so vertices duplicated across hard edges (per-face normals)
-    // move together and the hull stays watertight — no gaps at cube corners.
+    // move together and the hull stays watertight, with no gaps at cube corners.
     // Concave regions, where the radial direction leaves the surface, fall
     // back to the vertex normal.
     vec3 radial = a_position - pc.params0.xyz;

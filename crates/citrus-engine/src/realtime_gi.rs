@@ -4,7 +4,7 @@
 //! runtime so a shipped game lights the same way the editor previews.
 //!
 //! It only re-traces when the inputs change (lights/objects/settings), then lets
-//! the accumulated SH settle over a few updates and goes idle — so a static
+//! the accumulated SH settle over a few updates and goes idle, so a static
 //! scene does no GPU work and never hitches.
 
 use std::hash::{Hash, Hasher};
@@ -52,11 +52,11 @@ pub struct RealtimeGiState {
     /// Persistent, un-blurred temporal accumulation of per-cascade traces. Each
     /// frame only one cascade is re-traced (round-robin) and blended in here;
     /// `target` is its spatially-filtered view. Lumen-style: never re-trace the
-    /// whole field at once — amortize across frames + accumulate temporally.
+    /// whole field at once; amortize across frames and accumulate temporally.
     raw: Vec<citrus_render::ProbeSh>,
     /// Which cascade to trace next (round-robin over the probe volumes).
     trace_cursor: usize,
-    /// Latest finished trace (intensity applied) — the per-frame ease target.
+    /// Latest finished trace (intensity applied), the per-frame ease target.
     target: Vec<citrus_render::ProbeSh>,
     /// Volume layout to upload alongside `target` / `accum`.
     target_vols: Vec<VolUpload>,
@@ -72,7 +72,7 @@ pub struct RealtimeGiState {
         [usize; 3],
         usize,
     )>,
-    /// Volume layout + counts + cascade index for an in-flight async GPU march
+    /// Volume layout, counts, and cascade index for an in-flight async GPU march
     /// (collected via `gi_march_poll` next frame, so it never blocks the frame).
     gpu_pending: Option<(Vec<VolUpload>, [usize; 3], usize)>,
 }
@@ -97,7 +97,7 @@ impl RealtimeGiState {
         gi.update_interval = 0.0;
         let on = gi.enabled && scene.baked.is_none();
         // Always drain a finished async GPU march (even when off, so toggling GI
-        // off mid-flight can't wedge a re-enable — the in-flight march is freed).
+        // off mid-flight can't wedge a re-enable; the in-flight march is freed).
         let gpu_fresh = if renderer.gi_marching() {
             renderer.gi_march_poll()
         } else {
@@ -132,7 +132,7 @@ impl RealtimeGiState {
             return;
         }
 
-        // 1) Collect a finished async march, if any — CPU thread or GPU. The
+        // 1) Collect a finished async march, if any (CPU thread or GPU). The
         // tuple carries which cascade was traced (round-robin amortization).
         let mut fresh: Option<(Vec<citrus_render::ProbeSh>, Vec<VolUpload>, [usize; 3], usize)> =
             None;
@@ -157,7 +157,7 @@ impl RealtimeGiState {
             // Cadence floor. The software GPU march is cheap, so it can trace
             // every frame (floor 0). RayQuery re-bakes the whole probe grid
             // *synchronously on the main thread* (~ms × grid size), so a moving
-            // emitter/light would block every frame — floor it to ~10 Hz so a
+            // emitter/light would block every frame, so floor it to ~10 Hz so a
             // continuously animated GI input can't tank the framerate. Static
             // scenes settle and stop tracing regardless of mode.
             let interval_floor = if gi.mode == citrus_assets::GiMode::RayQuery {
@@ -217,12 +217,12 @@ impl RealtimeGiState {
                         let eps = (scene_size * 0.004).max(1e-3);
                         let max_dist = scene_size * 1.5 + 1.0;
                         // `vols`/`counts` go to whichever path produces the trace,
-                        // exactly once — GPU march (fresh) or CPU thread (job).
+                        // exactly once: GPU march (fresh) or CPU thread (job).
                         let mut pending = Some((vols, counts));
                         if renderer.gi_gpu_available() {
                             // The GDF is built from STATIC geometry only, so a
                             // moving dynamic object (a player, physics body) never
-                            // triggers the costly 64³ field rebuild — the prime
+                            // triggers the costly 64³ field rebuild, the prime
                             // cause of the play-mode framerate drop. Dynamic
                             // emitters still light the scene via analytic NEE
                             // (emitter spheres) below. Fall back to all instances
@@ -296,8 +296,8 @@ impl RealtimeGiState {
                             // Flux drives the main view from the GDF + emitters set
                             // above. The legacy world-probe DDGI march is ONLY for
                             // the in-game camera / off-screen fallback, so skip it
-                            // entirely when the fallback is Off — that's the "only
-                            // Flux runs" path (and kills the redundant march cost).
+                            // entirely when the fallback is Off. That's the "only
+                            // Flux runs" path, and it kills the redundant march cost.
                             let run_probes =
                                 gi.probe_fallback != citrus_assets::ProbeFallback::Off;
                             let march = citrus_render::GpuGiMarch {
@@ -319,7 +319,7 @@ impl RealtimeGiState {
                                 self.gpu_pending = Some((vols, counts, k));
                             }
                         }
-                        // No GPU compute (or the march failed) → CPU march thread.
+                        // No GPU compute (or the march failed): CPU march thread.
                         // Also gated: Off = Flux-only, no world-probe fallback.
                         let run_probes = gi.probe_fallback != citrus_assets::ProbeFallback::Off;
                         if run_probes
@@ -372,7 +372,7 @@ impl RealtimeGiState {
                 .iter()
                 .map(|(_, _, c, _)| (c[0] * c[1] * c[2]) as usize)
                 .sum();
-            // Resize (or first result) → allocate persistent buffers + re-point
+            // Resize (or first result): allocate persistent buffers and re-point
             // the GPU descriptors via the full upload, then fill this cascade.
             let resized = self.raw.len() != total || self.counts != counts;
             if resized {
@@ -418,9 +418,9 @@ impl RealtimeGiState {
                         t.dist[b] += (f.dist[b] - t.dist[b]) * alpha;
                     }
                 }
-                // Spatially filter this cascade (from raw → target). Recomputed
+                // Spatially filter this cascade (from raw into target). Recomputed
                 // from raw each time so repeated frames don't over-blur. Software
-                // grids are coarser → blur harder (also softens trilinear facets).
+                // grids are coarser, so blur harder (also softens trilinear facets).
                 let iters = if gi.mode == citrus_assets::GiMode::Software { 6 } else { 2 };
                 let mut filtered = self.raw[base..base + n].to_vec();
                 crate::sw_gi::blur_probe_grid(&mut filtered, cnt, iters);
@@ -449,8 +449,8 @@ impl RealtimeGiState {
 
         // 4) Per-frame ease of the uploaded probes toward the (already EMA-
         // smoothed) target, so the result glides between trace updates instead
-        // of stepping. Fixed short time-constant — variance smoothing lives in
-        // the EMA above; this is purely visual continuity. Cheap in-place upload.
+        // of stepping. Fixed short time-constant; variance smoothing lives in
+        // the EMA above, this is purely visual continuity. Cheap in-place upload.
         if self.target.is_empty() || self.accum.len() != self.target.len() {
             return;
         }
@@ -466,7 +466,7 @@ impl RealtimeGiState {
                     acc.coeffs[b][c] += d * f;
                     max_delta = max_delta.max(d.abs());
                 }
-                // Ease the visibility moments too (not counted in max_delta — the
+                // Ease the visibility moments too (not counted in max_delta; the
                 // radiance settling already keeps the upload alive while it eases).
                 acc.dist[b] += (tgt.dist[b] - acc.dist[b]) * f;
             }
@@ -499,7 +499,7 @@ fn vol_uploads(gather: &BakeGather) -> Vec<VolUpload> {
 
 /// Hash the realtime-GI inputs (light positions/colors, object transforms, GI
 /// settings) so an unchanged scene can skip the probe re-trace. f32s fold by bit
-/// pattern — exact, which is fine since we only ask "did anything change".
+/// pattern; exact, which is fine since we only ask "did anything change".
 fn hash_inputs(gather: &BakeGather, gi: &citrus_assets::RealtimeGi) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let f = |x: f32, h: &mut std::collections::hash_map::DefaultHasher| x.to_bits().hash(h);
@@ -523,7 +523,7 @@ fn hash_inputs(gather: &BakeGather, gi: &citrus_assets::RealtimeGi) -> u64 {
         let is_static = gather.instance_static.get(i).copied().unwrap_or(true);
         let emissive = inst.emission.iter().any(|&v| v != 0.0);
         // A dynamic, non-emissive object doesn't affect the GI (it's excluded
-        // from the static GDF and casts no light), so skip it — otherwise a prop
+        // from the static GDF and casts no light), so skip it; otherwise a prop
         // falling/jittering under physics would re-trace the probes every frame
         // and never let a Play-mode scene settle.
         if !is_static && !emissive {
@@ -534,7 +534,7 @@ fn hash_inputs(gather: &BakeGather, gi: &citrus_assets::RealtimeGi) -> u64 {
             f((v * 1024.0).round() / 1024.0, &mut h);
         }
         // Material emission + albedo affect the bounce, so editing an emitter's
-        // strength/colour (or a surface's albedo) must re-trace the GI — not just
+        // strength/colour (or a surface's albedo) must re-trace the GI, not just
         // moving the object. Without these the GI only updated on a transform change.
         for v in inst.emission.iter().chain(inst.albedo.iter()) {
             f(*v, &mut h);
@@ -558,7 +558,7 @@ fn hash_inputs(gather: &BakeGather, gi: &citrus_assets::RealtimeGi) -> u64 {
     h.finish()
 }
 
-/// Hash only the inputs the cached GDF is built from — per-instance geometry
+/// Hash only the inputs the cached GDF is built from: per-instance geometry
 /// (world→local transform, world scale, mesh SDF identity) and materials
 /// (albedo/emission), plus the field bounds and resolution. Lights/probes/sky
 /// are NOT included: they change per trace but don't affect the distance field,

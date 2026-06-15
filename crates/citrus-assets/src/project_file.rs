@@ -15,11 +15,11 @@ pub const PROJECT_FILE_NAME: &str = "project.citrus";
 pub struct ProjectFile {
     pub name: String,
     /// Project-relative path of the last opened scene; reloaded on startup
-    /// (editor convenience — which scene to reopen).
+    /// so the editor reopens the scene you were last in.
     pub last_scene: Option<String>,
     /// Project-relative path of the scene a built game loads first. Distinct
-    /// from `last_scene`: the editor restores `last_scene`, a shipped game boots
-    /// `boot_scene`. Set in Project Settings.
+    /// from `last_scene`: the editor restores `last_scene`, while a shipped game
+    /// boots `boot_scene`. Set in Project Settings.
     #[serde(default)]
     pub boot_scene: Option<String>,
     pub settings: ProjectSettings,

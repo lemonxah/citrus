@@ -1,6 +1,6 @@
 //! Minimal vim-style modal editing for the code editor.
 //!
-//! Core motions and operators only — enough for day-to-day editing; not a full
+//! Core motions and operators only, enough for day-to-day editing. Not a full
 //! vim. The code editor stores [`VimState`] in egui memory per file and, when
 //! enabled and focused, feeds captured key/text events through [`handle`]
 //! before the `TextEdit` sees them (Normal/Visual modes consume input; Insert

@@ -3,7 +3,7 @@
 //! signal with the default handler so a core dump is still produced.
 //!
 //! The systemd core dumps we captured only contained the null frame
-//! (`ip 0` — a call through a null function pointer); this handler captures
+//! (`ip 0`, a call through a null function pointer); this handler captures
 //! the real Rust stack at the moment of the fault.
 
 /// Install the crash handler (no-op on non-unix).
@@ -25,8 +25,8 @@ pub fn install() {
 #[cfg(unix)]
 extern "C" fn handler(sig: i32, _info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
     // force_capture ignores RUST_BACKTRACE and always unwinds. Allocating in a
-    // signal handler isn't async-signal-safe, but we're already crashing — a
-    // best-effort backtrace is far more useful than the bare `ip 0` core.
+    // signal handler isn't async-signal-safe, but we're already crashing, and a
+    // best-effort backtrace beats the bare `ip 0` core.
     let bt = std::backtrace::Backtrace::force_capture();
     let name = match sig {
         libc::SIGSEGV => "SIGSEGV",

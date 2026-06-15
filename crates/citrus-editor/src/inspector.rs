@@ -413,7 +413,7 @@ impl InspectorPanel {
     }
 }
 
-/// One grid row: `Label   X [....]  Y [....]  Z [....]` — all rows align
+/// One grid row: `Label   X [....]  Y [....]  Z [....]`. All rows align
 /// because the surrounding Grid sizes columns uniformly.
 fn transform_row(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64) -> bool {
     let mut changed = false;

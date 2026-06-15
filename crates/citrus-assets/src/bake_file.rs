@@ -1,9 +1,9 @@
 //! Baked-lighting asset files (compact little-endian binary; HDR float data
 //! is too large for RON).
 //!
-//! - `.lightmap` — per static object: an HDR irradiance lightmap (the baked
+//! - `.lightmap`: per static object, an HDR irradiance lightmap (the baked
 //!   GI sampled by the standard shader / GI pipeline).
-//! - `.lightdata` — light-probe volumes + SH-L1 irradiance, used to light
+//! - `.lightdata`: light-probe volumes + SH-L1 irradiance, used to light
 //!   dynamically moving objects (or leave them unlit, per how it was baked).
 //!
 //! Both sit next to their `.scene` (same stem) and load with it.

@@ -501,7 +501,7 @@ impl ScenePanel {
             ui.data_mut(|d| d.insert_temp(egui::Id::new(crate::DRAG_OBJECT_KEY), index));
             // Floating "ghost" of the dragged row, following the cursor, so the
             // drag has visual feedback (and the same chip lands in an ObjectRef
-            // drop box). Painted on a top layer, no egui dnd context involved.
+            // drop box). Painted on a top layer without any egui dnd context.
             if let Some(pos) = ui.ctx().pointer_interact_pos() {
                 let painter = ui.ctx().layer_painter(egui::LayerId::new(
                     egui::Order::Tooltip,

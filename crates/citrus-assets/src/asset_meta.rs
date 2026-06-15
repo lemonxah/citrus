@@ -1,7 +1,7 @@
 //! Per-asset `.meta` sidecar files (Unity/Godot-style). Each imported asset
-//! `foo.fbx` gets a companion `foo.fbx.meta` (RON) holding a **stable asset
-//! GUID** (so references survive renames/moves) plus that asset's **importer
-//! settings**. Living next to the asset means the data travels with it in
+//! `foo.fbx` gets a companion `foo.fbx.meta` (RON) holding a stable asset
+//! GUID (so references survive renames/moves) plus that asset's importer
+//! settings. Living next to the asset means the data travels with it in
 //! version control and scales to thousands of assets without a central hot file.
 //!
 //! `#[serde(default)]` everywhere so old `.meta` files keep loading as the
@@ -98,7 +98,7 @@ pub struct ModelImport {
     pub scale: f32,
     /// Import the file's materials (off = assign the default material).
     pub import_materials: bool,
-    /// Flip the V texture coordinate (DirectX↔OpenGL convention mismatch).
+    /// Flip the V texture coordinate (DirectX vs OpenGL convention mismatch).
     pub flip_uv: bool,
     /// Recompute smooth normals instead of using the file's.
     pub recalculate_normals: bool,
@@ -138,7 +138,7 @@ pub fn load_asset_meta(asset: impl AsRef<Path>) -> Result<Option<AssetMeta>> {
 }
 
 /// Load an asset's `.meta`, creating + writing a default (with a fresh GUID and
-/// type-appropriate importer settings) if it's missing — mirrors how Unity
+/// type-appropriate importer settings) if it's missing. Mirrors how Unity
 /// auto-generates a `.meta` the first time it sees an asset.
 pub fn load_or_create_asset_meta(asset: impl AsRef<Path>) -> Result<AssetMeta> {
     if let Some(meta) = load_asset_meta(&asset)? {

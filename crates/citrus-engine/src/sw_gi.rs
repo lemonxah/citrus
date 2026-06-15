@@ -1,10 +1,10 @@
-//! Software (Lumen-style) GI probe march — pure CPU, no RT cores. Mirrors the
+//! Software (Lumen-style) GI probe march on the CPU, no RT cores. Mirrors the
 //! ray-query `bake_probe.comp` but sphere-marches per-mesh signed distance
 //! fields instead of tracing a hardware BVH, so it runs on any GPU. Produces the
 //! same SH-L1 `ProbeSh` representation the standard shader already samples.
 //!
 //! Probes are few and the update is throttled + dirty-gated, so a CPU march is
-//! affordable for a coarse soft-GI preview; a GPU compute version is a later
+//! affordable for a coarse soft-GI preview. A GPU compute version is a later
 //! perf optimization.
 
 use std::sync::Arc;
@@ -21,22 +21,22 @@ const MAX_STEPS: u32 = 96;
 /// shared, not copied).
 #[derive(Clone)]
 pub struct SdfInstance {
-    /// World → mesh-local transform.
+    /// World-to-mesh-local transform.
     pub inv: Mat4,
-    /// Local-distance → world-distance scale (mesh's world scale).
+    /// Local-distance to world-distance scale (mesh's world scale).
     pub scale: f32,
     pub sdf: Arc<SdfVolume>,
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
     /// Non-moving geometry. The cached Global Distance Field is built from these
-    /// only, so a moving dynamic object never forces a (costly) GDF rebuild.
+    /// only, so a moving dynamic object never forces a costly GDF rebuild.
     pub static_geometry: bool,
 }
 
 /// An emissive instance reduced to a sphere area-light for next-event estimation
-/// (NEE). Sampling emitters directly — instead of waiting for random bounce rays
-/// to stumble onto a small bright surface — is what removes the blotchy variance
-/// in the GI fill around emissive objects.
+/// (NEE). Sampling emitters directly, instead of waiting for random bounce rays
+/// to stumble onto a small bright surface, removes the blotchy variance in the
+/// GI fill around emissive objects.
 struct Emitter {
     center: Vec3,
     radius: f32,
@@ -85,7 +85,7 @@ fn sphere_solid_angle(radius: f32, dist: f32) -> f32 {
 /// Irradiance at surface point `p` (normal `n`) from every visible emitter,
 /// each treated as a sphere area-light: `emission · (n·l) · Ω`, occlusion-tested
 /// up to the emitter's near surface. The caller folds in `albedo/π`. This is the
-/// low-variance (analytic) replacement for catching emitters via random hits.
+/// low-variance analytic replacement for catching emitters via random hits.
 fn emitter_light(insts: &[SdfInstance], emitters: &[Emitter], p: Vec3, n: Vec3, eps: f32) -> Vec3 {
     let mut sum = Vec3::ZERO;
     for em in emitters {
@@ -161,7 +161,7 @@ fn scene_distance(insts: &[SdfInstance], p: Vec3) -> (f32, usize) {
     (best, who)
 }
 
-/// Central-difference gradient of the merged field → surface normal.
+/// Central-difference gradient of the merged field, giving the surface normal.
 fn scene_normal(insts: &[SdfInstance], p: Vec3, eps: f32) -> Vec3 {
     let dx = scene_distance(insts, p + Vec3::X * eps).0 - scene_distance(insts, p - Vec3::X * eps).0;
     let dy = scene_distance(insts, p + Vec3::Y * eps).0 - scene_distance(insts, p - Vec3::Y * eps).0;
@@ -246,7 +246,7 @@ fn direct_light(insts: &[SdfInstance], lights: &[BakeLight], p: Vec3, n: Vec3, e
 
 /// Incoming radiance arriving along `dir`, path-traced through up to `bounces`
 /// diffuse bounces (sky on escape; emission + direct at each hit; cosine-weighted
-/// continuation, throughput attenuated by albedo each bounce — the "lumens drop
+/// continuation, throughput attenuated by albedo each bounce, the "lumens drop
 /// per bounce" scatter). One bounce ≈ the old behavior; more fills cavities.
 #[allow(clippy::too_many_arguments)]
 fn incoming(
@@ -265,7 +265,7 @@ fn incoming(
     let mut throughput = Vec3::ONE;
     let (mut ro, mut rd) = (origin, dir);
     // Distance from the probe to the first surface seen along `dir` (max_dist on
-    // escape to sky) — the DDGI visibility moment for this direction.
+    // escape to sky): the DDGI visibility moment for this direction.
     let mut first_dist = max_dist;
     for b in 0..bounces.max(1) {
         match march(insts, ro, rd, eps, max_dist) {
@@ -283,9 +283,9 @@ fn incoming(
                 }
                 let inst = &insts[who];
                 let albedo = Vec3::from(inst.albedo);
-                // Emitters are sampled via NEE below (not added on random hit),
-                // so a hit on an emissive surface contributes no emission here —
-                // that's what kills the firefly variance from small bright sources.
+                // Emitters are sampled via NEE below, not added on a random hit,
+                // so a hit on an emissive surface contributes no emission here.
+                // That kills the firefly variance from small bright sources.
                 // Lambert emit toward the ray: albedo/π · (direct lights + emitters).
                 let direct = direct_light(insts, lights, hp, n, eps)
                     + emitter_light(insts, emitters, hp, n, eps);
@@ -371,8 +371,8 @@ fn probe_sh(
 }
 
 /// March every probe and return SH-L1 radiance coefficients (same layout as the
-/// ray-query probe bake). Parallelized across CPU cores — each probe is
-/// independent. `scene_size` sizes the march epsilon + reach.
+/// ray-query probe bake). Parallelized across CPU cores; each probe is
+/// independent. `scene_size` sizes the march epsilon and reach.
 pub fn march_probes(
     insts: &[SdfInstance],
     lights: &[BakeLight],
@@ -415,8 +415,8 @@ pub fn march_probes(
 
 /// A merged Global Distance Field over the scene AABB: one signed-distance grid
 /// (min over all instances) plus the nearest-instance index per voxel. Uploaded
-/// to the GPU as a 3D distance texture (trilinear) + index texture (nearest) so
-/// the GPU march samples one field per step instead of looping instances. Built
+/// to the GPU as a 3D distance texture (trilinear) plus index texture (nearest)
+/// so the GPU march samples one field per step instead of looping instances. Built
 /// from the already-cached per-mesh SDFs, only when the scene changes.
 pub struct Gdf {
     pub dims: [u32; 3],
@@ -424,12 +424,12 @@ pub struct Gdf {
     pub max: Vec3,
     /// Signed distance per voxel (x fastest, then y, then z).
     pub dist: Vec<f32>,
-    /// Nearest-instance index per voxel (same layout) — looks up albedo/emission.
+    /// Nearest-instance index per voxel (same layout), used to look up albedo/emission.
     pub index: Vec<u32>,
 }
 
 /// Build the GDF over `[min,max]` at `dims` resolution from the marchable
-/// instances. Parallel over z-slices. Empty instances → a far, single-cell field.
+/// instances. Parallel over z-slices. Empty instances give a far, single-cell field.
 pub fn build_gdf(insts: &[SdfInstance], min: Vec3, max: Vec3, dims: [u32; 3]) -> Gdf {
     let dims = [dims[0].max(2), dims[1].max(2), dims[2].max(2)];
     let n = (dims[0] * dims[1] * dims[2]) as usize;
@@ -504,10 +504,10 @@ fn blur_axis(src: &[ProbeSh], dst: &mut [ProbeSh], counts: [usize; 3], axis: usi
 }
 
 /// Spatially denoise the probe SH grid in place with `iterations` separable
-/// blur passes. This is what cancels the blotchy per-probe Monte-Carlo variance
-/// — adjacent probes are independent noisy estimates, so averaging across the
+/// blur passes. This cancels the blotchy per-probe Monte-Carlo variance:
+/// adjacent probes are independent noisy estimates, so averaging across the
 /// grid pulls them toward the true (smooth, low-frequency) irradiance field with
-/// *no* temporal lag, unlike the EMA. Soft by design, which is the look we want.
+/// no temporal lag, unlike the EMA. Soft by design, which is the look we want.
 pub fn blur_probe_grid(probes: &mut [ProbeSh], counts: [usize; 3], iterations: u32) {
     let [nx, ny, nz] = counts;
     if probes.len() != nx * ny * nz || (nx < 3 && ny < 3 && nz < 3) {
@@ -639,9 +639,9 @@ mod tests {
         let at = |x: usize, y: usize, z: usize| {
             gdf.dist[(z * dims[1] as usize + y) * dims[0] as usize + x]
         };
-        // Grid center (voxel 8,8,8 spans -1.5..1.5) is the cube center → inside.
+        // Grid center (voxel 8,8,8 spans -1.5..1.5) is the cube center, so inside.
         assert!(at(8, 8, 8) < 0.0, "cube center should be inside (negative)");
-        // A corner voxel is well outside → positive.
+        // A corner voxel is well outside, so positive.
         assert!(at(0, 0, 0) > 0.0, "far corner should be outside (positive)");
         assert!(gdf.index.iter().all(|&i| i == 0), "only instance 0 exists");
     }

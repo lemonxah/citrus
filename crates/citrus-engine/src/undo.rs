@@ -23,7 +23,7 @@ pub struct ObjectState {
     pub translation: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
-    /// Components as (registry name, RON) — diffable and restorable.
+    /// Components as (registry name, RON). Diffable and restorable.
     pub components: Vec<(String, String)>,
 }
 

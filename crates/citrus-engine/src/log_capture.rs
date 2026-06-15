@@ -21,7 +21,7 @@ pub struct LogEntry {
     pub time: String,
 }
 
-/// Ring buffer of recent log entries, oldest dropped past the cap.
+/// Ring buffer of recent log entries; oldest dropped past the cap.
 pub struct LogRing {
     pub entries: VecDeque<LogEntry>,
     cap: usize,

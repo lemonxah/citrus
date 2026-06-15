@@ -1,7 +1,7 @@
 //! Transform gizmo driver.
 //!
 //! Drives `transform_gizmo::Gizmo` directly instead of via the crate's egui
-//! wrapper: the wrapper registers an interact widget under the cursor every
+//! wrapper. The wrapper registers an interact widget under the cursor every
 //! frame, which would make egui claim the pointer over the whole viewport
 //! and break click-to-pick. Here the gizmo hit-tests itself
 //! (`pick_preview`) and the viewport decides who gets the click.
@@ -123,15 +123,15 @@ impl GizmoState {
             snap_scale: 0.1,
             pixels_per_point: ui.ctx().pixels_per_point(),
             visuals: GizmoVisuals {
-                // Fat, easy-to-grab handles: the pick tolerance scales with
+                // Fat, easy-to-grab handles. The pick tolerance scales with
                 // `gizmo_size * 0.1 + stroke_width * 2`, so a thick stroke both
                 // widens the clickable band and makes grabbing reliable (much
                 // less accidental orbit).
                 gizmo_size: 110.0,
                 stroke_width: 11.0,
-                // Per-handle hover emphasis: idle axes are dimmed so the axis
-                // under the cursor (full alpha, its own color) clearly pops as
-                // "this is what you'll grab". The crate highlights only the
+                // Per-handle hover emphasis. Idle axes are dimmed so the axis
+                // under the cursor (full alpha, its own color) stands out as
+                // the one you'll grab. The crate highlights only the
                 // hovered/active sub-gizmo, so the rest of the widget is
                 // unaffected (no whole-gizmo resize).
                 inactive_alpha: 0.5,

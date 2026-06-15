@@ -21,7 +21,7 @@ pub use code_editor::{
 };
 // Editor-only component UI. The runtime component types (Component,
 // ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
-// citrus-core — import those directly, not through the editor.
+// citrus-core. Import those directly, not through the editor.
 pub use components::{
     ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoCtx, Inspect,
     InspectCtx, components_ui,

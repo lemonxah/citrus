@@ -21,8 +21,8 @@ pub struct GpuContext {
     pub device: ash::Device,
     pub queue_family: u32,
     pub queue: vk::Queue,
-    /// Acceleration-structure loader, present only when the device supports
-    /// ray query (the lighting bake's ray tracing). `None` disables baking.
+    /// Acceleration-structure loader. Present only when the device supports
+    /// ray query (the lighting bake's ray tracing); `None` disables baking.
     // Consumed by the bake's BLAS/TLAS builders (next phase).
     #[allow(dead_code)]
     pub accel: Option<khr::acceleration_structure::Device>,

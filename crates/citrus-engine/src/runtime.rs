@@ -2,7 +2,7 @@
 //!
 //! This is what a bundled game's generated `main.rs` calls. It reuses the same
 //! scene / renderer / component path as the editor's Play mode, minus every
-//! egui panel — `FrameInput.egui` is `None`, so no editor code runs. Components
+//! egui panel. `FrameInput.egui` is `None`, so no editor code runs. Components
 //! are linked in statically and registered through the `register` callback
 //! (the runtime replacement for the editor's dylib hot-load).
 
@@ -81,7 +81,7 @@ impl GameConfig {
 
 /// Run a game to completion: open a window, load the boot scene, and run the
 /// component loop until the window closes. `register` adds the game's component
-/// types (the built-ins are already present) — the statically-linked stand-in
+/// types (the built-ins are already present); it's the statically-linked stand-in
 /// for the editor's plugin dylib load.
 pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
     let mut registry = ComponentRegistry::with_builtins();
@@ -123,7 +123,7 @@ struct GameApp {
     renderer: Option<Renderer>,
     /// Physics simulation, rebuilt whenever a scene loads. A game always runs it.
     physics: Option<PhysicsWorld>,
-    /// Realtime-GI driver — runs the scene's realtime-GI setting in the game.
+    /// Realtime-GI driver. Runs the scene's realtime-GI setting in the game.
     rt_gi: crate::realtime_gi::RealtimeGiState,
     /// Input binding system (2C): keyboard/mouse/gamepad → action snapshot.
     input: InputManager,
@@ -173,7 +173,7 @@ impl GameApp {
             &mut self.shaders,
         )?;
         // Loaded scenes carry their own Camera/Light components, but older or
-        // hand-written scenes might not — mirror the editor's safety net.
+        // hand-written scenes might not, so mirror the editor's safety net.
         self.scene.ensure_camera_components(&self.registry);
         self.scene.ensure_light_components(&self.registry);
         self.scene.ensure_camera_ids();
@@ -324,7 +324,7 @@ impl GameApp {
         }
 
         let env = self.scene.environment.clone();
-        // Baked scene → the environment sun is in the bake, not realtime.
+        // For a baked scene the environment sun is in the bake, not realtime.
         let sun_realtime = env.sun_enabled && self.scene.baked.is_none();
         let mut lights = Vec::new();
         if sun_realtime {

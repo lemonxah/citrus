@@ -4,7 +4,7 @@
 //! material part (mirroring the glTF loader's one-mesh-per-primitive model),
 //! and PBR factors plus base color / normal / emission textures are mapped
 //! onto the standard shader. Roughness/metalness *textures* are not packed
-//! into ORM yet (factors only) — tracked in TODO.md.
+//! into ORM yet (factors only); tracked in TODO.md.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -237,7 +237,7 @@ fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>
 
 /// Pack each triangle into its own cell of a square grid in the [0,1] UV
 /// square, writing the result to `uv1`. Non-overlapping (valid for lightmap
-/// baking) but seam-heavy — a real chart-based unwrap (xatlas) is a follow-up.
+/// baking) but seam-heavy; a real chart-based unwrap (xatlas) is a follow-up.
 fn generate_lightmap_grid(vertices: &mut [Vertex]) {
     let tri_count = vertices.len() / 3;
     if tri_count == 0 {

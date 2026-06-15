@@ -1,10 +1,10 @@
-//! Input binding system (engine-agnostic). Defines abstract **actions**
-//! (`Move`, `Jump`, `Look`, ...) and **control schemes** that map physical
+//! Input binding system (engine-agnostic). Defines abstract actions
+//! (`Move`, `Jump`, `Look`, ...) and control schemes that map physical
 //! inputs (keys, mouse, gamepad) to them, plus the per-frame [`InputState`]
 //! snapshot a component reads through `ComponentCtx`.
 //!
-//! This crate is winit/gilrs-free by design, so physical inputs are mirrored as
-//! plain enums ([`Key`], [`MouseButton`], [`PadButton`], [`PadAxis`]); the engine
+//! This crate is winit/gilrs-free, so physical inputs are mirrored as
+//! plain enums ([`Key`], [`MouseButton`], [`PadButton`], [`PadAxis`]). The engine
 //! translates real device events into [`RawInput`] and [`resolve`]s it against the
 //! active [`ControlScheme`] into an [`InputState`].
 
