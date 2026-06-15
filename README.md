@@ -1,10 +1,31 @@
 # citrus
 
-A Rust + Vulkan game engine with a dockable in-engine editor, built VR-first
-(OpenXR). Powers [vrsh](../vrsh), a social-VR platform. citrus itself is
-general-purpose: scenes, materials, FBX/glTF import, components and Rust
-plugins, custom shaders, lighting + GPU bake, audio, physics (rapier3d), and a
-growing editor that builds standalone games.
+Citrus is a standalone 3D game engine in Rust + Vulkan with a dockable in-engine
+editor. It's a general-purpose desktop engine: scenes, materials, FBX/glTF
+import, a component + hot-reloadable Rust-plugin system, custom shaders, realtime
+global illumination (**Flux** — see below), a lighting bake, audio, physics
+(rapier3d), and building standalone games straight from the editor. VR (OpenXR)
+is on the roadmap, not a prerequisite.
+
+## Flux — realtime global illumination
+
+Flux is Citrus's built-in realtime GI: a Lumen-style screen-space technique that
+needs no bake and no RT cores. Each frame it places sparse screen-space probes
+(one per 4x4 pixel block), reconstructs world position + normal from a depth
+prepass, and cosine-traces them against a cached **Global Distance Field** — a
+merged 3D distance + nearest-instance texture built from per-mesh SDFs. Emissive
+surfaces are sampled analytically as sphere area lights (NEE), so emitter bounce
+is smooth instead of noisy. Results temporally accumulate with reprojection (and
+a per-frame jittered seed so the noise actually converges), are bilaterally
+upsampled to full resolution in the forward shader, and feed back into the next
+frame's trace for cheap multi-bounce (a radiance cache).
+
+The whole trace is folded into the main command buffer — no extra submits or
+fence stalls, on the order of 0.06 ms/frame of CPU. The result is soft,
+atmospheric, and fully dynamic: move a light or an emissive object and the bounce
+updates live. It's tuned per-scene in the Environment tab (intensity, quality
+preset, bounces, smoothing, GDF resolution). Baked lightmaps stay available as
+the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 
 ## Project docs
 
@@ -22,8 +43,9 @@ growing editor that builds standalone games.
 | Concern | Choice |
 |---|---|
 | Graphics | Vulkan 1.3 via [ash](https://crates.io/crates/ash) (dynamic rendering, sync2) |
+| Realtime GI | **Flux** — screen-space probes marching a global distance field (no bake, no RT cores) |
 | Lighting bake | Vulkan ray query (VK_KHR_ray_query / acceleration_structure) |
-| VR | OpenXR via the [openxr](https://crates.io/crates/openxr) crate (Monado / SteamVR runtimes) |
+| VR (planned) | OpenXR via the [openxr](https://crates.io/crates/openxr) crate (Monado / SteamVR runtimes) |
 | Editor GUI | [egui](https://crates.io/crates/egui) + egui_dock, rendered in-engine |
 | Worlds/props | glTF 2.0, FBX (ufbx) |
 | Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones (planned) |

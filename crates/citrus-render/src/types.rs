@@ -418,6 +418,16 @@ pub struct FrameInput<'a> {
     /// GI debug view: 0 = off, 1 = world normals, 2 = indirect/GI term only.
     /// Lets you isolate the probe-grid blockiness on screen.
     pub gi_debug: u32,
+    /// Whether the editor viewport is visible this frame. When false (e.g. only
+    /// the Camera tab is shown) the main scene draws + the viewport Flux trace
+    /// are skipped to save GPU; the swapchain is still cleared and egui drawn.
+    /// Always true for the game runtime.
+    pub render_viewport: bool,
+    /// Editor only: when set, render the viewport 3D into an offscreen texture of
+    /// this pixel size (the viewport dock rect) instead of the full swapchain, so
+    /// it isn't rasterized under the dock panels. `None` for the game runtime,
+    /// which renders straight to the swapchain.
+    pub viewport_extent: Option<[u32; 2]>,
     /// Resolved post-processing parameters (from the camera's blended Volume
     /// profiles). Per-pixel effects applied in the surface shaders.
     pub postfx: PostFx,

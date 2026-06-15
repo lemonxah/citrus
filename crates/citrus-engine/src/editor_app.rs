@@ -79,6 +79,8 @@ pub fn run(config: AppConfig) -> Result<()> {
         widget_filter: WidgetFilter::default(),
         gizmo_drag: false,
         orbit_armed: false,
+        camera_tab_visible: false,
+        viewport_visible: true,
         audio: audio::AudioEngine::new(),
         actions: Vec::new(),
         undo_stack: UndoStack::default(),
@@ -565,6 +567,14 @@ struct EngineApp {
     /// The current left-drag began with the pointer over the viewport, so it
     /// may orbit. Drags that start on a panel never orbit.
     orbit_armed: bool,
+    /// Set each frame iff the Camera tab was the visible/active dock tab; gates
+    /// the camera-preview render so it (and its Flux trace) is skipped when the
+    /// tab is hidden.
+    camera_tab_visible: bool,
+    /// Set each frame iff the Viewport tab was visible; gates the main scene draws
+    /// + viewport Flux trace so they're skipped when the viewport is hidden (e.g.
+    /// only the Camera tab is shown).
+    viewport_visible: bool,
     /// Audio playback (None if no output device). Drives AudioSource sounds
     /// in Play mode.
     audio: Option<audio::AudioEngine>,
@@ -3783,7 +3793,15 @@ impl EngineApp {
                     Tab::Code(p) => Some(p.clone()),
                     _ => None,
                 });
+            // egui_dock only calls TabViewer::ui for the visible (active) tab of
+            // each leaf, so camera_ui sets this flag iff the Camera tab is on
+            // screen this frame. Reset before the dock, read after to gate the
+            // (now Flux-traced) preview render.
+            self.camera_tab_visible = false;
+            self.viewport_visible = false;
             let mut tabs = EditorTabs {
+                camera_visible: &mut self.camera_tab_visible,
+                viewport_visible: &mut self.viewport_visible,
                 scene: &mut self.scene,
                 selection: &mut self.selection,
                 inspector: &mut self.inspector,
@@ -3826,6 +3844,9 @@ impl EngineApp {
                 // close-all button.
                 .show_close_buttons(true)
                 .show_leaf_close_all_buttons(false)
+                // No per-leaf collapse button: it only hid the leaf's contents
+                // without resizing the neighbouring docks, which was confusing.
+                .show_leaf_collapse_buttons(false)
                 .show(ctx, &mut tabs);
             self.dock_state = dock_state;
 
@@ -3978,13 +3999,12 @@ impl EngineApp {
             ]),
         };
 
-        // Render the camera preview when a Camera tab is open, or when a camera
-        // object is selected (shown as a viewport overlay so its framing can be
-        // tweaked live). A selected camera takes precedence over the main one.
-        let camera_tab_open = self
-            .dock_state
-            .iter_all_tabs()
-            .any(|(_, tab)| matches!(tab, Tab::Camera));
+        // Render the camera preview only when the Camera tab is actually VISIBLE
+        // (the active tab in its dock leaf this frame), or when a camera object is
+        // selected (shown as a viewport overlay so its framing can be tweaked
+        // live). The tab merely being present in the layout no longer forces the
+        // (now Flux-traced) preview to render every frame. Selected camera takes
+        // precedence over the main one.
         let selected_camera = match self.selection {
             Selection::Object(i) if self.scene.camera_view_proj_for(i, 1.0).is_some() => Some(i),
             _ => None,
@@ -3992,7 +4012,9 @@ impl EngineApp {
         let preview_view = selected_camera
             .and_then(|i| self.scene.camera_view_proj_for(i, 16.0 / 9.0))
             .or_else(|| {
-                camera_tab_open.then(|| self.scene.main_camera_view_proj(16.0 / 9.0)).flatten()
+                self.camera_tab_visible
+                    .then(|| self.scene.main_camera_view_proj(16.0 / 9.0))
+                    .flatten()
             });
         let camera_preview = preview_view.map(|(view, proj, position)| CameraData {
             view,
@@ -4029,6 +4051,9 @@ impl EngineApp {
             draws: &self.scene.draws,
             lightmap_preview: self.lightmap_preview,
             gi_debug: self.gi_debug,
+            render_viewport: self.viewport_visible,
+            // Wired in the final RTT step; None keeps the current swapchain path.
+            viewport_extent: None,
             postfx,
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
@@ -4066,6 +4091,10 @@ impl EngineApp {
 
 /// Dock tab renderer; collects actions for post-UI processing.
 struct EditorTabs<'a> {
+    /// Set true by `camera_ui` when the Camera tab is the visible/active tab.
+    camera_visible: &'a mut bool,
+    /// Set true by `viewport_ui` when the Viewport tab is the visible/active tab.
+    viewport_visible: &'a mut bool,
     scene: &'a mut LoadedScene,
     selection: &'a mut Selection,
     inspector: &'a mut InspectorPanel,
@@ -4872,6 +4901,9 @@ impl EditorTabs<'_> {
     /// The Camera tab: shows the main camera's offscreen preview, scaled to
     /// fit while preserving the target's aspect.
     fn camera_ui(&mut self, ui: &mut egui::Ui) {
+        // The Camera tab is on screen this frame, so the preview is worth
+        // rendering (the gate read after the dock pass in `redraw`).
+        *self.camera_visible = true;
         let has_camera = self.scene.main_camera().is_some();
         match self.camera_preview {
             Some((texture, size)) if has_camera => {
@@ -5275,6 +5307,9 @@ impl EditorTabs<'_> {
     }
 
     fn viewport_ui(&mut self, ui: &mut egui::Ui) {
+        // The Viewport tab is on screen this frame, so the main scene render is
+        // worth doing (gate read after the dock pass in `redraw`).
+        *self.viewport_visible = true;
         let rect = ui.max_rect();
         *self.viewport_rect = rect;
         let response = ui.interact(

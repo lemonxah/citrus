@@ -378,6 +378,8 @@ impl GameApp {
             draws: &self.scene.draws,
             lightmap_preview: false,
             gi_debug: 0,
+            render_viewport: true,
+            viewport_extent: None,
             postfx,
             egui: None,
         };

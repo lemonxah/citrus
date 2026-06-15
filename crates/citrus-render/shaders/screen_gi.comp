@@ -151,6 +151,25 @@ vec3 direct_light(vec3 p, vec3 n, float eps) {
     }
     return sum;
 }
+// Radiance-cache feedback: the previous frame's GI result reprojected to a world
+// point. A bounce ray hitting that surface can reuse it as incoming indirect,
+// which accumulates multi-bounce over frames at single-bounce cost (Lumen does
+// this via its surface cache). `valid` is false when the point was off-screen or
+// a different surface last frame (disocclusion), so the caller can fall back.
+vec3 prev_indirect(vec3 hp, out bool valid) {
+    valid = false;
+    vec4 pclip = pc.prev_view_proj * vec4(hp, 1.0);
+    if (pclip.w <= 1e-4) return vec3(0.0);
+    vec2 ndc = pclip.xy / pclip.w;
+    if (pc.misc.w != 0u) ndc.y = -ndc.y; // match the Y-flipped viewport
+    vec2 uv = ndc * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec3(0.0);
+    vec4 h = texture(u_history, uv);
+    float prev_dist = length(hp - pc.prev_cam.xyz);
+    if (abs(h.a - prev_dist) > max(prev_dist * 0.1, 0.15)) return vec3(0.0);
+    valid = true;
+    return max(h.rgb, vec3(0.0));
+}
 vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, inout uint rng) {
     vec3 radiance = vec3(0.0), throughput = vec3(1.0);
     vec3 ro = origin, rd = dir;
@@ -160,10 +179,16 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
         vec3 n = scene_normal(hp, eps);
         if (dot(n, rd) > 0.0) n = -n;
         vec3 albedo = insts[who].albedo.rgb;
-        // Light this bounce by NEE (direct lights + emitter spheres). The analytic
-        // form makes emitter contribution smooth and uniform, avoiding the blobby
-        // GDF-voxel pattern that adding emission on hit produced.
-        radiance += throughput * (albedo / PI) * (direct_light(hp, n, eps) + emitter_light(hp, n, eps));
+        // Light this bounce: fresh direct lights always, plus the indirect that
+        // reached this surface. When the radiance cache has a valid sample for the
+        // hit point, use it (it already holds the emitter NEE + prior bounces, so
+        // this accumulates multi-bounce over frames); otherwise fall back to the
+        // fresh emitter NEE so first-frame / disoccluded hits still get emitter
+        // light. Analytic NEE keeps emitter contribution smooth (no GDF-voxel blobs).
+        bool cache_ok;
+        vec3 cached = prev_indirect(hp, cache_ok);
+        vec3 indirect_in = cache_ok ? cached : emitter_light(hp, n, eps);
+        radiance += throughput * (albedo / PI) * (direct_light(hp, n, eps) + indirect_in);
         throughput *= albedo;
         if (max(max(throughput.r, throughput.g), throughput.b) < 0.01) break;
         ro = hp + n * (eps * 2.0);

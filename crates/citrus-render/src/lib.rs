@@ -656,6 +656,9 @@ struct CameraPreview {
     depth: vk::Image,
     depth_view: vk::ImageView,
     depth_alloc: Option<Allocation>,
+    /// Per-camera Flux targets (sampleable depth prepass + ping-pong gather), so
+    /// the preview gets its own screen-space GI traced from the game camera.
+    sgi: ScreenGiTargets,
     /// Per-frame-in-flight camera UBOs + their set-0 descriptor sets.
     ubos: Vec<Buffer>,
     sets: Vec<vk::DescriptorSet>,
@@ -815,6 +818,8 @@ impl CameraPreview {
         .map_err(|e| anyhow::anyhow!("camera preview descriptor set: {e}"))?;
         let texture_id = egui.add_user_texture(egui_set);
 
+        let sgi = ScreenGiTargets::new(ctx, allocator, extent)?;
+
         Ok(Self {
             extent,
             color,
@@ -823,6 +828,7 @@ impl CameraPreview {
             depth,
             depth_view,
             depth_alloc: Some(depth_alloc),
+            sgi,
             ubos,
             sets,
             ubo_pool,
@@ -833,11 +839,108 @@ impl CameraPreview {
     }
 
     fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        self.sgi.destroy(device, allocator);
         for b in &mut self.ubos {
             b.destroy(device, allocator);
         }
         unsafe {
             device.destroy_descriptor_pool(self.ubo_pool, None);
+            device.destroy_descriptor_pool(self.egui_pool, None);
+            device.destroy_descriptor_set_layout(self.egui_layout, None);
+            device.destroy_image_view(self.color_view, None);
+            device.destroy_image(self.color, None);
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.depth, None);
+        }
+        if let Some(a) = self.color_alloc.take() {
+            let _ = allocator.free(a);
+        }
+        if let Some(a) = self.depth_alloc.take() {
+            let _ = allocator.free(a);
+        }
+    }
+}
+
+/// Offscreen target for the EDITOR viewport. The 3D scene renders here sized to
+/// the viewport dock rect (so it isn't rasterized at full-window resolution under
+/// the panels) and egui shows it as an image. Editor-only: the game/runtime has
+/// no `ViewportTarget` and renders straight to the swapchain unchanged. Reuses
+/// the main camera descriptor set, so it only holds the color/depth surfaces +
+/// the egui texture.
+#[allow(dead_code)] // wired into render() in stage 2 of the viewport-RTT refactor
+struct ViewportTarget {
+    extent: vk::Extent2D,
+    color: vk::Image,
+    color_view: vk::ImageView,
+    color_alloc: Option<Allocation>,
+    depth: vk::Image,
+    depth_view: vk::ImageView,
+    depth_alloc: Option<Allocation>,
+    /// Rect-sized Flux targets for the editor main-camera trace (the game keeps
+    /// the renderer's own `self.sgi`).
+    sgi: ScreenGiTargets,
+    egui_layout: vk::DescriptorSetLayout,
+    egui_pool: vk::DescriptorPool,
+    texture_id: egui::TextureId,
+}
+
+#[allow(dead_code)] // wired in stage 2 of the viewport-RTT refactor
+impl ViewportTarget {
+    fn new(
+        ctx: &GpuContext,
+        allocator: &mut Allocator,
+        color_format: vk::Format,
+        sampler: vk::Sampler,
+        extent: vk::Extent2D,
+        egui: &mut egui_ash_renderer::Renderer,
+    ) -> Result<Self> {
+        let device = &ctx.device;
+        let (color, color_alloc) = create_image(
+            device,
+            allocator,
+            color_format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            extent,
+            "viewport color",
+        )?;
+        let color_view = create_view(device, color, color_format, vk::ImageAspectFlags::COLOR)?;
+        let (depth, depth_alloc) = create_image(
+            device,
+            allocator,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            extent,
+            "viewport depth",
+        )?;
+        let depth_view = create_view(device, depth, DEPTH_FORMAT, vk::ImageAspectFlags::DEPTH)?;
+        let egui_layout = egui_ash_renderer::vulkan::create_vulkan_descriptor_set_layout(device)
+            .map_err(|e| anyhow::anyhow!("viewport descriptor layout: {e}"))?;
+        let egui_pool = egui_ash_renderer::vulkan::create_vulkan_descriptor_pool(device, 1)
+            .map_err(|e| anyhow::anyhow!("viewport descriptor pool: {e}"))?;
+        let egui_set = egui_ash_renderer::vulkan::create_vulkan_descriptor_set(
+            device, egui_layout, egui_pool, color_view, sampler,
+        )
+        .map_err(|e| anyhow::anyhow!("viewport descriptor set: {e}"))?;
+        let texture_id = egui.add_user_texture(egui_set);
+        let sgi = ScreenGiTargets::new(ctx, allocator, extent)?;
+        Ok(Self {
+            extent,
+            color,
+            color_view,
+            color_alloc: Some(color_alloc),
+            depth,
+            depth_view,
+            depth_alloc: Some(depth_alloc),
+            sgi,
+            egui_layout,
+            egui_pool,
+            texture_id,
+        })
+    }
+
+    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        self.sgi.destroy(device, allocator);
+        unsafe {
             device.destroy_descriptor_pool(self.egui_pool, None);
             device.destroy_descriptor_set_layout(self.egui_layout, None);
             device.destroy_image_view(self.color_view, None);
@@ -1018,6 +1121,14 @@ pub struct Renderer {
     /// kept alive after the trace is recorded into the main cb, freed one frame
     /// later once that frame's fence has signalled.
     sgi_transients: Vec<Option<gpu_gi::ScreenGiTransient>>,
+    /// Temporal state + transient ring for the in-game camera preview's own Flux
+    /// trace (mirrors the editor-viewport state above, but for the game camera).
+    preview_sgi_parity: usize,
+    preview_sgi_last_view_proj: Option<glam::Mat4>,
+    preview_sgi_last_cam: glam::Vec3,
+    preview_sgi_history_valid: bool,
+    preview_sgi_frame: u32,
+    preview_sgi_transients: Vec<Option<gpu_gi::ScreenGiTransient>>,
     /// Camera position the previous gather was traced from (reprojection).
     sgi_last_cam: glam::Vec3,
     command_pool: vk::CommandPool,
@@ -1057,6 +1168,10 @@ pub struct Renderer {
     /// Offscreen main-camera target, created lazily the first frame the Camera
     /// tab asks for it.
     camera_preview: Option<CameraPreview>,
+    /// Editor-only offscreen target for the viewport 3D (see `ViewportTarget`).
+    /// `None` for the game runtime (renders straight to the swapchain).
+    #[allow(dead_code)] // read by the RTT render branch (stage 2, in progress)
+    viewport_target: Option<ViewportTarget>,
     /// Baked light-probe SH (set-0 binding 2). A 1-probe zero buffer until a
     /// bake is loaded, so the binding is always valid.
     probe_buffer: Buffer,
@@ -1443,6 +1558,12 @@ impl Renderer {
             sgi_parity: 0,
             sgi_frame: 0,
             sgi_transients: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
+            preview_sgi_parity: 0,
+            preview_sgi_last_view_proj: None,
+            preview_sgi_last_cam: glam::Vec3::ZERO,
+            preview_sgi_history_valid: false,
+            preview_sgi_frame: 0,
+            preview_sgi_transients: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
             sgi_last_cam: glam::Vec3::ZERO,
             command_pool,
             frames,
@@ -1467,6 +1588,7 @@ impl Renderer {
             egui: Some(egui),
             egui_free_queue: VecDeque::new(),
             camera_preview: None,
+            viewport_target: None,
             probe_buffer,
             probe_count: 1, // default buffer holds one probe
             probe_volumes: Vec::new(),
@@ -2236,6 +2358,10 @@ impl Renderer {
             let alloc = self.allocator();
             t.destroy(&device, &mut alloc.lock().unwrap());
         }
+        if let Some(mut t) = self.preview_sgi_transients[self.frame_index].take() {
+            let alloc = self.allocator();
+            t.destroy(&device, &mut alloc.lock().unwrap());
+        }
 
         // This frame's prior submission has retired; egui textures freed two
         // frames ago are safe to release now.
@@ -2322,7 +2448,9 @@ impl Renderer {
         // result. The actual depth prepass + GDF trace is recorded into the main
         // frame command buffer below (no separate submit/fence stall).
         let mut sgi_record: Option<(vk::Pipeline, bool, usize, glam::Mat4, glam::Vec3, f32)> = None;
-        if let Some(dp) = depth_pipe {
+        // Skip the viewport-camera Flux trace when the viewport is hidden (e.g.
+        // only the Camera tab is shown) — nothing samples its result.
+        if let Some(dp) = depth_pipe.filter(|_| input.render_viewport) {
             // Temporal reprojection means we can keep accumulating while the
             // camera moves (the gather reprojects the previous result). Trace
             // while moving, and for a few frames after stopping so it fully
@@ -2411,7 +2539,7 @@ impl Renderer {
                 }
             }
             if let Some(preview) = &mut self.camera_preview {
-                let cam_ubo = frame_ubo(
+                let mut cam_ubo = frame_ubo(
                     camera,
                     input,
                     lights,
@@ -2421,6 +2549,9 @@ impl Renderer {
                     &self.probe_volumes,
                     [preview.extent.width as f32, preview.extent.height as f32],
                 );
+                // The preview runs its own Flux trace when a GDF exists, so flag
+                // its shader to sample the screen-GI (binding 4) like the viewport.
+                cam_ubo.debug[2] = if sgi_active { 1.0 } else { 0.0 };
                 preview.ubos[self.frame_index].write(0, bytemuck::bytes_of(&cam_ubo));
             }
         }
@@ -2563,17 +2694,21 @@ impl Renderer {
                 }],
             );
 
-            // Skybox first (background), then the scene over it.
-            if input.draw_skybox {
-                self.record_skybox(&device, cb, frame_set)?;
+            // Skybox + scene only when the viewport is visible; otherwise the
+            // swapchain is just cleared (above) and egui draws the dock over it.
+            let mut stats = RenderStats::default();
+            if input.render_viewport {
+                if input.draw_skybox {
+                    self.record_skybox(&device, cb, frame_set)?;
+                }
+                stats = self.record_scene_draws(&device, cb, &order, input, frame_set)?;
             }
-            let mut stats = self.record_scene_draws(&device, cb, &order, input, frame_set)?;
 
             // Selection outlines: inverted hull pass over highlighted draws.
             let outline_draws: Vec<usize> = (0..input.draws.len())
                 .filter(|&i| input.draws[i].highlight > 0.0)
                 .collect();
-            if !outline_draws.is_empty() {
+            if input.render_viewport && !outline_draws.is_empty() {
                 stats.outline_draws += outline_draws.len() as u32 * 2;
                 stats.draw_calls += outline_draws.len() as u32 * 2;
                 stats.pipeline_binds += 2;
@@ -2899,6 +3034,8 @@ impl Renderer {
     /// and freed one frame later, after this frame's fence signals. `cur` is the
     /// ping-pong slot to write; `cur ^ 1` is the history read this frame.
     #[allow(clippy::too_many_arguments)]
+    /// Thin wrapper: trace Flux for the editor viewport camera into `self.sgi`,
+    /// stashing the per-frame transient for deferred free.
     fn record_screen_gi(
         &mut self,
         device: &ash::Device,
@@ -2911,12 +3048,64 @@ impl Renderer {
         prev_cam: glam::Vec3,
         alpha: f32,
     ) -> Result<()> {
-        if self.gpu_gi.as_ref().map_or(true, |g| !g.has_gdf()) {
-            return Ok(());
-        }
         let prev = cur ^ 1;
-        let extent = self.swapchain.extent;
-        // 1) Depth prepass: render opaque geometry depth-only into sgi.depth,
+        let t = self.record_flux_trace(
+            device,
+            cb,
+            depth_pipe,
+            input,
+            &input.camera,
+            self.sgi.depth_image,
+            self.sgi.depth_view,
+            self.sgi.probe_extent,
+            self.sgi.gi_image[cur],
+            self.sgi.gi_view[cur],
+            self.sgi.gi_view[prev],
+            self.swapchain.extent,
+            history_valid,
+            prev_vp,
+            prev_cam,
+            alpha,
+            self.sgi_frame,
+            self.screen_gi_flip_y,
+        )?;
+        if let Some(t) = t {
+            self.sgi_transients[self.frame_index] = Some(t);
+        }
+        Ok(())
+    }
+
+    /// Record a Flux trace (depth prepass + GDF gather) for an arbitrary camera
+    /// into caller-owned targets, returning the per-frame transient to hold until
+    /// the frame fence signals. Shared by the editor viewport and the in-game
+    /// camera preview (each passes its own camera + targets).
+    #[allow(clippy::too_many_arguments)]
+    fn record_flux_trace(
+        &self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        depth_pipe: vk::Pipeline,
+        input: &FrameInput,
+        cam: &CameraData,
+        depth_image: vk::Image,
+        depth_view: vk::ImageView,
+        probe_extent: vk::Extent2D,
+        gi_out_image: vk::Image,
+        gi_out_view: vk::ImageView,
+        gi_hist_view: vk::ImageView,
+        full_extent: vk::Extent2D,
+        history_valid: bool,
+        prev_vp: glam::Mat4,
+        prev_cam: glam::Vec3,
+        alpha: f32,
+        frame_seed: u32,
+        flip_y: bool,
+    ) -> Result<Option<gpu_gi::ScreenGiTransient>> {
+        if self.gpu_gi.as_ref().map_or(true, |g| !g.has_gdf()) {
+            return Ok(None);
+        }
+        let extent = full_extent;
+        // 1) Depth prepass: render opaque geometry depth-only into depth_image,
         //    recorded directly into the main cb (no separate submit/stall).
         unsafe {
             let to_depth = vk::ImageMemoryBarrier::default()
@@ -2924,7 +3113,7 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                .image(self.sgi.depth_image)
+                .image(depth_image)
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -2941,7 +3130,7 @@ impl Renderer {
                 &[to_depth],
             );
             let depth_att = vk::RenderingAttachmentInfo::default()
-                .image_view(self.sgi.depth_view)
+                .image_view(depth_view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -2972,7 +3161,7 @@ impl Renderer {
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, depth_pipe);
             // The shadow pipeline (depth-only, no color attachment) uses
             // `shadow.vert`, which reads only push constants (no descriptor sets).
-            let view_proj = (input.camera.proj * input.camera.view).to_cols_array_2d();
+            let view_proj = (cam.proj * cam.view).to_cols_array_2d();
             for draw in input.draws {
                 // Transparent surfaces are kept out of the Flux depth prepass:
                 // otherwise the screen probe at a glass pixel reconstructs the
@@ -3006,7 +3195,7 @@ impl Renderer {
                 .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .image(self.sgi.depth_image)
+                .image(depth_image)
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -3024,9 +3213,9 @@ impl Renderer {
             );
         }
 
-        // 2) Screen-GI gather: trace the GDF per pixel into sgi.gi.
+        // 2) Screen-GI gather: trace the GDF per pixel into the gather image.
         let allocator = self.allocator();
-        let inv_vp = (input.camera.proj * input.camera.view).inverse();
+        let inv_vp = (cam.proj * cam.view).inverse();
         let amb = input.light.ambient; // dim sky/ambient for escaped rays
         let lights: Vec<BakeLight> = input
             .lights
@@ -3058,7 +3247,7 @@ impl Renderer {
         let params = gpu_gi::ScreenGiParams {
             inv_view_proj: inv_vp.to_cols_array_2d(),
             prev_view_proj: prev_vp.to_cols_array_2d(),
-            cam: input.camera.position.extend(1.0).to_array(),
+            cam: cam.position.extend(1.0).to_array(),
             prev_cam: prev_cam.extend(1.0).to_array(),
             gdf_min: [0.0; 4],
             gdf_max: [0.0; 4],
@@ -3066,10 +3255,10 @@ impl Renderer {
             counts: [fs.samples.max(1), fs.bounces.max(1), 0, 0],
             march: [0.02, fs.march_distance.max(0.0), alpha, fs.firefly_clamp],
             misc: [
-                self.sgi_frame,
-                extent.width,
-                extent.height,
-                if self.screen_gi_flip_y { 1 } else { 0 },
+                frame_seed,
+                full_extent.width,
+                full_extent.height,
+                if flip_y { 1 } else { 0 },
             ],
         };
         // Trace at probe resolution (one probe per SCREEN_PROBE_DIV² pixels);
@@ -3079,23 +3268,18 @@ impl Renderer {
             device,
             cb,
             &allocator,
-            self.sgi.depth_view,
+            depth_view,
             self.lightmap_sampler,
-            self.sgi.gi_image[cur],
-            self.sgi.gi_view[cur],
-            self.sgi.gi_view[prev],
-            self.sgi.probe_extent,
+            gi_out_image,
+            gi_out_view,
+            gi_hist_view,
+            probe_extent,
             &lights,
             &self.gi_emitters,
             history_valid,
             params,
         )?;
-        // Hold the trace's descriptor pool/buffers until this frame's fence
-        // signals; the render loop frees this slot at the top of the next reuse.
-        if let Some(t) = transient {
-            self.sgi_transients[self.frame_index] = Some(t);
-        }
-        Ok(())
+        Ok(transient)
     }
 
     /// Record the opaque+transparent scene draws (no outline, no egui) for one
@@ -3245,6 +3429,93 @@ impl Renderer {
         input: &FrameInput,
         clear_color: [f32; 4],
     ) -> Result<()> {
+        // Flux GI for the in-game camera: trace from the preview (game) camera
+        // into the preview's own targets, before its color pass, so the preview
+        // shows screen-space GI like the main viewport. Folded into the same cb;
+        // its own temporal state + transient ring (freed a frame later).
+        if self.gi_has_gdf()
+            && let Some(pcam) = input.camera_preview.as_ref()
+        {
+            let (sgi_depth_image, sgi_depth_view, sgi_probe_extent, sgi_gi_image, sgi_gi_view, pextent) = {
+                let p = self.camera_preview.as_ref().unwrap();
+                (
+                    p.sgi.depth_image,
+                    p.sgi.depth_view,
+                    p.sgi.probe_extent,
+                    p.sgi.gi_image,
+                    p.sgi.gi_view,
+                    p.extent,
+                )
+            };
+            let depth_pipe = self.pipeline_cache.get(device, PipelineKey::shadow())?;
+            let vp = pcam.proj * pcam.view;
+            let moved = self.preview_sgi_last_view_proj != Some(vp);
+            let cur = self.preview_sgi_parity & 1;
+            let prev = cur ^ 1;
+            let prev_vp = self.preview_sgi_last_view_proj.unwrap_or(vp);
+            let prev_cam = if self.preview_sgi_last_view_proj.is_some() {
+                self.preview_sgi_last_cam
+            } else {
+                pcam.position
+            };
+            let hist_valid = self.preview_sgi_history_valid;
+            let s = self.flux_settings.smoothing.clamp(0.0, 1.0);
+            let alpha = if !hist_valid {
+                1.0
+            } else if moved {
+                0.5 - 0.4 * s
+            } else {
+                0.12 - 0.10 * s
+            };
+            self.preview_sgi_frame = self.preview_sgi_frame.wrapping_add(1);
+            let seed = self.preview_sgi_frame;
+            let flip = self.screen_gi_flip_y;
+            match self.record_flux_trace(
+                device,
+                cb,
+                depth_pipe,
+                input,
+                pcam,
+                sgi_depth_image,
+                sgi_depth_view,
+                sgi_probe_extent,
+                sgi_gi_image[cur],
+                sgi_gi_view[cur],
+                sgi_gi_view[prev],
+                pextent,
+                hist_valid,
+                prev_vp,
+                prev_cam,
+                alpha,
+                seed,
+                flip,
+            ) {
+                Ok(t) => {
+                    if let Some(t) = t {
+                        self.preview_sgi_transients[self.frame_index] = Some(t);
+                    }
+                    self.preview_sgi_history_valid = true;
+                    self.preview_sgi_last_view_proj = Some(vp);
+                    self.preview_sgi_last_cam = pcam.position;
+                    self.preview_sgi_parity ^= 1;
+                    // Point the preview's binding 4 at the gather just written.
+                    let view = sgi_gi_view[cur];
+                    let set = self.camera_preview.as_ref().unwrap().sets[self.frame_index];
+                    let info = [vk::DescriptorImageInfo::default()
+                        .sampler(self.lightmap_sampler)
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                    let write = vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(4)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&info);
+                    unsafe { device.update_descriptor_sets(&[write], &[]) };
+                }
+                Err(e) => tracing::warn!("preview Flux trace failed: {e:#}"),
+            }
+        }
+
         let preview = self.camera_preview.as_ref().unwrap();
         let extent = preview.extent;
         let color = preview.color;
@@ -3569,6 +3840,11 @@ impl Drop for Renderer {
                     t.destroy(device, &mut alloc);
                 }
             }
+            for slot in &mut self.preview_sgi_transients {
+                if let Some(mut t) = slot.take() {
+                    t.destroy(device, &mut alloc);
+                }
+            }
             for ubo in &mut self.frame_ubos {
                 ubo.destroy(device, &mut alloc);
             }
@@ -3578,6 +3854,9 @@ impl Drop for Renderer {
             self.default_fx_ubo.destroy(device, &mut alloc);
             if let Some(mut preview) = self.camera_preview.take() {
                 preview.destroy(device, &mut alloc);
+            }
+            if let Some(mut vt) = self.viewport_target.take() {
+                vt.destroy(device, &mut alloc);
             }
             self.depth.destroy(device, &mut alloc);
             self.sgi.destroy(device, &mut alloc);
