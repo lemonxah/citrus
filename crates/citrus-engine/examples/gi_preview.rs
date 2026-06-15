@@ -49,6 +49,7 @@ fn scene_instances() -> Vec<SdfInstance> {
             sdf: plane_sdf,
             albedo: [0.8, 0.8, 0.8],
             emission: [0.0, 0.0, 0.0],
+            static_geometry: true,
         },
         SdfInstance {
             inv: sphere_world.inverse(),
@@ -56,6 +57,7 @@ fn scene_instances() -> Vec<SdfInstance> {
             sdf: sphere_sdf,
             albedo: [0.1, 0.1, 0.1],
             emission: EMISSION.to_array(),
+            static_geometry: true,
         },
     ]
 }

@@ -20,12 +20,50 @@ use glam::Vec3;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::Allocator;
 
-use crate::alloc::{self, Buffer};
+use crate::alloc::Buffer;
 use crate::context::GpuContext;
 use crate::texture::GpuTexture;
 use crate::types::{BakeLight, LightKind, ProbeSh};
 
 const SW_GI_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sw_gi.comp.spv"));
+const SCREEN_GI_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/screen_gi.comp.spv"));
+
+/// Screen-GI compute params (std140 UBO mirror of `screen_gi.comp`'s Params).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ScreenGiParams {
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub prev_view_proj: [[f32; 4]; 4], // reproject world pos → previous-frame UV
+    pub cam: [f32; 4],
+    pub prev_cam: [f32; 4],            // previous frame camera pos (disocclusion)
+    pub gdf_min: [f32; 4],
+    pub gdf_max: [f32; 4],
+    pub sky: [f32; 4],
+    pub counts: [u32; 4], // samples, bounces, light_count, emitter_count
+    pub march: [f32; 4],  // eps, max_dist, temporal_alpha, _
+    pub misc: [u32; 4],   // seed, screen_w, screen_h, flip_y
+}
+
+/// Per-frame Flux trace resources that must outlive the command-buffer recording
+/// (the descriptor pool + the host SSBOs/UBO the dispatch reads). When the trace
+/// is folded into the main frame command buffer there is no fence wait to bound
+/// their lifetime, so the caller holds these and frees them one frame later —
+/// after the frame fence that consumed them has signalled.
+pub struct ScreenGiTransient {
+    desc_pool: vk::DescriptorPool,
+    light_buf: Buffer,
+    emitter_buf: Buffer,
+    param_buf: Buffer,
+}
+
+impl ScreenGiTransient {
+    pub fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
+        unsafe { device.destroy_descriptor_pool(self.desc_pool, None) };
+        self.light_buf.destroy(device, alloc);
+        self.emitter_buf.destroy(device, alloc);
+        self.param_buf.destroy(device, alloc);
+    }
+}
 
 /// Per-instance material the march shades GDF hits with (looked up by the index
 /// texture). Albedo drives the diffuse bounce; emission makes the surface a
@@ -125,6 +163,20 @@ impl CachedGdf {
     }
 }
 
+/// An async march submitted to the GPU but not yet read back. Its buffers must
+/// stay alive until the fence signals; polled each frame so the trace never
+/// blocks the main thread (Lumen-style: decouple GI work from the frame).
+struct InFlight {
+    fence: vk::Fence,
+    cb: vk::CommandBuffer,
+    desc_pool: vk::DescriptorPool,
+    light_buf: Buffer,
+    probe_buf: Buffer,
+    emitter_buf: Buffer,
+    out_buf: Buffer,
+    count: usize,
+}
+
 /// Persistent compute pipeline + samplers + cached GDF for the GI march.
 pub struct GpuGi {
     set_layout: vk::DescriptorSetLayout,
@@ -133,10 +185,19 @@ pub struct GpuGi {
     dist_sampler: vk::Sampler,  // trilinear, clamp
     index_sampler: vk::Sampler, // nearest, clamp
     gdf: Option<CachedGdf>,
+    /// Dedicated pool for async march command buffers (isolated from the
+    /// renderer's per-frame pool).
+    cmd_pool: vk::CommandPool,
+    in_flight: Option<InFlight>,
+    /// Screen-space GI final-gather compute (per-pixel GDF trace).
+    screen_set_layout: vk::DescriptorSetLayout,
+    screen_pipeline_layout: vk::PipelineLayout,
+    screen_pipeline: vk::Pipeline,
 }
 
 impl GpuGi {
-    pub fn new(device: &ash::Device) -> Result<Self> {
+    pub fn new(ctx: &GpuContext) -> Result<Self> {
+        let device = &ctx.device;
         let stage = vk::ShaderStageFlags::COMPUTE;
         let sampled = |b: u32| {
             vk::DescriptorSetLayoutBinding::default()
@@ -205,6 +266,78 @@ impl GpuGi {
         let dist_sampler = mk_sampler(vk::Filter::LINEAR)?;
         let index_sampler = mk_sampler(vk::Filter::NEAREST)?;
 
+        let cmd_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                    .queue_family_index(ctx.queue_family),
+                None,
+            )?
+        };
+
+        // Screen-space GI pipeline: GDF (0,1) + insts(2) + lights(3) + emitters(4)
+        // + depth sampler(5) + output storage image(6) + params UBO(7).
+        let storage_img = |b: u32| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(stage)
+        };
+        let ubo = |b: u32| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(b)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(stage)
+        };
+        let screen_bindings = [
+            sampled(0),
+            sampled(1),
+            ssbo(2),
+            ssbo(3),
+            ssbo(4),
+            sampled(5),
+            storage_img(6),
+            ubo(7),
+            sampled(8), // history (previous frame's result, for temporal accum)
+        ];
+        let screen_set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&screen_bindings),
+                None,
+            )?
+        };
+        let screen_layouts = [screen_set_layout];
+        let screen_pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&screen_layouts),
+                None,
+            )?
+        };
+        let screen_code = ash::util::read_spv(&mut Cursor::new(SCREEN_GI_COMP))?;
+        let screen_module = unsafe {
+            device
+                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&screen_code), None)?
+        };
+        let screen_pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(stage)
+                                .module(screen_module)
+                                .name(c"main"),
+                        )
+                        .layout(screen_pipeline_layout)],
+                    None,
+                )
+                .map_err(|(_, e)| e)?[0]
+        };
+        unsafe { device.destroy_shader_module(screen_module, None) };
+
         Ok(Self {
             set_layout,
             pipeline_layout,
@@ -212,6 +345,11 @@ impl GpuGi {
             dist_sampler,
             index_sampler,
             gdf: None,
+            cmd_pool,
+            in_flight: None,
+            screen_set_layout,
+            screen_pipeline_layout,
+            screen_pipeline,
         })
     }
 
@@ -261,22 +399,35 @@ impl GpuGi {
         Ok(())
     }
 
-    /// March the probes against the cached GDF; one `ProbeSh` per probe. Returns
-    /// empty if no GDF has been uploaded yet.
-    pub fn march(
-        &self,
+    /// True while an async march is submitted but not yet read back.
+    pub fn is_marching(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// True once a GDF has been uploaded (screen-GI can trace it).
+    pub fn has_gdf(&self) -> bool {
+        self.gdf.is_some()
+    }
+
+    /// Begin an async march against the cached GDF: record + submit the compute
+    /// with a fence but DON'T wait. Returns false if no GDF, no probes, or a
+    /// march is already in flight. Read the result later via [`march_poll`].
+    pub fn march_begin(
+        &mut self,
         ctx: &GpuContext,
         allocator: &Arc<Mutex<Allocator>>,
-        command_pool: vk::CommandPool,
         m: &GpuGiMarch<'_>,
-    ) -> Result<Vec<ProbeSh>> {
+    ) -> Result<bool> {
+        if self.in_flight.is_some() {
+            return Ok(false);
+        }
         let Some(gdf) = self.gdf.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(false);
         };
         let device = &ctx.device;
         let count = m.probes.len();
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok(false);
         }
         let mut alloc = allocator.lock().unwrap();
 
@@ -297,13 +448,13 @@ impl GpuGi {
                 })
                 .collect()
         };
-        let mut light_buf =
+        let light_buf =
             host_ssbo(device, &mut alloc, bytemuck::cast_slice(&lights), "gi lights")?;
-        let mut probe_buf =
+        let probe_buf =
             host_ssbo(device, &mut alloc, bytemuck::cast_slice(&probes), "gi probes")?;
-        let mut emitter_buf =
+        let emitter_buf =
             host_ssbo(device, &mut alloc, bytemuck::cast_slice(&emitters), "gi emitters")?;
-        let mut out_buf = Buffer::new(
+        let out_buf = Buffer::new(
             device,
             &mut alloc,
             (count * size_of::<[f32; 16]>()) as u64,
@@ -360,7 +511,21 @@ impl GpuGi {
             misc: [m.seed, m.emitters.len() as u32, 0, 0],
         };
         let groups = (count as u32).div_ceil(64);
-        alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        // Record + submit WITHOUT waiting; the fence is polled next frame.
+        let cb = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0]
+        };
+        unsafe {
+            device.begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             device.cmd_bind_descriptor_sets(
                 cb,
@@ -378,9 +543,43 @@ impl GpuGi {
                 bytemuck::bytes_of(&push),
             );
             device.cmd_dispatch(cb, groups, 1, 1);
-        })?;
+            device.end_command_buffer(cb)?;
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            device.queue_submit(ctx.queue, &[submit], fence)?;
+            self.in_flight = Some(InFlight {
+                fence,
+                cb,
+                desc_pool,
+                light_buf,
+                probe_buf,
+                emitter_buf,
+                out_buf,
+                count,
+            });
+        }
+        Ok(true)
+    }
 
-        let bytes = out_buf.read();
+    /// Poll the in-flight march; when the GPU has finished, read back the probe
+    /// SH, free its resources, and return them. `None` while still running or
+    /// when nothing is in flight.
+    pub fn march_poll(
+        &mut self,
+        ctx: &GpuContext,
+        allocator: &Arc<Mutex<Allocator>>,
+    ) -> Option<Vec<ProbeSh>> {
+        let f = self.in_flight.as_ref()?;
+        let device = &ctx.device;
+        // Non-blocking check: NOT_READY → still running.
+        let ready = unsafe { device.get_fence_status(f.fence) }.unwrap_or(false);
+        if !ready {
+            return None;
+        }
+        let mut f = self.in_flight.take().unwrap();
+        let count = f.count;
+        let bytes = f.out_buf.read();
         let raw: &[f32] = bytemuck::cast_slice(&bytes);
         let mut out = Vec::with_capacity(count);
         for p in 0..count {
@@ -392,13 +591,240 @@ impl GpuGi {
             }
             out.push(sh);
         }
+        let mut alloc = allocator.lock().unwrap();
+        unsafe {
+            device.destroy_fence(f.fence, None);
+            device.free_command_buffers(self.cmd_pool, &[f.cb]);
+            device.destroy_descriptor_pool(f.desc_pool, None);
+        }
+        f.light_buf.destroy(device, &mut alloc);
+        f.probe_buf.destroy(device, &mut alloc);
+        f.emitter_buf.destroy(device, &mut alloc);
+        f.out_buf.destroy(device, &mut alloc);
+        Some(out)
+    }
 
-        unsafe { device.destroy_descriptor_pool(desc_pool, None) };
-        light_buf.destroy(device, &mut alloc);
-        probe_buf.destroy(device, &mut alloc);
-        emitter_buf.destroy(device, &mut alloc);
-        out_buf.destroy(device, &mut alloc);
-        Ok(out)
+    /// Screen-space GI final gather: per-pixel GDF trace into `out_view` (a
+    /// STORAGE image). Reads `depth_view` (must already be SHADER_READ_ONLY).
+    /// Synchronous (blocks) for now — correctness first; async is a follow-up.
+    /// Leaves `out` in SHADER_READ_ONLY_OPTIMAL for the forward pass to sample.
+    /// Record the Flux gather dispatch into an externally-owned command buffer
+    /// (the main frame cb) instead of submitting + blocking on its own fence.
+    /// Returns the transient descriptor pool/buffers the caller must keep alive
+    /// until that frame's fence signals, then free via [`ScreenGiTransient::destroy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn screen_resolve_record(
+        &self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        allocator: &Arc<Mutex<Allocator>>,
+        depth_view: vk::ImageView,
+        depth_sampler: vk::Sampler,
+        out_image: vk::Image,
+        out_view: vk::ImageView,
+        history_view: vk::ImageView,
+        extent: vk::Extent2D,
+        lights: &[BakeLight],
+        emitters: &[GpuGiEmitter],
+        history_valid: bool,
+        mut params: ScreenGiParams,
+    ) -> Result<Option<ScreenGiTransient>> {
+        let Some(gdf) = self.gdf.as_ref() else {
+            return Ok(None);
+        };
+        let mut alloc = allocator.lock().unwrap();
+        let gi_lights: Vec<GiLight> = if lights.is_empty() {
+            vec![GiLight::zeroed()]
+        } else {
+            lights.iter().map(pack_light).collect()
+        };
+        let gi_emitters: Vec<GiEmitter> = if emitters.is_empty() {
+            vec![GiEmitter::zeroed()]
+        } else {
+            emitters
+                .iter()
+                .map(|e| GiEmitter {
+                    center_radius: [e.center[0], e.center[1], e.center[2], e.radius],
+                    emission: [e.emission[0], e.emission[1], e.emission[2], 0.0],
+                })
+                .collect()
+        };
+        params.gdf_min = [gdf.min[0], gdf.min[1], gdf.min[2], 0.0];
+        params.gdf_max = [gdf.max[0], gdf.max[1], gdf.max[2], 0.0];
+        // Auto max trace distance (march.y == 0): the GDF box diagonal, so rays
+        // can cross the whole scene without an arbitrary fixed cap.
+        if params.march[1] <= 0.0 {
+            let d = [
+                gdf.max[0] - gdf.min[0],
+                gdf.max[1] - gdf.min[1],
+                gdf.max[2] - gdf.min[2],
+            ];
+            params.march[1] = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        }
+        params.counts[2] = lights.len() as u32;
+        params.counts[3] = emitters.len() as u32;
+        params.misc[1] = extent.width;
+        params.misc[2] = extent.height;
+        // params.march[2] (temporal alpha) is set by the caller — motion-aware:
+        // snap when fresh, trust the new trace more while moving, converge gently
+        // when still. (history_valid only gates the descriptor sanity below.)
+        let _ = history_valid;
+        let light_buf =
+            host_ssbo(device, &mut alloc, bytemuck::cast_slice(&gi_lights), "sgi lights")?;
+        let emitter_buf = host_ssbo(
+            device,
+            &mut alloc,
+            bytemuck::cast_slice(&gi_emitters),
+            "sgi emitters",
+        )?;
+        let mut param_buf = Buffer::new(
+            device,
+            &mut alloc,
+            size_of::<ScreenGiParams>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            MemoryLocation::CpuToGpu,
+            "sgi params",
+        )?;
+        param_buf.write(0, bytemuck::bytes_of(&params));
+        drop(alloc);
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 4, // dist, index, depth, history
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 3,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 1,
+            },
+        ];
+        let desc_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )?
+        };
+        let layouts = [self.screen_set_layout];
+        let set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(desc_pool)
+                    .set_layouts(&layouts),
+            )?[0]
+        };
+        self.write_image(device, set, 0, self.dist_sampler, gdf.dist_tex.view);
+        self.write_image(device, set, 1, self.index_sampler, gdf.index_tex.view);
+        write_ssbo(device, set, 2, gdf.inst_buf.handle);
+        write_ssbo(device, set, 3, light_buf.handle);
+        write_ssbo(device, set, 4, emitter_buf.handle);
+        self.write_image(device, set, 5, depth_sampler, depth_view);
+        // Storage image (binding 6) — GENERAL layout for compute write.
+        let img_info = [vk::DescriptorImageInfo::default()
+            .image_view(out_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let img_write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(6)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&img_info);
+        let buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(param_buf.handle)
+            .range(vk::WHOLE_SIZE)];
+        let buf_write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(7)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&buf_info);
+        // Binding 8: history = the PREVIOUS frame's gather image (ping-pong, in
+        // SHADER_READ), reprojected per pixel for temporal accumulation.
+        let _ = history_valid;
+        let hist_info = [vk::DescriptorImageInfo::default()
+            .sampler(depth_sampler)
+            .image_view(history_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let hist_write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(8)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&hist_info);
+        unsafe { device.update_descriptor_sets(&[img_write, buf_write, hist_write], &[]) };
+
+        let groups_x = extent.width.div_ceil(8);
+        let groups_y = extent.height.div_ceil(8);
+        unsafe {
+            // Output is a fresh (ping-pong) image fully overwritten this trace —
+            // discard its old contents. History is the OTHER image (read-only).
+            let to_general = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .image(out_image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_general],
+            );
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.screen_pipeline);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                self.screen_pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            device.cmd_dispatch(cb, groups_x, groups_y, 1);
+            // out image: GENERAL -> SHADER_READ_ONLY for the forward pass.
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .image(out_image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+        }
+
+        Ok(Some(ScreenGiTransient {
+            desc_pool,
+            light_buf,
+            emitter_buf,
+            param_buf,
+        }))
     }
 
     fn write_image(
@@ -422,15 +848,31 @@ impl GpuGi {
     }
 
     pub fn destroy(&mut self, device: &ash::Device, alloc: &mut Allocator) {
+        if let Some(mut f) = self.in_flight.take() {
+            unsafe {
+                let _ = device.wait_for_fences(&[f.fence], true, u64::MAX);
+                device.destroy_fence(f.fence, None);
+                device.free_command_buffers(self.cmd_pool, &[f.cb]);
+                device.destroy_descriptor_pool(f.desc_pool, None);
+            }
+            f.light_buf.destroy(device, alloc);
+            f.probe_buf.destroy(device, alloc);
+            f.emitter_buf.destroy(device, alloc);
+            f.out_buf.destroy(device, alloc);
+        }
         if let Some(mut gdf) = self.gdf.take() {
             gdf.destroy(device, alloc);
         }
         unsafe {
+            device.destroy_command_pool(self.cmd_pool, None);
             device.destroy_sampler(self.dist_sampler, None);
             device.destroy_sampler(self.index_sampler, None);
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
+            device.destroy_pipeline(self.screen_pipeline, None);
+            device.destroy_pipeline_layout(self.screen_pipeline_layout, None);
+            device.destroy_descriptor_set_layout(self.screen_set_layout, None);
         }
     }
 }

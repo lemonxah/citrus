@@ -41,7 +41,7 @@ pub use citrus_core::{
     AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo,
 };
 pub use inspector::{
-    CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse, ObjectInfoModel,
-    TransformModel,
+    CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse, ObjectHeaderResponse,
+    ObjectInfoModel, TransformModel,
 };
 pub use scene_panel::{SceneObjectRow, ScenePanel, ScenePanelResponse, SpawnKind};

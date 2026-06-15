@@ -254,6 +254,12 @@ impl PipelineCache {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Screen-space GI gather result (full-res indirect irradiance).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set0_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -263,8 +269,14 @@ impl PipelineCache {
         };
 
         // set 1: material textures (albedo, normal, ORM, emission)
-        let tex_bindings: Vec<_> = (0..4)
-            .map(|i| {
+        // Texture samplers at bindings 0-3 (albedo/normal/orm/emission) and 5-12
+        // (opacity, emission mask, 3 matcaps + 3 matcap masks). Binding 4 is the
+        // FX uniform block. Every material set writes all of these (create_material
+        // + the skybox set), so they're always valid.
+        let sampler_bindings: [u32; 12] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut tex_bindings: Vec<_> = sampler_bindings
+            .iter()
+            .map(|&i| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -272,6 +284,15 @@ impl PipelineCache {
                     .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             })
             .collect();
+        // Binding 4: per-material "FX" uniform block (rim, animated emission,
+        // matcap strengths — extended params beyond the 128-byte push block).
+        tex_bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        );
         let set1_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&tex_bindings),

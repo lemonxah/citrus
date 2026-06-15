@@ -547,10 +547,10 @@ impl FileBrowser {
             } else {
                 response.activated = Some(path.to_owned());
             }
-        } else if tile.clicked() && !renaming_this && !is_dir {
-            // Single-click selects a file (shown in the Inspector). Folders are
-            // navigation only — they aren't inspectable assets, so a folder
-            // click doesn't change the selection.
+        } else if tile.clicked() && !renaming_this {
+            // Single-click selects a file *or folder* (so folders can be
+            // deleted / copied / duplicated / renamed); double-click still enters
+            // a folder. The selection shows in the Inspector.
             response.clicked = Some(path.to_owned());
         }
         if is_dir {

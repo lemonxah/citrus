@@ -377,6 +377,7 @@ impl GameApp {
             time: t,
             draws: &self.scene.draws,
             lightmap_preview: false,
+            gi_debug: 0,
             postfx,
             egui: None,
         };

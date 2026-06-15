@@ -172,47 +172,39 @@ pub fn test_scene() -> Scene {
     ];
 
     let instances = vec![
-        Instance {
-            name: "Floor".into(),
-            mesh: PLANE,
-            material: 3,
-            transform: Mat4::IDENTITY,
-        },
-        Instance {
-            name: "Toon Sphere".into(),
-            mesh: SPHERE,
-            material: 0,
-            transform: Mat4::from_translation(Vec3::new(-1.3, 0.5, 0.0)),
-        },
-        Instance {
-            name: "Metal Cube".into(),
-            mesh: CUBE,
-            material: 1,
-            transform: Mat4::from_rotation_translation(
-                Quat::from_rotation_y(0.6),
-                Vec3::new(1.3, 0.5, 0.0),
-            ),
-        },
-        Instance {
-            name: "Emissive Core".into(),
-            mesh: SPHERE,
-            material: 2,
-            transform: Mat4::from_scale_rotation_translation(
+        Instance::single("Floor", PLANE, 3, Mat4::IDENTITY),
+        Instance::single(
+            "Toon Sphere",
+            SPHERE,
+            0,
+            Mat4::from_translation(Vec3::new(-1.3, 0.5, 0.0)),
+        ),
+        Instance::single(
+            "Metal Cube",
+            CUBE,
+            1,
+            Mat4::from_rotation_translation(Quat::from_rotation_y(0.6), Vec3::new(1.3, 0.5, 0.0)),
+        ),
+        Instance::single(
+            "Emissive Core",
+            SPHERE,
+            2,
+            Mat4::from_scale_rotation_translation(
                 Vec3::splat(0.6),
                 Quat::IDENTITY,
                 Vec3::new(0.0, 0.3, 1.4),
             ),
-        },
-        Instance {
-            name: "Glass Panel".into(),
-            mesh: CUBE,
-            material: 4,
-            transform: Mat4::from_scale_rotation_translation(
+        ),
+        Instance::single(
+            "Glass Panel",
+            CUBE,
+            4,
+            Mat4::from_scale_rotation_translation(
                 Vec3::new(1.6, 1.0, 0.05),
                 Quat::from_rotation_y(-0.4),
                 Vec3::new(0.0, 0.6, -1.6),
             ),
-        },
+        ),
     ];
 
     Scene {

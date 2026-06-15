@@ -20,7 +20,10 @@ pub use input::{
     ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
     MouseAxis, MouseButton, PadAxis, PadButton, RawInput, resolve,
 };
-pub use models::{AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};
+pub use models::{
+    AlphaModeModel, MatcapBlend, MaterialModel, MaterialTexturePaths, ShaderPropKindUi,
+    ShaderPropUi, ShaderUiInfo, TEXTURE_SLOT_LABELS,
+};
 
 // ------------------------------------------------------------------ object id
 

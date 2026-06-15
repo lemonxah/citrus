@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result, bail};
 use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, Vertex};
 use glam::Mat4;
 
-use crate::{Instance, Scene, SceneMaterial};
+use crate::{Instance, MeshSlot, Scene, SceneMaterial};
 
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
     let path = path.as_ref();
@@ -223,23 +223,21 @@ fn visit_node(
             .or_else(|| mesh.name())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("node {}", node.index()));
-        let multi = mesh.primitives().len() > 1;
-        for primitive in mesh.primitives() {
-            if let Some(&(mesh_index, material)) =
-                primitive_map.get(&(mesh.index(), primitive.index()))
-            {
-                let name = if multi {
-                    format!("{base_name} [{}]", primitive.index())
-                } else {
-                    base_name.clone()
-                };
-                instances.push(Instance {
-                    name,
-                    mesh: mesh_index,
-                    material,
-                    transform,
-                });
-            }
+        // All of the mesh's primitives become material slots on one instance.
+        let slots: Vec<MeshSlot> = mesh
+            .primitives()
+            .filter_map(|primitive| {
+                primitive_map
+                    .get(&(mesh.index(), primitive.index()))
+                    .map(|&(mesh, material)| MeshSlot { mesh, material })
+            })
+            .collect();
+        if !slots.is_empty() {
+            instances.push(Instance {
+                name: base_name,
+                transform,
+                slots,
+            });
         }
     }
     for child in node.children() {

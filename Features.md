@@ -14,8 +14,43 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 ### Rendering
 - [done] Vulkan 1.3 renderer (ash 0.38, dynamic rendering, sync2)
 - [done] PBR standard shader (metal/rough, base/normal/emission), multi-light frag loop —
-  energy-conserving Cook-Torrance (Fresnel kS / diffuse kD = 1-F) + roughness-aware ambient;
-  indirect term fed by baked lightmaps / probe SH (else flat ambient)
+  energy-conserving Cook-Torrance (Fresnel kS / diffuse kD = 1-F) + roughness-aware ambient
+  **diffuse + specular** (indirect split so metals/smooth surfaces pick up environment colour,
+  not flat black; reflection probes are a follow-up); indirect term fed by baked lightmaps /
+  probe SH (else flat ambient). Normals use the inverse-transpose model matrix (correct under
+  non-uniform scale). **Two PBR variants share this pipeline (so both get GI + baked maps):**
+  - **Standard** (Mochie-like): the full PBR path above.
+  - **Toon** (Poiyomi-like, the `Toon Shading` material toggle / `FEAT_TOON` variant): a smooth
+    quantized **cel ramp** (Ramp Steps + Toon Strength + Ramp Smoothness) over the same PBR base, a
+    crisp toon specular, and a **Fresnel rim light** (Rim Strength / Rim Color / Rim Power). Still
+    samples the same probe GI + baked lightmaps + shadows.
+  - **12 texture slots** (set 1): albedo, normal, ORM, emission, **opacity**, **emission mask**,
+    and **3 matcaps + 3 matcap masks**. Matcaps are view-space sphere-mapped, masked, and added
+    with per-layer strength (FX UBO); opacity drives alpha; the emission mask gates the glow.
+    `.material` files carry all slots (`MaterialTextures`, `#[serde(default)]` back-compatible).
+    All 12 slots are assignable in the inspector, placed in the section they belong to: **Base**
+    (albedo, normal map + strength, ORM, opacity), **Emission** (emission map, emission mask), and
+    **Matcaps** (each of the 3 layers is its own sub-section: matcap texture, blend mode, strength,
+    mask). Drag an image from the file browser onto a slot; per-slot clear. `apply_material` rebinds
+    the material's descriptor set live (`Renderer::set_material_textures`, skipped when unchanged),
+    resolving model paths (sRGB colour / linear data) with a fallback to import-embedded handles.
+    Round-trips through `.material` files and inline scene materials (`MaterialRef::Inline { textures }`).
+    Imported materials stay read-only until extracted.
+  - **Matcap blend modes**: each matcap layer combines with the shaded colour via Add / Multiply /
+    Replace (`MatcapBlend`), carried in the FX UBO (`fx.matcap_blend`) and applied by `blend_matcap`
+    in the shader. Per-layer strength + mask still apply.
+  - **Per-material FX uniform buffer** (set 1, binding 4): the 128-byte push block is full (and
+    AMD-capped), so extended params live in a small per-material UBO instead — rim colour/power/
+    strength, ramp smoothness, and **animated UV scroll + emission pulse** (Poiyomi-style). The
+    UBO is host-visible and rewritten on edit (`Renderer::upload_material_fx`); materials are static
+    at runtime so there's no in-flight hazard. `.material` files stay back-compatible (the new
+    `MaterialParams` fields are `#[serde(default)]`). This is the unlock for richer built-in shader
+    options without a custom shader.
+- [done] **Custom-shader pipeline exposes the full scene**: the preamble now declares the complete
+  frame UBO (lights array, shadows `u_shadow`, probe SH `probes`, baked `u_lightmap`, post settings)
+  plus ready-to-call helpers — `citrus_gi(world_pos, n)` (probe-SH baked GI with ambient fallback),
+  `citrus_direct_diffuse(world_pos, n)` (all scene lights with attenuation/spot cones), and
+  `citrus_sh(...)` — so custom shaders integrate with lighting/GI the same way the built-ins do.
 - [done] Lights: directional / point / spot — color, intensity, range, spot angle/blend
   (up to 16/frame, distance attenuation + spot cones)
 - [partial] Shadow-casting lights (shadow-map array, PCF; needs acne/bias GPU validation).
@@ -37,6 +72,14 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] glTF import (PBR factors + textures, lightmap UV via TEXCOORD_1)
 - [done] FBX import via ufbx (per-material parts, PBR factors, base/normal/emission,
   embedded textures)
+- [done] **Multi-material slots**: an imported mesh with N materials is one scene object
+  with N material slots (not N objects). `SceneObject.extra_render` holds slots beyond the
+  primary; `sync_draws` fans out one draw per slot, picking tests all slots, realtime GI
+  gathers all slots' emission/albedo. The inspector shows a slot selector (when >1) that
+  picks which slot to edit; drops/edits target the selected slot. Round-trips via
+  `ObjectSource::Model::extra_meshes` + `SceneEntry::extra_materials` (both `#[serde(default)]`).
+  Known gap: the baked-lightmap path still atlases slot 0 only (one layer per object); realtime
+  GI covers every slot.
 - [done] Procedural primitives (cube/sphere/capsule/plane)
 - [done] `.material` files (RON): save/load/assign, per-path texture cache
 - [done] `.scene` files: full save/load (objects, transforms, parents, components, materials)
@@ -157,6 +200,39 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   Next: surface cache
   / screen probes for contact-scale GI — probe GI is low-frequency, so tight contact fill
   (under-object darkening) is still limited.
+- [wip] **Screen-space probe GI (Lumen-style realtime)**: a per-pixel-resolution dynamic GI
+  path layered over the world probes for contact-scale, view-dependent indirect. A depth
+  prepass (`screen_gi_pass`, shadow pipeline → sampleable `sgi.depth`) feeds a compute trace
+  (`screen_gi.comp`): one screen probe per `SCREEN_PROBE_DIV²` (4×4) block reconstructs world
+  pos + normal from depth, cosine-samples the hemisphere against the cached **GDF**, and adds
+  the analytic emitter **NEE** pool. Results **temporally accumulate with reprojection**
+  (ping-pong image pair, prev-frame view-proj + camera-distance disocclusion) and are
+  **depth-aware bilaterally upsampled** in `standard.frag` (binding 4). Emissive objects are
+  **excluded from the GDF entirely** (static or not) — their light comes from the variance-free
+  NEE spheres, while their coarse padded SDF box in the field only stamped a square halo +
+  voxel banding on the bounce; keeping them out makes a static emitter look identical to a
+  dynamic one. The trace RNG is **seeded per frame** (`sgi_frame` → `misc.x`) so each frame
+  samples different directions and temporal accumulation actually converges the Monte-Carlo
+  noise (a fixed `0` seed produced un-averageable fixed-pattern blotches). Trace cost tuned to
+  10 samples / 2 bounces / 96-step march cap, leaning on temporal accumulation for smoothness.
+  The depth prepass + compute trace are **folded into the main frame command buffer** (one
+  submit, no per-frame CPU fence stalls): the trace's transient descriptor pool + host buffers
+  are returned to the renderer and freed one frame later, after that frame's fence signals
+  (`ScreenGiTransient`, `sgi_transients[frame_index]`). **Transparent** surfaces are kept out of
+  the depth prepass (a glass pixel would otherwise trace GI on the glass → milky fill); emissive
+  surfaces ARE in it, so they sample their own GI and receive bounce additively on top of their
+  emission. Probe normals are reconstructed from the depth neighbour CLOSER in depth per axis,
+  so the tangent never spans a silhouette (which left a dark no-GI outline around objects).
+  **Emitter NEE falloff**: a soft cosine terminator (`dot(n,l)+0.3` clamped) — emission fades
+  smoothly past the horizon but a surface facing clearly away gets nothing (no bleed onto a
+  box's back face). NO occlusion test on the direct emitter NEE: GDF-based occlusion blotches
+  against the coarse field, and a screen-space occlusion trace false-shadowed whenever the
+  emitter was on-screen (the ray grazes the receiver floor) — both looked worse than the leak.
+  The hemisphere bounce still occludes via the GDF march. (A solid object can leak an emitter's
+  *direct* glow; the proper fix is the surface/radiance cache below, where occlusion is intrinsic
+  to the trace.)
+  Next: surface/radiance cache for cheap multi-bounce + intrinsic occlusion; masked depth-prepass
+  for alpha-test cutout holes; per-camera trace for the in-game camera.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
   even cube-face packing) — the seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.

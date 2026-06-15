@@ -32,6 +32,10 @@ pub struct SceneObject {
     pub id: ObjectId,
     pub name: String,
     pub render: Option<RenderInfo>,
+    /// Additional render slots beyond `render` (slot 0). Each is its own
+    /// (mesh, material) drawn at the same transform — lets one imported mesh
+    /// expose multiple material slots. Empty for single-material objects.
+    pub extra_render: Vec<RenderInfo>,
     pub source: ObjectSource,
     /// When false the object is skipped at draw time (and its light, if any,
     /// stops contributing) but it stays in the scene.
@@ -53,6 +57,13 @@ pub struct SceneObject {
 impl SceneObject {
     pub fn local_transform(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    }
+
+    /// Iterate every render slot (primary + extras) as `RenderInfo`.
+    pub fn render_slots(&self) -> impl Iterator<Item = RenderInfo> + '_ {
+        self.render
+            .into_iter()
+            .chain(self.extra_render.iter().copied())
     }
 
     /// Serialize all components (undo snapshots, play-mode restore).
@@ -93,7 +104,20 @@ pub struct MaterialEntry {
     /// they stay inline. Retained for a future "convert to asset" path.
     #[allow(dead_code)]
     pub embedded_textures: bool,
+    /// Texture handles bound at creation (import-embedded or `.material`-loaded),
+    /// in the 12-slot order. Used as the per-slot fallback when the model has no
+    /// explicit texture path, so editing one slot doesn't drop the others.
+    pub base_textures: TexSlots,
+    /// The texture handles currently bound on the descriptor set. apply_material
+    /// only rebinds (a GPU-stalling op) when the resolved slots differ from this,
+    /// so per-frame param edits (slider drags) don't thrash the textures.
+    pub bound_textures: TexSlots,
 }
+
+/// The 12 material texture slots in binding order: albedo, normal, orm,
+/// emission, opacity, emission_mask, matcap0, matcap0_mask, matcap1,
+/// matcap1_mask, matcap2, matcap2_mask.
+pub type TexSlots = [Option<TextureHandle>; 12];
 
 #[derive(Clone, Copy)]
 pub struct MeshInfo {
@@ -164,6 +188,10 @@ pub struct BakeGather {
     pub instances: Vec<citrus_render::BakeInstance>,
     /// Object index per instance (parallel to `instances`).
     pub instance_objects: Vec<usize>,
+    /// Whether each instance's object is static (parallel to `instances`).
+    /// Realtime GI re-traces only on static-geometry / moving-emitter changes,
+    /// so a dynamic prop falling/jittering under physics doesn't keep retracing.
+    pub instance_static: Vec<bool>,
     pub lights: Vec<citrus_render::BakeLight>,
     pub probes: Vec<Vec3>,
     pub probe_volumes: Vec<ProbeVolumeMeta>,
@@ -409,6 +437,7 @@ impl LoadedScene {
             orm: None,
             emission: None,
             error: false,
+            ..Default::default()
         };
         let handle = renderer.create_material(&desc)?;
         let model = model_from_material(
@@ -423,6 +452,8 @@ impl LoadedScene {
             handle,
             file: None,
             embedded_textures: false,
+            base_textures: TexSlots::default(),
+            bound_textures: TexSlots::default(),
         });
         let index = self.materials.len() - 1;
         self.default_material = Some(index);
@@ -480,6 +511,7 @@ impl LoadedScene {
             id: ObjectId::new(),
             name,
             render,
+            extra_render: Vec::new(),
             source,
             enabled: true,
             static_geometry: false,
@@ -542,6 +574,7 @@ impl LoadedScene {
                 orm: material.orm.map(|i| textures[i]),
                 emission: material.emission.map(|i| textures[i]),
                 error: false,
+                ..Default::default()
             };
             let handle = renderer.create_material(&desc)?;
             let model = model_from_material(
@@ -550,6 +583,13 @@ impl LoadedScene {
                 &material.features,
                 material.normal.is_some(),
             );
+            // Slot order matches TexSlots / create_material. Imported models
+            // only carry albedo/normal/orm/emission; the rest are unset.
+            let mut base_textures = TexSlots::default();
+            base_textures[0] = material.albedo.map(|i| textures[i]);
+            base_textures[1] = material.normal.map(|i| textures[i]);
+            base_textures[2] = material.orm.map(|i| textures[i]);
+            base_textures[3] = material.emission.map(|i| textures[i]);
             self.materials.push(MaterialEntry {
                 default: model.clone(),
                 model,
@@ -559,31 +599,71 @@ impl LoadedScene {
                     || material.normal.is_some()
                     || material.orm.is_some()
                     || material.emission.is_some(),
+                base_textures,
+                bound_textures: base_textures,
             });
         }
 
+        // Group all of the model's objects under a single root (named after the
+        // file), so an imported model is one entry in the Scene tree you can move
+        // as a unit — and the loaders' per-material mesh split stays tidy.
+        let root_index = self.objects.len();
+        let root_name = source_path
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Model".to_string());
+        self.objects.push(SceneObject {
+            id: ObjectId::new(),
+            name: root_name,
+            render: None,
+            extra_render: Vec::new(),
+            source: ObjectSource::Empty,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            parent: None,
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            components: Vec::new(),
+        });
+
         for instance in &scene.instances {
+            let Some(&slot0) = instance.slots.first() else {
+                continue;
+            };
             let (scale, rotation, translation) = instance.transform.to_scale_rotation_translation();
-            let mesh = mesh_base + instance.mesh;
-            let material = material_base + instance.material;
+            let render = RenderInfo {
+                mesh: mesh_base + slot0.mesh,
+                material: material_base + slot0.material,
+            };
+            // Slots beyond the first become extra render slots / extra meshes.
+            let extra_render: Vec<RenderInfo> = instance.slots[1..]
+                .iter()
+                .map(|s| RenderInfo {
+                    mesh: mesh_base + s.mesh,
+                    material: material_base + s.material,
+                })
+                .collect();
+            let extra_meshes: Vec<usize> = instance.slots[1..].iter().map(|s| s.mesh).collect();
             let source = match source_path {
                 Some(path) => ObjectSource::Model {
                     path: path.to_string_lossy().into_owned(),
-                    mesh: instance.mesh,
+                    mesh: slot0.mesh,
+                    extra_meshes,
                 },
-                None => ObjectSource::Builtin {
-                    mesh: instance.mesh,
-                },
+                None => ObjectSource::Builtin { mesh: slot0.mesh },
             };
             self.objects.push(SceneObject {
                 id: ObjectId::new(),
                 name: instance.name.clone(),
-                render: Some(RenderInfo { mesh, material }),
+                render: Some(render),
+                extra_render,
                 source,
                 enabled: true,
                 static_geometry: false,
                 lightmap_scale: 1.0,
-                parent: None,
+                parent: Some(root_index),
                 translation,
                 rotation,
                 scale,
@@ -623,6 +703,7 @@ impl LoadedScene {
                     orm: None,
                     emission: None,
                     error: true,
+                    ..Default::default()
                 };
                 let handle = renderer.create_material(&desc).expect("material pool full");
                 let model = model_from_material(
@@ -637,6 +718,8 @@ impl LoadedScene {
                     handle,
                     file: Some(path.to_owned()),
                     embedded_textures: false,
+                    base_textures: TexSlots::default(),
+                    bound_textures: TexSlots::default(),
                 });
                 self.materials.len() - 1
             }
@@ -668,6 +751,18 @@ impl LoadedScene {
         let normal = load_tex(&file.textures.normal, false)?;
         let orm = load_tex(&file.textures.orm, false)?;
         let emission = load_tex(&file.textures.emission, true)?;
+        let opacity = load_tex(&file.textures.opacity, false)?;
+        let emission_mask = load_tex(&file.textures.emission_mask, false)?;
+        let matcap = [
+            load_tex(&file.textures.matcap[0], true)?,
+            load_tex(&file.textures.matcap[1], true)?,
+            load_tex(&file.textures.matcap[2], true)?,
+        ];
+        let matcap_mask = [
+            load_tex(&file.textures.matcap_mask[0], false)?,
+            load_tex(&file.textures.matcap_mask[1], false)?,
+            load_tex(&file.textures.matcap_mask[2], false)?,
+        ];
 
         let desc = MaterialDesc {
             name: file.name.clone(),
@@ -677,6 +772,10 @@ impl LoadedScene {
             normal,
             orm,
             emission,
+            opacity,
+            emission_mask,
+            matcap,
+            matcap_mask,
             error: false,
         };
         let handle = renderer.create_material(&desc)?;
@@ -686,36 +785,91 @@ impl LoadedScene {
         if let Some(q) = file.render_queue {
             model.render_queue = q;
         }
+        // Surface the file's texture assignments in the editable model.
+        model.textures = tex_paths_from_file(&file.textures);
         if file.shader != "standard" {
             let entry = shaders.resolve(renderer, project_root, &file.shader);
             if let Some(source) = &entry.source {
                 model.custom_values = source.pack(&file.custom).to_vec();
             }
         }
+        // File-backed materials are driven entirely by `model.textures` (so a
+        // slot can be cleared); no embedded fallback. The bindings created above
+        // get re-resolved from the same paths by apply_material below — record
+        // them so that resolve matches and apply_material skips a redundant
+        // (GPU-stalling) rebind.
+        let bound_textures = [
+            albedo,
+            normal,
+            orm,
+            emission,
+            opacity,
+            emission_mask,
+            matcap[0],
+            matcap_mask[0],
+            matcap[1],
+            matcap_mask[1],
+            matcap[2],
+            matcap_mask[2],
+        ];
         self.materials.push(MaterialEntry {
             default: model.clone(),
             model,
             handle,
             file: Some(path.to_owned()),
             embedded_textures: false,
+            base_textures: TexSlots::default(),
+            bound_textures,
         });
         let index = self.materials.len() - 1;
         self.apply_material(renderer, shaders, project_root, index);
         Ok(index)
     }
 
-    /// Assign a `.material` file to an object's slot.
+    /// The material index of one of an object's render slots (0 = primary).
+    pub fn slot_material(&self, object: usize, slot: usize) -> Option<usize> {
+        let obj = self.objects.get(object)?;
+        if slot == 0 {
+            obj.render.map(|r| r.material)
+        } else {
+            obj.extra_render.get(slot - 1).map(|r| r.material)
+        }
+    }
+
+    /// Set the material index of one of an object's render slots (0 = primary).
+    pub fn set_slot_material(&mut self, object: usize, slot: usize, material: usize) {
+        let Some(obj) = self.objects.get_mut(object) else {
+            return;
+        };
+        if slot == 0 {
+            if let Some(r) = &mut obj.render {
+                r.material = material;
+            }
+        } else if let Some(r) = obj.extra_render.get_mut(slot - 1) {
+            r.material = material;
+        }
+    }
+
+    /// Assign a `.material` file to one of an object's material slots (slot 0 =
+    /// the primary `render`, 1.. = `extra_render`). Out-of-range slots are
+    /// ignored.
     pub fn assign_material(
         &mut self,
         renderer: &mut Renderer,
         shaders: &mut ShaderLibrary,
         object: usize,
+        slot: usize,
         path: &Path,
         project_root: &Path,
     ) {
         let material = self.material_from_file(renderer, shaders, path, project_root);
-        if let Some(render) = &mut self.objects[object].render {
-            render.material = material;
+        let obj = &mut self.objects[object];
+        if slot == 0 {
+            if let Some(render) = &mut obj.render {
+                render.material = material;
+            }
+        } else if let Some(r) = obj.extra_render.get_mut(slot - 1) {
+            r.material = material;
         }
     }
 
@@ -728,8 +882,18 @@ impl LoadedScene {
         project_root: &Path,
         index: usize,
     ) {
+        // Resolve and rebind the 12 texture slots first, so `has_normal_texture`
+        // is current before the feature gate (normal_map) reads it below.
+        let handle = self.materials[index].handle;
+        let tex_paths = self.materials[index].model.textures.clone();
+        let base = self.materials[index].base_textures;
+        let slots = self.resolve_texture_slots(renderer, project_root, &tex_paths, &base);
+        if slots != self.materials[index].bound_textures {
+            renderer.set_material_textures(handle, &slots);
+            self.materials[index].bound_textures = slots;
+        }
+
         let entry = &self.materials[index];
-        let handle = entry.handle;
         let m = &entry.model;
         let params = renderer.material_params_mut(handle);
         params.base_color = m.base_color;
@@ -742,8 +906,22 @@ impl LoadedScene {
         params.emission_intensity = m.emission_intensity;
         params.alpha_cutoff = m.alpha_cutoff;
         params.normal_strength = m.normal_strength;
+        params.rim_color = m.rim_color;
+        params.rim_power = m.rim_power;
+        params.rim_strength = m.rim_strength;
+        params.ramp_smoothness = m.ramp_smoothness;
+        params.emission_scroll = m.emission_scroll;
+        params.emission_pulse = m.emission_pulse;
+        params.matcap_strength = m.matcap_strength;
+        params.matcap_blend = [
+            m.matcap_blend[0].to_f32(),
+            m.matcap_blend[1].to_f32(),
+            m.matcap_blend[2].to_f32(),
+        ];
         renderer.set_material_features(handle, features_from_model(m));
         renderer.set_material_render_queue(handle, m.render_queue);
+        // Push the extended FX params into the material's UBO (set 1, binding 4).
+        renderer.upload_material_fx(handle);
 
         if m.shader == "standard" {
             renderer.set_material_shader(handle, None);
@@ -759,8 +937,11 @@ impl LoadedScene {
                 if model.custom_values.len() != defaults.len() {
                     model.custom_values = defaults;
                 }
+                // 15 prop floats into the first lanes; the 16th (d3.w) is the
+                // engine-set baked-lightmap layer, so don't overwrite it here.
                 let mut data = [0.0f32; 16];
-                data.copy_from_slice(&model.custom_values);
+                let n = model.custom_values.len().min(15);
+                data[..n].copy_from_slice(&model.custom_values[..n]);
                 renderer.set_material_shader(handle, Some(id));
                 renderer.set_material_custom_data(handle, data);
                 renderer.set_material_error(handle, false);
@@ -768,6 +949,60 @@ impl LoadedScene {
             // Broken/missing shader → error swirl.
             None => renderer.set_material_error(handle, true),
         }
+    }
+
+    /// Load a project-relative texture, caching by (absolute path, srgb).
+    fn load_texture_cached(
+        &mut self,
+        renderer: &mut Renderer,
+        project_root: &Path,
+        rel: &Path,
+        srgb: bool,
+    ) -> Result<TextureHandle> {
+        let abs = project_root.join(rel);
+        if let Some(&handle) = self.texture_file_cache.get(&(abs.clone(), srgb)) {
+            return Ok(handle);
+        }
+        let data = citrus_assets::load_texture_file(&abs, srgb)?;
+        let handle = renderer.upload_texture(&data)?;
+        self.texture_file_cache.insert((abs, srgb), handle);
+        Ok(handle)
+    }
+
+    /// Resolve a material's 12 texture slots: an explicit model path (loaded and
+    /// cached) overrides the per-slot `base` fallback (import-embedded handles).
+    /// Colour slots (albedo/emission/matcaps) load as sRGB; data slots
+    /// (normal/orm/opacity/masks) load linear.
+    fn resolve_texture_slots(
+        &mut self,
+        renderer: &mut Renderer,
+        project_root: &Path,
+        paths: &citrus_core::MaterialTexturePaths,
+        base: &TexSlots,
+    ) -> TexSlots {
+        let order: [(&Option<PathBuf>, bool); 12] = [
+            (&paths.albedo, true),
+            (&paths.normal, false),
+            (&paths.orm, false),
+            (&paths.emission, true),
+            (&paths.opacity, false),
+            (&paths.emission_mask, false),
+            (&paths.matcap[0], true),
+            (&paths.matcap_mask[0], false),
+            (&paths.matcap[1], true),
+            (&paths.matcap_mask[1], false),
+            (&paths.matcap[2], true),
+            (&paths.matcap_mask[2], false),
+        ];
+        let mut slots = *base;
+        for (i, (path, srgb)) in order.iter().enumerate() {
+            let Some(rel) = path else { continue };
+            match self.load_texture_cached(renderer, project_root, rel, *srgb) {
+                Ok(handle) => slots[i] = Some(handle),
+                Err(e) => tracing::error!("loading texture {}: {e:#}", rel.display()),
+            }
+        }
+        slots
     }
 
     /// Link a material to a `.material` file it was saved to (auto-save of
@@ -1357,6 +1592,8 @@ impl LoadedScene {
         let amb = self.environment.ambient;
         let ai = self.environment.ambient_intensity;
         BakeGather {
+            // The bake only includes static geometry.
+            instance_static: vec![true; instances.len()],
             instances,
             instance_objects,
             lights,
@@ -1376,44 +1613,50 @@ impl LoadedScene {
 
         let mut instances = Vec::new();
         let mut instance_objects = Vec::new();
+        let mut instance_static = Vec::new();
         let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
                 continue;
             }
-            let Some(render) = self.objects[i].render else {
+            if self.objects[i].render.is_none() {
                 continue;
-            };
+            }
+            let is_static = self.objects[i].static_geometry;
             let world = self.world_transform(i);
-            let (min, max) = self.mesh_bounds[render.mesh];
-            // Expand the scene AABB by this object's 8 transformed corners.
-            for cx in [min.x, max.x] {
-                for cy in [min.y, max.y] {
-                    for cz in [min.z, max.z] {
-                        let p = world.transform_point3(Vec3::new(cx, cy, cz));
-                        lo = lo.min(p);
-                        hi = hi.max(p);
+            // Every material slot contributes geometry + emission to the trace.
+            for render in self.objects[i].render_slots() {
+                let (min, max) = self.mesh_bounds[render.mesh];
+                // Expand the scene AABB by this slot's 8 transformed corners.
+                for cx in [min.x, max.x] {
+                    for cy in [min.y, max.y] {
+                        for cz in [min.z, max.z] {
+                            let p = world.transform_point3(Vec3::new(cx, cy, cz));
+                            lo = lo.min(p);
+                            hi = hi.max(p);
+                        }
                     }
                 }
+                let model = &self.materials[render.material].model;
+                let emission = if model.emission_enabled {
+                    [
+                        model.emission_color[0] * model.emission_intensity,
+                        model.emission_color[1] * model.emission_intensity,
+                        model.emission_color[2] * model.emission_intensity,
+                    ]
+                } else {
+                    [0.0; 3]
+                };
+                instances.push(citrus_render::BakeInstance {
+                    mesh: self.mesh_handles[render.mesh],
+                    transform: world,
+                    lightmap_size: 8, // unused: probes_only skips lightmap tracing
+                    albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
+                    emission,
+                });
+                instance_objects.push(i);
+                instance_static.push(is_static);
             }
-            let model = &self.materials[render.material].model;
-            let emission = if model.emission_enabled {
-                [
-                    model.emission_color[0] * model.emission_intensity,
-                    model.emission_color[1] * model.emission_intensity,
-                    model.emission_color[2] * model.emission_intensity,
-                ]
-            } else {
-                [0.0; 3]
-            };
-            instances.push(citrus_render::BakeInstance {
-                mesh: self.mesh_handles[render.mesh],
-                transform: world,
-                lightmap_size: 8, // unused: probes_only skips lightmap tracing
-                albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
-                emission,
-            });
-            instance_objects.push(i);
         }
         if instances.is_empty() || !lo.is_finite() {
             return None;
@@ -1501,7 +1744,11 @@ impl LoadedScene {
         // which paradoxically coarsens the (off-center) emitter region — the
         // multi-cascade nest at 32 keeps the center denser. Grid-cell structure is
         // smoothed by the probe-grid denoise blur, not by raw count alone.
-        let max_axis = if software { 32 } else { 32 };
+        // Software uses nested cascades (small boxes) so a 32-cap stays cheap on
+        // the GPU march. RayQuery bakes a single grid *synchronously*, so 32³ =
+        // 32768 probes is ~9ms/trace — cap it to 24³ (~13k) for realtime; the
+        // probe-grid blur keeps the soft look at the lower resolution.
+        let max_axis = if software { 32 } else { 24 };
         let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, max_axis) as usize;
         let counts = [axis_count(size.x), axis_count(size.y), axis_count(size.z)];
 
@@ -1554,6 +1801,7 @@ impl LoadedScene {
         Some(BakeGather {
             instances,
             instance_objects,
+            instance_static,
             lights,
             probes,
             probe_volumes,
@@ -1569,33 +1817,42 @@ impl LoadedScene {
         &mut self,
         gather: &BakeGather,
     ) -> (Vec<crate::sw_gi::SdfInstance>, f32) {
-        for &obj in &gather.instance_objects {
-            let Some(render) = self.objects[obj].render else {
-                continue;
-            };
-            if self.mesh_sdf[render.mesh].is_none() {
-                let (pos, idx) = &self.mesh_geometry[render.mesh];
-                self.mesh_sdf[render.mesh] =
+        // Resolve each gather instance to its local mesh index by its handle
+        // (an object may contribute several slots, each a different mesh).
+        let mesh_index = |handle: citrus_render::MeshHandle| -> Option<usize> {
+            self.mesh_handles.iter().position(|&h| h == handle)
+        };
+        for inst in &gather.instances {
+            let Some(mi) = mesh_index(inst.mesh) else { continue };
+            if self.mesh_sdf[mi].is_none() {
+                let (pos, idx) = &self.mesh_geometry[mi];
+                self.mesh_sdf[mi] =
                     Some(std::sync::Arc::new(citrus_render::sdf::generate_sdf(pos, idx, 32, 0.1)));
             }
         }
         let mut insts = Vec::with_capacity(gather.instances.len());
-        for (k, &obj) in gather.instance_objects.iter().enumerate() {
-            let Some(render) = self.objects[obj].render else {
+        for (k, instance) in gather.instances.iter().enumerate() {
+            let Some(mi) = mesh_index(instance.mesh) else {
                 continue;
             };
-            let Some(sdf) = self.mesh_sdf[render.mesh].as_ref() else {
+            let Some(sdf) = self.mesh_sdf[mi].as_ref() else {
                 continue;
             };
-            let world = gather.instances[k].transform;
+            let static_geometry = gather
+                .instance_objects
+                .get(k)
+                .map(|&obj| self.objects[obj].static_geometry)
+                .unwrap_or(false);
+            let world = instance.transform;
             let scale = (world.x_axis.length() + world.y_axis.length() + world.z_axis.length())
                 / 3.0;
             insts.push(crate::sw_gi::SdfInstance {
                 inv: world.inverse(),
                 scale: scale.max(1e-4),
                 sdf: sdf.clone(),
-                albedo: gather.instances[k].albedo,
-                emission: gather.instances[k].emission,
+                albedo: instance.albedo,
+                emission: instance.emission,
+                static_geometry,
             });
         }
         let scene_size = gather
@@ -1750,9 +2007,9 @@ impl LoadedScene {
     pub fn sync_draws(&mut self, selected: Option<usize>, highlight: f32) {
         self.draws.clear();
         for i in 0..self.objects.len() {
-            let Some(render) = self.objects[i].render else {
+            if self.objects[i].render.is_none() {
                 continue;
-            };
+            }
             if !self.is_active(i) {
                 continue;
             }
@@ -1769,15 +2026,20 @@ impl LoadedScene {
             } else {
                 0
             };
-            self.draws.push(DrawCmd {
-                mesh: self.mesh_handles[render.mesh],
-                material: self.materials[render.material].handle,
-                transform: self.world_transform(i),
-                highlight: if selected == Some(i) { highlight } else { 0.0 },
-                mesh_center: self.mesh_center_local(render.mesh),
-                lightmap_layer,
-                lightmap_size,
-            });
+            let transform = self.world_transform(i);
+            let highlight = if selected == Some(i) { highlight } else { 0.0 };
+            // One draw per material slot (slot 0 + extras), all at this transform.
+            for render in self.objects[i].render_slots().collect::<Vec<_>>() {
+                self.draws.push(DrawCmd {
+                    mesh: self.mesh_handles[render.mesh],
+                    material: self.materials[render.material].handle,
+                    transform,
+                    highlight,
+                    mesh_center: self.mesh_center_local(render.mesh),
+                    lightmap_layer,
+                    lightmap_size,
+                });
+            }
         }
     }
 
@@ -1881,6 +2143,7 @@ impl LoadedScene {
                     src.name.clone()
                 },
                 render: src.render,
+                extra_render: src.extra_render.clone(),
                 source: src.source.clone(),
                 enabled: src.enabled,
                 static_geometry: src.static_geometry,
@@ -1902,61 +2165,82 @@ impl LoadedScene {
     pub fn pick(&self, origin: Vec3, dir: Vec3) -> Option<usize> {
         let mut best: Option<(usize, f32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
-            let Some(render) = &object.render else {
+            if object.render.is_none() {
                 continue;
-            };
+            }
             let world = self.world_transform(i);
             let inv = world.inverse();
             let local_origin = inv.transform_point3(origin);
             let local_dir = inv.transform_vector3(dir);
-            let (min, max) = self.mesh_bounds[render.mesh];
-            if let Some(t_local) = ray_aabb(local_origin, local_dir, min, max) {
-                let hit_world = world.transform_point3(local_origin + local_dir * t_local);
-                let t_world = (hit_world - origin).length();
-                if best.is_none_or(|(_, t)| t_world < t) {
-                    best = Some((i, t_world));
+            // Test every slot's mesh AABB so a click on any sub-mesh selects the
+            // whole object.
+            for render in object.render_slots() {
+                let (min, max) = self.mesh_bounds[render.mesh];
+                if let Some(t_local) = ray_aabb(local_origin, local_dir, min, max) {
+                    let hit_world = world.transform_point3(local_origin + local_dir * t_local);
+                    let t_world = (hit_world - origin).length();
+                    if best.is_none_or(|(_, t)| t_world < t) {
+                        best = Some((i, t_world));
+                    }
                 }
             }
         }
         best.map(|(i, _)| i)
     }
 
+    /// Build the serialized `MaterialRef` for one material index (File if it
+    /// has a backing `.material`, else an Inline snapshot).
+    fn material_ref(
+        &self,
+        material_index: usize,
+        project_root: &Path,
+        shaders: &ShaderLibrary,
+    ) -> MaterialRef {
+        let entry = &self.materials[material_index];
+        match &entry.file {
+            Some(path) => MaterialRef::File(relative_to(path, project_root)),
+            None => {
+                let (params, features) = material_from_model(&entry.model);
+                let custom = shaders
+                    .get(&entry.model.shader)
+                    .and_then(|e| e.source.as_ref())
+                    .map(|s| s.unpack(&entry.model.custom_values))
+                    .unwrap_or_default();
+                MaterialRef::Inline {
+                    params,
+                    features,
+                    shader: entry.model.shader.clone(),
+                    custom,
+                    render_queue: Some(entry.model.render_queue),
+                    textures: tex_file_from_paths(&entry.model.textures),
+                }
+            }
+        }
+    }
+
     /// Serialize the current scene to a SceneFile.
     pub fn to_scene_file(&self, project_root: &Path, shaders: &ShaderLibrary) -> SceneFile {
+        let default_material = || MaterialRef::Inline {
+            params: MaterialParams::default(),
+            features: MaterialFeatures::default(),
+            shader: "standard".into(),
+            custom: Default::default(),
+            render_queue: None,
+            textures: Default::default(),
+        };
         let entries = self
             .objects
             .iter()
             .map(|object| {
                 let material = match &object.render {
-                    Some(render) => {
-                        let entry = &self.materials[render.material];
-                        match &entry.file {
-                            Some(path) => MaterialRef::File(relative_to(path, project_root)),
-                            None => {
-                                let (params, features) = material_from_model(&entry.model);
-                                let custom = shaders
-                                    .get(&entry.model.shader)
-                                    .and_then(|e| e.source.as_ref())
-                                    .map(|s| s.unpack(&entry.model.custom_values))
-                                    .unwrap_or_default();
-                                MaterialRef::Inline {
-                                    params,
-                                    features,
-                                    shader: entry.model.shader.clone(),
-                                    custom,
-                                    render_queue: Some(entry.model.render_queue),
-                                }
-                            }
-                        }
-                    }
-                    None => MaterialRef::Inline {
-                        params: MaterialParams::default(),
-                        features: MaterialFeatures::default(),
-                        shader: "standard".into(),
-                        custom: Default::default(),
-                        render_queue: None,
-                    },
+                    Some(render) => self.material_ref(render.material, project_root, shaders),
+                    None => default_material(),
                 };
+                let extra_materials: Vec<MaterialRef> = object
+                    .extra_render
+                    .iter()
+                    .map(|r| self.material_ref(r.material, project_root, shaders))
+                    .collect();
                 SceneEntry {
                     id: object.id.to_string(),
                     name: object.name.clone(),
@@ -1965,6 +2249,7 @@ impl LoadedScene {
                     static_geometry: object.static_geometry,
                     lightmap_scale: object.lightmap_scale,
                     material,
+                    extra_materials,
                     parent: object.parent,
                     components: object
                         .components
@@ -1984,6 +2269,51 @@ impl LoadedScene {
             entries,
             skybox: self.skybox.clone(),
             environment: self.environment.clone(),
+        }
+    }
+
+    /// Resolve one serialized `MaterialRef` to a material index. `File` loads
+    /// (or fetches cached) the asset; `Inline` overrides the given template
+    /// material's model in place and returns it.
+    fn resolve_material_ref(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        mref: &MaterialRef,
+        default_material: usize,
+    ) -> usize {
+        match mref {
+            MaterialRef::File(path) => {
+                let abs = project_root.join(path);
+                self.material_from_file(renderer, shaders, &abs, project_root)
+            }
+            MaterialRef::Inline {
+                params,
+                features,
+                shader,
+                custom,
+                render_queue,
+                textures,
+            } => {
+                let entry_ref = &mut self.materials[default_material];
+                let has_normal = entry_ref.model.has_normal_texture;
+                let name = entry_ref.model.name.clone();
+                let mut model = model_from_material(&name, params, features, has_normal);
+                model.shader = shader.clone();
+                if let Some(q) = render_queue {
+                    model.render_queue = *q;
+                }
+                model.textures = tex_paths_from_file(textures);
+                if shader != "standard" {
+                    let shader_entry = shaders.resolve(renderer, project_root, shader);
+                    if let Some(source) = &shader_entry.source {
+                        model.custom_values = source.pack(custom).to_vec();
+                    }
+                }
+                self.materials[default_material].model = model;
+                default_material
+            }
         }
     }
 
@@ -2037,15 +2367,15 @@ impl LoadedScene {
         let mut model_info: HashMap<String, (usize, Vec<usize>)> = HashMap::new();
         for path in model_object_template.keys() {
             let abs = project_root.join(path);
-            let asset = citrus_assets::load_model(&abs)
+            let asset = citrus_assets::load_model_with_meta(&abs)
                 .with_context(|| format!("importing {path} for scene"))?;
             let mesh_base = scene.mesh_handles.len();
             let object_start = scene.objects.len();
             scene.add_asset_scene(renderer, &asset, Some(Path::new(path)))?;
-            // Template: per model-local mesh index → material index.
+            // Template: per model-local mesh index → material index (all slots).
             let mut per_mesh_material = vec![0usize; asset.meshes.len()];
             for object in &scene.objects[object_start..] {
-                if let Some(render) = &object.render {
+                for render in object.render_slots() {
                     per_mesh_material[render.mesh - mesh_base] = render.material;
                 }
             }
@@ -2055,14 +2385,24 @@ impl LoadedScene {
         }
 
         for entry in &file.entries {
-            // (mesh, template material) for sources that render.
-            let mesh_material = match &entry.source {
-                ObjectSource::Model { path, mesh } => {
+            // (mesh, template material) for every render slot of this source.
+            // Slot 0 first, then any extra material slots.
+            let slots: Vec<(usize, usize)> = match &entry.source {
+                ObjectSource::Model {
+                    path,
+                    mesh,
+                    extra_meshes,
+                } => {
                     let (base, materials) = model_info
                         .get(path)
                         .context("scene references a model that failed to load")?;
-                    let local = (*mesh).min(materials.len().saturating_sub(1));
-                    Some((base + local, materials[local]))
+                    let resolve = |m: usize| {
+                        let local = m.min(materials.len().saturating_sub(1));
+                        (base + local, materials[local])
+                    };
+                    std::iter::once(resolve(*mesh))
+                        .chain(extra_meshes.iter().map(|m| resolve(*m)))
+                        .collect()
                 }
                 ObjectSource::Builtin { mesh } => {
                     let (base, materials) = builtin_template
@@ -2072,61 +2412,45 @@ impl LoadedScene {
                     // clamped into the material list as a fallback.
                     let local = (*mesh).min(2);
                     let material = materials.get(local).copied().unwrap_or(0);
-                    Some((base + local, material))
+                    vec![(base + local, material)]
                 }
                 ObjectSource::Primitive { shape } => {
                     let mesh = scene.ensure_primitive_mesh(renderer, *shape)?;
                     let material = scene.ensure_default_material(renderer)?;
-                    Some((mesh, material))
+                    vec![(mesh, material)]
                 }
-                ObjectSource::Empty | ObjectSource::Camera | ObjectSource::Light => None,
+                ObjectSource::Empty | ObjectSource::Camera | ObjectSource::Light => Vec::new(),
             };
 
-            let render = match mesh_material {
-                Some((mesh, default_material)) => {
-                    let material = match &entry.material {
-                        MaterialRef::File(path) => {
-                            let abs = project_root.join(path);
-                            scene.material_from_file(renderer, shaders, &abs, project_root)
-                        }
-                        MaterialRef::Inline {
-                            params,
-                            features,
-                            shader,
-                            custom,
-                            render_queue,
-                        } => {
-                            // Apply the stored params over the imported
-                            // material's textures by editing its model.
-                            let entry_ref = &mut scene.materials[default_material];
-                            let has_normal = entry_ref.model.has_normal_texture;
-                            let name = entry_ref.model.name.clone();
-                            let mut model =
-                                model_from_material(&name, params, features, has_normal);
-                            model.shader = shader.clone();
-                            if let Some(q) = render_queue {
-                                model.render_queue = *q;
-                            }
-                            if shader != "standard" {
-                                let shader_entry = shaders.resolve(renderer, project_root, shader);
-                                if let Some(source) = &shader_entry.source {
-                                    model.custom_values = source.pack(custom).to_vec();
-                                }
-                            }
-                            scene.materials[default_material].model = model;
-                            default_material
-                        }
-                    };
-                    Some(RenderInfo { mesh, material })
+            // Resolve slot 0 from `entry.material`, extras from
+            // `entry.extra_materials` (falling back to the template material).
+            let mut render = None;
+            let mut extra_render = Vec::new();
+            for (k, &(mesh, default_material)) in slots.iter().enumerate() {
+                let mref = if k == 0 {
+                    Some(&entry.material)
+                } else {
+                    entry.extra_materials.get(k - 1)
+                };
+                let material = match mref {
+                    Some(m) => scene
+                        .resolve_material_ref(renderer, shaders, project_root, m, default_material),
+                    None => default_material,
+                };
+                let info = RenderInfo { mesh, material };
+                if k == 0 {
+                    render = Some(info);
+                } else {
+                    extra_render.push(info);
                 }
-                None => None,
-            };
+            }
 
             scene.objects.push(SceneObject {
                 // Use the saved id; generate one for legacy scenes (empty).
                 id: entry.id.parse().unwrap_or_else(|_| ObjectId::new()),
                 name: entry.name.clone(),
                 render,
+                extra_render,
                 source: entry.source.clone(),
                 enabled: entry.enabled,
                 static_geometry: entry.static_geometry,
@@ -2191,12 +2515,57 @@ pub fn model_from_material(
         normal_map_enabled: f.normal_map,
         normal_strength: p.normal_strength,
         double_sided: f.double_sided,
+        rim_color: p.rim_color,
+        rim_power: p.rim_power,
+        rim_strength: p.rim_strength,
+        ramp_smoothness: p.ramp_smoothness,
+        emission_scroll: p.emission_scroll,
+        emission_pulse: p.emission_pulse,
+        matcap_strength: p.matcap_strength,
+        matcap_blend: [
+            citrus_core::MatcapBlend::from_f32(p.matcap_blend[0]),
+            citrus_core::MatcapBlend::from_f32(p.matcap_blend[1]),
+            citrus_core::MatcapBlend::from_f32(p.matcap_blend[2]),
+        ],
         render_queue: (match f.alpha_mode {
             AlphaMode::Opaque => AlphaModeModel::Opaque,
             AlphaMode::Cutout => AlphaModeModel::Cutout,
             AlphaMode::Blend => AlphaModeModel::Blend,
         })
         .default_render_queue(),
+        textures: citrus_core::MaterialTexturePaths::default(),
+    }
+}
+
+/// Convert an asset-file texture set into the editable model paths.
+pub fn tex_paths_from_file(
+    t: &citrus_assets::MaterialTextures,
+) -> citrus_core::MaterialTexturePaths {
+    citrus_core::MaterialTexturePaths {
+        albedo: t.albedo.clone(),
+        normal: t.normal.clone(),
+        orm: t.orm.clone(),
+        emission: t.emission.clone(),
+        opacity: t.opacity.clone(),
+        emission_mask: t.emission_mask.clone(),
+        matcap: t.matcap.clone(),
+        matcap_mask: t.matcap_mask.clone(),
+    }
+}
+
+/// Convert the editable model paths back into an asset-file texture set.
+pub fn tex_file_from_paths(
+    t: &citrus_core::MaterialTexturePaths,
+) -> citrus_assets::MaterialTextures {
+    citrus_assets::MaterialTextures {
+        albedo: t.albedo.clone(),
+        normal: t.normal.clone(),
+        orm: t.orm.clone(),
+        emission: t.emission.clone(),
+        opacity: t.opacity.clone(),
+        emission_mask: t.emission_mask.clone(),
+        matcap: t.matcap.clone(),
+        matcap_mask: t.matcap_mask.clone(),
     }
 }
 
@@ -2213,6 +2582,19 @@ pub fn material_from_model(m: &MaterialModel) -> (MaterialParams, MaterialFeatur
             emission_intensity: m.emission_intensity,
             alpha_cutoff: m.alpha_cutoff,
             normal_strength: m.normal_strength,
+            rim_color: m.rim_color,
+            rim_power: m.rim_power,
+            rim_strength: m.rim_strength,
+            ramp_smoothness: m.ramp_smoothness,
+            base_scroll: [0.0, 0.0],
+            emission_scroll: m.emission_scroll,
+            emission_pulse: m.emission_pulse,
+            matcap_strength: m.matcap_strength,
+            matcap_blend: [
+                m.matcap_blend[0].to_f32(),
+                m.matcap_blend[1].to_f32(),
+                m.matcap_blend[2].to_f32(),
+            ],
         },
         features_from_model(m),
     )

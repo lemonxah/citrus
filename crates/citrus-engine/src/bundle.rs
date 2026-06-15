@@ -61,6 +61,7 @@ fn inline_material() -> MaterialRef {
         shader: "standard".into(),
         custom: Default::default(),
         render_queue: None,
+        textures: Default::default(),
     }
 }
 
@@ -73,6 +74,7 @@ fn entry(name: &str, source: ObjectSource, translation: [f32; 3], scale: [f32; 3
         static_geometry: false,
         lightmap_scale: 1.0,
         material: inline_material(),
+        extra_materials: Vec::new(),
         parent: None,
         components: Vec::new(),
         translation,

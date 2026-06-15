@@ -67,6 +67,8 @@ pub struct ScenePanelResponse {
     pub delete: Option<usize>,
     /// (index, new name) inline-rename commit (F2 in the tree).
     pub rename: Option<(usize, String)>,
+    /// A model file dropped onto the tree (import it into the scene).
+    pub import_model: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -268,6 +270,16 @@ impl ScenePanel {
                 let bg = ui.allocate_rect(rest, Sense::click());
                 if let Some(payload) = bg.dnd_release_payload::<usize>() {
                     response.reparent.push((*payload, None));
+                }
+                // A model file dragged from the Files panel onto the tree imports it.
+                if let Some(payload) = bg.dnd_release_payload::<std::path::PathBuf>()
+                    && payload
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fbx" | "gltf" | "glb" | "obj"))
+                        .unwrap_or(false)
+                {
+                    response.import_model = Some((*payload).clone());
                 }
                 bg.context_menu(|ui| spawn_menu(ui, &mut response));
             });

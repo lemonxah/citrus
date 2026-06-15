@@ -63,6 +63,13 @@ pub enum InspectorContent<'a> {
     },
 }
 
+/// Result of the pinned object header row.
+#[derive(Default)]
+pub struct ObjectHeaderResponse {
+    pub object_changed: bool,
+    pub lock_changed: bool,
+}
+
 #[derive(Default)]
 pub struct InspectorResponse {
     pub object_changed: bool,
@@ -72,6 +79,9 @@ pub struct InspectorResponse {
     pub load_scene: bool,
     /// A `.material` file was dropped on the material slot.
     pub material_dropped: Option<PathBuf>,
+    /// An image file was dropped on a texture slot: (slot index 0..12, absolute
+    /// path). The engine converts it to project-relative and assigns it.
+    pub texture_dropped: Option<(usize, PathBuf)>,
     /// Component picked from the Add Component menu.
     pub add_component: Option<&'static str>,
     /// Component index whose remove button was clicked.
@@ -113,6 +123,56 @@ impl InspectorPanel {
             search: String::new(),
             locked: false,
         }
+    }
+
+    /// Pinned object header: a single flex row
+    /// `[enabled] [name (grows)] [static] [lock]`. The name field flexes to fill;
+    /// static + lock stay pinned right. Drawn above the scroll body so it never
+    /// moves. Returns what changed.
+    pub fn object_header(
+        &mut self,
+        ui: &mut Ui,
+        name: &mut String,
+        enabled: &mut bool,
+        static_geometry: &mut bool,
+    ) -> ObjectHeaderResponse {
+        let mut r = ObjectHeaderResponse::default();
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(enabled, "")
+                .on_hover_text("Enable / disable (skips rendering and lighting)")
+                .changed()
+            {
+                r.object_changed = true;
+            }
+            // Right side first (right_to_left): lock, then Static; the name field
+            // then fills the remaining width on the left.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let icon = if self.locked { "🔒" } else { "🔓" };
+                if ui
+                    .selectable_label(self.locked, icon)
+                    .on_hover_text("Lock the Inspector to the current selection")
+                    .clicked()
+                {
+                    self.locked = !self.locked;
+                    r.lock_changed = true;
+                }
+                if ui
+                    .checkbox(static_geometry, "Static")
+                    .on_hover_text("Non-moving: included in the lighting bake (lightmapped + occluder)")
+                    .changed()
+                {
+                    r.object_changed = true;
+                }
+                if ui
+                    .add(egui::TextEdit::singleline(name).desired_width(ui.available_width()))
+                    .changed()
+                {
+                    r.object_changed = true;
+                }
+            });
+        });
+        r
     }
 
     /// Draw the lock toggle header (a 🔒 button). Returns true if the lock
@@ -194,8 +254,14 @@ impl InspectorPanel {
                     }
                 });
                 ui.separator();
-                response.material_changed |=
-                    material_editor_ui(ui, &mut self.search, material, shaders, shader_info);
+                response.material_changed |= material_editor_ui(
+                    ui,
+                    &mut self.search,
+                    material,
+                    shaders,
+                    shader_info,
+                    &mut response.texture_dropped,
+                );
             }
             InspectorContent::SceneFile { path } => {
                 ui.heading("Scene");
@@ -234,32 +300,8 @@ impl InspectorPanel {
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
-        ui.horizontal(|ui| {
-            if ui
-                .checkbox(&mut info.enabled, "")
-                .on_hover_text("Enable / disable (skips rendering and lighting)")
-                .changed()
-            {
-                response.object_changed = true;
-            }
-            ui.label(RichText::new(info.kind).small().weak());
-            if ui.text_edit_singleline(&mut info.name).changed() {
-                response.object_changed = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .checkbox(&mut info.static_geometry, "Static")
-                    .on_hover_text(
-                        "Non-moving: included in the lighting bake (lightmapped + occluder)",
-                    )
-                    .changed()
-                {
-                    response.object_changed = true;
-                }
-            });
-        });
-        ui.separator();
-
+        // The object name / enabled / static row is drawn as the pinned header
+        // (see `object_header`), so the body starts at Transform.
         ui.label(RichText::new("Transform").strong());
         let t = &mut info.transform;
         egui::Grid::new("transform-grid")
@@ -317,13 +359,13 @@ impl InspectorPanel {
             });
             ui.separator();
         }
-        ui.label(RichText::new("Material Slots").strong());
-        // One slot per object for now (imports split multi-material meshes
-        // into one object per part).
+        // The active material slot (the slot selector, when an object has more
+        // than one, is drawn by the engine above the inspector body). Dropping a
+        // `.material` here assigns it to the selected slot.
         let slot = Frame::group(ui.style())
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Slot 0");
+                    ui.label("Active Material");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(&material.name).strong());
                     });
@@ -360,8 +402,14 @@ impl InspectorPanel {
                 }
             });
         });
-        response.material_changed |=
-            material_editor_ui(ui, &mut self.search, material, shaders, shader_info);
+        response.material_changed |= material_editor_ui(
+            ui,
+            &mut self.search,
+            material,
+            shaders,
+            shader_info,
+            &mut response.texture_dropped,
+        );
     }
 }
 

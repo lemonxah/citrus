@@ -13,9 +13,16 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, TextureData, Vertex};
 use glam::Mat4;
 
-use crate::{Instance, Scene, SceneMaterial};
+use crate::{Instance, MeshSlot, ModelImport, Scene, SceneMaterial};
 
+/// Import an FBX with default settings.
 pub fn load_fbx(path: impl AsRef<Path>) -> Result<Scene> {
+    load_fbx_with(path, &ModelImport::default())
+}
+
+/// Import an FBX, applying the asset's [`ModelImport`] settings (scale, flip-UV,
+/// import-materials) from its `.meta` sidecar.
+pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<Scene> {
     let path = path.as_ref();
     let opts = ufbx::LoadOpts {
         target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
@@ -67,8 +74,10 @@ pub fn load_fbx(path: impl AsRef<Path>) -> Result<Scene> {
             node.element.name.to_string()
         };
 
-        // Parts: one per material, or the whole mesh when unpartitioned.
+        // Parts: one per material, or the whole mesh when unpartitioned. All
+        // parts of a node become one instance with a material slot per part.
         let part_count = mesh.material_parts.len().max(1);
+        let mut slots: Vec<MeshSlot> = Vec::new();
         for part_index in 0..part_count {
             let key = (mesh.element.element_id, part_index);
             let entry = match part_cache.get(&key) {
@@ -97,16 +106,16 @@ pub fn load_fbx(path: impl AsRef<Path>) -> Result<Scene> {
                     (mesh_index, material_index)
                 }
             };
-            let name = if part_count > 1 {
-                format!("{node_name} [{part_index}]")
-            } else {
-                node_name.clone()
-            };
-            scene.instances.push(Instance {
-                name,
+            slots.push(MeshSlot {
                 mesh: entry.0,
                 material: entry.1,
+            });
+        }
+        if !slots.is_empty() {
+            scene.instances.push(Instance {
+                name: node_name,
                 transform,
+                slots,
             });
         }
     }
@@ -114,6 +123,34 @@ pub fn load_fbx(path: impl AsRef<Path>) -> Result<Scene> {
     if scene.instances.is_empty() {
         bail!("FBX file {} produced no renderable meshes", path.display());
     }
+
+    // Apply per-asset import settings (.meta) to the converted scene.
+    if settings.scale != 1.0 || settings.flip_uv {
+        for mesh in &mut scene.meshes {
+            for v in &mut mesh.vertices {
+                if settings.scale != 1.0 {
+                    v.position[0] *= settings.scale;
+                    v.position[1] *= settings.scale;
+                    v.position[2] *= settings.scale;
+                }
+                if settings.flip_uv {
+                    v.uv[1] = 1.0 - v.uv[1];
+                }
+            }
+        }
+    }
+    if !settings.import_materials {
+        // Strip imported materials: keep geometry, fall back to plain defaults.
+        for m in &mut scene.materials {
+            m.params = MaterialParams::default();
+            m.features = MaterialFeatures::default();
+            m.albedo = None;
+            m.normal = None;
+            m.orm = None;
+            m.emission = None;
+        }
+    }
+
     tracing::info!(
         meshes = scene.meshes.len(),
         materials = scene.materials.len(),

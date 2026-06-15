@@ -81,6 +81,29 @@ pub struct MaterialParams {
     pub alpha_cutoff: f32,
     pub normal_strength: f32,
     pub occlusion_strength: f32,
+    // --- extended "FX" params, delivered via a per-material UBO (set 1, binding
+    // 4) so the built-in Standard/Toon shaders can have rich options beyond the
+    // full 128-byte push block. ---
+    /// Toon rim-light colour.
+    pub rim_color: [f32; 3],
+    /// Toon rim Fresnel exponent (higher = tighter edge).
+    pub rim_power: f32,
+    /// Toon rim strength (0 = off).
+    pub rim_strength: f32,
+    /// Toon cel-ramp edge softness.
+    pub ramp_smoothness: f32,
+    /// Animated UV scroll for the base maps (uv units / second).
+    pub base_scroll: [f32; 2],
+    /// Animated UV scroll for the emission map.
+    pub emission_scroll: [f32; 2],
+    /// Emission pulse speed (0 = steady); brightness oscillates.
+    pub emission_pulse: f32,
+    /// Additive matcap strengths (3 layers; 0 = off). Each layer samples its own
+    /// matcap texture, multiplied by its mask.
+    pub matcap_strength: [f32; 3],
+    /// Per-layer matcap blend mode encoded as a float: 0 = Add, 1 = Multiply,
+    /// 2 = Replace.
+    pub matcap_blend: [f32; 3],
 }
 
 impl Default for MaterialParams {
@@ -96,6 +119,59 @@ impl Default for MaterialParams {
             alpha_cutoff: 0.5,
             normal_strength: 1.0,
             occlusion_strength: 1.0,
+            rim_color: [1.0, 1.0, 1.0],
+            rim_power: 4.0,
+            rim_strength: 0.0,
+            ramp_smoothness: 0.12,
+            base_scroll: [0.0, 0.0],
+            emission_scroll: [0.0, 0.0],
+            emission_pulse: 0.0,
+            matcap_strength: [0.0, 0.0, 0.0],
+            matcap_blend: [0.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// Per-material "FX" uniform block (std140) — the GPU layout of the extended
+/// [`MaterialParams`] fields. Five vec4s = 80 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MaterialFx {
+    /// rgb rim colour, w rim power.
+    pub rim: [f32; 4],
+    /// x rim strength, y ramp smoothness, z emission pulse, w unused.
+    pub toon: [f32; 4],
+    /// xy base UV scroll, zw emission UV scroll.
+    pub scroll: [f32; 4],
+    /// xyz matcap layer strengths, w unused.
+    pub matcap: [f32; 4],
+    /// xyz matcap layer blend modes (0 Add / 1 Multiply / 2 Replace), w unused.
+    pub matcap_blend: [f32; 4],
+}
+
+impl MaterialFx {
+    pub fn from_params(p: &MaterialParams) -> Self {
+        Self {
+            rim: [p.rim_color[0], p.rim_color[1], p.rim_color[2], p.rim_power],
+            toon: [p.rim_strength, p.ramp_smoothness, p.emission_pulse, 0.0],
+            scroll: [
+                p.base_scroll[0],
+                p.base_scroll[1],
+                p.emission_scroll[0],
+                p.emission_scroll[1],
+            ],
+            matcap: [
+                p.matcap_strength[0],
+                p.matcap_strength[1],
+                p.matcap_strength[2],
+                0.0,
+            ],
+            matcap_blend: [
+                p.matcap_blend[0],
+                p.matcap_blend[1],
+                p.matcap_blend[2],
+                0.0,
+            ],
         }
     }
 }
@@ -110,6 +186,7 @@ pub struct MaterialHandle(pub(crate) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShaderId(pub(crate) usize);
 
+#[derive(Default)]
 pub struct MaterialDesc {
     pub name: String,
     pub params: MaterialParams,
@@ -118,6 +195,11 @@ pub struct MaterialDesc {
     pub normal: Option<TextureHandle>,
     pub orm: Option<TextureHandle>,
     pub emission: Option<TextureHandle>,
+    // Extended texture slots (bindings 5-12).
+    pub opacity: Option<TextureHandle>,
+    pub emission_mask: Option<TextureHandle>,
+    pub matcap: [Option<TextureHandle>; 3],
+    pub matcap_mask: [Option<TextureHandle>; 3],
     /// Render with the error swirl shader (broken/missing material).
     pub error: bool,
 }
@@ -333,6 +415,9 @@ pub struct FrameInput<'a> {
     /// Debug: render objects as a lightmap-UV checkerboard (cell size tracks
     /// each object's lightmap resolution) instead of their material.
     pub lightmap_preview: bool,
+    /// GI debug view: 0 = off, 1 = world normals, 2 = indirect/GI term only.
+    /// Lets you isolate the probe-grid blockiness on screen.
+    pub gi_debug: u32,
     /// Resolved post-processing parameters (from the camera's blended Volume
     /// profiles). Per-pixel effects applied in the surface shaders.
     pub postfx: PostFx,

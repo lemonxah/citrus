@@ -24,6 +24,8 @@ fn main() {
         "bake_probe.comp",
         // Software (SDF) GI probe march — GPU compute over the Global Distance Field.
         "sw_gi.comp",
+        // Screen-space GI final gather — per-pixel GDF trace (Lumen-style).
+        "screen_gi.comp",
     ] {
         let src = format!("shaders/{name}");
         let dst = Path::new(&out_dir).join(format!("{name}.spv"));

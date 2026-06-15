@@ -3,13 +3,15 @@
 //! master enable checkbox follow the Poiyomi pattern (off = feature compiled
 //! out of the shader variant).
 
-use egui::collapsing_header::{CollapsingState, paint_default_icon};
-use egui::{ComboBox, DragValue, Label, RichText, Sense, Slider, Ui};
+use std::path::{Path, PathBuf};
 
-use citrus_core::{AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderUiInfo};
+use egui::collapsing_header::{CollapsingState, paint_default_icon};
+use egui::{ComboBox, DragValue, Frame, Label, RichText, Sense, Slider, Ui};
+
+use citrus_core::{AlphaModeModel, MatcapBlend, MaterialModel, ShaderPropKindUi, ShaderUiInfo};
 
 /// Section metadata for search: (title, keywords).
-const SECTIONS: [(&str, &[&str]); 5] = [
+const SECTIONS: [(&str, &[&str]); 6] = [
     (
         "Base",
         &[
@@ -34,7 +36,74 @@ const SECTIONS: [(&str, &[&str]); 5] = [
         "Geometry",
         &["normal", "double", "sided", "culling", "bump"],
     ),
+    ("Matcaps", &["matcap", "matcaps", "sphere", "reflection"]),
 ];
+
+const MATCAP_TITLES: [&str; 3] = ["Matcap 1", "Matcap 2", "Matcap 3"];
+
+/// True for file extensions the engine can load as a texture.
+fn is_image_path(p: &Path) -> bool {
+    matches!(
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some(
+            "png" | "jpg" | "jpeg" | "tga" | "bmp" | "dds" | "hdr" | "exr" | "ktx" | "ktx2"
+                | "webp" | "gif"
+        )
+    )
+}
+
+/// One texture-slot row: assigned filename + a drag-drop target (drag an image
+/// from the file browser) + a clear button. `idx` is the 0..12 slot index
+/// reported on drop via `tex_dropped`. Returns true if cleared in place.
+fn texture_row(
+    ui: &mut Ui,
+    label: &str,
+    idx: usize,
+    slot: &mut Option<PathBuf>,
+    tex_dropped: &mut Option<(usize, PathBuf)>,
+) -> bool {
+    let mut cleared = false;
+    let current = slot
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned());
+    let resp = Frame::group(ui.style())
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if current.is_some() && ui.small_button("✖").on_hover_text("Clear").clicked() {
+                        *slot = None;
+                        cleared = true;
+                    }
+                    match &current {
+                        Some(name) => ui.label(RichText::new(name).weak()),
+                        None => ui.label(RichText::new("drop image").small().weak()),
+                    };
+                });
+            });
+        })
+        .response;
+    if let Some(hover) = resp.dnd_hover_payload::<PathBuf>()
+        && is_image_path(&hover)
+    {
+        ui.painter().rect_stroke(
+            resp.rect,
+            4.0,
+            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+            egui::StrokeKind::Outside,
+        );
+    }
+    if let Some(dropped) = resp.dnd_release_payload::<PathBuf>()
+        && is_image_path(&dropped)
+    {
+        *tex_dropped = Some((idx, (*dropped).clone()));
+    }
+    cleared
+}
 
 fn section_matches(search: &str, index: usize) -> bool {
     if search.is_empty() {
@@ -44,13 +113,16 @@ fn section_matches(search: &str, index: usize) -> bool {
     title.to_lowercase().contains(search) || keywords.iter().any(|k| k.contains(search))
 }
 
-/// Full material editor. Returns true if anything changed.
+/// Full material editor. Returns true if anything changed. Texture-slot drops
+/// are reported via `tex_dropped` ((slot 0..12, absolute image path)); the
+/// engine converts the path to project-relative and assigns it.
 pub fn material_editor_ui(
     ui: &mut Ui,
     search: &mut String,
     m: &mut MaterialModel,
     shaders: &[&str],
     shader_info: Option<&ShaderUiInfo>,
+    tex_dropped: &mut Option<(usize, PathBuf)>,
 ) -> bool {
     let mut changed = false;
 
@@ -110,6 +182,7 @@ pub fn material_editor_ui(
             property_row(ui, "Base Color", changed, |ui| {
                 ui.color_edit_button_rgba_unmultiplied(&mut m.base_color)
             });
+            *changed |= texture_row(ui, "Albedo", 0, m.textures.slot_mut(0).unwrap(), tex_dropped);
             property_row(ui, "Metallic", changed, |ui| {
                 ui.add(Slider::new(&mut m.metallic, 0.0..=1.0))
             });
@@ -119,6 +192,27 @@ pub fn material_editor_ui(
             property_row(ui, "Occlusion", changed, |ui| {
                 ui.add(Slider::new(&mut m.occlusion_strength, 0.0..=1.0))
             });
+            *changed |= texture_row(
+                ui,
+                "ORM (Occl/Rough/Metal)",
+                2,
+                m.textures.slot_mut(2).unwrap(),
+                tex_dropped,
+            );
+            ui.separator();
+            *changed |=
+                texture_row(ui, "Normal Map", 1, m.textures.slot_mut(1).unwrap(), tex_dropped);
+            ui.add_enabled_ui(m.has_normal_texture, |ui| {
+                property_row(ui, "Use Normal Map", changed, |ui| {
+                    ui.checkbox(&mut m.normal_map_enabled, "")
+                });
+                property_row(ui, "Normal Strength", changed, |ui| {
+                    ui.add(Slider::new(&mut m.normal_strength, 0.0..=2.0))
+                });
+            });
+            ui.separator();
+            *changed |=
+                texture_row(ui, "Opacity", 4, m.textures.slot_mut(4).unwrap(), tex_dropped);
         });
     }
 
@@ -129,11 +223,36 @@ pub fn material_editor_ui(
             Some(&mut m.toon_enabled),
             &mut changed,
             |ui, changed| {
-                property_row(ui, "Steps", changed, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Poiyomi-style cel shading (PBR base + ramp + rim). Shares GI \
+                         + baked lightmaps with the Standard shader.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                property_row(ui, "Ramp Steps", changed, |ui| {
                     ui.add(Slider::new(&mut m.toon_steps, 2.0..=8.0).step_by(1.0))
                 });
-                property_row(ui, "PBR → Toon", changed, |ui| {
+                property_row(ui, "Toon Strength", changed, |ui| {
                     ui.add(Slider::new(&mut m.pbr_toon_blend, 0.0..=1.0))
+                        .on_hover_text("Blend between smooth PBR (0) and full cel ramp (1)")
+                });
+                property_row(ui, "Ramp Smoothness", changed, |ui| {
+                    ui.add(Slider::new(&mut m.ramp_smoothness, 0.01..=0.49))
+                        .on_hover_text("Softness of each cel-band terminator")
+                });
+                ui.separator();
+                property_row(ui, "Rim Strength", changed, |ui| {
+                    ui.add(Slider::new(&mut m.rim_strength, 0.0..=3.0))
+                        .on_hover_text("Fresnel edge glow (0 = off)")
+                });
+                property_row(ui, "Rim Color", changed, |ui| {
+                    ui.color_edit_button_rgb(&mut m.rim_color)
+                });
+                property_row(ui, "Rim Power", changed, |ui| {
+                    ui.add(Slider::new(&mut m.rim_power, 0.5..=8.0))
+                        .on_hover_text("Higher = tighter edge")
                 });
             },
         );
@@ -149,12 +268,41 @@ pub fn material_editor_ui(
                 property_row(ui, "Color", changed, |ui| {
                     ui.color_edit_button_rgb(&mut m.emission_color)
                 });
+                *changed |= texture_row(
+                    ui,
+                    "Emission Map",
+                    3,
+                    m.textures.slot_mut(3).unwrap(),
+                    tex_dropped,
+                );
                 property_row(ui, "Intensity", changed, |ui| {
                     ui.add(
                         DragValue::new(&mut m.emission_intensity)
                             .speed(0.05)
                             .range(0.0..=100.0),
                     )
+                });
+                *changed |= texture_row(
+                    ui,
+                    "Emission Mask",
+                    5,
+                    m.textures.slot_mut(5).unwrap(),
+                    tex_dropped,
+                );
+                property_row(ui, "Pulse Speed", changed, |ui| {
+                    ui.add(Slider::new(&mut m.emission_pulse, 0.0..=10.0))
+                        .on_hover_text("Brightness oscillation rate (0 = steady)")
+                });
+                ui.horizontal(|ui| {
+                    ui.label("UV Scroll");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        *changed |= ui
+                            .add(DragValue::new(&mut m.emission_scroll[1]).speed(0.01).prefix("y "))
+                            .changed();
+                        *changed |= ui
+                            .add(DragValue::new(&mut m.emission_scroll[0]).speed(0.01).prefix("x "))
+                            .changed();
+                    });
                 });
             },
         );
@@ -171,16 +319,68 @@ pub fn material_editor_ui(
             property_row(ui, "Double Sided", changed, |ui| {
                 ui.checkbox(&mut m.double_sided, "")
             });
-            ui.add_enabled_ui(m.has_normal_texture, |ui| {
-                property_row(ui, "Normal Map", changed, |ui| {
-                    ui.checkbox(&mut m.normal_map_enabled, "")
+            ui.label(
+                RichText::new("Normal map + strength live in the Base section.")
+                    .small()
+                    .weak(),
+            );
+        });
+    }
+
+    if section_matches(&search_lower, 5) {
+        section(ui, "Matcaps", None, &mut changed, |ui, changed| {
+            ui.label(
+                RichText::new(
+                    "Sphere-mapped reflection layers. Drop a matcap texture, pick how it \
+                     blends with the colour, and (optionally) a mask. Strength 0 = off.",
+                )
+                .small()
+                .weak(),
+            );
+            // Per-layer slot indices into the 12-slot texture set:
+            // matcap tex = 6/8/10, matcap mask = 7/9/11.
+            for i in 0..3 {
+                let tex_slot = 6 + i * 2;
+                let mask_slot = 7 + i * 2;
+                section(ui, MATCAP_TITLES[i], None, changed, |ui, changed| {
+                    *changed |= texture_row(
+                        ui,
+                        "Matcap",
+                        tex_slot,
+                        m.textures.slot_mut(tex_slot).unwrap(),
+                        tex_dropped,
+                    );
+                    let before = m.matcap_blend[i];
+                    ui.horizontal(|ui| {
+                        ui.label("Blend");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ComboBox::from_id_salt(("matcap-blend", i))
+                                .selected_text(m.matcap_blend[i].label())
+                                .show_ui(ui, |ui| {
+                                    for mode in MatcapBlend::ALL {
+                                        ui.selectable_value(
+                                            &mut m.matcap_blend[i],
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                });
+                        });
+                    });
+                    if m.matcap_blend[i] != before {
+                        *changed = true;
+                    }
+                    property_row(ui, "Strength", changed, |ui| {
+                        ui.add(Slider::new(&mut m.matcap_strength[i], 0.0..=2.0))
+                    });
+                    *changed |= texture_row(
+                        ui,
+                        "Mask",
+                        mask_slot,
+                        m.textures.slot_mut(mask_slot).unwrap(),
+                        tex_dropped,
+                    );
                 });
-                property_row(ui, "Normal Strength", changed, |ui| {
-                    ui.add(Slider::new(&mut m.normal_strength, 0.0..=2.0))
-                });
-            });
-            if !m.has_normal_texture {
-                ui.label(RichText::new("No normal texture assigned").small().weak());
             }
         });
     }

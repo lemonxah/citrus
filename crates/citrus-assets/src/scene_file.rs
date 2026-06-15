@@ -7,14 +7,23 @@ use anyhow::{Context as _, Result};
 use citrus_render::{MaterialFeatures, MaterialParams};
 use serde::{Deserialize, Serialize};
 
+use crate::material_file::MaterialTextures;
+
 pub const SCENE_EXTENSION: &str = "scene";
 
 /// Where an object's mesh came from.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ObjectSource {
     /// A model file in the project; `mesh` is the flattened primitive index
-    /// produced by the importer (stable for an unchanged file).
-    Model { path: String, mesh: usize },
+    /// (slot 0) produced by the importer (stable for an unchanged file).
+    /// `extra_meshes` holds the flattened indices of any additional material
+    /// slots on the same object (empty for single-material meshes).
+    Model {
+        path: String,
+        mesh: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_meshes: Vec<usize>,
+    },
     /// A built-in test-scene mesh (sphere/cube/plane by index).
     Builtin { mesh: usize },
     /// A generated primitive shape.
@@ -71,6 +80,10 @@ pub enum MaterialRef {
         /// Draw-order priority (Unity render queue); None = derive from alpha.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         render_queue: Option<i32>,
+        /// User-assigned texture slots (project-relative). Empty = none / use
+        /// the object's import-embedded textures.
+        #[serde(default, skip_serializing_if = "MaterialTextures::is_empty")]
+        textures: MaterialTextures,
     },
 }
 
@@ -111,6 +124,10 @@ pub struct SceneEntry {
     #[serde(default = "default_lightmap_scale")]
     pub lightmap_scale: f32,
     pub material: MaterialRef,
+    /// Materials for additional slots beyond the first (parallel to
+    /// `ObjectSource::Model::extra_meshes`). Empty for single-material objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_materials: Vec<MaterialRef>,
     /// Index of the parent entry in this file, if any. Transforms are local
     /// to the parent.
     #[serde(default)]
@@ -192,7 +209,7 @@ where
 }
 
 /// How the realtime-GI probe trace is computed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum GiMode {
     /// Hardware ray-query (RT cores) against the scene BVH — most accurate.
     #[default]
@@ -212,43 +229,125 @@ impl GiMode {
     pub const ALL: [GiMode; 2] = [Self::RayQuery, Self::Software];
 }
 
+/// Flux quality preset. Drives per-frame samples-per-probe and the march step
+/// cap; the temporal accumulator does the rest, so even Performance stays smooth
+/// once settled. Probe density (screen-probe spacing) is fixed for now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum FluxQuality {
+    /// Fewest rays — cheapest, slightly noisier while moving.
+    Performance,
+    #[default]
+    Balanced,
+    High,
+    /// Most rays — sharpest contact GI, highest cost.
+    Ultra,
+}
+
+impl FluxQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Performance => "Performance",
+            Self::Balanced => "Balanced",
+            Self::High => "High",
+            Self::Ultra => "Ultra",
+        }
+    }
+    pub const ALL: [FluxQuality; 4] =
+        [Self::Performance, Self::Balanced, Self::High, Self::Ultra];
+    /// Rays per screen probe per frame (temporal accumulation does the rest).
+    pub fn samples(self) -> u32 {
+        match self {
+            Self::Performance => 6,
+            Self::Balanced => 10,
+            Self::High => 16,
+            Self::Ultra => 24,
+        }
+    }
+}
+
+/// World-probe fallback policy. Flux drives the main view; the legacy world-probe
+/// DDGI grid only feeds the in-game camera + off-screen fallback, so it doesn't
+/// need to re-march every frame (that was the redundant ~6ms CPU cost).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ProbeFallback {
+    /// No world-probe march while Flux is active (lowest CPU).
+    Off,
+    /// March the world probes at a low cadence for the fallback paths.
+    #[default]
+    Throttled,
+}
+
+impl ProbeFallback {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Throttled => "Throttled",
+        }
+    }
+    pub const ALL: [ProbeFallback; 2] = [Self::Off, Self::Throttled];
+}
+
 /// Realtime global-illumination (probe) settings. Drives the live probe re-trace
 /// that lets realtime lights cast soft indirect bounce without a bake.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RealtimeGi {
     pub enabled: bool,
-    /// Tracing backend (hardware ray-query vs software SDF march).
-    pub mode: GiMode,
+    /// Flux quality preset (samples-per-probe + march step cap).
+    pub quality: FluxQuality,
     /// Indirect bounces per path (1 = single bounce; more = softer fill).
     pub bounces: u32,
-    /// Rays traced per probe — higher = less noise, more cost.
-    pub samples: u32,
-    /// GI strength multiplier applied to the probe SH before upload.
+    /// GI strength multiplier on the indirect term.
     pub intensity: f32,
-    /// World-units between auto-grid probes (smaller = finer GI, more cost).
+    /// Temporal smoothing 0..1: higher = smoother but more motion lag; lower =
+    /// sharper/more responsive but noisier while the camera moves.
+    pub smoothing: f32,
+    // --- Advanced ---
+    /// GDF resolution (occlusion + bounce detail): 64 / 128 / 256.
+    pub gdf_resolution: u32,
+    /// Max trace distance in world units (0 = auto from scene size).
+    pub march_distance: f32,
+    /// Firefly clamp on bounce samples — caps bright outliers (lower = calmer).
+    pub firefly_clamp: f32,
+    /// World-probe fallback policy for the in-game camera / off-screen surfaces.
+    pub probe_fallback: ProbeFallback,
+    // --- Internal: not shown in the UI. The world-probe DDGI fallback path still
+    // uses these; samples/mode are derived from `quality`/Flux on load. ---
+    #[doc(hidden)]
+    pub mode: GiMode,
+    #[doc(hidden)]
+    pub samples: u32,
+    #[doc(hidden)]
     pub probe_spacing: f32,
-    /// Per-update blend toward the new trace (0..1): lower = smoother/laggier,
-    /// higher = snappier/noisier.
+    #[doc(hidden)]
     pub temporal_blend: f32,
-    /// Seconds between probe re-traces when the scene is changing.
+    #[doc(hidden)]
     pub update_interval: f32,
 }
 
 impl Default for RealtimeGi {
     fn default() -> Self {
-        // Tuned for the soft, gently-settling Lumen look: low temporal blend so
-        // the GI eases in over ~a second, a coarse probe grid (low-frequency =
-        // soft), 2 bounces for ambient fill.
+        // Flux is the realtime GI path: soft, gently-settling Lumen look. The
+        // internal world-probe fields stay only for the throttled fallback.
         Self {
             enabled: false,
-            mode: GiMode::RayQuery,
+            quality: FluxQuality::Balanced,
             bounces: 2,
-            samples: 64,
             intensity: 1.0,
+            smoothing: 0.5,
+            gdf_resolution: 128,
+            march_distance: 0.0, // auto
+            firefly_clamp: 4.0,
+            // Default: Flux only (no world-probe march). The DDGI fallback is
+            // opt-in for projects using the in-game camera / off-screen GI.
+            probe_fallback: ProbeFallback::Off,
+            mode: GiMode::Software,
+            samples: 64,
             probe_spacing: 2.0,
             temporal_blend: 0.12,
-            update_interval: 0.2,
+            // 0 = the GDF + emitter feed (what Flux samples) refreshes every
+            // frame so moving emitters track without lag.
+            update_interval: 0.0,
         }
     }
 }

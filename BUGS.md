@@ -8,6 +8,96 @@ Legend: `[ ]` open · `[verify]` believed fixed, confirm after a rebuild · `[x]
 
 ## Open / verify
 
+- [x] **Flux: emissive object showed a coloured band from the emitter behind it** — emissive
+  surfaces were excluded from the Flux depth prepass, so their pixels reconstructed the surface
+  BEHIND them and sampled that (a magenta floor behind a green box bled onto the box face).
+  Fixed by putting emissive back in the depth prepass (they sample their own GI; received GI is
+  additive on top of emission). Confirmed.
+- [x] **Flux: emitter glow worked off-screen but vanished when the emitter came on-screen** —
+  the screen-space NEE occlusion trace false-shadowed at grazing angles (ray skims the receiver
+  floor) only while the emitter was on-screen. Removed the screen-space occlusion entirely; the
+  emitter NEE now has NO occlusion (a soft cosine terminator handles back-faces, emissive-in-
+  depth-prepass handles the behind-GI). Trade-off: an emitter's direct glow can pass through a
+  solid (proper fix = surface/radiance cache, tracked). Confirmed gone.
+- [known] **Firefly speckles on the floor when a light is near the transparent window** — the
+  static transparent window sits in the GDF as a solid occluder, so bounce rays hit it right
+  next to the point light → inverse-square blowup → fireflies. Fix (pending): exclude transparent
+  from the GDF (glass shouldn't occlude GI) and/or clamp the near-light attenuation in the Flux
+  direct term.
+- [x] **Screen-space GI: fixed-pattern blotches that never converged** — the trace RNG seed
+  (`screen_gi.comp`, `hash(... + pc.misc.x * 26699u)`) had `misc.x` hardcoded to `0`, so every
+  frame traced the identical random directions per pixel → the Monte-Carlo noise was a fixed
+  pattern and temporal accumulation was blending a value against itself (no convergence).
+  Fixed: a monotonic `sgi_frame` counter increments each trace and feeds `misc.x`, so each frame
+  samples different directions and the noise averages away within a few frames (and reprojects
+  cleanly while moving). Confirmed visually.
+- [x] **Screen-space GI: square halo + voxel banding around static emissive objects** — static
+  emitters were baked into the GDF, so the hemisphere bounce hit their coarse padded SDF box
+  (square edge) and the 128³ voxel lattice (banding); dynamic emitters dodged it by being
+  excluded from the field. Fixed: emissive instances are excluded from the GDF regardless of the
+  static flag (`realtime_gi.rs` gdf_insts filter) — their light still reaches the scene via the
+  analytic NEE spheres. A static emitter now looks identical to a dynamic one. Confirmed visually.
+- [verify] **Realtime GI tanked framerate in Play mode (≈1200→150 fps, same 7 draw calls)** —
+  the editor runs GI every frame too but a static scene *settles* and stops tracing; in Play,
+  physics nudges/jitters bodies every frame so the GI input hash changed continuously and it
+  re-traced (march + 6-iter blur + probe upload) forever. Three fixes:
+  1. The GI input hash (`hash_inputs`) now **ignores dynamic, non-emissive objects** — a prop
+     falling/resting under physics no longer forces a re-trace (it's not in the static field and
+     casts no light; it still *receives* GI via the fixed probe volume). Static geometry and
+     moving emitters still drive re-traces.
+  2. Transforms in the hash are **quantized to ~1mm** so a resting body's solver jitter doesn't
+     re-trace.
+  3. The 64³ Global Distance Field (`build_gdf`) is built from **static geometry only**
+     (`SdfInstance::static_geometry`), so dynamic motion never triggers the (heavy) rebuild.
+  Net: a Play-mode scene settles and idles like the editor. Mark level geometry "Contribute GI"
+  (static) so it occludes/bounces in the cached field.
+
+  **Confirmed via per-section CPU log** (`play CPU: gi … components … physics … audio …`):
+  components/physics/audio were ~0; the cost was **GI re-tracing in RayQuery (hardware) mode**
+  — a 32³ = 32768-probe grid re-baked **synchronously on the main thread (~9 ms)** on most
+  frames, because a GI contributor (a light, emissive object, or static-marked mesh) was being
+  animated by a component every frame, so the GI hash never settled. The probe volume is
+  scene-centered, so camera/player motion is *not* the trigger. Two more fixes:
+  4. RayQuery's trace cadence is **floored to ~10 Hz** (`interval_floor` in `update`) so a
+     continuously-animated GI input can't block every frame (software march stays floor-0 / async).
+  5. The RayQuery realtime grid is **capped at 24³** (~13k probes) instead of 32³ — the grid
+     blur keeps the soft look at lower res, each trace is ~2.4× cheaper.
+  Recommendation: use **Software** GI mode for realtime (cheap GPU march, async, cascaded);
+  RayQuery is best reserved for the offline bake.
+
+- [verify] **Material inspector had no texture inputs** — the shader binds 12 sampler
+  slots and imports show embedded textures, but `MaterialModel` carried no texture
+  references so the inspector couldn't expose them. Added `MaterialTexturePaths` (12
+  project-relative slots) to the model, a **Textures** collapsing section in the
+  material editor with per-slot drag-drop (drop an image from the file browser) and
+  clear buttons, a renderer `set_material_textures` that rebinds an existing
+  material's descriptor set, and `apply_material` now resolves model paths (sRGB for
+  colour slots, linear for data) falling back to import-embedded handles. Round-trips
+  through `.material` files (`MaterialTextures`) and inline scene materials
+  (`MaterialRef::Inline { textures }`, `#[serde(default)]` so old scenes still load).
+  Imported materials stay read-only until extracted. Confirm assigning/clearing a
+  texture updates the viewport after a rebuild.
+
+- [verify] **Switching GI mode (Hardware ↔ Software) didn't update the viewport** —
+  `hash_inputs` folded in lights/geometry/materials/settings but not `gi.mode`, so
+  the software-SDF and hardware-ray-query backends hashed identically and the toggle
+  never triggered a re-trace. `GiMode` now derives `Hash` and is hashed. Confirm the
+  viewport re-traces when flipping the mode after a rebuild.
+
+- [verify] **Realtime GI didn't re-trace on a material change** — editing/resetting a
+  material, assigning a material, or editing a `.material` file (and the matching
+  undo/redo) now calls `RealtimeGiState::invalidate()`, forcing the next trace even
+  when the input hash doesn't catch the change. Emission/albedo are also folded into
+  `hash_inputs` so emissive edits re-trace on their own. Confirm bounce light updates
+  live after a rebuild.
+
+- [x] **Scroll wheel dollied the camera through floating windows over the viewport** —
+  fixed. Scroll-dolly was gated only on `pointer_in_viewport` (a winit rect test), which
+  is true even when a floating egui window sits over the cursor inside the viewport rect,
+  so the wheel bled through (clicks were already blocked via the occlusion-aware
+  `response.hovered()`). Now scroll-dolly also requires `response.contains_pointer()`
+  (occlusion-aware), so a window over the cursor swallows the wheel like it does clicks.
+
 - [verify] Gizmo floated away from the selected object's pivot — fixed by projecting
   the gizmo against the full window rect (the swapchain) instead of the viewport tab
   rect; confirm anchored correctly after the rebuild.

@@ -41,6 +41,8 @@ use texture::GpuTexture;
 
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const MAX_MATERIALS: u32 = 1024;
+/// set-1 sampler binding indices in texture-slot order (binding 4 is the FX UBO).
+const TEXTURE_BINDINGS: [u32; 12] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
 
 /// Maximum scene lights evaluated per frame by the standard shader. Matches
 /// `MAX_LIGHTS` in standard.frag; the array lives in the frame UBO.
@@ -153,6 +155,11 @@ struct FrameUbo {
     probe_volumes: [GpuProbeVolume; MAX_PROBE_VOLUMES],
     /// x = lightmap-UV-checker preview flag (>0.5 on); yzw reserved.
     debug: [f32; 4],
+    /// Inverse view / projection — for reconstructing world position from a
+    /// depth sample (screen-space GI). Appended last so existing shaders that
+    /// read a prefix of FrameData are unaffected.
+    inv_view: [[f32; 4]; 4],
+    inv_proj: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -382,9 +389,12 @@ struct Material {
     error: bool,
     /// Custom fragment shader; None = standard shader.
     custom_shader: Option<ShaderId>,
-    /// Custom-shader push data (16 floats packed by property offsets).
+    /// Custom-shader push data (15 props + reserved lightmap layer).
     custom_data: [f32; 16],
     set: vk::DescriptorSet,
+    /// Extended "FX" uniform block (set 1, binding 4); host-visible, rewritten on
+    /// param change. Holds rim + animated-emission params for the built-in shaders.
+    fx_ubo: Buffer,
 }
 
 struct DepthTarget {
@@ -504,6 +514,135 @@ fn create_view(
                 .layer_count(1),
         );
     Ok(unsafe { device.create_image_view(&info, None)? })
+}
+
+/// Screen-probe tile size: one screen-space GI probe is traced per
+/// `SCREEN_PROBE_DIV × SCREEN_PROBE_DIV` block of pixels, then bilinearly
+/// upsampled to full resolution in the forward shader (Lumen screen-probe
+/// scheme). Larger = cheaper/softer; smaller = sharper/more rays.
+const SCREEN_PROBE_DIV: u32 = 4;
+
+/// Runtime-tunable Flux (screen-space GI) parameters, set from the Environment
+/// tab via [`Renderer::set_flux_settings`]. These drive the per-frame trace that
+/// was previously hardcoded.
+#[derive(Clone, Copy)]
+pub struct FluxSettings {
+    /// Rays per screen probe per frame (temporal accumulation smooths the rest).
+    pub samples: u32,
+    /// Indirect bounces per ray.
+    pub bounces: u32,
+    /// Max trace distance in world units; 0 = auto from the GDF bounds.
+    pub march_distance: f32,
+    /// Per-sample firefly clamp on the bounce term (caps bright outliers).
+    pub firefly_clamp: f32,
+    /// Temporal smoothing 0..1: higher = smoother/more lag, lower = sharper/noisier.
+    pub smoothing: f32,
+    /// Indirect strength multiplier (applied before temporal accumulation).
+    pub intensity: f32,
+}
+
+impl Default for FluxSettings {
+    fn default() -> Self {
+        // Mirrors the old hardcoded trace (Balanced preset).
+        Self {
+            samples: 10,
+            bounces: 2,
+            march_distance: 0.0,
+            firefly_clamp: 4.0,
+            smoothing: 0.5,
+            intensity: 1.0,
+        }
+    }
+}
+
+/// Screen-space GI targets: a full-res sampleable camera depth prepass + a
+/// reduced-resolution **screen-probe** radiance buffer (one probe per
+/// `SCREEN_PROBE_DIV²` pixels), bilinearly upsampled by the forward shader.
+struct ScreenGiTargets {
+    /// Probe-grid resolution (screen extent / SCREEN_PROBE_DIV).
+    probe_extent: vk::Extent2D,
+    depth_image: vk::Image,
+    depth_view: vk::ImageView,
+    depth_alloc: Option<Allocation>,
+    /// Ping-pong screen-probe buffers: temporal reprojection reads the previous
+    /// frame's image and writes the other (in-place would race since reprojection
+    /// reads neighbour texels). `parity` selects which is current.
+    gi_image: [vk::Image; 2],
+    gi_view: [vk::ImageView; 2],
+    gi_alloc: [Option<Allocation>; 2],
+}
+
+impl ScreenGiTargets {
+    fn new(ctx: &GpuContext, allocator: &mut Allocator, extent: vk::Extent2D) -> Result<Self> {
+        let (depth_image, depth_alloc) = create_image(
+            &ctx.device,
+            allocator,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            extent,
+            "sgi depth prepass",
+        )?;
+        let depth_view = create_view(
+            &ctx.device,
+            depth_image,
+            DEPTH_FORMAT,
+            vk::ImageAspectFlags::DEPTH,
+        )?;
+        // The probe buffer is the screen-probe grid: one texel per tile.
+        let probe_extent = vk::Extent2D {
+            width: extent.width.div_ceil(SCREEN_PROBE_DIV).max(1),
+            height: extent.height.div_ceil(SCREEN_PROBE_DIV).max(1),
+        };
+        let mut gi_image = [vk::Image::null(); 2];
+        let mut gi_view = [vk::ImageView::null(); 2];
+        let mut gi_alloc: [Option<Allocation>; 2] = [None, None];
+        for k in 0..2 {
+            let (img, alloc) = create_image(
+                &ctx.device,
+                allocator,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                probe_extent,
+                "sgi screen probes",
+            )?;
+            gi_view[k] = create_view(
+                &ctx.device,
+                img,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            gi_image[k] = img;
+            gi_alloc[k] = Some(alloc);
+        }
+        Ok(Self {
+            probe_extent,
+            depth_image,
+            depth_view,
+            depth_alloc: Some(depth_alloc),
+            gi_image,
+            gi_view,
+            gi_alloc,
+        })
+    }
+
+    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        unsafe {
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.depth_image, None);
+            for k in 0..2 {
+                device.destroy_image_view(self.gi_view[k], None);
+                device.destroy_image(self.gi_image[k], None);
+            }
+        }
+        if let Some(a) = self.depth_alloc.take() {
+            let _ = allocator.free(a);
+        }
+        for k in 0..2 {
+            if let Some(a) = self.gi_alloc[k].take() {
+                let _ = allocator.free(a);
+            }
+        }
+    }
 }
 
 /// Fixed-size offscreen render target for the scene's main camera, shown in
@@ -643,6 +782,14 @@ impl CameraPreview {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&lightmap_info),
+                // Binding 4 (screen-GI) — the preview doesn't run the gather, so
+                // just point it at a valid image; the shader gates its use on the
+                // screen-GI-active flag (off for the preview).
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(4)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&lightmap_info),
             ];
@@ -838,6 +985,40 @@ pub struct Renderer {
     allocator: Option<Arc<Mutex<Allocator>>>,
     swapchain: Swapchain,
     depth: DepthTarget,
+    /// Screen-space GI: depth prepass + gather output (recreated on resize).
+    sgi: ScreenGiTargets,
+    /// Flip Y in the screen-GI depth→world reconstruction (runtime toggle so the
+    /// Y-flipped-viewport convention can be corrected without a rebuild).
+    screen_gi_flip_y: bool,
+    /// Whether the screen-GI image holds a valid previous-frame result (for
+    /// temporal accumulation). False on the first frame + after a resize.
+    sgi_history_valid: bool,
+    /// Emissive sphere area-lights for the screen-GI gather (analytic NEE —
+    /// smooth emitter bounce, no coarse-GDF footprint). Set by the realtime-GI
+    /// driver alongside the GDF.
+    gi_emitters: Vec<gpu_gi::GpuGiEmitter>,
+    /// Runtime Flux trace parameters (Environment tab → Flux GI).
+    flux_settings: FluxSettings,
+    /// Last camera view-proj the screen-GI was traced for; while unchanged the
+    /// gather is skipped and the converged result reused (idle costs nothing).
+    sgi_last_view_proj: Option<glam::Mat4>,
+    /// Consecutive still frames — keep tracing (temporal accumulation) until the
+    /// result has converged, then idle. Reset when the camera moves.
+    sgi_still_frames: u32,
+    /// Ping-pong parity: which gather image is current (written this trace); the
+    /// other holds the previous frame's result for temporal reprojection.
+    sgi_parity: usize,
+    /// Monotonic trace counter feeding the trace RNG seed. Without per-frame
+    /// variation every frame samples the identical random directions, so the
+    /// Monte Carlo noise is fixed-pattern and temporal accumulation can never
+    /// average it out — the source of the static blotches.
+    sgi_frame: u32,
+    /// Per-frame-in-flight Flux trace resources (descriptor pool + host buffers)
+    /// kept alive after the trace is recorded into the main cb, freed one frame
+    /// later once that frame's fence has signalled.
+    sgi_transients: Vec<Option<gpu_gi::ScreenGiTransient>>,
+    /// Camera position the previous gather was traced from (reprojection).
+    sgi_last_cam: glam::Vec3,
     command_pool: vk::CommandPool,
     frames: Vec<Frame>,
     frame_index: usize,
@@ -846,6 +1027,9 @@ pub struct Renderer {
     pipeline_cache: PipelineCache,
     descriptor_pool: vk::DescriptorPool,
     material_pool: vk::DescriptorPool,
+    /// Shared zero FX block bound to non-material set-1 users (e.g. the skybox
+    /// set) so set-1 binding 4 is always valid.
+    default_fx_ubo: Buffer,
     frame_ubos: Vec<Buffer>,
     frame_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
@@ -920,6 +1104,8 @@ impl Renderer {
         let size = window.inner_size();
         let swapchain = Swapchain::new(&ctx, size.width, size.height, true)?;
         let depth = DepthTarget::new(&ctx, &mut allocator.lock().unwrap(), swapchain.extent)?;
+        let sgi =
+            ScreenGiTargets::new(&ctx, &mut allocator.lock().unwrap(), swapchain.extent)?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -965,14 +1151,24 @@ impl Renderer {
                 None,
             )?
         };
-        let material_pool_sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: MAX_MATERIALS * 4,
-        }];
+        // +1 set for the skybox, which also draws from this pool (it shares the
+        // set-1 layout: 4 samplers + the FX uniform buffer).
+        let material_sets = MAX_MATERIALS + 1;
+        let material_pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: material_sets * 12,
+            },
+            // One FX uniform buffer per material set (+ the skybox set).
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: material_sets,
+            },
+        ];
         let material_pool = unsafe {
             ctx.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(MAX_MATERIALS)
+                    .max_sets(material_sets)
                     .pool_sizes(&material_pool_sizes),
                 None,
             )?
@@ -1104,13 +1300,38 @@ impl Renderer {
             unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
         }
 
-        // 1x1 defaults: white albedo (sRGB), flat normal, white ORM, white
-        // emission mask. Bound wherever a material has no texture assigned.
+        // Screen-space GI gather result (set 0, binding 4). Wired into every
+        // frame set; re-pointed after a resize (the target is recreated).
+        for &set in &frame_sets {
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(lightmap_sampler)
+                .image_view(sgi.gi_view[0])
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
+
+        // 1x1 defaults, indexed by texture slot (see create_material's slot list):
+        // albedo white, flat normal, white ORM, white emission, white opacity,
+        // white emission-mask, then 3×(black matcap, white matcap-mask). Black
+        // matcaps contribute nothing; white masks pass through.
         let defaults = [
-            ([255u8, 255, 255, 255], true),
-            ([128, 128, 255, 255], false),
-            ([255, 255, 255, 255], false),
-            ([255, 255, 255, 255], true),
+            ([255u8, 255, 255, 255], true),  // 0 albedo
+            ([128, 128, 255, 255], false),   // 1 normal
+            ([255, 255, 255, 255], false),   // 2 orm
+            ([255, 255, 255, 255], true),    // 3 emission
+            ([255, 255, 255, 255], false),   // 4 opacity
+            ([255, 255, 255, 255], false),   // 5 emission mask
+            ([0, 0, 0, 255], true),          // 6 matcap 1
+            ([255, 255, 255, 255], false),   // 7 matcap 1 mask
+            ([0, 0, 0, 255], true),          // 8 matcap 2
+            ([255, 255, 255, 255], false),   // 9 matcap 2 mask
+            ([0, 0, 0, 255], true),          // 10 matcap 3
+            ([255, 255, 255, 255], false),   // 11 matcap 3 mask
         ];
         let mut default_textures = Vec::new();
         {
@@ -1131,6 +1352,13 @@ impl Renderer {
             }
         }
 
+        // Shared zero FX block for set-1 users that aren't materials (skybox).
+        let default_fx_ubo = {
+            let mut alloc = allocator.lock().unwrap();
+            let fx = MaterialFx::from_params(&MaterialParams::default());
+            make_fx_ubo(&ctx.device, &mut alloc, fx, "default fx ubo")?
+        };
+
         // Skybox descriptor set (set 1 layout): the equirect texture sits in
         // slot 0; default white fills the unused slots. Bound for the
         // fullscreen skybox pass.
@@ -1141,7 +1369,10 @@ impl Renderer {
                     .descriptor_pool(material_pool)
                     .set_layouts(&layouts),
             )?[0];
-            let infos: Vec<[vk::DescriptorImageInfo; 1]> = (0..4)
+            // Fill all 12 sampler slots with defaults (the skybox shader only
+            // reads slot 0, but every binding must be valid). set_skybox writes
+            // the real equirect into binding 0 later.
+            let infos: Vec<[vk::DescriptorImageInfo; 1]> = (0..12)
                 .map(|i| {
                     [vk::DescriptorImageInfo::default()
                         .sampler(sampler)
@@ -1155,12 +1386,22 @@ impl Renderer {
                 .map(|(i, info)| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(set)
-                        .dst_binding(i as u32)
+                        .dst_binding(TEXTURE_BINDINGS[i])
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .image_info(info)
                 })
                 .collect();
             ctx.device.update_descriptor_sets(&writes, &[]);
+            // Binding 4: the shared zero FX block (skybox ignores it).
+            let fx_info = [vk::DescriptorBufferInfo::default()
+                .buffer(default_fx_ubo.handle)
+                .range(vk::WHOLE_SIZE)];
+            let fx_write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&fx_info);
+            ctx.device.update_descriptor_sets(&[fx_write], &[]);
             set
         };
 
@@ -1181,7 +1422,7 @@ impl Renderer {
         .map_err(|e| anyhow::anyhow!("creating egui renderer: {e}"))?;
 
         // GPU software-GI march pipeline; None falls back to the CPU march.
-        let gpu_gi = gpu_gi::GpuGi::new(&ctx.device)
+        let gpu_gi = gpu_gi::GpuGi::new(&ctx)
             .map_err(|e| tracing::warn!("GPU GI init failed, using CPU march: {e:#}"))
             .ok();
 
@@ -1191,6 +1432,17 @@ impl Renderer {
             allocator: Some(allocator),
             swapchain,
             depth,
+            sgi,
+            screen_gi_flip_y: true,
+            sgi_history_valid: false,
+            gi_emitters: Vec::new(),
+            flux_settings: FluxSettings::default(),
+            sgi_last_view_proj: None,
+            sgi_still_frames: 0,
+            sgi_parity: 0,
+            sgi_frame: 0,
+            sgi_transients: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
+            sgi_last_cam: glam::Vec3::ZERO,
             command_pool,
             frames,
             frame_index: 0,
@@ -1198,6 +1450,7 @@ impl Renderer {
             pipeline_cache,
             descriptor_pool,
             material_pool,
+            default_fx_ubo,
             frame_ubos,
             frame_sets,
             sampler,
@@ -1476,20 +1729,68 @@ impl Renderer {
         self.gpu_gi.is_some()
     }
 
-    /// March the probes against the cached GDF on the GPU. Returns one `ProbeSh`
-    /// per probe, or None if the GPU pipeline is unavailable / no GDF is uploaded
-    /// / the march failed (the realtime-GI driver then falls back to the CPU march).
-    pub fn gi_march(&self, m: &GpuGiMarch<'_>) -> Option<Vec<ProbeSh>> {
-        let gpu = self.gpu_gi.as_ref()?;
+    /// True while an async GPU march is submitted but not yet read back.
+    pub fn gi_marching(&self) -> bool {
+        self.gpu_gi.as_ref().is_some_and(|g| g.is_marching())
+    }
+
+    /// True once a GDF is uploaded — screen-space GI can run its gather.
+    pub fn gi_has_gdf(&self) -> bool {
+        self.gpu_gi.as_ref().is_some_and(|g| g.has_gdf())
+    }
+
+    /// Cache the emissive sphere area-lights the screen-GI gather samples (NEE).
+    /// A changed emitter set also invalidates the idle-skip so it re-traces.
+    pub fn gi_set_emitters(&mut self, emitters: &[GpuGiEmitter]) {
+        if self.gi_emitters.len() != emitters.len() {
+            self.sgi_last_view_proj = None; // emitter count changed → re-trace
+        }
+        self.gi_emitters.clear();
+        self.gi_emitters.extend_from_slice(emitters);
+        // Any emitter change should re-trace (emissive moved/toggled).
+        self.sgi_last_view_proj = None;
+    }
+
+    /// Set the runtime Flux trace parameters (Environment tab → Flux GI). A
+    /// changed setting re-traces so the new quality/intensity takes effect.
+    pub fn set_flux_settings(&mut self, s: FluxSettings) {
+        self.flux_settings = s;
+        self.sgi_last_view_proj = None;
+    }
+
+    /// Toggle the screen-GI depth→world Y-flip (corrects a flipped gather without
+    /// a rebuild).
+    pub fn set_screen_gi_flip_y(&mut self, flip: bool) {
+        self.screen_gi_flip_y = flip;
+    }
+
+    pub fn screen_gi_flip_y(&self) -> bool {
+        self.screen_gi_flip_y
+    }
+
+    /// Begin an async GPU march (submit, don't wait). Returns true if a march was
+    /// started. The result is collected later via [`gi_march_poll`] so the trace
+    /// never blocks the frame.
+    pub fn gi_march_begin(&mut self, m: &GpuGiMarch<'_>) -> bool {
         let allocator = self.allocator();
-        match gpu.march(&self.ctx, &allocator, self.command_pool, m) {
-            Ok(out) if !out.is_empty() => Some(out),
-            Ok(_) => None,
+        let Some(gpu) = self.gpu_gi.as_mut() else {
+            return false;
+        };
+        match gpu.march_begin(&self.ctx, &allocator, m) {
+            Ok(started) => started,
             Err(e) => {
-                tracing::warn!("GPU GI march failed: {e:#}");
-                None
+                tracing::warn!("GPU GI march failed to start: {e:#}");
+                false
             }
         }
+    }
+
+    /// Collect a finished async GPU march, or None if still running / none in
+    /// flight. One `ProbeSh` per probe.
+    pub fn gi_march_poll(&mut self) -> Option<Vec<ProbeSh>> {
+        let allocator = self.allocator();
+        let gpu = self.gpu_gi.as_mut()?;
+        gpu.march_poll(&self.ctx, &allocator)
     }
 
     pub fn upload_texture(&mut self, data: &TextureData) -> Result<TextureHandle> {
@@ -1515,7 +1816,22 @@ impl Renderer {
             )?[0]
         };
 
-        let slots = [desc.albedo, desc.normal, desc.orm, desc.emission];
+        // 12 texture slots in slot order; bindings skip 4 (the FX UBO).
+        let slots = [
+            desc.albedo,
+            desc.normal,
+            desc.orm,
+            desc.emission,
+            desc.opacity,
+            desc.emission_mask,
+            desc.matcap[0],
+            desc.matcap_mask[0],
+            desc.matcap[1],
+            desc.matcap_mask[1],
+            desc.matcap[2],
+            desc.matcap_mask[2],
+        ];
+        let bindings = TEXTURE_BINDINGS;
         let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = slots
             .iter()
             .enumerate()
@@ -1536,12 +1852,33 @@ impl Renderer {
             .map(|(i, info)| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
-                    .dst_binding(i as u32)
+                    .dst_binding(bindings[i])
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(info)
             })
             .collect();
         unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
+
+        // Per-material FX uniform block (set 1, binding 4).
+        let fx_ubo = {
+            let allocator = self.allocator();
+            let mut alloc = allocator.lock().unwrap();
+            make_fx_ubo(
+                &self.ctx.device,
+                &mut alloc,
+                MaterialFx::from_params(&desc.params),
+                "material fx ubo",
+            )?
+        };
+        let fx_info = [vk::DescriptorBufferInfo::default()
+            .buffer(fx_ubo.handle)
+            .range(vk::WHOLE_SIZE)];
+        let fx_write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(4)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&fx_info);
+        unsafe { self.ctx.device.update_descriptor_sets(&[fx_write], &[]) };
 
         let mut features = desc.features;
         features.normal_map &= desc.normal.is_some();
@@ -1555,8 +1892,67 @@ impl Renderer {
             custom_shader: None,
             custom_data: [0.0; 16],
             set,
+            fx_ubo,
         });
         Ok(MaterialHandle(self.materials.len() - 1))
+    }
+
+    /// Rewrite a material's FX uniform block from its current params (set 1,
+    /// binding 4). Called after a param edit so rim / animated emission update
+    /// live. Host-visible write; materials are static at runtime so there's no
+    /// in-flight hazard there, and an editor edit at worst tears for one frame.
+    pub fn upload_material_fx(&mut self, handle: MaterialHandle) {
+        let Some(material) = self.materials.get_mut(handle.0) else {
+            return;
+        };
+        let fx = MaterialFx::from_params(&material.params);
+        material.fx_ubo.write(0, bytemuck::bytes_of(&fx));
+    }
+
+    /// Rebind a material's 12 texture slots on its existing descriptor set
+    /// (binding order = create_material's slot list; binding 4 is the FX UBO and
+    /// is untouched). `None` in a slot binds the 1×1 default for that slot.
+    /// Waits for device idle first since the set may be in use by an in-flight
+    /// frame; texture edits are user-initiated and rare, so the stall is fine.
+    pub fn set_material_textures(&mut self, handle: MaterialHandle, slots: &[Option<TextureHandle>; 12]) {
+        let Some(material) = self.materials.get(handle.0) else {
+            return;
+        };
+        let set = material.set;
+        let views: Vec<vk::ImageView> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| match slot {
+                Some(h) => self.textures[h.0].view,
+                None => self.default_textures[i].view,
+            })
+            .collect();
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+        let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = views
+            .iter()
+            .map(|view| {
+                [vk::DescriptorImageInfo::default()
+                    .sampler(self.sampler)
+                    .image_view(*view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+            })
+            .collect();
+        let writes: Vec<_> = image_infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(TEXTURE_BINDINGS[i])
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(info)
+            })
+            .collect();
+        unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
+        // Slot 1 is the normal map; keep the feature gate's source in sync.
+        self.materials[handle.0].has_normal_texture = slots[1].is_some();
     }
 
     /// Set (or clear) the equirectangular skybox texture. `None` reverts to
@@ -1766,8 +2162,27 @@ impl Renderer {
         let mut alloc = allocator.lock().unwrap();
         self.swapchain.destroy(&self.ctx.device);
         self.depth.destroy(&self.ctx.device, &mut alloc);
+        self.sgi.destroy(&self.ctx.device, &mut alloc);
         self.swapchain = Swapchain::new(&self.ctx, size.width, size.height, self.vsync)?;
         self.depth = DepthTarget::new(&self.ctx, &mut alloc, self.swapchain.extent)?;
+        self.sgi = ScreenGiTargets::new(&self.ctx, &mut alloc, self.swapchain.extent)?;
+        self.sgi_history_valid = false; // recreated target has no history yet
+        self.sgi_parity = 0;
+        self.sgi_last_view_proj = None;
+        drop(alloc);
+        // Re-point the screen-GI sampler (binding 4) at the recreated target.
+        for &set in &self.frame_sets {
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(self.lightmap_sampler)
+                .image_view(self.sgi.gi_view[0])
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { self.ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
         self.needs_resize = false;
         Ok(())
     }
@@ -1797,9 +2212,29 @@ impl Renderer {
         }
 
         let device = self.ctx.device.clone();
-        let frame = &self.frames[self.frame_index];
+        // Screen-space GI: prefetch the depth-only pipeline (needs &mut self,
+        // before the per-frame immutable borrow below) when a GDF is available.
+        let sgi_active = self.gi_has_gdf();
+        let depth_pipe = if sgi_active {
+            // The shadow pipeline is the color-less depth-only one (matches our
+            // standalone depth prepass with no color attachment).
+            Some(self.pipeline_cache.get(&device, PipelineKey::shadow())?)
+        } else {
+            None
+        };
+        let in_flight = self.frames[self.frame_index].in_flight;
+        let image_available = self.frames[self.frame_index].image_available;
+        let command_buffer = self.frames[self.frame_index].command_buffer;
 
-        unsafe { device.wait_for_fences(&[frame.in_flight], true, u64::MAX)? };
+        unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX)? };
+
+        // This frame slot's prior submission has retired, so the Flux trace
+        // resources it referenced (descriptor pool + host buffers, folded into
+        // that submission's command buffer) are now safe to free.
+        if let Some(mut t) = self.sgi_transients[self.frame_index].take() {
+            let alloc = self.allocator();
+            t.destroy(&device, &mut alloc.lock().unwrap());
+        }
 
         // This frame's prior submission has retired; egui textures freed two
         // frames ago are safe to release now.
@@ -1812,7 +2247,7 @@ impl Renderer {
                 .map_err(|e| anyhow::anyhow!("freeing egui textures: {e}"))?;
         }
 
-        let image_index = match self.swapchain.acquire(frame.image_available) {
+        let image_index = match self.swapchain.acquire(image_available) {
             Ok((index, suboptimal)) => {
                 if suboptimal {
                     self.needs_resize = true;
@@ -1826,7 +2261,7 @@ impl Renderer {
             Err(e) => return Err(e).context("acquiring swapchain image"),
         };
 
-        unsafe { device.reset_fences(&[frame.in_flight])? };
+        unsafe { device.reset_fences(&[in_flight])? };
 
         // Per-frame uniforms.
         //
@@ -1863,7 +2298,7 @@ impl Renderer {
         // before building the UBOs that carry the shadow matrices.
         let (shadow_views, shadow_vp, cascade_splits) = plan_shadows(input, &mut lights, count);
 
-        let ubo = frame_ubo(
+        let mut ubo = frame_ubo(
             &input.camera,
             input,
             lights,
@@ -1876,7 +2311,80 @@ impl Renderer {
                 self.swapchain.extent.height as f32,
             ],
         );
+        // debug.z = screen-GI active → the forward shader samples the gather
+        // instead of the coarse world-probe grid.
+        ubo.debug[2] = if sgi_active { 1.0 } else { 0.0 };
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
+
+        // Decide whether to trace the screen-GI gather this frame, then point
+        // the forward sampler (binding 4) at the image that will hold the latest
+        // result. The actual depth prepass + GDF trace is recorded into the main
+        // frame command buffer below (no separate submit/fence stall).
+        let mut sgi_record: Option<(vk::Pipeline, bool, usize, glam::Mat4, glam::Vec3, f32)> = None;
+        if let Some(dp) = depth_pipe {
+            // Temporal reprojection means we can keep accumulating while the
+            // camera moves (the gather reprojects the previous result). Trace
+            // while moving, and for a few frames after stopping so it fully
+            // converges, then idle (reuse the converged image — a still camera
+            // costs nothing). gi_set_emitters resets sgi_last_view_proj.
+            let view_proj = input.camera.proj * input.camera.view;
+            let camera_moved = self.sgi_last_view_proj != Some(view_proj);
+            if camera_moved {
+                self.sgi_still_frames = 0;
+            } else {
+                self.sgi_still_frames = self.sgi_still_frames.saturating_add(1);
+            }
+            const SGI_CONVERGE_FRAMES: u32 = 48;
+            if camera_moved || self.sgi_still_frames < SGI_CONVERGE_FRAMES {
+                // New seed every trace so each frame samples different directions
+                // and temporal accumulation can converge the noise.
+                self.sgi_frame = self.sgi_frame.wrapping_add(1);
+                let hist_valid = self.sgi_history_valid;
+                let cur = self.sgi_parity & 1; // ping-pong slot written this frame
+                // Capture the PREVIOUS camera before advancing it, so the gather
+                // reprojects history from where the surface actually was last
+                // frame (advancing first would make reprojection identity → smear).
+                let prev_vp = self.sgi_last_view_proj.unwrap_or(view_proj);
+                let prev_cam = if self.sgi_last_view_proj.is_some() {
+                    self.sgi_last_cam
+                } else {
+                    input.camera.position
+                };
+                // Motion-aware temporal blend, scaled by the Flux smoothing
+                // setting (0 = responsive/sharper, 1 = smooth/more lag): snap on
+                // the first frame, trust the fresh trace more while moving (cuts
+                // reprojection-residual smear), converge gently when still.
+                let s = self.flux_settings.smoothing.clamp(0.0, 1.0);
+                let alpha = if !hist_valid {
+                    1.0
+                } else if camera_moved {
+                    0.5 - 0.4 * s
+                } else {
+                    0.12 - 0.10 * s
+                };
+                sgi_record = Some((dp, hist_valid, cur, prev_vp, prev_cam, alpha));
+                // Advance temporal state for next frame; the swap makes this
+                // frame's output the next frame's history.
+                self.sgi_history_valid = true;
+                self.sgi_last_view_proj = Some(view_proj);
+                self.sgi_last_cam = input.camera.position;
+                self.sgi_parity ^= 1;
+            }
+            // After the swap, gi[parity ^ 1] is the slot written this frame (or
+            // the last-written one on a skip frame) — sample that.
+            let cur = (self.sgi_parity ^ 1) & 1;
+            let cur_view = self.sgi.gi_view[cur];
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(self.lightmap_sampler)
+                .image_view(cur_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(self.frame_sets[self.frame_index])
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { device.update_descriptor_sets(&[write], &[]) };
+        }
 
         // Lazily create the offscreen camera target the first time the Camera
         // tab requests it, then write its view UBO for this frame.
@@ -1916,14 +2424,12 @@ impl Renderer {
             }
         }
 
-        let cb = frame.command_buffer;
+        let cb = command_buffer;
         let image = self.swapchain.images[image_index as usize];
         let color_view = self.swapchain.views[image_index as usize];
         let extent = self.swapchain.extent;
         let render_finished = self.swapchain.render_finished[image_index as usize];
         let frame_set = self.frame_sets[self.frame_index];
-        let image_available = frame.image_available;
-        let in_flight = frame.in_flight;
 
         // Sort: opaque/cutout first, then transparent back-to-front.
         let mut order: Vec<usize> = (0..input.draws.len()).collect();
@@ -1957,6 +2463,18 @@ impl Renderer {
             // pass sample them, so they must be rendered + made readable up
             // front.
             self.record_shadows(&device, cb, &shadow_views, input.draws)?;
+
+            // Flux GI: depth prepass + GDF trace, folded into this frame's cb so
+            // there are no extra submits or fence stalls. Writes the gather image
+            // that binding 4 (set above) now points at; transitions it to
+            // SHADER_READ before the forward pass samples it.
+            if let Some((dp, hist_valid, cur, prev_vp, prev_cam, alpha)) = sgi_record {
+                if let Err(e) =
+                    self.record_screen_gi(&device, cb, dp, input, hist_valid, cur, prev_vp, prev_cam, alpha)
+                {
+                    tracing::warn!("Flux GI record failed: {e:#}");
+                }
+            }
 
             // Offscreen main-camera pass next, so the swapchain's egui pass
             // can sample the result this frame.
@@ -2334,7 +2852,14 @@ fn frame_ubo(
         lights,
         shadow_vp,
         probe_volumes: volumes,
-        debug: [if input.lightmap_preview { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        debug: [
+            if input.lightmap_preview { 1.0 } else { 0.0 },
+            input.gi_debug as f32,
+            0.0,
+            0.0,
+        ],
+        inv_view: camera.view.inverse().to_cols_array_2d(),
+        inv_proj: camera.proj.inverse().to_cols_array_2d(),
         postfx0: [
             input.postfx.tonemap as f32,
             input.postfx.exposure,
@@ -2363,6 +2888,215 @@ fn frame_ubo(
 }
 
 impl Renderer {
+    /// Screen-space GI: render a camera depth prepass, then trace the GDF per
+    /// pixel into the gather target (sampled by the forward pass). Synchronous
+    /// (own submits) for now. `depth_pipe` is the depth-only pipeline; `frame_set`
+    /// supplies the camera UBO (binding 0). Returns true if the gather ran.
+    /// Record the Flux gather (depth prepass + GDF trace) into the main frame
+    /// command buffer `cb`, writing gather image `cur`. No fence wait: the
+    /// per-frame trace resources are returned into `sgi_transients[frame_index]`
+    /// and freed one frame later, after this frame's fence signals. `cur` is the
+    /// ping-pong slot to write; `cur ^ 1` is the history read this frame.
+    #[allow(clippy::too_many_arguments)]
+    fn record_screen_gi(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        depth_pipe: vk::Pipeline,
+        input: &FrameInput,
+        history_valid: bool,
+        cur: usize,
+        prev_vp: glam::Mat4,
+        prev_cam: glam::Vec3,
+        alpha: f32,
+    ) -> Result<()> {
+        if self.gpu_gi.as_ref().map_or(true, |g| !g.has_gdf()) {
+            return Ok(());
+        }
+        let prev = cur ^ 1;
+        let extent = self.swapchain.extent;
+        // 1) Depth prepass: render opaque geometry depth-only into sgi.depth,
+        //    recorded directly into the main cb (no separate submit/stall).
+        unsafe {
+            let to_depth = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .image(self.sgi.depth_image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_depth],
+            );
+            let depth_att = vk::RenderingAttachmentInfo::default()
+                .image_view(self.sgi.depth_view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                });
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                .layer_count(1)
+                .depth_attachment(&depth_att);
+            device.cmd_begin_rendering(cb, &info);
+            // Match the main pass's negative-height (Y-flip) viewport so the
+            // depth buffer aligns with the shaded image.
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: extent.height as f32,
+                width: extent.width as f32,
+                height: -(extent.height as f32),
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            device.cmd_set_viewport(cb, 0, &[viewport]);
+            device.cmd_set_scissor(
+                cb,
+                0,
+                &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }],
+            );
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, depth_pipe);
+            // The shadow pipeline (depth-only, no color attachment) uses
+            // `shadow.vert`, which reads only push constants (no descriptor sets).
+            let view_proj = (input.camera.proj * input.camera.view).to_cols_array_2d();
+            for draw in input.draws {
+                // Transparent surfaces are kept out of the Flux depth prepass:
+                // otherwise the screen probe at a glass pixel reconstructs the
+                // glass and traces GI there, which the glass samples as a milky
+                // diffuse fill. (Emissive surfaces ARE included now — they sample
+                // their own GI; the old square-halo bleed was self-illumination
+                // from the half-Lambert wrap, which the proper cosine removed.)
+                let mat = &self.materials[draw.material.0];
+                if mat.render_queue >= RENDER_QUEUE_TRANSPARENT {
+                    continue;
+                }
+                let mesh = &self.meshes[draw.mesh.0];
+                let push = ShadowPush {
+                    light_vp: view_proj,
+                    model: draw.transform.to_cols_array_2d(),
+                };
+                device.cmd_push_constants(
+                    cb,
+                    self.pipeline_cache.layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&push),
+                );
+                device.cmd_bind_vertex_buffers(cb, 0, &[mesh.vertex_buffer.handle], &[0]);
+                device.cmd_bind_index_buffer(cb, mesh.index_buffer.handle, 0, vk::IndexType::UINT32);
+                device.cmd_draw_indexed(cb, mesh.index_count, 1, 0, 0, 0);
+            }
+            device.cmd_end_rendering(cb);
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .image(self.sgi.depth_image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_read],
+            );
+        }
+
+        // 2) Screen-GI gather: trace the GDF per pixel into sgi.gi.
+        let allocator = self.allocator();
+        let inv_vp = (input.camera.proj * input.camera.view).inverse();
+        let amb = input.light.ambient; // dim sky/ambient for escaped rays
+        let lights: Vec<BakeLight> = input
+            .lights
+            .iter()
+            .map(|l| BakeLight {
+                kind: l.kind,
+                position: l.position,
+                direction: l.direction,
+                color: [
+                    l.color[0] * l.intensity,
+                    l.color[1] * l.intensity,
+                    l.color[2] * l.intensity,
+                ],
+                range: l.range,
+                spot_inner_deg: l.spot_inner_deg,
+                spot_outer_deg: l.spot_outer_deg,
+                radius: 0.0,
+            })
+            .collect();
+        // prev_vp / prev_cam are the PREVIOUS frame's camera (captured before the
+        // caller advanced sgi_last_*), so the gather reprojects history correctly;
+        // alpha is the motion-aware temporal blend the caller chose.
+        // Runtime Flux params (Environment tab → Flux GI). Samples/bounces drive
+        // the trace; temporal accumulation smooths low per-frame sample counts.
+        // march[1] (max trace distance) of 0 = auto: screen_resolve_record fills
+        // it from the GDF diagonal. sky.w carries the indirect intensity;
+        // march.w the firefly clamp.
+        let fs = self.flux_settings;
+        let params = gpu_gi::ScreenGiParams {
+            inv_view_proj: inv_vp.to_cols_array_2d(),
+            prev_view_proj: prev_vp.to_cols_array_2d(),
+            cam: input.camera.position.extend(1.0).to_array(),
+            prev_cam: prev_cam.extend(1.0).to_array(),
+            gdf_min: [0.0; 4],
+            gdf_max: [0.0; 4],
+            sky: [amb[0], amb[1], amb[2], fs.intensity],
+            counts: [fs.samples.max(1), fs.bounces.max(1), 0, 0],
+            march: [0.02, fs.march_distance.max(0.0), alpha, fs.firefly_clamp],
+            misc: [
+                self.sgi_frame,
+                extent.width,
+                extent.height,
+                if self.screen_gi_flip_y { 1 } else { 0 },
+            ],
+        };
+        // Trace at probe resolution (one probe per SCREEN_PROBE_DIV² pixels);
+        // the depth is full-res but sampled by normalized UV, so this is
+        // resolution-independent. The forward shader bilinearly upsamples.
+        let transient = self.gpu_gi.as_ref().unwrap().screen_resolve_record(
+            device,
+            cb,
+            &allocator,
+            self.sgi.depth_view,
+            self.lightmap_sampler,
+            self.sgi.gi_image[cur],
+            self.sgi.gi_view[cur],
+            self.sgi.gi_view[prev],
+            self.sgi.probe_extent,
+            &lights,
+            &self.gi_emitters,
+            history_valid,
+            params,
+        )?;
+        // Hold the trace's descriptor pool/buffers until this frame's fence
+        // signals; the render loop frees this slot at the top of the next reuse.
+        if let Some(t) = transient {
+            self.sgi_transients[self.frame_index] = Some(t);
+        }
+        Ok(())
+    }
+
     /// Record the opaque+transparent scene draws (no outline, no egui) for one
     /// pass, binding `frame_set` as set 0. Returns draw statistics.
     fn record_scene_draws(
@@ -2435,12 +3169,21 @@ impl Renderer {
             let p = &material.params;
             let push = if material.custom_shader.is_some() && !material.error {
                 let d = &material.custom_data;
+                // Custom shaders get 15 prop floats; the 16th lane (d3.w) is
+                // reserved for the baked-lightmap layer so custom shaders can
+                // sample static GI just like the standard shader (preamble's
+                // `citrus_baked_gi`). -1 = no lightmap → fall back to probe GI.
+                let layer = if input.lightmap_preview {
+                    draw.lightmap_size as f32
+                } else {
+                    draw.lightmap_layer as f32
+                };
                 PushData {
                     model: draw.transform.to_cols_array_2d(),
                     base_color: d[0..4].try_into().unwrap(),
                     emission: d[4..8].try_into().unwrap(),
                     params0: d[8..12].try_into().unwrap(),
-                    params1: d[12..16].try_into().unwrap(),
+                    params1: [d[12], d[13], d[14], layer],
                 }
             } else {
                 PushData {
@@ -2766,6 +3509,25 @@ fn device_bind(device: &ash::Device, cb: vk::CommandBuffer, pipeline: vk::Pipeli
     }
 }
 
+/// Create a host-visible uniform buffer holding one [`MaterialFx`] block.
+fn make_fx_ubo(
+    device: &ash::Device,
+    alloc: &mut Allocator,
+    fx: MaterialFx,
+    name: &str,
+) -> Result<Buffer> {
+    let mut buf = Buffer::new(
+        device,
+        alloc,
+        size_of::<MaterialFx>() as u64,
+        vk::BufferUsageFlags::UNIFORM_BUFFER,
+        MemoryLocation::CpuToGpu,
+        name,
+    )?;
+    buf.write(0, bytemuck::bytes_of(&fx));
+    Ok(buf)
+}
+
 impl Drop for Renderer {
     fn drop(&mut self) {
         let device = &self.ctx.device;
@@ -2799,13 +3561,25 @@ impl Drop for Renderer {
             if let Some(gpu_gi) = &mut self.gpu_gi {
                 gpu_gi.destroy(device, &mut alloc);
             }
+            // Free any deferred Flux trace resources still held (the device idle
+            // wait above guarantees the GPU is done with them).
+            for slot in &mut self.sgi_transients {
+                if let Some(mut t) = slot.take() {
+                    t.destroy(device, &mut alloc);
+                }
+            }
             for ubo in &mut self.frame_ubos {
                 ubo.destroy(device, &mut alloc);
             }
+            for material in &mut self.materials {
+                material.fx_ubo.destroy(device, &mut alloc);
+            }
+            self.default_fx_ubo.destroy(device, &mut alloc);
             if let Some(mut preview) = self.camera_preview.take() {
                 preview.destroy(device, &mut alloc);
             }
             self.depth.destroy(device, &mut alloc);
+            self.sgi.destroy(device, &mut alloc);
         }
 
         unsafe {

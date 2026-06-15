@@ -27,7 +27,7 @@ use citrus_editor::{
 };
 use citrus_render::{CameraData, FrameInput, LightData, Renderer};
 use crate::gizmo::{GizmoState, GizmoTool};
-use crate::scene::{LoadedScene, material_from_model, model_from_material, relative_to};
+use crate::scene::{LoadedScene, RenderInfo, material_from_model, model_from_material, relative_to};
 use crate::shaders::ShaderLibrary;
 use crate::undo::{ObjectState, UndoEntry, UndoStack};
 
@@ -69,6 +69,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         file_browser: FileBrowser::new(project_root.clone()),
         selection: Selection::None,
         file_material: None,
+        file_meta: None,
         open_editors: vec![],
         lsp: None,
         lsp_failed: false,
@@ -94,12 +95,14 @@ pub fn run(config: AppConfig) -> Result<()> {
         shaders: ShaderLibrary::default(),
         shader_files: Vec::new(),
         last_shader_scan: None,
+        last_asset_check: None,
         dirty_materials: HashSet::new(),
         last_material_edit: None,
         plugins: plugins::PluginHost::default(),
         plugin_build_error: None,
         status: None,
         reload_pending: false,
+        pending_job: None,
         project: citrus_assets::ProjectFile::default(),
         camera: FlyCamera::default(),
         orbit_pivot: None,
@@ -143,6 +146,9 @@ pub fn run(config: AppConfig) -> Result<()> {
         start: Instant::now(),
         last_frame: Instant::now(),
         rt_gi: crate::realtime_gi::RealtimeGiState::default(),
+        selected_material_slot: 0,
+        frame_timings: FrameTimings::default(),
+        gi_debug: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -212,6 +218,21 @@ struct FileMaterial {
     dirty: bool,
 }
 
+/// A model file's `.meta` open in the Inspector for editing import options.
+struct FileMeta {
+    path: PathBuf,
+    meta: citrus_assets::AssetMeta,
+    dirty: bool,
+}
+
+/// A heavy, UI-blocking operation deferred one frame so a "busy" overlay paints
+/// before it runs (otherwise the window looks frozen).
+enum PendingJob {
+    ReloadPlugins,
+    Bake,
+    ImportModel(PathBuf),
+}
+
 #[derive(Default)]
 struct Stats {
     frames: u64,
@@ -247,10 +268,32 @@ enum EditorAction {
     CreateFolder(PathBuf),
     PickAt(egui::Pos2),
     AssignMaterialAt(egui::Pos2, PathBuf),
-    AssignMaterialToObject(usize, PathBuf),
+    /// (object index, material slot, `.material` path)
+    AssignMaterialToObject(usize, usize, PathBuf),
     MaterialEdited(usize),
     ResetMaterial(usize),
+    /// An image was dropped on a scene material's texture slot: (material index,
+    /// slot 0..12, absolute image path). Converted to project-relative + applied.
+    AssignTexture {
+        material: usize,
+        slot: usize,
+        path: PathBuf,
+    },
+    /// An image was dropped on a texture slot of the open `.material` file
+    /// editor: (slot 0..12, absolute image path).
+    AssignFileTexture {
+        slot: usize,
+        path: PathBuf,
+    },
+    /// Extract an embedded (imported) material to a `.material` file so it can be
+    /// edited + saved.
+    ExtractMaterial(usize),
     SaveFileMaterial,
+    /// Write the open model `.meta` import settings to disk.
+    SaveFileMeta,
+    /// Save the model's `.meta` and reload the scene so it reimports with the new
+    /// settings.
+    ReimportModel(PathBuf),
     /// A `.material` file's model changed in the Inspector: propagate to
     /// every scene material loaded from that file.
     FileMaterialEdited(PathBuf),
@@ -502,6 +545,8 @@ struct EngineApp {
     file_browser: FileBrowser,
     selection: Selection,
     file_material: Option<FileMaterial>,
+    /// Model `.meta` currently shown in the Inspector (FBX/glTF import options).
+    file_meta: Option<FileMeta>,
     open_editors: Vec<OpenEditor>,
     /// Language server (rust-analyzer) for `.rs` editing; spawned on demand.
     lsp: Option<lsp::LspClient>,
@@ -555,6 +600,9 @@ struct EngineApp {
     shader_files: Vec<String>,
     /// Last shader-file scan / hot-reload poll.
     last_shader_scan: Option<Instant>,
+    /// Wall-clock of the last asset-change check (on window-focus regain), so
+    /// externally-edited assets (e.g. a re-exported FBX) reimport automatically.
+    last_asset_check: Option<std::time::SystemTime>,
     /// Scene materials edited since their last auto-save.
     dirty_materials: HashSet<usize>,
     /// Debounce for material auto-save (save when the gesture settles).
@@ -568,6 +616,9 @@ struct EngineApp {
     /// A plugin reload was requested; deferred one frame so the status bar can
     /// show "Compiling components…" before the (blocking) cargo build.
     reload_pending: bool,
+    /// A heavy op to run after this frame paints its busy overlay (so the UI
+    /// shows it's working instead of appearing frozen).
+    pending_job: Option<PendingJob>,
     /// project.citrus: name, last scene, per-project engine settings.
     project: citrus_assets::ProjectFile,
     camera: FlyCamera,
@@ -648,6 +699,31 @@ struct EngineApp {
     /// throttle timer.
     /// Realtime-GI driver (continuous probe re-trace from the realtime lights).
     rt_gi: crate::realtime_gi::RealtimeGiState,
+    /// Which material slot of the selected object the inspector edits (for
+    /// multi-material meshes). Clamped to the object's slot count.
+    selected_material_slot: usize,
+    /// EMA-smoothed per-frame CPU section timings (ms) for the stats overlay.
+    frame_timings: FrameTimings,
+    /// GI debug view: 0 = off, 1 = world normals, 2 = indirect/GI term.
+    gi_debug: u32,
+}
+
+/// Per-frame main-thread CPU costs (ms), EMA-smoothed for a readable overlay.
+#[derive(Default, Clone, Copy)]
+struct FrameTimings {
+    gi: f32,
+    components: f32,
+    physics: f32,
+    audio: f32,
+    draws: f32,
+    render: f32,
+}
+
+impl FrameTimings {
+    /// Blend a fresh sample into the smoothed value.
+    fn ema(slot: &mut f32, sample_ms: f32) {
+        *slot += (sample_ms - *slot) * 0.2;
+    }
 }
 
 impl EngineApp {
@@ -740,7 +816,7 @@ impl EngineApp {
                 self.current_scene_path = Some(PathBuf::from(path));
             }
             Some(path) => {
-                let asset = citrus_assets::load_model(&path)?;
+                let asset = citrus_assets::load_model_with_meta(&path)?;
                 self.scene
                     .add_asset_scene(&mut renderer, &asset, Some(Path::new(&path)))?;
             }
@@ -915,6 +991,26 @@ impl EngineApp {
             match action {
                 EditorAction::SelectFile(path) => {
                     self.file_material = None;
+                    // Model file → load its .meta so import options show in the
+                    // Inspector (creating the sidecar on first view).
+                    self.file_meta = None;
+                    let is_model = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fbx" | "gltf" | "glb" | "obj"))
+                        .unwrap_or(false);
+                    if is_model {
+                        match citrus_assets::load_or_create_asset_meta(&path) {
+                            Ok(meta) => {
+                                self.file_meta = Some(FileMeta {
+                                    path: path.clone(),
+                                    meta,
+                                    dirty: false,
+                                })
+                            }
+                            Err(e) => tracing::error!("loading .meta: {e:#}"),
+                        }
+                    }
                     if path.extension().is_some_and(|e| e == "material") {
                         match citrus_assets::load_material_file(&path) {
                             Ok(file) => {
@@ -928,6 +1024,7 @@ impl EngineApp {
                                 if let Some(q) = file.render_queue {
                                     model.render_queue = q;
                                 }
+                                model.textures = crate::scene::tex_paths_from_file(&file.textures);
                                 self.file_material = Some(FileMaterial {
                                     path: path.clone(),
                                     file,
@@ -940,22 +1037,11 @@ impl EngineApp {
                     }
                     self.selection = Selection::File(path);
                 }
-                EditorAction::ImportModel(path) => match citrus_assets::load_model(&path) {
-                    Ok(asset) => {
-                        let rel = self
-                            .project_root
-                            .join(relative_to(&path, &self.project_root));
-                        let source = relative_to(&rel, &self.project_root);
-                        if let Err(e) = self.scene.add_asset_scene(
-                            renderer!(),
-                            &asset,
-                            Some(Path::new(&source)),
-                        ) {
-                            tracing::error!("importing model: {e:#}");
-                        }
-                    }
-                    Err(e) => tracing::error!("importing model: {e:#}"),
-                },
+                EditorAction::ImportModel(path) => {
+                    // Defer the (blocking) import one frame so the busy overlay shows.
+                    self.set_status("Importing model…", true);
+                    self.pending_job = Some(PendingJob::ImportModel(path));
+                }
                 EditorAction::CreateMaterial(dir) => {
                     let path = unique_path(&dir, "new_material", "material");
                     let file = citrus_assets::MaterialFile {
@@ -1020,6 +1106,7 @@ impl EngineApp {
                     if let Some((origin, dir)) = self.cursor_ray(pos)
                         && let Some(hit) = self.scene.pick(origin, dir)
                     {
+                        // Viewport drops target the primary slot (slot 0).
                         let Some(before) = self.scene.objects[hit].render.map(|r| r.material)
                         else {
                             continue;
@@ -1028,6 +1115,7 @@ impl EngineApp {
                             renderer!(),
                             &mut self.shaders,
                             hit,
+                            0,
                             &path,
                             &self.project_root,
                         );
@@ -1038,34 +1126,37 @@ impl EngineApp {
                         if before != after {
                             self.undo_stack.record(UndoEntry::Assign {
                                 object: hit,
+                                slot: 0,
                                 before,
                                 after,
                             });
                         }
+                        // A reassigned material may change emission/albedo.
+                        self.rt_gi.invalidate();
                     }
                 }
-                EditorAction::AssignMaterialToObject(object, path) => {
-                    let Some(before) = self.scene.objects[object].render.map(|r| r.material) else {
+                EditorAction::AssignMaterialToObject(object, slot, path) => {
+                    let Some(before) = self.scene.slot_material(object, slot) else {
                         continue;
                     };
                     self.scene.assign_material(
                         renderer!(),
                         &mut self.shaders,
                         object,
+                        slot,
                         &path,
                         &self.project_root,
                     );
-                    let after = self.scene.objects[object]
-                        .render
-                        .map(|r| r.material)
-                        .unwrap_or(before);
+                    let after = self.scene.slot_material(object, slot).unwrap_or(before);
                     if before != after {
                         self.undo_stack.record(UndoEntry::Assign {
                             object,
+                            slot,
                             before,
                             after,
                         });
                     }
+                    self.rt_gi.invalidate();
                 }
                 EditorAction::MaterialEdited(index) => {
                     self.scene.apply_material(
@@ -1074,6 +1165,43 @@ impl EngineApp {
                         &self.project_root,
                         index,
                     );
+                    // Emission/albedo may have changed; re-trace bounce light.
+                    self.rt_gi.invalidate();
+                }
+                EditorAction::AssignTexture {
+                    material,
+                    slot,
+                    path,
+                } => {
+                    if material < self.scene.materials.len() {
+                        let rel = PathBuf::from(relative_to(&path, &self.project_root));
+                        if let Some(s) =
+                            self.scene.materials[material].model.textures.slot_mut(slot)
+                        {
+                            *s = Some(rel);
+                        }
+                        self.scene.apply_material(
+                            renderer!(),
+                            &mut self.shaders,
+                            &self.project_root,
+                            material,
+                        );
+                        // A new texture (albedo/emission/etc.) can change bounce light.
+                        self.rt_gi.invalidate();
+                        // Persist to the backing `.material` file if there is one.
+                        self.dirty_materials.insert(material);
+                    }
+                }
+                EditorAction::AssignFileTexture { slot, path } => {
+                    if let Some(fm) = self.file_material.as_mut() {
+                        let rel = PathBuf::from(relative_to(&path, &self.project_root));
+                        if let Some(s) = fm.model.textures.slot_mut(slot) {
+                            *s = Some(rel);
+                        }
+                        fm.dirty = true;
+                        self.actions
+                            .push(EditorAction::FileMaterialEdited(fm.path.clone()));
+                    }
                 }
                 EditorAction::ResetMaterial(index) => {
                     self.scene.materials[index].model = self.scene.materials[index].default.clone();
@@ -1083,6 +1211,10 @@ impl EngineApp {
                         &self.project_root,
                         index,
                     );
+                    self.rt_gi.invalidate();
+                }
+                EditorAction::ExtractMaterial(index) => {
+                    self.extract_material(index);
                 }
                 EditorAction::FileMaterialEdited(path) => {
                     let Some(fm) = &self.file_material else {
@@ -1106,6 +1238,7 @@ impl EngineApp {
                             index,
                         );
                     }
+                    self.rt_gi.invalidate();
                 }
                 EditorAction::SaveFileMaterial => {
                     if let Some(fm) = &mut self.file_material {
@@ -1115,6 +1248,7 @@ impl EngineApp {
                         fm.file.shader = fm.model.shader.clone();
                         fm.file.name = fm.model.name.clone();
                         fm.file.render_queue = Some(fm.model.render_queue);
+                        fm.file.textures = crate::scene::tex_file_from_paths(&fm.model.textures);
                         if fm.model.shader != "standard" {
                             // Save custom values by property name (robust to
                             // property reordering in the shader source).
@@ -1132,6 +1266,34 @@ impl EngineApp {
                             Ok(()) => fm.dirty = false,
                             Err(e) => tracing::error!("saving material: {e:#}"),
                         }
+                    }
+                }
+                EditorAction::SaveFileMeta => {
+                    if let Some(fm) = &mut self.file_meta {
+                        match citrus_assets::save_asset_meta(&fm.path, &fm.meta) {
+                            Ok(()) => fm.dirty = false,
+                            Err(e) => tracing::error!("saving .meta: {e:#}"),
+                        }
+                    }
+                }
+                EditorAction::ReimportModel(path) => {
+                    if let Some(fm) = &mut self.file_meta
+                        && fm.path == path
+                    {
+                        if let Err(e) = citrus_assets::save_asset_meta(&fm.path, &fm.meta) {
+                            tracing::error!("saving .meta: {e:#}");
+                        }
+                        fm.dirty = false;
+                    }
+                    // Reload the scene so instances of this model reimport with the
+                    // new settings (skips while playing / with unsaved scene edits).
+                    if self.playing {
+                        self.set_status("Stop play mode to reimport", false);
+                    } else if self.scene_dirty {
+                        self.set_status("Save the scene first to reimport", false);
+                    } else if let Some(scene) = self.current_scene_path.clone() {
+                        self.load_scene_runtime(&scene);
+                        self.set_status("Reimported model", false);
                     }
                 }
                 EditorAction::OpenCodeFile(path) => {
@@ -1526,12 +1688,15 @@ impl EngineApp {
                     }
                 }
                 EditorAction::ReloadPlugins => {
-                    // Defer the blocking cargo build one frame so the status
-                    // bar paints "Compiling components…" first.
+                    // Defer the blocking cargo build one frame so the busy overlay
+                    // paints "Compiling components…" first.
                     self.set_status("Compiling components…", true);
-                    self.reload_pending = true;
+                    self.pending_job = Some(PendingJob::ReloadPlugins);
                 }
-                EditorAction::BakeLighting => self.run_bake(),
+                EditorAction::BakeLighting => {
+                    self.set_status("Baking lighting…", true);
+                    self.pending_job = Some(PendingJob::Bake);
+                }
                 EditorAction::ClearBake => {
                     self.scene.baked = None;
                     self.upload_baked_probes();
@@ -1880,6 +2045,13 @@ impl EngineApp {
                             self.actions.push(EditorAction::ClearSkybox);
                             ui.close();
                         }
+                        ui.separator();
+                        ui.label(egui::RichText::new("GI Debug View").small().weak());
+                        ui.radio_value(&mut self.gi_debug, 0, "Off (normal shading)");
+                        ui.radio_value(&mut self.gi_debug, 1, "World normals")
+                            .on_hover_text("Verify the surface normals feeding GI");
+                        ui.radio_value(&mut self.gi_debug, 2, "Indirect GI only")
+                            .on_hover_text("Isolate the Flux indirect bounce");
                         if ui.button("Reset Layout").clicked() {
                             self.dock_state = default_layout();
                             ui.close();
@@ -2196,6 +2368,35 @@ impl EngineApp {
 
     /// Gather the scene's static geometry, baked lights, and probe volumes,
     /// run the GPU lighting bake, and store the result for runtime sampling.
+    /// Import a model file into the scene (deferred from `ImportModel` so the
+    /// busy overlay shows first). Blocks while the file loads + uploads.
+    fn do_import_model(&mut self, path: PathBuf) {
+        let asset = match citrus_assets::load_model_with_meta(&path) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!("importing model: {e:#}");
+                self.set_status(format!("Import failed: {e}"), false);
+                return;
+            }
+        };
+        let rel = self.project_root.join(relative_to(&path, &self.project_root));
+        let source = relative_to(&rel, &self.project_root);
+        let result = match self.renderer.as_mut() {
+            Some(renderer) => self.scene.add_asset_scene(renderer, &asset, Some(Path::new(&source))),
+            None => return,
+        };
+        match result {
+            Ok(()) => {
+                self.scene_dirty = true;
+                self.set_status("Imported model", false);
+            }
+            Err(e) => {
+                tracing::error!("importing model: {e:#}");
+                self.set_status(format!("Import failed: {e}"), false);
+            }
+        }
+    }
+
     /// Blocks the UI while the GPU traces (off the hot path; explicit action).
     fn run_bake(&mut self) {
         let Some(renderer) = self.renderer.as_ref() else {
@@ -2951,6 +3152,75 @@ impl EngineApp {
         self.status = Some((msg.into(), Instant::now(), spinner));
     }
 
+    /// While a heavy job is queued, dim the screen and show a centered
+    /// "working…" card. It paints this frame; the blocking job runs right after
+    /// render, so the user sees it's busy instead of a frozen window.
+    fn busy_overlay(&self, ctx: &egui::Context) {
+        let label = match &self.pending_job {
+            Some(PendingJob::ReloadPlugins) => "Compiling components…",
+            Some(PendingJob::Bake) => "Baking lighting…",
+            Some(PendingJob::ImportModel(_)) => "Importing model…",
+            None => return,
+        };
+        // Dim the whole UI.
+        let screen = ctx.content_rect();
+        egui::Area::new("citrus-busy-dim".into())
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+            });
+        // Centered card with a spinner + label.
+        egui::Area::new("citrus-busy-card".into())
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(egui::RichText::new(label).strong());
+                    });
+                    ui.label(
+                        egui::RichText::new("The editor is busy — this can take a few seconds.")
+                            .small()
+                            .weak(),
+                    );
+                });
+            });
+        ctx.request_repaint();
+    }
+
+    /// On window-focus regain: if any project asset changed in another app since
+    /// the last check, reload the current scene (which reimports models/textures/
+    /// materials/shaders fresh). Skips while playing or with unsaved scene edits
+    /// (those would be clobbered) — surfacing a hint instead.
+    fn reload_changed_assets(&mut self) {
+        let now = std::time::SystemTime::now();
+        // First focus just establishes a baseline (don't reload on startup).
+        let Some(since) = self.last_asset_check.replace(now) else {
+            return;
+        };
+        if self.playing {
+            return;
+        }
+        let Some(changed) = first_changed_asset(&self.project_root, since) else {
+            return;
+        };
+        let label = changed
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.scene_dirty {
+            self.set_status(format!("'{label}' changed on disk — reload the scene to apply"), false);
+            return;
+        }
+        if let Some(scene) = self.current_scene_path.clone() {
+            self.load_scene_runtime(&scene);
+            self.set_status(format!("Reimported after '{label}' changed on disk"), false);
+        }
+    }
+
     /// Apply a captured input to the slot/action currently being rebound (2C),
     /// then persist bindings. Called from the window-event handler.
     fn apply_rebind(&mut self, src: citrus_core::InputSource) {
@@ -3212,36 +3482,15 @@ impl EngineApp {
         }
     }
 
-    /// Persist one scene material to its `.material` file, creating
-    /// `materials/<name>.material` if it has none yet. Texture paths in an
-    /// existing file are preserved (the editor doesn't model them yet).
+    /// Persist one scene material to its `.material` file — **only if it already
+    /// has one**. Embedded (imported) materials have no backing file and are
+    /// read-only until the user extracts them ([`extract_material`]); we never
+    /// auto-create a phantom `.material` for them.
     fn save_scene_material(&mut self, index: usize) {
-        let model = self.scene.materials[index].model.clone();
-        let path = match &self.scene.materials[index].file {
-            Some(path) => path.clone(),
-            None => {
-                let dir = self.project_root.join("materials");
-                let stem: String = model
-                    .name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let stem = stem.trim_matches('_');
-                let path = unique_path(
-                    &dir,
-                    if stem.is_empty() { "material" } else { stem },
-                    "material",
-                );
-                self.scene.set_material_file(index, path.clone());
-                path
-            }
+        let Some(path) = self.scene.materials[index].file.clone() else {
+            return;
         };
+        let model = self.scene.materials[index].model.clone();
         let mut file = citrus_assets::load_material_file(&path).unwrap_or_else(|_| {
             citrus_assets::MaterialFile {
                 name: model.name.clone(),
@@ -3259,6 +3508,7 @@ impl EngineApp {
         file.params = params;
         file.features = features;
         file.render_queue = Some(model.render_queue);
+        file.textures = crate::scene::tex_file_from_paths(&model.textures);
         file.custom = if model.shader != "standard" {
             self.shaders
                 .get(&model.shader)
@@ -3272,6 +3522,29 @@ impl EngineApp {
             Ok(()) => tracing::info!("auto-saved material to {}", path.display()),
             Err(e) => tracing::error!("auto-saving material: {e:#}"),
         }
+    }
+
+    /// Extract an embedded (imported) material to a real `.material` file under
+    /// `materials/`, assign it back to the material slot, and persist it — after
+    /// which it's a normal editable asset. No-op if it already has a file.
+    fn extract_material(&mut self, index: usize) {
+        if index >= self.scene.materials.len() || self.scene.materials[index].file.is_some() {
+            return;
+        }
+        let name = self.scene.materials[index].model.name.clone();
+        let stem: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .collect();
+        let stem = stem.trim_matches('_');
+        let dir = self.project_root.join("materials");
+        let path = unique_path(&dir, if stem.is_empty() { "material" } else { stem }, "material");
+        self.scene.set_material_file(index, path.clone());
+        self.save_scene_material(index);
+        self.set_status(
+            format!("Extracted material '{}' → {}", name, relative_to(&path, &self.project_root)),
+            false,
+        );
     }
 
     /// Apply one history entry (true = undo, false = redo).
@@ -3317,20 +3590,20 @@ impl EngineApp {
                             index,
                         );
                     }
+                    self.rt_gi.invalidate();
                 }
             }
             UndoEntry::Assign {
                 object,
+                slot,
                 before,
                 after,
             } => {
                 let material = if undo { before } else { after };
-                if object < self.scene.objects.len()
-                    && material < self.scene.materials.len()
-                    && let Some(render) = &mut self.scene.objects[object].render
-                {
-                    render.material = material;
+                if object < self.scene.objects.len() && material < self.scene.materials.len() {
+                    self.scene.set_slot_material(object, slot, material);
                 }
+                self.rt_gi.invalidate();
             }
             UndoEntry::FileMaterial {
                 path,
@@ -3399,6 +3672,15 @@ impl EngineApp {
                     row(ui, "Materials drawn", stats.materials_drawn.to_string());
                     row(ui, "Pipeline binds", stats.pipeline_binds.to_string());
                     row(ui, "Shader variants", stats.pipeline_variants.to_string());
+                    // Per-frame main-thread CPU breakdown (EMA-smoothed, ms).
+                    let t = &self.frame_timings;
+                    ui.separator();
+                    row(ui, "CPU realtime GI", format!("{:.2} ms", t.gi));
+                    row(ui, "CPU components", format!("{:.2} ms", t.components));
+                    row(ui, "CPU physics", format!("{:.2} ms", t.physics));
+                    row(ui, "CPU audio", format!("{:.2} ms", t.audio));
+                    row(ui, "CPU build draws", format!("{:.2} ms", t.draws));
+                    row(ui, "CPU render submit", format!("{:.2} ms", t.render));
                     // Reflections / probes / shadows report here once those
                     // passes exist (see TODO.md).
                 });
@@ -3412,7 +3694,10 @@ impl EngineApp {
         self.stats.tick(dt);
         self.update_camera(dt);
         self.refresh_shaders();
+        let gi_t = Instant::now();
         self.update_realtime_gi(dt);
+        let gi_ms = gi_t.elapsed().as_secs_f32() * 1000.0;
+        FrameTimings::ema(&mut self.frame_timings.gi, gi_ms);
 
         // If mouse-look just ended, egui's pointer state is stale: window
         // events are withheld while looking, so egui (a) never saw the right
@@ -3475,6 +3760,7 @@ impl EngineApp {
             self.project_windows(ctx);
             self.bindings_window(ctx);
             self.network_window(ctx);
+            self.busy_overlay(ctx);
             self.status_bar(ctx);
             if self.show_stats_overlay {
                 self.stats_overlay(ctx, render_stats);
@@ -3507,6 +3793,7 @@ impl EngineApp {
                 file_diagnostics: &self.file_diagnostics,
                 editor_components: &self.editor_components,
                 file_material: &mut self.file_material,
+                file_meta: &mut self.file_meta,
                 open_editors: &mut self.open_editors,
                 focused_code,
                 gizmo: &mut self.gizmo,
@@ -3531,6 +3818,7 @@ impl EngineApp {
                 collider_drag: &mut self.collider_drag,
                 can_bake,
                 lightmap_preview: &mut self.lightmap_preview,
+                selected_material_slot: &mut self.selected_material_slot,
             };
             DockArea::new(&mut dock_state)
                 .style(egui_dock::Style::from_egui(ctx.style().as_ref()))
@@ -3580,22 +3868,33 @@ impl EngineApp {
             let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
             self.input.resolve_frame();
             let mut commands = Vec::new();
+            let comp_t = Instant::now();
             self.scene
                 .update_components(dt, self.play_time, self.input.state(), &net_view, &mut commands);
+            let comp_ms = comp_t.elapsed().as_secs_f32() * 1000.0;
             // Physics: step after component logic, then write the simulated
             // transforms back onto dynamic/kinematic objects.
+            let phys_t = Instant::now();
             if let Some(phys) = self.physics.as_mut()
                 && !phys.is_empty()
             {
                 phys.step(dt);
                 phys.sync_back(&mut self.scene);
             }
+            let phys_ms = phys_t.elapsed().as_secs_f32() * 1000.0;
             // Spatialize audio against the listener (moves with components).
+            let audio_t = Instant::now();
             if let Some(audio) = self.audio.as_mut() {
                 let cues = self.scene.gather_audio();
                 let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
                 audio.update(&cues, listener);
             }
+            let audio_ms = audio_t.elapsed().as_secs_f32() * 1000.0;
+            FrameTimings::ema(&mut self.frame_timings.components, comp_ms);
+            FrameTimings::ema(&mut self.frame_timings.physics, phys_ms);
+            FrameTimings::ema(&mut self.frame_timings.audio, audio_ms);
+            // (Per-section CPU breakdown is shown live in the FrameTimings overlay;
+            // no periodic log spam.)
             // Apply deferred requests (e.g. ctx.load_scene) after the update
             // pass so the scene isn't swapped mid-iteration.
             self.apply_component_commands(commands);
@@ -3621,6 +3920,10 @@ impl EngineApp {
             }
         } else {
             self.record_edits(pre_edit);
+            // Not simulating → decay the play-only timings toward zero.
+            FrameTimings::ema(&mut self.frame_timings.components, 0.0);
+            FrameTimings::ema(&mut self.frame_timings.physics, 0.0);
+            FrameTimings::ema(&mut self.frame_timings.audio, 0.0);
         }
         self.autosave_materials();
         // Cameras always carry a Camera component (covers spawns, loaded
@@ -3632,7 +3935,12 @@ impl EngineApp {
             Selection::Object(i) => Some(i),
             _ => None,
         };
+        let draws_t = Instant::now();
         self.scene.sync_draws(selected, 1.0);
+        FrameTimings::ema(
+            &mut self.frame_timings.draws,
+            draws_t.elapsed().as_secs_f32() * 1000.0,
+        );
         // World sun (from the Environment window) leads the light list; scene
         // Light objects follow.
         let env = self.scene.environment.clone();
@@ -3720,6 +4028,7 @@ impl EngineApp {
             time: t,
             draws: &self.scene.draws,
             lightmap_preview: self.lightmap_preview,
+            gi_debug: self.gi_debug,
             postfx,
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
@@ -3727,17 +4036,28 @@ impl EngineApp {
                 textures_delta: output.textures_delta,
             }),
         };
+        let render_t = Instant::now();
         if let Err(e) = renderer.render(&frame) {
             tracing::error!("render failed: {e:#}");
             event_loop.exit();
         }
+        FrameTimings::ema(
+            &mut self.frame_timings.render,
+            render_t.elapsed().as_secs_f32() * 1000.0,
+        );
 
-        // Deferred plugin reload: this frame already painted "Compiling
-        // components…", so run the blocking cargo build now (the next frame
-        // shows the result).
+        // Deferred heavy jobs: this frame already painted the busy overlay, so
+        // run the blocking work now (the next frame shows the result + clears it).
         if self.reload_pending {
             self.reload_pending = false;
             self.do_reload_plugins();
+        }
+        if let Some(job) = self.pending_job.take() {
+            match job {
+                PendingJob::ReloadPlugins => self.do_reload_plugins(),
+                PendingJob::Bake => self.run_bake(),
+                PendingJob::ImportModel(path) => self.do_import_model(path),
+            }
         }
 
         window.request_redraw();
@@ -3756,6 +4076,7 @@ struct EditorTabs<'a> {
     editor_components: &'a EditorComponents,
     vim_mode: bool,
     file_material: &'a mut Option<FileMaterial>,
+    file_meta: &'a mut Option<FileMeta>,
     open_editors: &'a mut Vec<OpenEditor>,
     /// Path of the focused code tab (drives Inspector diagnostics).
     focused_code: Option<PathBuf>,
@@ -3786,6 +4107,8 @@ struct EditorTabs<'a> {
     can_bake: bool,
     /// Baker tab: lightmap-UV checker preview toggle.
     lightmap_preview: &'a mut bool,
+    /// Inspector: selected material slot of the current object (multi-material).
+    selected_material_slot: &'a mut usize,
 }
 
 impl egui_dock::TabViewer for EditorTabs<'_> {
@@ -3875,6 +4198,9 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     // Caught by record_edits (dirty flag + undo) since F2 only
                     // renames the selected object, which is the edit snapshot.
                     self.scene.objects[index].name = name;
+                }
+                if let Some(path) = response.import_model {
+                    self.actions.push(EditorAction::ImportModel(path));
                 }
                 if let Some(kind) = response.spawn {
                     use citrus_assets::{ObjectSource, PrimitiveShape};
@@ -4706,7 +5032,6 @@ impl EditorTabs<'_> {
 
                 {
                     let baked = self.scene.baked.is_some();
-                    let can_bake = self.can_bake;
                     let env = &mut self.scene.environment;
                     ui.label(RichText::new("World Light (Sun / Moon)").strong());
                     ui.checkbox(&mut env.sun_enabled, "Enabled");
@@ -4748,116 +5073,98 @@ impl EditorTabs<'_> {
                     });
 
                     ui.separator();
-                    ui.label(RichText::new("Realtime GI").strong());
+                    ui.label(RichText::new("Flux GI (realtime)").strong());
                     let gi = &mut env.realtime_gi;
-                    ui.add_enabled_ui(can_bake && !baked, |ui| {
+                    ui.add_enabled_ui(!baked, |ui| {
                         ui.checkbox(&mut gi.enabled, "Enabled").on_hover_text(
-                            "Continuously trace light probes from the realtime lights so \
-                             surfaces show live indirect bounce (no bake needed). Applies in \
-                             the editor and a shipped game.",
+                            "Flux: Lumen-style realtime global illumination. Screen-space probes \
+                             march the scene distance field every frame for live indirect bounce \
+                             — no bake, runs anywhere (no RT cores needed).",
                         );
                         ui.add_enabled_ui(gi.enabled, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label("Mode");
-                                egui::ComboBox::from_id_salt("citrus-gi-mode")
-                                    .selected_text(gi.mode.label())
-                                    .show_ui(ui, |ui| {
-                                        for m in citrus_assets::GiMode::ALL {
-                                            ui.selectable_value(&mut gi.mode, m, m.label());
-                                        }
-                                    });
-                            });
-                            let software = gi.mode == citrus_assets::GiMode::Software;
-                            if software {
-                                ui.label(
-                                    RichText::new("Software SDF GI (no RT cores): CPU-marched, \
-                                        coarse preview — soft + low-frequency. The probe grid is \
-                                        spatially denoised, so raise Responsiveness for snappier \
-                                        updates without adding noise.")
-                                        .small()
-                                        .weak(),
-                                );
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label("Bounces");
-                                // Software pays per bounce on the CPU and gains
-                                // little past a couple (albedo falls off fast),
-                                // so cap it lower to keep traces fast.
-                                let max_bounces = if software { 4 } else { 16 };
-                                ui.add(egui::Slider::new(&mut gi.bounces, 1..=max_bounces))
-                                    .on_hover_text("Indirect bounces per path");
+                                ui.label("Intensity");
+                                ui.add(egui::Slider::new(&mut gi.intensity, 0.0..=4.0))
+                                    .on_hover_text("Indirect bounce strength multiplier.");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Quality");
-                                // GPU march affords more rays/probe than the old
-                                // CPU path; the denoise + stratified sampling keep
-                                // even low spp clean, so this is mostly headroom.
-                                let max_spp = if software { 256 } else { 256 };
-                                ui.add(
-                                    egui::Slider::new(&mut gi.samples, 16..=max_spp)
-                                        .suffix(" spp")
-                                        .logarithmic(true),
-                                )
-                                .on_hover_text(
-                                    "Rays per probe — higher = less noise, more cost. The grid \
-                                     is denoised after tracing, so low values (~48-96) stay clean \
-                                     and keep traces fast enough for realtime.",
-                                );
+                                egui::ComboBox::from_id_salt("citrus-flux-quality")
+                                    .selected_text(gi.quality.label())
+                                    .show_ui(ui, |ui| {
+                                        for q in citrus_assets::FluxQuality::ALL {
+                                            ui.selectable_value(&mut gi.quality, q, q.label());
+                                        }
+                                    });
+                            })
+                            .response
+                            .on_hover_text(
+                                "Rays per screen probe each frame. Temporal accumulation smooths \
+                                 the rest, so even Performance stays clean once settled.",
+                            );
+                            ui.horizontal(|ui| {
+                                ui.label("Bounces");
+                                ui.add(egui::Slider::new(&mut gi.bounces, 1..=4))
+                                    .on_hover_text("Indirect bounces per ray (more = softer fill).");
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Intensity");
-                                ui.add(
-                                    DragValue::new(&mut gi.intensity).speed(0.1).range(0.0..=64.0),
-                                )
-                                .on_hover_text("GI strength multiplier");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Probe Spacing");
-                                ui.add(
-                                    egui::Slider::new(&mut gi.probe_spacing, 0.25..=8.0)
-                                        .suffix(" m"),
-                                )
-                                .on_hover_text(
-                                    "World units between auto-grid probes — smaller = finer GI, \
-                                     more cost. Very small values just hit the per-axis cap and \
-                                     make traces slow (laggy) without looking better.",
-                                );
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Responsiveness");
-                                ui.add(egui::Slider::new(&mut gi.temporal_blend, 0.05..=1.0))
+                                ui.label("Smoothing");
+                                ui.add(egui::Slider::new(&mut gi.smoothing, 0.0..=1.0))
                                     .on_hover_text(
-                                        "How fast bounce light tracks MOVING lights/emitters — at \
-                                         max it snaps straight to the latest (clean GPU) trace, so \
-                                         a moving emitter lights at full brightness immediately. \
-                                         Still scenes always settle smoothly (denoised), so raising \
-                                         this does NOT add flicker when nothing is moving.",
+                                        "Temporal stability: higher = smoother but more motion lag; \
+                                         lower = sharper/more responsive but noisier while moving.",
                                     );
                             });
-                            ui.horizontal(|ui| {
-                                ui.label("Update Interval");
-                                ui.add(
-                                    egui::Slider::new(&mut gi.update_interval, 0.0..=1.0)
-                                        .suffix(" s"),
-                                )
-                                .on_hover_text(
-                                    "Seconds between re-traces while the scene changes. 0 = every \
-                                     frame (the GPU march is cheap) for the snappiest moving-light \
-                                     bounce; raise it to throttle GI cost. Still scenes stop \
-                                     tracing once settled regardless.",
-                                );
-                            });
+                            egui::CollapsingHeader::new("Advanced")
+                                .id_salt("citrus-flux-advanced")
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label("GDF resolution");
+                                        egui::ComboBox::from_id_salt("citrus-flux-gdfres")
+                                            .selected_text(format!("{}³", gi.gdf_resolution))
+                                            .show_ui(ui, |ui| {
+                                                for r in [64u32, 128, 256] {
+                                                    ui.selectable_value(
+                                                        &mut gi.gdf_resolution,
+                                                        r,
+                                                        format!("{r}³"),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("March distance");
+                                        ui.add(
+                                            egui::Slider::new(&mut gi.march_distance, 0.0..=500.0)
+                                                .suffix(" m"),
+                                        )
+                                        .on_hover_text("Max trace distance (0 = auto from scene size).");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Firefly clamp");
+                                        ui.add(egui::Slider::new(&mut gi.firefly_clamp, 0.5..=16.0))
+                                            .on_hover_text("Caps bright bounce outliers (lower = calmer).");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Probe fallback");
+                                        egui::ComboBox::from_id_salt("citrus-flux-fallback")
+                                            .selected_text(gi.probe_fallback.label())
+                                            .show_ui(ui, |ui| {
+                                                for f in citrus_assets::ProbeFallback::ALL {
+                                                    ui.selectable_value(
+                                                        &mut gi.probe_fallback,
+                                                        f,
+                                                        f.label(),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                });
                         });
                     });
                     if baked {
                         ui.label(
-                            RichText::new("Off while a bake is loaded (Clear it to use Realtime GI).")
-                                .small()
-                                .weak(),
-                        );
-                    } else if !can_bake {
-                        ui.label(
-                            RichText::new("This GPU has no ray-query support.")
+                            RichText::new("Off while a bake is loaded (Clear it to use Flux GI).")
                                 .small()
                                 .weak(),
                         );
@@ -4985,11 +5292,13 @@ impl EditorTabs<'_> {
             self.actions.push(EditorAction::StartLook);
         }
 
-        // Scroll dollies the camera only while the pointer is over the
-        // viewport. Uses the winit-based test (not egui `contains_pointer`)
-        // so it re-arms immediately after mouse-look ends, when egui's
-        // pointer state is briefly stale.
-        if self.pointer_in_viewport {
+        // Scroll dollies the camera only while the pointer is over the viewport
+        // AND the viewport widget actually has the pointer (not occluded by a
+        // floating window). The winit rect test alone let scroll bleed through
+        // windows sitting over the viewport — `contains_pointer()` is
+        // occlusion-aware (same reason clicks use `hovered()` above), so a window
+        // over the cursor now swallows the wheel like it swallows clicks.
+        if self.pointer_in_viewport && response.contains_pointer() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
                 self.actions.push(EditorAction::Dolly(scroll / 50.0));
@@ -5963,13 +6272,25 @@ impl EditorTabs<'_> {
                 });
             });
 
-        // Drop a .material anywhere on the viewport: assign to the hit mesh.
-        if let Some(payload) = response.dnd_release_payload::<PathBuf>()
-            && payload.extension().is_some_and(|e| e == "material")
-            && let Some(pos) = ui.input(|i| i.pointer.latest_pos())
-        {
-            self.actions
-                .push(EditorAction::AssignMaterialAt(pos, (*payload).clone()));
+        // Drop from the Files panel onto the viewport: a `.material` assigns to
+        // the hit mesh; a model file (FBX/glTF) imports into the scene.
+        if let Some(payload) = response.dnd_release_payload::<PathBuf>() {
+            let ext = payload
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            match ext.as_deref() {
+                Some("material") => {
+                    if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                        self.actions
+                            .push(EditorAction::AssignMaterialAt(pos, (*payload).clone()));
+                    }
+                }
+                Some("fbx" | "gltf" | "glb" | "obj") => {
+                    self.actions.push(EditorAction::ImportModel((*payload).clone()));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -6021,15 +6342,7 @@ impl EditorTabs<'_> {
             return;
         }
 
-        // Lock toggle: when locked, the inspector keeps showing the snapshot
-        // selection regardless of what the user clicks next.
-        if self.inspector.lock_header(ui) {
-            *self.inspector_lock_target = if self.inspector.locked {
-                Some(self.selection.clone())
-            } else {
-                None
-            };
-        }
+        // Effective selection (honours the lock).
         let effective = if self.inspector.locked {
             self.inspector_lock_target
                 .clone()
@@ -6037,6 +6350,42 @@ impl EditorTabs<'_> {
         } else {
             self.selection.clone()
         };
+        // Pinned header — stays put while the body scrolls. For an object it's the
+        // single flex row [enabled][name (grows)][static][lock]; otherwise just
+        // the lock toggle.
+        match &effective {
+            Selection::Object(i) if *i < self.scene.objects.len() => {
+                let index = *i;
+                let obj = &mut self.scene.objects[index];
+                let mut name = obj.name.clone();
+                let mut enabled = obj.enabled;
+                let mut static_geometry = obj.static_geometry;
+                let hr =
+                    self.inspector
+                        .object_header(ui, &mut name, &mut enabled, &mut static_geometry);
+                if hr.object_changed {
+                    obj.name = name;
+                    obj.enabled = enabled;
+                    obj.static_geometry = static_geometry;
+                }
+                if hr.lock_changed {
+                    *self.inspector_lock_target = if self.inspector.locked {
+                        Some(self.selection.clone())
+                    } else {
+                        None
+                    };
+                }
+            }
+            _ => {
+                if self.inspector.lock_header(ui) {
+                    *self.inspector_lock_target = if self.inspector.locked {
+                        Some(self.selection.clone())
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
         ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -6070,7 +6419,32 @@ impl EditorTabs<'_> {
                             (mi.vertices, mi.triangles)
                         }),
                     };
-                    let material_index = render.map(|r| r.material);
+                    // Material slots for this object (slot 0 + extras). The
+                    // inspector edits the selected one.
+                    let slots: Vec<RenderInfo> = object.render_slots().collect();
+                    let slot_count = slots.len();
+                    if *self.selected_material_slot >= slot_count.max(1) {
+                        *self.selected_material_slot = 0;
+                    }
+                    // A multi-material mesh: pick which slot to edit.
+                    if slot_count > 1 {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("Material Slots").strong());
+                            for s in 0..slot_count {
+                                let mi = slots[s].material;
+                                let name = &self.scene.materials[mi].model.name;
+                                let label = format!("{s}: {name}");
+                                if ui
+                                    .selectable_label(*self.selected_material_slot == s, label)
+                                    .clicked()
+                                {
+                                    *self.selected_material_slot = s;
+                                }
+                            }
+                        });
+                    }
+                    let slot = *self.selected_material_slot;
+                    let material_index = slots.get(slot).map(|r| r.material);
                     // Object list (id + name) for ObjectRef pickers — built as an
                     // owned Vec before the mutable component borrow so it doesn't
                     // alias scene.objects.
@@ -6080,11 +6454,20 @@ impl EditorTabs<'_> {
                         .iter()
                         .map(|o| (o.id, o.name.clone()))
                         .collect();
+                    // Imported (embedded) materials have no backing file — they're
+                    // read-only until extracted, so don't hand them to the editor.
+                    let embedded = material_index
+                        .map(|m| self.scene.materials[m].file.is_none())
+                        .unwrap_or(false);
                     // Split borrows: components live on the object, the
                     // material model in the scene's material list.
                     let scene = &mut *self.scene;
                     let components = &mut scene.objects[index].components;
-                    let material = material_index.map(|m| &mut scene.materials[m].model);
+                    let material = if embedded {
+                        None
+                    } else {
+                        material_index.map(|m| &mut scene.materials[m].model)
+                    };
                     let response = self.inspector.ui(
                         ui,
                         InspectorContent::Object {
@@ -6124,8 +6507,34 @@ impl EditorTabs<'_> {
                         }
                     }
                     if let Some(path) = response.material_dropped {
-                        self.actions
-                            .push(EditorAction::AssignMaterialToObject(index, path));
+                        self.actions.push(EditorAction::AssignMaterialToObject(
+                            index, slot, path,
+                        ));
+                    }
+                    if let Some((slot, path)) = response.texture_dropped
+                        && let Some(mi) = material_index
+                    {
+                        self.actions.push(EditorAction::AssignTexture {
+                            material: mi,
+                            slot,
+                            path,
+                        });
+                    }
+                    // Embedded material: offer extraction (then it's editable).
+                    if embedded
+                        && let Some(mi) = material_index
+                    {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(
+                                "Imported material — read-only. Extract it to a .material file to edit + save.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        if ui.button("⤓ Extract Material").clicked() {
+                            self.actions.push(EditorAction::ExtractMaterial(mi));
+                        }
                     }
                     // Component add/remove takes effect immediately so the
                     // frame's undo diff captures it as one Object entry.
@@ -6169,6 +6578,10 @@ impl EditorTabs<'_> {
                                 if response.save_material {
                                     self.actions.push(EditorAction::SaveFileMaterial);
                                 }
+                                if let Some((slot, path)) = response.texture_dropped {
+                                    self.actions
+                                        .push(EditorAction::AssignFileTexture { slot, path });
+                                }
                             } else {
                                 ui.label("Failed to open material (see log).");
                             }
@@ -6210,6 +6623,52 @@ impl EditorTabs<'_> {
                                 self.actions.push(EditorAction::OpenCodeFile(path.clone()));
                             }
                         }
+                        Some("fbx" | "gltf" | "glb" | "obj") => {
+                            ui.heading("Model Import");
+                            ui.label(egui::RichText::new(&path_display).small().weak());
+                            ui.separator();
+                            let mut do_save = false;
+                            let mut do_reimport = false;
+                            if let Some(fm) = self.file_meta.as_mut().filter(|f| f.path == *path) {
+                                match fm.meta.importer.as_model_mut() {
+                                    Some(model) => {
+                                        if model_import_ui(ui, model) {
+                                            fm.dirty = true;
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("No import settings for this asset type.");
+                                    }
+                                }
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(fm.dirty, egui::Button::new("💾 Save"))
+                                        .clicked()
+                                    {
+                                        do_save = true;
+                                    }
+                                    if ui
+                                        .button("↻ Reimport")
+                                        .on_hover_text("Save settings + reload the scene so this model reimports")
+                                        .clicked()
+                                    {
+                                        do_reimport = true;
+                                    }
+                                    if fm.dirty {
+                                        ui.label(egui::RichText::new("unsaved").small().weak());
+                                    }
+                                });
+                            } else {
+                                ui.label("Loading import settings…");
+                            }
+                            if do_save {
+                                self.actions.push(EditorAction::SaveFileMeta);
+                            }
+                            if do_reimport {
+                                self.actions.push(EditorAction::ReimportModel(path.clone()));
+                            }
+                        }
                         _ => {
                             let size = std::fs::metadata(path).map(|m| m.len()).ok();
                             self.inspector.ui(
@@ -6225,6 +6684,38 @@ impl EditorTabs<'_> {
                 }
             });
     }
+}
+
+/// Model (.fbx/.gltf) import options editor, backed by the asset's `.meta`.
+/// Returns true when a value changed.
+fn model_import_ui(ui: &mut egui::Ui, m: &mut citrus_assets::ModelImport) -> bool {
+    use egui::{DragValue, Slider};
+    let mut changed = false;
+    egui::Grid::new("model-import-grid").num_columns(2).show(ui, |ui| {
+        ui.label("Scale");
+        changed |= ui
+            .add(DragValue::new(&mut m.scale).speed(0.001).range(0.0001..=1000.0))
+            .on_hover_text("Uniform import scale (e.g. 0.01 for cm→m sources)")
+            .changed();
+        ui.end_row();
+        ui.label("Import Materials");
+        changed |= ui.checkbox(&mut m.import_materials, "").changed();
+        ui.end_row();
+        ui.label("Flip UV (V)");
+        changed |= ui.checkbox(&mut m.flip_uv, "").changed();
+        ui.end_row();
+        ui.label("Recalc Normals");
+        changed |= ui.checkbox(&mut m.recalculate_normals, "").changed();
+        ui.end_row();
+        if m.recalculate_normals {
+            ui.label("Smoothing Angle");
+            changed |= ui
+                .add(Slider::new(&mut m.smoothing_angle, 0.0..=180.0).suffix("°"))
+                .changed();
+            ui.end_row();
+        }
+    });
+    changed
 }
 
 /// Sliders for a `.postfx` profile (the post-processing asset editor). Returns
@@ -6780,6 +7271,37 @@ fn hover_text(result: &serde_json::Value) -> String {
 
 /// A unique sibling path for duplicating `src`: `<stem>_copy.<ext>` (numbered
 /// if taken). Works for files and directories.
+/// First project asset file (recursively) modified after `since`, or None.
+/// Skips `target/` and dot-directories. Used by the focus-regain reimport.
+fn first_changed_asset(root: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
+    const EXTS: &[&str] = &[
+        "fbx", "gltf", "glb", "obj", "png", "jpg", "jpeg", "tga", "hdr", "material", "frag",
+        "scene", "postfx", "wav", "flac", "mp3",
+    ];
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            if let Some(found) = first_changed_asset(&path, since) {
+                return Some(found);
+            }
+        } else if let Some(ext) = path.extension().and_then(|x| x.to_str())
+            && EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
+            && let Ok(modified) = entry.metadata().and_then(|m| m.modified())
+            && modified > since
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn duplicate_file_path(src: &Path) -> Option<PathBuf> {
     let dir = src.parent()?;
     let stem = src.file_stem()?.to_string_lossy();
@@ -7030,6 +7552,9 @@ impl ApplicationHandler for EngineApp {
                     renderer.resize();
                 }
             }
+            // Regained focus → reimport assets edited in other apps (e.g. an FBX
+            // re-exported from Blender) without a manual reimport.
+            WindowEvent::Focused(true) => self.reload_changed_assets(),
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressed = state == ElementState::Pressed;
                 if self.playing {

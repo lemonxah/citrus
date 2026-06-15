@@ -44,6 +44,8 @@ pub enum UndoEntry {
     /// Material slot assignment on an object.
     Assign {
         object: usize,
+        /// Which material slot (0 = primary, 1.. = extra slots).
+        slot: usize,
         before: usize,
         after: usize,
     },

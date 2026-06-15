@@ -4,6 +4,7 @@
 //! parsing (humanoid rig, expressions, spring bones) on top of the glTF
 //! loader.
 
+mod asset_meta;
 mod bake_file;
 mod fbx_loader;
 mod gltf_loader;
@@ -14,7 +15,11 @@ mod project_file;
 mod scene_file;
 mod shader_file;
 
-pub use fbx_loader::load_fbx;
+pub use asset_meta::{
+    AssetMeta, ImporterSettings, META_EXT, ModelImport, load_asset_meta,
+    load_or_create_asset_meta, meta_path, save_asset_meta,
+};
+pub use fbx_loader::{load_fbx, load_fbx_with};
 pub use gltf_loader::load_gltf;
 pub use material_file::{
     MATERIAL_EXTENSION, MaterialFile, MaterialTextures, load_material_file, load_texture_file,
@@ -33,8 +38,9 @@ pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
 pub use scene_file::{
-    ComponentData, GiMode, MaterialRef, ObjectSource, PrimitiveShape, RealtimeGi, SCENE_EXTENSION,
-    SceneEntry, BakeSettings, SceneFile, WorldEnvironment, load_scene_file, save_scene_file,
+    ComponentData, FluxQuality, GiMode, MaterialRef, ObjectSource, PrimitiveShape, ProbeFallback,
+    RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile, WorldEnvironment,
+    load_scene_file, save_scene_file,
 };
 pub use shader_file::{
     SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,
@@ -47,12 +53,31 @@ use anyhow::{Result, bail};
 use citrus_render::{MaterialFeatures, MaterialParams, MeshData, TextureData};
 use glam::Mat4;
 
-/// One renderable placement of a mesh with a material.
-pub struct Instance {
-    pub name: String,
+/// One (mesh, material) sub-part of an instance.
+#[derive(Clone, Copy)]
+pub struct MeshSlot {
     pub mesh: usize,
     pub material: usize,
+}
+
+/// One renderable placement at a transform, with one or more material slots.
+/// A single-material node has one slot; a multi-material mesh has one slot per
+/// material (all drawn at the same transform, presented as one scene object).
+pub struct Instance {
+    pub name: String,
     pub transform: Mat4,
+    pub slots: Vec<MeshSlot>,
+}
+
+impl Instance {
+    /// A single-material instance (the common case).
+    pub fn single(name: impl Into<String>, mesh: usize, material: usize, transform: Mat4) -> Self {
+        Self {
+            name: name.into(),
+            transform,
+            slots: vec![MeshSlot { mesh, material }],
+        }
+    }
 }
 
 /// A material referencing scene-local texture indices; the engine maps
@@ -96,6 +121,26 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
     {
         Some("gltf" | "glb") => load_gltf(path),
         Some("fbx") => load_fbx(path),
+        other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
+    }
+}
+
+/// Load a model applying its `.meta` sidecar import settings if the sidecar
+/// exists (read-only — safe in a shipped game; the editor creates/edits the meta
+/// separately). FBX honours the settings; glTF uses defaults for now.
+pub fn load_model_with_meta(path: impl AsRef<Path>) -> Result<Scene> {
+    let path = path.as_ref();
+    let model = load_asset_meta(path)?
+        .and_then(|m| m.importer.as_model().cloned())
+        .unwrap_or_default();
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        Some("gltf" | "glb") => load_gltf(path),
+        Some("fbx") => load_fbx_with(path, &model),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }
 }

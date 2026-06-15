@@ -28,6 +28,9 @@ pub struct SdfInstance {
     pub sdf: Arc<SdfVolume>,
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
+    /// Non-moving geometry. The cached Global Distance Field is built from these
+    /// only, so a moving dynamic object never forces a (costly) GDF rebuild.
+    pub static_geometry: bool,
 }
 
 /// An emissive instance reduced to a sphere area-light for next-event estimation
@@ -549,6 +552,7 @@ mod tests {
             sdf,
             albedo: [0.8, 0.8, 0.8],
             emission: [0.0; 3],
+                static_geometry: true,
         };
         let light = BakeLight {
             kind: LightKind::Point,
@@ -628,6 +632,7 @@ mod tests {
             sdf,
             albedo: [0.8; 3],
             emission: [0.0; 3],
+                static_geometry: true,
         };
         let dims = [16, 16, 16];
         let gdf = build_gdf(&[inst], Vec3::splat(-1.5), Vec3::splat(1.5), dims);

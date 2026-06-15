@@ -58,6 +58,49 @@ layout(set = 0, binding = 2) readonly buffer Probes { Probe probes[]; };
 // uv1. Each texel is incoming irradiance E; the caller applies albedo/PI.
 layout(set = 0, binding = 3) uniform sampler2DArray u_lightmap;
 
+// Screen-space GI gather (sparse screen probes, Lumen-style). One texel per
+// SGI_DIV×SGI_DIV screen block; rgb = indirect irradiance, a = probe camera
+// distance (for depth-aware upsampling). Used in place of the coarse world-probe
+// grid when active (frame.debug.z > 0.5). Sampled by screen UV.
+layout(set = 0, binding = 4) uniform sampler2D u_screen_gi;
+// Must match SCREEN_PROBE_DIV in lib.rs (probe grid = screen / SGI_DIV).
+const float SGI_DIV = 4.0;
+
+// Bilateral spatial filter + depth-aware upsample of the sparse screen probes:
+// a wide (5×5 probe) edge-aware gather. Each probe is weighted by a spatial
+// Gaussian (distance to the pixel in probe space) AND by how close its stored
+// camera distance is to this fragment's — so it smooths the few-ray noise
+// (Lumen's screen-probe spatial filter) while rejecting probes across a depth
+// edge (no bleed/blockiness). This is the main grain reduction.
+vec3 screen_gi_upsample(vec2 suv, float frag_dist) {
+    vec2 screen = vec2(frame.postfx2.w, frame.postfx3.w);
+    vec2 texel = SGI_DIV / max(screen, vec2(1.0)); // probe-texel size in UV
+    vec2 pc = suv / texel - 0.5;                    // probe-grid coords (int = probe)
+    ivec2 c = ivec2(floor(pc + 0.5));              // nearest probe
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    const int R = 2;                               // 5×5 probe window
+    for (int j = -R; j <= R; ++j) {
+        for (int i = -R; i <= R; ++i) {
+            ivec2 g = c + ivec2(i, j);
+            vec2 uv = (vec2(g) + 0.5) * texel;
+            vec4 s = texture(u_screen_gi, clamp(uv, vec2(0.0), vec2(1.0)));
+            vec2 off = vec2(g) - pc;
+            float sw = exp(-dot(off, off) * 0.5);          // spatial Gaussian
+            // RELATIVE depth difference: same-surface neighbours (small relative
+            // delta) are kept so probes blend smoothly; only true depth edges
+            // (large relative delta) are rejected. An absolute threshold wrongly
+            // rejected neighbours on slanted surfaces → blocky "big pixels".
+            float dd = abs(s.a - frag_dist) / max(frag_dist, 0.5);
+            float dw = exp(-dd * 6.0);                      // depth-edge reject
+            float w = sw * dw + 1e-6;
+            sum += s.rgb * w;
+            wsum += w;
+        }
+    }
+    return wsum > 1e-6 ? sum / wsum : vec3(0.0);
+}
+
 // Diffuse irradiance / PI from the probe's SH-L1 radiance coefficients, in
 // direction n. The bake stores radiance projected onto SH (Y0 = 0.282095,
 // Y1 = 0.488603; sh1~y, sh2~z, sh3~x). Converting radiance SH to Lambertian
@@ -291,6 +334,25 @@ layout(set = 1, binding = 1) uniform sampler2D t_normal;
 layout(set = 1, binding = 2) uniform sampler2D t_orm; // R occlusion, G roughness, B metallic
 layout(set = 1, binding = 3) uniform sampler2D t_emission;
 
+// Extended per-material params (beyond the 128-byte push block).
+layout(set = 1, binding = 4) uniform MaterialFx {
+    vec4 rim;    // rgb rim colour, w rim power
+    vec4 toon;   // x rim strength, y ramp smoothness, z emission pulse, w _
+    vec4 scroll; // xy base UV scroll, zw emission UV scroll
+    vec4 matcap; // xyz matcap layer strengths, w _
+    vec4 matcap_blend; // xyz blend modes (0 add / 1 mul / 2 replace), w _
+} fx;
+
+// Extended texture slots (bindings 5-12).
+layout(set = 1, binding = 5) uniform sampler2D t_opacity;
+layout(set = 1, binding = 6) uniform sampler2D t_emission_mask;
+layout(set = 1, binding = 7) uniform sampler2D t_matcap0;
+layout(set = 1, binding = 8) uniform sampler2D t_matcap0_mask;
+layout(set = 1, binding = 9) uniform sampler2D t_matcap1;
+layout(set = 1, binding = 10) uniform sampler2D t_matcap1_mask;
+layout(set = 1, binding = 11) uniform sampler2D t_matcap2;
+layout(set = 1, binding = 12) uniform sampler2D t_matcap2_mask;
+
 layout(push_constant) uniform Push {
     mat4 model;
     vec4 base_color;
@@ -317,6 +379,14 @@ const float PI = 3.14159265359;
 vec3 tonemap_aces(vec3 x) {
     const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Combine one matcap layer with the colour beneath it. `t` is the layer's
+// mask*strength weight; `mode` selects 0 add / 1 multiply / 2 replace.
+vec3 blend_matcap(vec3 base, vec3 mc, float t, float mode) {
+    if (mode > 1.5) return mix(base, mc, t);          // replace
+    if (mode > 0.5) return mix(base, base * mc, t);   // multiply
+    return base + mc * t;                             // add
 }
 
 // Per-pixel post from the blended Volume profile: exposure → grading → tonemap →
@@ -391,7 +461,11 @@ void main() {
         return;
     }
 
-    vec4 albedo = texture(t_albedo, v_uv) * pc.base_color * v_color;
+    // Animated UV scroll (Poiyomi-style) from the material FX block.
+    vec2 uv = v_uv + fx.scroll.xy * frame.misc.x;
+
+    vec4 albedo = texture(t_albedo, uv) * pc.base_color * v_color;
+    albedo.a *= texture(t_opacity, uv).r; // dedicated opacity map (default white)
     if (ALPHA_MODE == 1u && albedo.a < pc.params1.x) {
         discard;
     }
@@ -403,17 +477,15 @@ void main() {
     if (FEAT_NORMAL_MAP) {
         vec3 T = normalize(v_tangent.xyz - N * dot(v_tangent.xyz, N));
         vec3 B = cross(N, T) * v_tangent.w;
-        vec3 tn = texture(t_normal, v_uv).xyz * 2.0 - 1.0;
+        vec3 tn = texture(t_normal, uv).xyz * 2.0 - 1.0;
         tn.xy *= pc.params1.y;
         N = normalize(mat3(T, B, N) * normalize(tn));
     }
 
-    vec3 orm = texture(t_orm, v_uv).rgb;
-    // params1.z is occlusion strength for the Standard (PBR) shader; the Toon
-    // shader reinterprets it as the rim-light strength (toon surfaces rarely need
-    // texture-AO scaling), so the two PBR variants share one param block.
-    float ao = FEAT_TOON ? orm.r : mix(1.0, orm.r, pc.params1.z);
-    float rim_strength = FEAT_TOON ? pc.params1.z : 0.0;
+    vec3 orm = texture(t_orm, uv).rgb;
+    float ao = mix(1.0, orm.r, pc.params1.z);
+    // Toon rim strength now comes from the FX block (so occlusion stays usable).
+    float rim_strength = FEAT_TOON ? fx.toon.x : 0.0;
     float roughness = clamp(orm.g * pc.params0.y, 0.045, 1.0);
     float metallic = clamp(orm.b * pc.params0.x, 0.0, 1.0);
 
@@ -481,7 +553,8 @@ void main() {
             float steps = max(pc.params0.z, 2.0);
             float scaled = clamp(NdotL, 0.0, 1.0) * steps;
             float lower = floor(scaled);
-            float edge = smoothstep(0.42, 0.58, scaled - lower);
+            float sm = clamp(fx.toon.y, 0.01, 0.49);
+            float edge = smoothstep(0.5 - sm, 0.5 + sm, scaled - lower);
             float banded = (lower + edge) / steps;
             // Specular as a crisp toon highlight, only on lit bands.
             vec3 lit_toon = (kd * diffuse_color / PI) * banded
@@ -500,6 +573,13 @@ void main() {
     if (pc.params1.w >= 0.0) {
         int layer = int(pc.params1.w + 0.5);
         indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
+    } else if (frame.debug.z > 0.5) {
+        // Screen-space GI: depth-aware upsample of the sparse screen probes.
+        // Emissive surfaces are in the depth prepass again, so they sample their
+        // OWN GI here (their emission still dominates the look).
+        vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
+        float frag_dist = length(v_world_pos - frame.camera_pos.xyz);
+        indirect = screen_gi_upsample(suv, frag_dist);
     } else {
         // Probe GI where a cascade covers the fragment, fading to flat ambient
         // at the outermost cascade's edge (coverage < 1) and beyond it (0).
@@ -507,20 +587,55 @@ void main() {
         float cov = sample_probes(v_world_pos, N, probe_irr);
         indirect = mix(frame.ambient.rgb, probe_irr, cov);
     }
-    // Energy-conserving ambient diffuse: keep only the non-reflected share.
-    vec3 kd_amb = vec3(1.0) - f_schlick_rough(NdotV, f0, roughness);
+    // Energy-conserving ambient: split indirect into diffuse (non-reflected) and
+    // a cheap specular share so metals/smooth surfaces pick up environment colour
+    // instead of reading flat. Uses the probe/lightmap irradiance as a stand-in
+    // for environment radiance (no reflection probes yet) — approximate but it
+    // keeps metals lively. Smoother surfaces concentrate the spec response.
+    vec3 F_amb = f_schlick_rough(NdotV, f0, roughness);
+    vec3 kd_amb = vec3(1.0) - F_amb;
     color += kd_amb * indirect * diffuse_color * ao;
+    float spec_amb = mix(1.0, 0.25, roughness); // rough surfaces scatter it away
+    color += F_amb * indirect * ao * spec_amb;
 
     if (FEAT_EMISSION) {
-        color += texture(t_emission, v_uv).rgb * pc.emission.rgb;
+        // Emission can scroll on its own UV, pulse over time, and be masked.
+        vec2 euv = v_uv + fx.scroll.zw * frame.misc.x;
+        float pulse = fx.toon.z > 0.0 ? (0.5 + 0.5 * sin(frame.misc.x * fx.toon.z)) : 1.0;
+        float emask = texture(t_emission_mask, uv).r;
+        color += texture(t_emission, euv).rgb * pc.emission.rgb * pulse * emask;
     }
 
-    // Toon rim light (Poiyomi-style): a Fresnel edge glow tinted by the scene's
-    // key light + ambient, so silhouettes pop. Strength = params1.z (Rim Light).
+    // Matcaps (Poiyomi-style): sample 3 view-space sphere-mapped layers, each
+    // scaled by its mask + strength and combined by its per-layer blend mode.
+    // Default matcaps are black with strength 0 so unused layers cost nothing.
+    if (fx.matcap.x > 0.0 || fx.matcap.y > 0.0 || fx.matcap.z > 0.0) {
+        vec3 vn = normalize(mat3(frame.view) * N);
+        vec2 muv = vn.xy * 0.5 + 0.5;
+        color = blend_matcap(color, texture(t_matcap0, muv).rgb,
+                             texture(t_matcap0_mask, uv).r * fx.matcap.x, fx.matcap_blend.x);
+        color = blend_matcap(color, texture(t_matcap1, muv).rgb,
+                             texture(t_matcap1_mask, uv).r * fx.matcap.y, fx.matcap_blend.y);
+        color = blend_matcap(color, texture(t_matcap2, muv).rgb,
+                             texture(t_matcap2_mask, uv).r * fx.matcap.z, fx.matcap_blend.z);
+    }
+
+    // Toon rim light (Poiyomi-style): a Fresnel edge glow in the rim colour,
+    // with tunable power + strength from the FX block.
     if (FEAT_TOON && rim_strength > 0.0) {
-        float rim = pow(1.0 - NdotV, 4.0);
-        vec3 rim_col = frame.light_color.rgb + frame.ambient.rgb;
-        color += rim * rim_strength * rim_col;
+        float rim = pow(1.0 - NdotV, max(fx.rim.w, 0.1));
+        color += rim * rim_strength * fx.rim.rgb;
+    }
+
+    // GI debug views (frame.debug.y): 1 = world normals, 2 = indirect/GI term
+    // only (isolates the probe-grid blockiness on screen).
+    int gi_dbg = int(frame.debug.y + 0.5);
+    if (gi_dbg == 1) {
+        o_color = vec4(N * 0.5 + 0.5, 1.0);
+        return;
+    } else if (gi_dbg == 2) {
+        o_color = vec4(indirect, 1.0);
+        return;
     }
 
     color = apply_postfx(color, gl_FragCoord.xy);

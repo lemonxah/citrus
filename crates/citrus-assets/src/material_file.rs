@@ -26,6 +26,25 @@ pub struct MaterialTextures {
     pub normal: Option<PathBuf>,
     pub orm: Option<PathBuf>,
     pub emission: Option<PathBuf>,
+    // Extended slots (Poiyomi-style). `#[serde(default)]` keeps old files loading.
+    pub opacity: Option<PathBuf>,
+    pub emission_mask: Option<PathBuf>,
+    pub matcap: [Option<PathBuf>; 3],
+    pub matcap_mask: [Option<PathBuf>; 3],
+}
+
+impl MaterialTextures {
+    /// True when no slot is assigned (used to skip serializing empty sets).
+    pub fn is_empty(&self) -> bool {
+        self.albedo.is_none()
+            && self.normal.is_none()
+            && self.orm.is_none()
+            && self.emission.is_none()
+            && self.opacity.is_none()
+            && self.emission_mask.is_none()
+            && self.matcap.iter().all(Option::is_none)
+            && self.matcap_mask.iter().all(Option::is_none)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

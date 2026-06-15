@@ -301,6 +301,18 @@ lives.
 
 ## Renderer debt
 
+### Lighting gaps (specular / reflections)
+The runtime lighting is **forward rasterization**: per-fragment Cook-Torrance over ≤16 lights +
+shadow maps, sampling baked lightmaps / probe SH for indirect (GI is computed off-pass via ray-query
+bake or the realtime SDF march). Missing specular/reflection paths:
+- [ ] **Reflection probes** — baked cubemap/SH specular per region; the standard shader currently
+      fakes ambient specular by reusing the diffuse irradiance (`spec_amb` in `standard.frag`),
+      which is a stand-in, not real environment reflection.
+- [ ] **Screen-space reflections (SSR)** — reflect the depth/color buffer for glossy surfaces.
+- [ ] **Ray-traced reflections** — reuse the existing Vulkan ray-query path (already used for the
+      GI bake) for runtime reflections on capable GPUs.
+- [ ] (related) Specular occlusion + a proper split-sum BRDF LUT for the IBL term.
+
 - [ ] **Occlusion culling** — skip drawing objects hidden behind others. Likely GPU
       two-phase: Hi-Z depth pyramid from last frame + per-object bounds test in compute;
       frustum culling first as the cheap baseline. Stats overlay should report culled counts.
