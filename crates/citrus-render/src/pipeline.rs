@@ -260,6 +260,25 @@ impl PipelineCache {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // SSR: full-res scene depth (the Flux depth prepass), sampled to
+            // reconstruct view position/normal for the screen-space march.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // SSR: previous frame's lit colour, sampled at the reflection hit.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Reflection probe: prefiltered environment cubemap (samplerCube).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set0_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -472,6 +491,20 @@ impl PipelineCache {
                 binding: 0,
                 format: vk::Format::R32G32_SFLOAT,
                 offset: 64,
+            },
+            // Skinning joint indices (uvec4), offset 72.
+            vk::VertexInputAttributeDescription {
+                location: 6,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_UINT,
+                offset: 72,
+            },
+            // Skinning weights (vec4), offset 88.
+            vk::VertexInputAttributeDescription {
+                location: 7,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 88,
             },
         ];
         // The skybox is a vertex-buffer-less fullscreen triangle.

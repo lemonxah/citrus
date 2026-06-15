@@ -14,8 +14,10 @@ use glam::{Mat4, Quat, Vec3};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+mod ik;
 mod input;
 mod models;
+pub use ik::{IkTargets, TrackerTargets, TwoBoneSolution, solve_fabrik, solve_two_bone};
 pub use input::{
     ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
     MouseAxis, MouseButton, PadAxis, PadButton, RawInput, resolve,
@@ -546,6 +548,7 @@ impl ComponentRegistry {
         registry.register::<CameraComponent>();
         registry.register::<LightComponent>();
         registry.register::<LightProbeVolume>();
+        registry.register::<ReflectionProbe>();
         registry.register::<AudioSource>();
         registry.register::<AudioListener>();
         registry.register::<VolumeComponent>();
@@ -905,6 +908,39 @@ impl LightProbeVolume {
 
 impl TypedComponent for LightProbeVolume {
     const NAME: &'static str = "Light Probe Volume";
+}
+
+/// A precomputed reflection capture: a box zone whose surroundings are captured
+/// into a roughness-prefiltered cubemap (Unreal reflection-capture / Unity
+/// reflection-probe style) and sampled at runtime for specular environment
+/// reflection. The object's transform places it; `size` is the box influence
+/// region (used for box-projected parallax + blend between probes).
+#[derive(Serialize, Deserialize)]
+pub struct ReflectionProbe {
+    /// Full box influence size in local meters (centered on the object).
+    pub size: [f32; 3],
+    /// Captured cubemap face resolution (per side). 64 / 128 / 256.
+    pub resolution: u32,
+    /// Reflection strength multiplier applied when sampled.
+    pub intensity: f32,
+    /// Box-projected parallax correction (Unity-style): reproject the reflection
+    /// ray onto the box so flat surfaces line up. Off = treat as distant (infinite).
+    pub box_projection: bool,
+}
+
+impl Default for ReflectionProbe {
+    fn default() -> Self {
+        Self {
+            size: [10.0, 6.0, 10.0],
+            resolution: 128,
+            intensity: 1.0,
+            box_projection: true,
+        }
+    }
+}
+
+impl TypedComponent for ReflectionProbe {
+    const NAME: &'static str = "Reflection Probe";
 }
 
 /// How a spatial audio source quietens with distance.

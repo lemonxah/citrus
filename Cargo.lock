@@ -440,6 +440,7 @@ dependencies = [
  "citrus-core",
  "citrus-editor",
  "citrus-render",
+ "citrus-xr",
  "cpal",
  "egui",
  "egui-winit",

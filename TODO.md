@@ -305,14 +305,46 @@ lives.
 The runtime lighting is **forward rasterization**: per-fragment Cook-Torrance over ≤16 lights +
 shadow maps, sampling baked lightmaps / probe SH for indirect (GI is computed off-pass via ray-query
 bake or the realtime SDF march). Missing specular/reflection paths:
-- [ ] **Reflection probes** — baked cubemap/SH specular per region; the standard shader currently
-      fakes ambient specular by reusing the diffuse irradiance (`spec_amb` in `standard.frag`),
-      which is a stand-in, not real environment reflection.
-- [ ] **Screen-space reflections (SSR)** — reflect the depth/color buffer for glossy surfaces.
+- [~] **Reflection probes** — prefiltered environment cubemap done: `ReflectionEnv` builds a 6-face
+      roughness-mip cube from the skybox (CPU equirect→cube, box-blurred mips), rebuilt on
+      `set_skybox`, bound as `samplerCube` (set 0 binding 7) across all pass sites, sampled in
+      `standard.frag` spec-env (roughness→mip; SSR refines on hit). Smooth/metallic surfaces reflect
+      the environment. Placeable `ReflectionProbe` component (box zone) is in core.
+      - [x] Placed ZONE: `ReflectionProbe` component box drives box-projected parallax + per-probe
+            intensity in the shader (`FrameInput.reflection_probe` ← `scene.active_reflection_probe`
+            picks the covering/nearest probe → `FrameUbo.refl_center/refl_extents` → standard.frag
+            reprojects the reflection ray onto the box). Addable via Add Component.
+      - [x] Per-zone scene CAPTURE: `Renderer::request_reflection_capture(center)` →
+            `do_reflection_capture` renders the scene 6 faces (90° FOV) from the probe center into a
+            cube, box-blurs a roughness mip chain (blit), and swaps it in as the reflection env. The
+            engine requests it on scene load at the first `ReflectionProbe` zone. Reuses the frame's
+            lights/shadows + capture set-0. (Face orientation + prefilter want on-device tuning.)
+      - [ ] Blend multiple probes; editor box gizmo + size/intensity inspector UI + re-bake button.
+- [x] **Screen-space reflections (SSR)** — cheap forward-integrated march in `standard.frag`:
+      reflects last frame's colour against the full-res Flux depth prepass, view-space ray with
+      binary refine, gated to smooth/metallic pixels (roughness cutoff), screen-edge fade. Tunable
+      from Environment → Flux GI → Reflections (SSR). Rides on the Flux depth prepass, so it is
+      active only while realtime GI is on. Set-0 bindings 5 (scene depth) + 6 (last-frame colour);
+      colour history blitted per frame (swapchain + editor viewport paths).
+- [x] **HDR rendering + bloom** — the game swapchain path renders the scene into a linear
+      `R16G16B16A16_SFLOAT` target (`post::PostPass`, per-frame-in-flight), then a fullscreen post
+      pass (`fullscreen.vert`+`post.frag`) applies bloom + chromatic aberration + exposure + grading
+      + tonemap + vignette → swapchain. Surface shaders skip inline tonemap when HDR (`debug.w` /
+      skybox `params0.w`). SSR history is now HDR. All `PostFx` fields (incl. bloom/CA) are live.
+      Editor viewport keeps inline tonemap for now (no bloom there yet — follow-up).
 - [ ] **Ray-traced reflections** — reuse the existing Vulkan ray-query path (already used for the
       GI bake) for runtime reflections on capable GPUs.
 - [ ] (related) Specular occlusion + a proper split-sum BRDF LUT for the IBL term.
 
+- [~] **Skybox** — equirect 360 (existing) + 6-texture cubemap done: `WorldEnvironment.skybox_faces`
+      (6 paths, +X,-X,+Y,-Y,+Z,-Z) → `Renderer::set_skybox_cube` builds the env cube (sharp mip 0) →
+      `skybox.frag` samples it via `samplerCube` (binding 7) when `params0.z` set; reflections reuse
+      the same cube's blurred mips. Remaining: single pre-packed cubemap image (cross/strip) parse +
+      an editor UI to assign the 6 faces (scene field works; set via `.scene` for now).
+- [~] **Fog** — exponential distance + height fog done: `WorldEnvironment.fog_*` → `FrameInput.fog`
+      → `FrameUbo.fog_color/fog_params` → `standard.frag` blends toward fog colour by
+      `1 - exp(-density * (dist - start) * exp(-falloff * height))` pre-tonemap. Editor UI under
+      Environment → Fog. (True volumetric light-shaft scattering is a later upgrade.)
 - [ ] **Occlusion culling** — skip drawing objects hidden behind others. Likely GPU
       two-phase: Hi-Z depth pyramid from last frame + per-object bounds test in compute;
       frustum culling first as the cheap baseline. Stats overlay should report culled counts.
@@ -327,8 +359,51 @@ bake or the realtime SDF march). Missing specular/reflection paths:
 
 ## Milestones (see README)
 
-- [ ] M3 — VRM avatars: skinning, blendshapes, spring bones; mipmaps
-- [ ] M4 — VR: OpenXR session, stereo multiview rendering, controller input
+- [~] M3 — VRM avatars: skinning, blendshapes, spring bones; mipmaps
+      - [x] Rigging IMPORT: `Vertex` joints+weights (glTF read_joints/weights, FBX ufbx skin
+            deformers); glTF full armature (`Skeleton`: joint hierarchy + inverse-bind + rest pose)
+            + animation clips (`AnimationClip` per-joint TRS channels). Runtime sampler
+            `AnimationClip::sample` → `Skeleton::palette` (linear-blend skinning matrices).
+      - [x] Skinning PLAYBACK (CPU): skinned meshes upload to a host-visible buffer
+            (`upload_mesh_skinned`); `LoadedScene::update_skinning` samples the clip → joint palette
+            (`Skeleton::palette`) → CPU-skins (`skin_position`/`skin_direction`) → `update_mesh_vertices`
+            every frame in both the game runtime and the editor. Rigged glTF characters animate
+            on-screen (first clip, looped).
+      - [x] FBX skeleton hierarchy from skin clusters (`build_skeleton`): joints in cluster order
+            (matches vertex indices), `geometry_to_bone` = inverse-bind, parents from the bone nodes'
+            FBX parent chain, rest TRS from `local_transform`. FBX rigs now import an armature
+            (posable by VR IK).
+      - [x] FBX anim-stack → `AnimationClip` (`build_rig`): every anim stack sampled at 30 fps over its
+            time range via `Node::evaluate_transform` into dense per-joint TRS channels. FBX rigs now
+            animate like glTF.
+      - [ ] Move to GPU skinning (joint-palette SSBO + SKINNED vertex variant) for perf; per-object
+            Animator with clip selection + blending; double-buffer the skinned vertex buffer.
+- [~] M4 — VR: OpenXR session, stereo multiview rendering, controller input
+      - [x] OpenXR START (`citrus-xr`): `XrContext::start` loads the loader at runtime, creates an
+            instance (XR_KHR_vulkan_enable2), selects the HMD system + tracking caps. Wired into both
+            the game runtime (`GameApp.xr`) and the editor (`EngineApp.xr`); degrades to flat with no
+            runtime/headset.
+      - [x] Full-body IK solver (`citrus_core::ik`): analytic two-bone (limbs) + FABRIK (spine),
+            `TrackerTargets` for head/hands/hips/feet. Unit-tested. Maps tracker poses → skeleton.
+      - [x] OpenXR SESSION created sharing citrus-render's VkDevice (`XrContext::create_session` via
+            `Renderer::vulkan_raw_handles`), lifecycle pumped each frame (`XrSession::poll`), head pose
+            read (`head_pose` → stage/view reference spaces) → `TrackerTargets` (game + editor).
+      - [ ] Per-eye swapchains + stereo render into the XR swapchains (session exists; rendering not
+            yet — needs the renderer to render into XR-provided images).
+      - [x] Controller + SteamVR/Vive tracker poses via OpenXR action sets: a "fullbody" action set
+            with pose actions for hands (simple-controller `aim/pose`) + waist/feet (Vive tracker
+            `role/{waist,left_foot,right_foot}` paths, htcx extension enabled when present), synced +
+            located each frame → `XrSession::body_poses` → fills `TrackerTargets` (head/hands/hips/feet)
+            in game + editor.
+      - [x] Apply the IK solve to a humanoid avatar: `humanoid::HumanoidRig::map` matches bones by
+            name (Mixamo/VRM/Unity), `pose_from_trackers` drives hips/head + two-bone arms/legs from
+            `TrackerTargets` → joint local transforms → palette. Wired into `update_skinning`, game +
+            editor. Retarget math is a first cut; per-rig roll/offset tuning needs a real avatar.
+      - [x] IK generalized beyond VR: `citrus_core::IkTargets` alias + `LoadedScene::set_ik_targets`
+            so any source (gameplay/procedural/network, not just VR) poses any humanoid avatar;
+            `update_skinning` applies IK whenever any limb target is set + the rig is humanoid.
+      - [ ] Per-eye swapchains + stereo render into XR images so it shows IN the headset (headset-
+            gated; the avatar is tracker-driven + rendered on the desktop view now).
 - [ ] M5 — Full editor: world building tools, avatar setup tooling
 - [ ] M6 — Networking: world/avatar sync, voice, IK replication
 - [ ] M7 — Content pipeline: publishing format, mobile-tier validation, sandboxing

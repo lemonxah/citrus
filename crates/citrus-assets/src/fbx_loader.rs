@@ -11,8 +11,9 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, TextureData, Vertex};
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 
+use crate::skeleton::{AnimChannel, AnimationClip, ChannelPath, Joint, Skeleton};
 use crate::{Instance, MeshSlot, ModelImport, Scene, SceneMaterial};
 
 /// Import an FBX with default settings.
@@ -42,6 +43,8 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
         textures: Vec::new(),
         materials: Vec::new(),
         instances: Vec::new(),
+        skeletons: Vec::new(),
+        animations: Vec::new(),
     };
 
     // Default material for parts without one.
@@ -66,6 +69,15 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
         let Some(mesh) = &node.mesh else { continue };
         if mesh.num_triangles == 0 {
             continue;
+        }
+        // Build the armature + animation clips from the first skinned mesh's
+        // deformer (cluster order matches the skin-local joint indices on the
+        // vertices); sample every FBX anim stack onto the bone nodes.
+        if scene.skeletons.is_empty() {
+            if let Some((skel, clips)) = build_rig(&fbx, mesh) {
+                scene.skeletons.push(skel);
+                scene.animations.extend(clips);
+            }
         }
         let transform = matrix_to_mat4(&node.geometry_to_world);
         let node_name = if node.element.name.is_empty() {
@@ -161,6 +173,161 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
     Ok(scene)
 }
 
+/// Skin weights for one triangle corner: up to 4 (joint = skin-cluster index,
+/// weight) from the mesh's first skin deformer, keyed by control-point index.
+/// Returns zeros for unrigged meshes. Cluster indices line up with the skeleton
+/// the importer builds from the same deformer's cluster order.
+fn skin_corner(mesh: &ufbx::Mesh, corner: usize) -> ([u32; 4], [f32; 4]) {
+    let mut joints = [0u32; 4];
+    let mut weights = [0.0f32; 4];
+    let Some(skin) = (&mesh.skin_deformers).into_iter().next() else {
+        return (joints, weights);
+    };
+    if corner >= mesh.vertex_indices.count {
+        return (joints, weights);
+    }
+    let cp = mesh.vertex_indices[corner] as usize;
+    if cp >= skin.vertices.count {
+        return (joints, weights);
+    }
+    let sv = skin.vertices[cp];
+    let begin = sv.weight_begin as usize;
+    let n = (sv.num_weights as usize).min(4);
+    for k in 0..n {
+        let w = skin.weights[begin + k];
+        joints[k] = w.cluster_index;
+        weights[k] = w.weight as f32;
+    }
+    let sum: f32 = weights.iter().sum();
+    if sum > 1e-6 {
+        for w in &mut weights {
+            *w /= sum;
+        }
+    }
+    (joints, weights)
+}
+
+fn ufbx_v3(v: ufbx::Vec3) -> Vec3 {
+    Vec3::new(v.x as f32, v.y as f32, v.z as f32)
+}
+fn ufbx_quat(q: ufbx::Quat) -> Quat {
+    Quat::from_xyzw(q.x as f32, q.y as f32, q.z as f32, q.w as f32)
+}
+
+/// Build a [`Skeleton`] + animation clips from a mesh's first skin deformer.
+/// Joints are emitted in cluster order (matching the skin-local `cluster_index`
+/// stored on vertices); each cluster's `geometry_to_bone` is the inverse-bind,
+/// parents come from the bone nodes' FBX parent chain, and every FBX anim stack
+/// is sampled (30 fps) onto the bone nodes into per-joint TRS channels.
+fn build_rig<'a>(
+    fbx: &'a ufbx::Scene,
+    mesh: &'a ufbx::Mesh,
+) -> Option<(Skeleton, Vec<AnimationClip>)> {
+    let skin = (&mesh.skin_deformers).into_iter().next()?;
+    if skin.clusters.count == 0 {
+        return None;
+    }
+    let mut id_to_joint: HashMap<u32, usize> = HashMap::new();
+    for (i, cluster) in (&skin.clusters).into_iter().enumerate() {
+        if let Some(node) = &cluster.bone_node {
+            id_to_joint.insert(node.element.element_id, i);
+        }
+    }
+    let mut joints = Vec::new();
+    let mut bone_nodes: Vec<Option<&ufbx::Node>> = Vec::new();
+    for cluster in &skin.clusters {
+        let Some(node) = &cluster.bone_node else {
+            joints.push(Joint {
+                name: "joint".into(),
+                parent: None,
+                inverse_bind: Mat4::IDENTITY,
+                rest_translation: Vec3::ZERO,
+                rest_rotation: Quat::IDENTITY,
+                rest_scale: Vec3::ONE,
+            });
+            bone_nodes.push(None);
+            continue;
+        };
+        let parent = node
+            .parent
+            .as_ref()
+            .and_then(|p| id_to_joint.get(&p.element.element_id).copied());
+        let t = node.local_transform;
+        joints.push(Joint {
+            name: if node.element.name.is_empty() {
+                format!("joint {}", node.element.element_id)
+            } else {
+                node.element.name.to_string()
+            },
+            parent,
+            inverse_bind: matrix_to_mat4(&cluster.geometry_to_bone),
+            rest_translation: ufbx_v3(t.translation),
+            rest_rotation: ufbx_quat(t.rotation),
+            rest_scale: ufbx_v3(t.scale),
+        });
+        bone_nodes.push(Some(node.as_ref()));
+    }
+    let skeleton = Skeleton { joints };
+
+    // Sample each anim stack at 30 fps over its time range into dense TRS channels.
+    const FPS: f64 = 30.0;
+    let mut clips = Vec::new();
+    for stack in &fbx.anim_stacks {
+        let anim = stack.anim.as_ref();
+        let duration = (stack.time_end - stack.time_begin).max(0.0);
+        if duration <= 1e-4 {
+            continue;
+        }
+        let frames = (duration * FPS).ceil() as usize + 1;
+        let times: Vec<f32> = (0..frames).map(|f| f as f32 / FPS as f32).collect();
+        let mut channels = Vec::new();
+        for (j, node) in bone_nodes.iter().enumerate() {
+            let Some(node) = node else { continue };
+            let mut trans = Vec::with_capacity(frames);
+            let mut rots = Vec::with_capacity(frames);
+            let mut scales = Vec::with_capacity(frames);
+            for f in 0..frames {
+                let t = stack.time_begin + f as f64 / FPS;
+                let tr = node.evaluate_transform(anim, t);
+                trans.push(ufbx_v3(tr.translation));
+                rots.push(ufbx_quat(tr.rotation));
+                scales.push(ufbx_v3(tr.scale));
+            }
+            channels.push(AnimChannel {
+                joint: j,
+                path: ChannelPath::Translation,
+                times: times.clone(),
+                vec_values: trans,
+                quat_values: Vec::new(),
+            });
+            channels.push(AnimChannel {
+                joint: j,
+                path: ChannelPath::Rotation,
+                times: times.clone(),
+                vec_values: Vec::new(),
+                quat_values: rots,
+            });
+            channels.push(AnimChannel {
+                joint: j,
+                path: ChannelPath::Scale,
+                times: times.clone(),
+                vec_values: scales,
+                quat_values: Vec::new(),
+            });
+        }
+        clips.push(AnimationClip {
+            name: if stack.element.name.is_empty() {
+                "clip".into()
+            } else {
+                stack.element.name.to_string()
+            },
+            duration: duration as f32,
+            channels,
+        });
+    }
+    Some((skeleton, clips))
+}
+
 /// Convert one material part of a ufbx mesh into MeshData (un-indexed:
 /// one vertex per triangle corner; index dedup is a later optimization).
 fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>> {
@@ -212,6 +379,9 @@ fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>
                 }
                 None => [0.0, 0.0],
             };
+            // Skin weights are resolved in a second pass (skin_for_part) keyed by
+            // control-point index, since ufbx weights are per control point.
+            let (joints, weights) = skin_corner(mesh, i);
             vertices.push(Vertex {
                 position: [p.x as f32, p.y as f32, p.z as f32],
                 normal: n,
@@ -219,6 +389,8 @@ fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>
                 color,
                 tangent,
                 uv1,
+                joints,
+                weights,
             });
         }
     }

@@ -19,6 +19,8 @@ layout(set = 0, binding = 0) uniform FrameData {
 } frame;
 
 layout(set = 1, binding = 0) uniform sampler2D t_sky;
+// Cubemap skybox: the shared environment cube (mip 0 = sharp sky).
+layout(set = 0, binding = 7) uniform samplerCube u_env;
 
 layout(push_constant) uniform Push {
     mat4 model;
@@ -69,7 +71,10 @@ vec3 apply_postfx(vec3 color, vec2 fragcoord) {
 void main() {
     vec3 dir = normalize(v_dir);
     vec3 color;
-    if (pc.params0.x > 0.5) {
+    if (pc.params0.z > 0.5) {
+        // Cubemap skybox: sample the sharp mip 0 of the environment cube.
+        color = textureLod(u_env, dir, 0.0).rgb;
+    } else if (pc.params0.x > 0.5) {
         float u = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
         float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
         color = texture(t_sky, vec2(u, v)).rgb;
@@ -84,5 +89,10 @@ void main() {
             color = mix(horizon, ground, clamp(-dir.y * 2.0, 0.0, 1.0));
         }
     }
-    o_color = vec4(apply_postfx(color, gl_FragCoord.xy), 1.0);
+    // params0.w = HDR output: skip inline tonemap (the fullscreen post pass does it).
+    if (pc.params0.w > 0.5) {
+        o_color = vec4(color, 1.0);
+    } else {
+        o_color = vec4(apply_postfx(color, gl_FragCoord.xy), 1.0);
+    }
 }

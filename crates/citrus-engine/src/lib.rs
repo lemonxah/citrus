@@ -7,6 +7,7 @@
 // Always compiled (runtime + bundling path; no egui / editor).
 mod audio;
 mod bundle;
+mod humanoid;
 mod log_capture;
 mod physics;
 mod plugins;

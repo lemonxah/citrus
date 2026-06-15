@@ -125,11 +125,30 @@ pub struct MeshInfo {
     pub triangles: u32,
 }
 
+/// A CPU-skinned mesh: its renderer mesh (host-visible vertex buffer), the
+/// original bind-pose vertices, and which imported skeleton drives it.
+struct SkinnedMesh {
+    mesh_index: usize,
+    base_vertices: Vec<citrus_render::Vertex>,
+    skeleton: usize,
+}
+
 pub struct LoadedScene {
     /// Rebuilt every frame from renderable objects.
     pub draws: Vec<DrawCmd>,
     pub objects: Vec<SceneObject>,
     pub materials: Vec<MaterialEntry>,
+    /// Imported armatures + animation clips (skeletal rigging). Skinned meshes
+    /// reference a skeleton by index; the first clip plays on a loop for now.
+    skeletons: Vec<citrus_assets::Skeleton>,
+    animations: Vec<citrus_assets::AnimationClip>,
+    skinned_meshes: Vec<SkinnedMesh>,
+    /// Global animation playback clock (seconds), advanced each frame.
+    anim_time: f32,
+    /// Full-body IK targets for humanoid avatars (from VR trackers, gameplay,
+    /// procedural, or network). When set + the rig is humanoid, the avatar is
+    /// IK-posed instead of playing the clip. Not VR-specific.
+    ik_targets: Option<citrus_core::IkTargets>,
     mesh_handles: Vec<MeshHandle>,
     mesh_infos: Vec<MeshInfo>,
     mesh_bounds: Vec<(Vec3, Vec3)>,
@@ -204,6 +223,11 @@ impl LoadedScene {
             draws: Vec::new(),
             objects: Vec::new(),
             materials: Vec::new(),
+            skeletons: Vec::new(),
+            animations: Vec::new(),
+            skinned_meshes: Vec::new(),
+            anim_time: 0.0,
+            ik_targets: None,
             mesh_geometry: Vec::new(),
             mesh_sdf: Vec::new(),
             postfx_cache: std::collections::HashMap::new(),
@@ -543,8 +567,29 @@ impl LoadedScene {
             .iter()
             .map(|t| renderer.upload_texture(t))
             .collect::<Result<_>>()?;
+        // Carry imported armatures + animation clips (skeletal rigging). Joint
+        // indices on the vertices are skin-local, matching `skeletons[*].joints`;
+        // a skinned mesh references skeleton 0 (the common single-armature case).
+        let skel_base = self.skeletons.len();
+        self.skeletons.extend(scene.skeletons.iter().cloned());
+        self.animations.extend(scene.animations.iter().cloned());
+        let has_skeleton = !scene.skeletons.is_empty();
         for mesh in &scene.meshes {
-            self.mesh_handles.push(renderer.upload_mesh(mesh)?);
+            // A mesh is skinned if any vertex carries skin weights and the model
+            // brought a skeleton. Skinned meshes get a host-visible buffer + a
+            // CPU-skinning record so they animate each frame.
+            let skinned = has_skeleton && mesh.vertices.iter().any(|v| v.weights.iter().sum::<f32>() > 0.0);
+            if skinned {
+                let handle = renderer.upload_mesh_skinned(mesh)?;
+                self.mesh_handles.push(handle);
+                self.skinned_meshes.push(SkinnedMesh {
+                    mesh_index: self.mesh_handles.len() - 1,
+                    base_vertices: mesh.vertices.clone(),
+                    skeleton: skel_base,
+                });
+            } else {
+                self.mesh_handles.push(renderer.upload_mesh(mesh)?);
+            }
             self.mesh_geometry.push((
                 mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
                 mesh.indices.clone(),
@@ -1867,6 +1912,119 @@ impl LoadedScene {
     /// effective per-frame parameters (Unity-style: priority-ordered, weight ×
     /// local proximity). Profiles are loaded from `.postfx` files (cached).
     /// With no volumes, returns neutral defaults (ACES, no grading/vignette).
+    /// Advance skeletal animation and CPU-skin all skinned meshes into their
+    /// host-visible vertex buffers. Plays the first imported clip on a loop (a
+    /// per-object Animator with clip selection is a follow-up). No-op when the
+    /// scene has no rigged meshes.
+    /// Set full-body IK targets for humanoid avatars this frame (VR, gameplay,
+    /// procedural, …). `None` clears them so avatars play their clips.
+    pub fn set_ik_targets(&mut self, targets: Option<citrus_core::IkTargets>) {
+        self.ik_targets = targets;
+    }
+
+    pub fn update_skinning(&mut self, renderer: &mut Renderer, dt: f32) {
+        if self.skinned_meshes.is_empty() {
+            return;
+        }
+        // IK targets (any source) pose humanoid avatars when present; otherwise
+        // the first animation clip plays (no clip + no IK = static rest pose).
+        let ik = self.ik_targets;
+        let ik_active = ik
+            .map(|t| {
+                t.head.is_some()
+                    || t.left_hand.is_some()
+                    || t.right_hand.is_some()
+                    || t.hips.is_some()
+                    || t.left_foot.is_some()
+                    || t.right_foot.is_some()
+            })
+            .unwrap_or(false);
+        if !ik_active && self.animations.is_empty() {
+            return;
+        }
+        self.anim_time += dt;
+        for sm in &self.skinned_meshes {
+            let Some(skel) = self.skeletons.get(sm.skeleton) else {
+                continue;
+            };
+            let locals = match ik {
+                Some(targets)
+                    if ik_active && crate::humanoid::HumanoidRig::map(skel).is_humanoid() =>
+                {
+                    crate::humanoid::pose_from_trackers(skel, &targets)
+                }
+                _ => self.animations[0].sample(skel, self.anim_time),
+            };
+            let palette = skel.palette(&locals);
+            let mut verts = sm.base_vertices.clone();
+            for v in &mut verts {
+                v.position = citrus_assets::skin_position(
+                    Vec3::from(v.position),
+                    v.joints,
+                    v.weights,
+                    &palette,
+                )
+                .to_array();
+                v.normal = citrus_assets::skin_direction(
+                    Vec3::from(v.normal),
+                    v.joints,
+                    v.weights,
+                    &palette,
+                )
+                .to_array();
+            }
+            renderer.update_mesh_vertices(self.mesh_handles[sm.mesh_index], &verts);
+        }
+    }
+
+    /// The reflection-probe zone covering `camera_pos` (or the nearest), as a
+    /// world-space box for box-projected reflections. `None` when the scene has
+    /// no `ReflectionProbe` — the env cube is then sampled as distant/infinite.
+    pub fn active_reflection_probe(
+        &self,
+        camera_pos: Vec3,
+    ) -> Option<citrus_render::ReflectionProbeBox> {
+        use citrus_core::ReflectionProbe;
+        let mut best: Option<(f32, citrus_render::ReflectionProbeBox)> = None;
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(probe) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<ReflectionProbe>())
+            else {
+                continue;
+            };
+            let center = self.world_transform(i).w_axis.truncate();
+            let half = Vec3::from(probe.size) * 0.5 * self.objects[i].scale;
+            let outside = ((camera_pos - center).abs() - half).max(Vec3::ZERO).length();
+            let candidate = citrus_render::ReflectionProbeBox {
+                center: center.to_array(),
+                half_extents: half.to_array(),
+                intensity: probe.intensity.max(0.0),
+                box_projection: probe.box_projection,
+            };
+            if best.as_ref().is_none_or(|(d, _)| outside < *d) {
+                best = Some((outside, candidate));
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// Scene fog parameters for the renderer, or `None` when fog is disabled.
+    pub fn fog_params(&self) -> Option<citrus_render::FogParams> {
+        let e = &self.environment;
+        e.fog_enabled.then_some(citrus_render::FogParams {
+            color: e.fog_color,
+            density: e.fog_density,
+            height_falloff: e.fog_height_falloff,
+            height_ref: e.fog_height_ref,
+            start_distance: e.fog_start_distance,
+        })
+    }
+
     pub fn effective_postfx(
         &mut self,
         camera_pos: Vec3,
@@ -1920,7 +2078,12 @@ impl LoadedScene {
         }
 
         stack.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let blend: Vec<_> = stack.into_iter().map(|(_, p, w)| (p, w)).collect();
+        // The scene's global postfx is the always-present base ("global volume");
+        // local volumes blend on top by priority. Prepended at weight 1.0 so it
+        // fully replaces the neutral default before any volume contributes.
+        let mut blend: Vec<(citrus_assets::PostFxProfile, f32)> =
+            vec![(self.environment.postfx, 1.0)];
+        blend.extend(stack.into_iter().map(|(_, p, w)| (p, w)));
         let p = citrus_assets::blend_profiles(&blend);
 
         let tonemap = match p.tonemap.mode {

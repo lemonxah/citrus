@@ -8,6 +8,23 @@ Legend: `[ ]` open · `[verify]` believed fixed, confirm after a rebuild · `[x]
 
 ## Open / verify
 
+- [x] **Post-processing only worked through Volumes (no global postfx)** — `effective_postfx`
+  only contributed a profile when a `VolumeComponent` covered the camera; a scene with no volume
+  fell back to `PostFxProfile::default()` (which happens to enable ACES tonemap, so *only* tonemap
+  appeared — exposure/grading/vignette/bloom were dead). Added an always-applied global postfx to
+  the scene environment (`WorldEnvironment.postfx`), seeded as the blend base so local volumes layer
+  on top, editable in **Environment → Post-processing (global)**. Note bloom + chromatic aberration
+  are carried in `PostFx` but still NOT rendered (need a fullscreen HDR post pass — tracked).
+- [x] **GPU memory leak: `material fx ubo` allocations leaked on scene reset** — `reset_scene`
+  destroyed mesh + texture GPU buffers but did `self.materials.clear()` directly; `Buffer` needs
+  an explicit `destroy(device, alloc)` (it doesn't free in `Drop`), so every material's `fx_ubo`
+  was orphaned on each scene reload (gpu_allocator reported the leaked chunks at shutdown). Fixed
+  by destroying each material's `fx_ubo` before the clear, matching `Renderer::drop`. Confirmed
+  via compile; verify no leak warnings after a scene reload.
+- [verify] **SSR Y-flip / first-frame correctness** — the new screen-space reflections self-
+  calibrate the viewport Y-flip per fragment and seed the colour history to black at creation,
+  but the depth/UV convention and 1-frame-lag reflection want an on-device visual check (smooth
+  metal floor reflecting the scene; no smearing while the camera moves).
 - [x] **Flux: emissive object showed a coloured band from the emitter behind it** — emissive
   surfaces were excluded from the Flux depth prepass, so their pixels reconstructed the surface
   BEHIND them and sampled that (a magenta floor behind a green box bled onto the box face).

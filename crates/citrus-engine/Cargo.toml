@@ -25,6 +25,7 @@ editor = [
 citrus-core.workspace = true
 citrus-render.workspace = true
 citrus-assets.workspace = true
+citrus-xr.workspace = true
 winit.workspace = true
 # Always-on (runtime needs them): plugin loading, audio, logging.
 libloading.workspace = true

@@ -5,8 +5,9 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use citrus_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, Vertex};
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 
+use crate::skeleton::{AnimChannel, AnimationClip, ChannelPath, Joint, Skeleton};
 use crate::{Instance, MeshSlot, Scene, SceneMaterial};
 
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
@@ -19,6 +20,8 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
         textures: Vec::new(),
         materials: Vec::new(),
         instances: Vec::new(),
+        skeletons: Vec::new(),
+        animations: Vec::new(),
     };
     // (image index, srgb) -> scene texture index. The same image can be
     // legally referenced as both color and data; cache per usage.
@@ -163,6 +166,20 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 .read_tangents()
                 .map(|t| t.collect())
                 .unwrap_or_else(|| vec![[1.0, 0.0, 0.0, 1.0]; positions.len()]);
+            // Skinning: joint indices (skin-local) + weights. Absent on static
+            // meshes → zero (the skinned pipeline variant is unused for them).
+            let joints: Vec<[u32; 4]> = reader
+                .read_joints(0)
+                .map(|j| {
+                    j.into_u16()
+                        .map(|[a, b, c, d]| [a as u32, b as u32, c as u32, d as u32])
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![[0u32; 4]; positions.len()]);
+            let weights: Vec<[f32; 4]> = reader
+                .read_weights(0)
+                .map(|w| w.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0f32; 4]; positions.len()]);
 
             let vertices: Vec<Vertex> = (0..positions.len())
                 .map(|i| Vertex {
@@ -172,6 +189,8 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                     color: colors[i],
                     tangent: tangents[i],
                     uv1: uvs1[i],
+                    joints: joints[i],
+                    weights: weights[i],
                 })
                 .collect();
             let indices: Vec<u32> = reader
@@ -185,6 +204,100 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 (mesh.index(), primitive.index()),
                 (scene.meshes.len() - 1, material),
             );
+        }
+    }
+
+    // Skeletons (armatures) — one per glTF skin. Joints stay in skin order so
+    // the skin-local vertex joint indices line up. Parent links come from the
+    // node hierarchy (node -> parent node, mapped back to joint index).
+    let mut node_parent: HashMap<usize, usize> = HashMap::new();
+    for node in doc.nodes() {
+        for child in node.children() {
+            node_parent.insert(child.index(), node.index());
+        }
+    }
+    for skin in doc.skins() {
+        let reader = skin.reader(|b| Some(&buffers[b.index()]));
+        let ibms: Vec<Mat4> = reader
+            .read_inverse_bind_matrices()
+            .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+            .unwrap_or_default();
+        let joint_nodes: Vec<usize> = skin.joints().map(|j| j.index()).collect();
+        let node_to_joint: HashMap<usize, usize> =
+            joint_nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+        let mut joints = Vec::with_capacity(joint_nodes.len());
+        for (i, node) in skin.joints().enumerate() {
+            let (t, r, s) = node.transform().decomposed();
+            let parent = node_parent
+                .get(&node.index())
+                .and_then(|p| node_to_joint.get(p))
+                .copied();
+            joints.push(Joint {
+                name: node.name().unwrap_or("joint").to_string(),
+                parent,
+                inverse_bind: ibms.get(i).copied().unwrap_or(Mat4::IDENTITY),
+                rest_translation: Vec3::from(t),
+                rest_rotation: Quat::from_array(r),
+                rest_scale: Vec3::from(s),
+            });
+        }
+        scene.skeletons.push(Skeleton { joints });
+    }
+
+    // Animations: per-joint TRS channels. Joint indices are resolved against the
+    // first skin (the common single-armature case); channels targeting nodes not
+    // in that skin are skipped.
+    if let Some(skin) = doc.skins().next() {
+        let node_to_joint: HashMap<usize, usize> = skin
+            .joints()
+            .enumerate()
+            .map(|(i, j)| (j.index(), i))
+            .collect();
+        for anim in doc.animations() {
+            let mut channels = Vec::new();
+            let mut duration = 0.0f32;
+            for ch in anim.channels() {
+                let Some(&joint) = node_to_joint.get(&ch.target().node().index()) else {
+                    continue;
+                };
+                let reader = ch.reader(|b| Some(&buffers[b.index()]));
+                let times: Vec<f32> = match reader.read_inputs() {
+                    Some(it) => it.collect(),
+                    None => continue,
+                };
+                if let Some(last) = times.last() {
+                    duration = duration.max(*last);
+                }
+                use gltf::animation::util::ReadOutputs;
+                let (path, vecs, quats) = match reader.read_outputs() {
+                    Some(ReadOutputs::Translations(it)) => {
+                        (ChannelPath::Translation, it.map(Vec3::from).collect(), Vec::new())
+                    }
+                    Some(ReadOutputs::Scales(it)) => {
+                        (ChannelPath::Scale, it.map(Vec3::from).collect(), Vec::new())
+                    }
+                    Some(ReadOutputs::Rotations(it)) => (
+                        ChannelPath::Rotation,
+                        Vec::new(),
+                        it.into_f32().map(Quat::from_array).collect(),
+                    ),
+                    _ => continue, // morph-target weights unsupported
+                };
+                channels.push(AnimChannel {
+                    joint,
+                    path,
+                    times,
+                    vec_values: vecs,
+                    quat_values: quats,
+                });
+            }
+            if !channels.is_empty() {
+                scene.animations.push(AnimationClip {
+                    name: anim.name().unwrap_or("clip").to_string(),
+                    duration,
+                    channels,
+                });
+            }
         }
     }
 

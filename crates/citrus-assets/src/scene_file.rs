@@ -174,6 +174,37 @@ pub struct WorldEnvironment {
     /// show live indirect bounce, both in the editor and in a shipped game.
     #[serde(default, deserialize_with = "de_realtime_gi")]
     pub realtime_gi: RealtimeGi,
+    /// Always-applied global post-processing (the implicit "global volume").
+    /// Local `VolumeComponent`s blend on top of this by priority/weight. Defaults
+    /// to ACES tonemap so a fresh scene is tonemapped without needing a volume.
+    #[serde(default)]
+    pub postfx: crate::PostFxProfile,
+    /// Exponential distance + height fog (atmospheric depth).
+    #[serde(default)]
+    pub fog_enabled: bool,
+    #[serde(default = "default_fog_color")]
+    pub fog_color: [f32; 3],
+    #[serde(default = "default_fog_density")]
+    pub fog_density: f32,
+    /// Height falloff (fog thins above `fog_height_ref`; 0 = uniform).
+    #[serde(default)]
+    pub fog_height_falloff: f32,
+    #[serde(default)]
+    pub fog_height_ref: f32,
+    /// View distance before fog starts.
+    #[serde(default)]
+    pub fog_start_distance: f32,
+    /// Cubemap skybox: 6 project-relative face image paths in +X,-X,+Y,-Y,+Z,-Z
+    /// order. Takes precedence over the equirect skybox when set.
+    #[serde(default)]
+    pub skybox_faces: Option<[String; 6]>,
+}
+
+fn default_fog_color() -> [f32; 3] {
+    [0.6, 0.68, 0.78]
+}
+fn default_fog_density() -> f32 {
+    0.02
 }
 
 /// Accept both the legacy `realtime_gi: bool` (just the enable toggle) and the
@@ -311,6 +342,15 @@ pub struct RealtimeGi {
     pub firefly_clamp: f32,
     /// World-probe fallback policy for the in-game camera / off-screen surfaces.
     pub probe_fallback: ProbeFallback,
+    /// Screen-space reflections: trace specular rays against the depth prepass +
+    /// last frame's colour. Only active while Flux runs (it owns the depth prepass).
+    pub ssr_enabled: bool,
+    /// SSR reflection strength multiplier.
+    pub ssr_intensity: f32,
+    /// SSR max ray distance in view-space units.
+    pub ssr_max_distance: f32,
+    /// SSR roughness cutoff: surfaces rougher than this skip the march.
+    pub ssr_roughness_cutoff: f32,
     // --- Internal: not shown in the UI. The world-probe DDGI fallback path still
     // uses these; samples/mode are derived from `quality`/Flux on load. ---
     #[doc(hidden)]
@@ -341,6 +381,10 @@ impl Default for RealtimeGi {
             // Default: Flux only (no world-probe march). The DDGI fallback is
             // opt-in for projects using the in-game camera / off-screen GI.
             probe_fallback: ProbeFallback::Off,
+            ssr_enabled: true,
+            ssr_intensity: 1.0,
+            ssr_max_distance: 40.0,
+            ssr_roughness_cutoff: 0.6,
             mode: GiMode::Software,
             samples: 64,
             probe_spacing: 2.0,
@@ -406,6 +450,14 @@ impl Default for WorldEnvironment {
             shadow_distance: default_shadow_distance(),
             bake: BakeSettings::default(),
             realtime_gi: RealtimeGi::default(),
+            postfx: crate::PostFxProfile::default(),
+            fog_enabled: false,
+            fog_color: default_fog_color(),
+            fog_density: default_fog_density(),
+            fog_height_falloff: 0.0,
+            fog_height_ref: 0.0,
+            fog_start_distance: 0.0,
+            skybox_faces: None,
         }
     }
 }

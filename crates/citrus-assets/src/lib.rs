@@ -14,6 +14,7 @@ mod procedural;
 mod project_file;
 mod scene_file;
 mod shader_file;
+mod skeleton;
 
 pub use asset_meta::{
     AssetMeta, ImporterSettings, META_EXT, ModelImport, load_asset_meta,
@@ -21,6 +22,9 @@ pub use asset_meta::{
 };
 pub use fbx_loader::{load_fbx, load_fbx_with};
 pub use gltf_loader::load_gltf;
+pub use skeleton::{
+    AnimChannel, AnimationClip, ChannelPath, Joint, Skeleton, skin_direction, skin_position,
+};
 pub use material_file::{
     MATERIAL_EXTENSION, MaterialFile, MaterialTextures, load_material_file, load_texture_file,
     save_material_file,
@@ -97,6 +101,11 @@ pub struct Scene {
     pub textures: Vec<TextureData>,
     pub materials: Vec<SceneMaterial>,
     pub instances: Vec<Instance>,
+    /// Imported armatures (one per glTF skin / FBX skin deformer). Vertex joint
+    /// indices are skin-local and line up with `skeletons[mesh's skin].joints`.
+    pub skeletons: Vec<Skeleton>,
+    /// Imported skeletal animation clips (shared across the file's skeletons).
+    pub animations: Vec<AnimationClip>,
 }
 
 /// True if the extension is an importable model format.

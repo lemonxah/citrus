@@ -1,16 +1,16 @@
 (
     tonemap: (
         mode: Aces,
-        exposure: 0.5,
+        exposure: 0.0,
     ),
     bloom: (
-        enabled: true,
-        threshold: 5.0,
-        intensity: 1.35,
-        radius: 0.45,
+        enabled: false,
+        threshold: 4.1,
+        intensity: 2.6,
+        radius: 0.75,
     ),
     color_grading: (
-        enabled: true,
+        enabled: false,
         exposure: 1.5,
         contrast: 1.1,
         saturation: 1.0,
@@ -25,6 +25,6 @@
     ),
     chromatic_aberration: (
         enabled: false,
-        intensity: 0.3,
+        intensity: 0.2,
     ),
 )

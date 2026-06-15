@@ -36,6 +36,11 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
     resolving model paths (sRGB colour / linear data) with a fallback to import-embedded handles.
     Round-trips through `.material` files and inline scene materials (`MaterialRef::Inline { textures }`).
     Imported materials stay read-only until extracted.
+  - **Extract textures & materials** (Model Import inspector, `⤓` button): re-loads the model file and
+    writes its embedded textures as PNGs + materials as `.material` files into
+    `<project>/extracted/<model>/{textures,materials}/`, with the `.material` texture slots pointing at
+    the extracted PNGs (project-relative). Turns an imported FBX/glTF's inline assets into editable,
+    reusable project files. (`EditorAction::ExtractModelAssets` → `extract_model_assets`.)
   - **Matcap blend modes**: each matcap layer combines with the shaded colour via Add / Multiply /
     Replace (`MatcapBlend`), carried in the FX UBO (`fx.matcap_blend`) and applied by `blend_matcap`
     in the shader. Per-layer strength + mask still apply.
@@ -233,6 +238,19 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   to the trace.)
   Next: surface/radiance cache for cheap multi-bounce + intrinsic occlusion; masked depth-prepass
   for alpha-test cutout holes; per-camera trace for the in-game camera.
+- [wip] **Screen-space reflections (SSR)**: cheap forward-integrated specular reflections, traced
+  inside `standard.frag`'s ambient-specular block (the old "no reflection probes yet" stand-in).
+  Reuses the full-res Flux depth prepass (set-0 binding 5) + a per-frame copy of last frame's lit
+  colour (binding 6, `ColorHistory`, blitted after the scene pass on both the swapchain and editor-
+  viewport paths). The march is view-space: reflect the view ray about the surface normal, step
+  ~24× against the depth buffer with a thickness test, binary-refine the hit, then sample the
+  colour history; screen-edge fade + roughness-weighted blend mean smooth/metallic pixels get the
+  reflection while rough ones keep the irradiance stand-in. Self-calibrates the viewport Y-flip per
+  fragment. Tunable from **Environment → Flux GI → Reflections (SSR)** (enable, intensity, max
+  distance, roughness cutoff), serialized in `RealtimeGi`. Limits: one frame of lag, reflects LDR
+  colour, on-screen geometry only (off-screen rays miss and fall back), and it rides on the Flux
+  depth prepass so it's active only while realtime GI is on. Off-screen fallback (GDF march) and a
+  prefiltered reflection-probe fallback are the planned follow-ups.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
   even cube-face packing). The seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.

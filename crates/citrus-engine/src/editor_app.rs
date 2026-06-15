@@ -59,6 +59,9 @@ pub fn run(config: AppConfig) -> Result<()> {
         config,
         window: None,
         renderer: None,
+        xr: None,
+        xr_session: None,
+        vr_targets: citrus_core::TrackerTargets::default(),
         scene: LoadedScene::empty(),
         egui_ctx: egui::Context::default(),
         egui_state: None,
@@ -296,6 +299,9 @@ enum EditorAction {
     /// Save the model's `.meta` and reload the scene so it reimports with the new
     /// settings.
     ReimportModel(PathBuf),
+    /// Re-load a model file and write its embedded textures (PNG) + materials
+    /// (`.material`) into `<project>/extracted/<model>/` as reusable assets.
+    ExtractModelAssets(PathBuf),
     /// A `.material` file's model changed in the Inspector: propagate to
     /// every scene material loaded from that file.
     FileMaterialEdited(PathBuf),
@@ -551,6 +557,14 @@ struct EngineApp {
     config: AppConfig,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// OpenXR context (VR). `None` when no runtime/headset; editor runs flat.
+    xr: Option<citrus_xr::XrContext>,
+    /// Live VR session (poses/lifecycle), once the device is created.
+    xr_session: Option<citrus_xr::XrSession>,
+    /// Latest VR tracker poses for the full-body IK solver (consumed by the
+    /// avatar-IK application step — humanoid bone mapping).
+    #[allow(dead_code)]
+    vr_targets: citrus_core::TrackerTargets,
     scene: LoadedScene,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
@@ -891,11 +905,35 @@ impl EngineApp {
         ));
         self.renderer = Some(renderer);
         self.window = Some(window);
+        // Start OpenXR (VR) for the editor too, so VR can be previewed/authored
+        // in-editor. Degrades gracefully to flat when no runtime/headset.
+        match citrus_xr::XrContext::start("citrus editor") {
+            Ok(Some(xr)) => {
+                tracing::info!("VR ready: {}", xr.system_name());
+                let (vi, pd, dev, qfi) = self.renderer.as_ref().unwrap().vulkan_raw_handles();
+                match xr.create_session(vi, pd, dev, qfi) {
+                    Ok(session) => self.xr_session = Some(session),
+                    Err(e) => tracing::warn!("OpenXR session create failed: {e:#}"),
+                }
+                self.xr = Some(xr);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("OpenXR start failed: {e:#}"),
+        }
         self.apply_skybox();
         // Load + upload the scene's baked lighting AFTER the renderer is stored,
         // so `upload_baked_probes` can actually push the lightmaps/probes to the
         // GPU (otherwise a scene with a bake loads black until re-baked).
         self.load_bake();
+        // Precompute a scene reflection map (capture surroundings into the cube)
+        // from the first reflection-probe zone, if any.
+        let center = self
+            .scene
+            .active_reflection_probe(glam::Vec3::ZERO)
+            .map(|p| glam::Vec3::from(p.center));
+        if let (Some(center), Some(r)) = (center, self.renderer.as_mut()) {
+            r.request_reflection_capture(center);
+        }
         Ok(())
     }
 
@@ -1317,6 +1355,9 @@ impl EngineApp {
                         self.load_scene_runtime(&scene);
                         self.set_status("Reimported model", false);
                     }
+                }
+                EditorAction::ExtractModelAssets(path) => {
+                    self.extract_model_assets(&path);
                 }
                 EditorAction::OpenCodeFile(path) => {
                     self.open_code_file(path);
@@ -3124,10 +3165,28 @@ impl EngineApp {
     /// Push the scene's skybox (or the procedural sky) to the renderer.
     fn apply_skybox(&mut self) {
         let skybox = self.scene.skybox.clone();
+        let faces = self.scene.environment.skybox_faces.clone();
         let project_root = self.project_root.clone();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        // Cubemap (6-face) skybox takes precedence over the equirect one.
+        if let Some(faces) = faces {
+            let loaded: Result<Vec<_>, _> = faces
+                .iter()
+                .map(|rel| citrus_assets::load_texture_file(project_root.join(rel), true))
+                .collect();
+            match loaded {
+                Ok(data) => {
+                    let refs: [&citrus_render::TextureData; 6] = std::array::from_fn(|i| &data[i]);
+                    if let Err(e) = renderer.set_skybox_cube(refs) {
+                        tracing::error!("setting cubemap skybox: {e:#}");
+                    }
+                    return;
+                }
+                Err(e) => tracing::error!("loading cubemap skybox: {e:#}"),
+            }
+        }
         match skybox {
             Some(rel) => {
                 let abs = project_root.join(&rel);
@@ -3565,6 +3624,97 @@ impl EngineApp {
         self.save_scene_material(index);
         self.set_status(
             format!("Extracted material '{}' → {}", name, relative_to(&path, &self.project_root)),
+            false,
+        );
+    }
+
+    /// Re-load a model file and write its embedded textures (PNG) + materials
+    /// (`.material`) into `<project>/extracted/<model>/{textures,materials}/` so the
+    /// imported assets become editable, reusable project files. Textures decoded on
+    /// import are not retained, so this re-reads the source model.
+    fn extract_model_assets(&mut self, path: &Path) {
+        let scene = match citrus_assets::load_model(path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_status(format!("Extract failed: {e:#}"), true);
+                return;
+            }
+        };
+        let stem: String = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .collect();
+        let stem = stem.trim_matches('_');
+        let stem = if stem.is_empty() { "model" } else { stem };
+        let base = self.project_root.join("extracted").join(stem);
+        let tex_dir = base.join("textures");
+        let mat_dir = base.join("materials");
+        if let Err(e) = std::fs::create_dir_all(&tex_dir).and_then(|_| std::fs::create_dir_all(&mat_dir)) {
+            self.set_status(format!("Extract failed: {e}"), true);
+            return;
+        }
+
+        // Write each embedded texture as a PNG; remember its path per index.
+        let mut tex_paths: Vec<Option<PathBuf>> = vec![None; scene.textures.len()];
+        let mut tex_written = 0;
+        for (i, t) in scene.textures.iter().enumerate() {
+            let p = tex_dir.join(format!("tex_{i}.png"));
+            match image::RgbaImage::from_raw(t.width, t.height, t.pixels.clone()) {
+                Some(buf) => match buf.save(&p) {
+                    Ok(()) => {
+                        tex_paths[i] = Some(p);
+                        tex_written += 1;
+                    }
+                    Err(e) => tracing::warn!("extract texture {i}: {e}"),
+                },
+                None => tracing::warn!("extract texture {i}: bad RGBA buffer size"),
+            }
+        }
+
+        // Write each material as a `.material` referencing the extracted textures
+        // by project-relative path.
+        let rel = |p: &Option<PathBuf>| -> Option<PathBuf> {
+            p.as_ref().map(|p| PathBuf::from(relative_to(p, &self.project_root)))
+        };
+        let mut mat_written = 0;
+        for (mi, m) in scene.materials.iter().enumerate() {
+            let mut textures = citrus_assets::MaterialTextures::default();
+            textures.albedo = m.albedo.and_then(|i| rel(&tex_paths[i]));
+            textures.normal = m.normal.and_then(|i| rel(&tex_paths[i]));
+            textures.orm = m.orm.and_then(|i| rel(&tex_paths[i]));
+            textures.emission = m.emission.and_then(|i| rel(&tex_paths[i]));
+            let mf = citrus_assets::MaterialFile {
+                name: m.name.clone(),
+                shader: "standard".into(),
+                params: m.params,
+                features: m.features,
+                render_queue: None,
+                textures,
+                custom: Default::default(),
+            };
+            let name_stem: String = m
+                .name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+                .collect();
+            let name_stem = name_stem.trim_matches('_');
+            let fallback = format!("material_{mi}");
+            let stem = if name_stem.is_empty() { fallback.as_str() } else { name_stem };
+            let mp = unique_path(&mat_dir, stem, "material");
+            match citrus_assets::save_material_file(&mp, &mf) {
+                Ok(()) => mat_written += 1,
+                Err(e) => tracing::warn!("extract material '{}': {e:#}", m.name),
+            }
+        }
+
+        self.set_status(
+            format!(
+                "Extracted {tex_written} texture(s) + {mat_written} material(s) → {}",
+                relative_to(&base, &self.project_root)
+            ),
             false,
         );
     }
@@ -4068,6 +4218,24 @@ impl EngineApp {
         if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
             tracing::error!("setting shadow resolution: {e:#}");
         }
+        // VR: pump the OpenXR session + read tracker poses for the IK solver.
+        if let Some(session) = &mut self.xr_session {
+            session.poll();
+            let b = session.body_poses();
+            self.vr_targets = citrus_core::TrackerTargets {
+                head: b.head,
+                left_hand: b.left_hand,
+                right_hand: b.right_hand,
+                hips: b.hips,
+                left_foot: b.left_foot,
+                right_foot: b.right_foot,
+            };
+        }
+        // Feed VR tracker poses into the scene's humanoid IK targets (any source
+        // can; IK isn't VR-specific), then advance + CPU-skin (previews in-editor).
+        self.scene
+            .set_ik_targets(self.xr_session.as_ref().map(|_| self.vr_targets));
+        self.scene.update_skinning(renderer, dt);
         let postfx = self
             .scene
             .effective_postfx(self.camera.position, &self.project_root);
@@ -4093,6 +4261,8 @@ impl EngineApp {
             render_viewport: false,
             viewport_extent,
             postfx,
+            reflection_probe: self.scene.active_reflection_probe(self.camera.position),
+            fog: self.scene.fog_params(),
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
                 primitives,
@@ -5235,6 +5405,42 @@ impl EditorTabs<'_> {
                                             });
                                     });
                                 });
+                            egui::CollapsingHeader::new("Reflections (SSR)")
+                                .id_salt("citrus-flux-ssr")
+                                .show(ui, |ui| {
+                                    ui.checkbox(&mut gi.ssr_enabled, "Screen-space reflections")
+                                        .on_hover_text(
+                                            "Trace specular rays against the depth prepass + last \
+                                             frame's colour. Rides on Flux (the depth prepass), so \
+                                             it only runs while realtime GI is on.",
+                                        );
+                                    ui.add_enabled_ui(gi.ssr_enabled, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Intensity");
+                                            ui.add(egui::Slider::new(&mut gi.ssr_intensity, 0.0..=2.0))
+                                                .on_hover_text("Reflection strength multiplier.");
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Max distance");
+                                            ui.add(
+                                                egui::Slider::new(&mut gi.ssr_max_distance, 1.0..=200.0)
+                                                    .suffix(" m"),
+                                            )
+                                            .on_hover_text("Max view-space ray distance.");
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Roughness cutoff");
+                                            ui.add(egui::Slider::new(
+                                                &mut gi.ssr_roughness_cutoff,
+                                                0.0..=1.0,
+                                            ))
+                                            .on_hover_text(
+                                                "Surfaces rougher than this skip SSR (the cheap \
+                                                 ambient-specular env carries them instead).",
+                                            );
+                                        });
+                                    });
+                                });
                         });
                     });
                     if baked {
@@ -5287,6 +5493,53 @@ impl EditorTabs<'_> {
                     ui.separator();
                     ui.label(RichText::new("Skybox").strong());
                     ui.checkbox(&mut env.skybox_enabled, "Draw skybox");
+
+                    ui.separator();
+                    egui::CollapsingHeader::new("Fog")
+                        .id_salt("citrus-env-fog")
+                        .show(ui, |ui| {
+                            ui.checkbox(&mut env.fog_enabled, "Enabled")
+                                .on_hover_text("Exponential distance + height fog (atmospheric depth).");
+                            ui.add_enabled_ui(env.fog_enabled, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Color");
+                                    ui.color_edit_button_rgb(&mut env.fog_color);
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Density");
+                                    ui.add(egui::Slider::new(&mut env.fog_density, 0.0..=0.5).logarithmic(true));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Start distance");
+                                    ui.add(egui::Slider::new(&mut env.fog_start_distance, 0.0..=100.0).suffix(" m"));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Height falloff");
+                                    ui.add(egui::Slider::new(&mut env.fog_height_falloff, 0.0..=1.0))
+                                        .on_hover_text("Fog thins above the height reference (0 = uniform).");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Height ref");
+                                    ui.add(egui::Slider::new(&mut env.fog_height_ref, -50.0..=50.0).suffix(" m"));
+                                });
+                            });
+                        });
+
+                    ui.separator();
+                    egui::CollapsingHeader::new("Post-processing (global)")
+                        .id_salt("citrus-env-postfx")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Always-applied scene post FX (the global volume). Local Volume \
+                                     components blend on top by priority/weight.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            postfx_editor_ui(ui, &mut env.postfx);
+                        });
                 }
 
                 // Skybox texture slot: drop an image from the Files panel.
@@ -6732,6 +6985,7 @@ impl EditorTabs<'_> {
                             ui.separator();
                             let mut do_save = false;
                             let mut do_reimport = false;
+                            let mut do_extract = false;
                             if let Some(fm) = self.file_meta.as_mut().filter(|f| f.path == *path) {
                                 match fm.meta.importer.as_model_mut() {
                                     Some(model) => {
@@ -6762,6 +7016,18 @@ impl EditorTabs<'_> {
                                         ui.label(egui::RichText::new("unsaved").small().weak());
                                     }
                                 });
+                                ui.separator();
+                                if ui
+                                    .button("⤓ Extract textures & materials")
+                                    .on_hover_text(
+                                        "Write this model's embedded textures (PNG) and materials \
+                                         (.material) into <project>/extracted/<model>/ so they can \
+                                         be edited and reused as project assets.",
+                                    )
+                                    .clicked()
+                                {
+                                    do_extract = true;
+                                }
                             } else {
                                 ui.label("Loading import settings…");
                             }
@@ -6770,6 +7036,9 @@ impl EditorTabs<'_> {
                             }
                             if do_reimport {
                                 self.actions.push(EditorAction::ReimportModel(path.clone()));
+                            }
+                            if do_extract {
+                                self.actions.push(EditorAction::ExtractModelAssets(path.clone()));
                             }
                         }
                         _ => {

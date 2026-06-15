@@ -18,6 +18,13 @@ pub struct Vertex {
     /// model's second UV channel, or generated when absent. Kept at the end of
     /// the struct so existing vertex attributes keep their offsets.
     pub uv1: [f32; 2],
+    /// Skinning: up to 4 skeleton joint indices influencing this vertex. All
+    /// zero on static meshes (the skinned pipeline variant is only used when the
+    /// mesh has a skeleton, so static meshes ignore these). Appended last to keep
+    /// existing attribute offsets stable.
+    pub joints: [u32; 4],
+    /// Skinning: the 4 joint weights (normalized). All zero on static meshes.
+    pub weights: [f32; 4],
 }
 
 impl Default for Vertex {
@@ -29,6 +36,8 @@ impl Default for Vertex {
             color: [1.0; 4],
             tangent: [1.0, 0.0, 0.0, 1.0],
             uv1: [0.0; 2],
+            joints: [0; 4],
+            weights: [0.0; 4],
         }
     }
 }
@@ -431,7 +440,38 @@ pub struct FrameInput<'a> {
     /// Resolved post-processing parameters (from the camera's blended Volume
     /// profiles). Per-pixel effects applied in the surface shaders.
     pub postfx: PostFx,
+    /// Active reflection-probe zone (the placed `ReflectionProbe` whose box
+    /// contains the camera, or the nearest). Drives box-projected parallax +
+    /// intensity for the environment reflection. `None` = treat the env cube as
+    /// distant/infinite (no parallax, intensity 1).
+    pub reflection_probe: Option<ReflectionProbeBox>,
+    /// Distance + height exponential fog (atmospheric depth). `None` = no fog.
+    pub fog: Option<FogParams>,
     pub egui: Option<EguiDraw>,
+}
+
+/// Exponential distance + height fog parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct FogParams {
+    pub color: [f32; 3],
+    /// Fog buildup per world unit of view distance.
+    pub density: f32,
+    /// Height falloff: fog thins above `height_ref` at this rate (0 = uniform).
+    pub height_falloff: f32,
+    /// World Y where fog is at full density.
+    pub height_ref: f32,
+    /// View distance (world units) before fog starts accumulating.
+    pub start_distance: f32,
+}
+
+/// A placed reflection-probe zone in world space, for box-projected reflections.
+#[derive(Clone, Copy, Debug)]
+pub struct ReflectionProbeBox {
+    pub center: [f32; 3],
+    pub half_extents: [f32; 3],
+    pub intensity: f32,
+    /// Box-projected parallax (Unity-style) vs. infinite/distant sampling.
+    pub box_projection: bool,
 }
 
 /// Resolved per-frame post-processing parameters (the blended profile flattened

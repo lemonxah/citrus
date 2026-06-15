@@ -106,6 +106,9 @@ pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry
         start: Instant::now(),
         last_frame: Instant::now(),
         init_error: None,
+        xr: None,
+        xr_session: None,
+        vr_targets: citrus_core::TrackerTargets::default(),
     };
     event_loop.run_app(&mut app)?;
     if let Some(e) = app.init_error.take() {
@@ -135,6 +138,14 @@ struct GameApp {
     last_frame: Instant,
     /// Set if `init` failed; surfaced after the loop exits.
     init_error: Option<anyhow::Error>,
+    /// OpenXR context (VR). `None` when no runtime/headset; the game runs flat.
+    xr: Option<citrus_xr::XrContext>,
+    /// Live VR session (poses/lifecycle), once the device is created.
+    xr_session: Option<citrus_xr::XrSession>,
+    /// Latest VR tracker poses (head/hands/hips/feet) for the full-body IK solver.
+    /// Consumed by the avatar-IK application step (humanoid bone mapping) — wired.
+    #[allow(dead_code)]
+    vr_targets: citrus_core::TrackerTargets,
 }
 
 impl GameApp {
@@ -154,6 +165,22 @@ impl GameApp {
 
         self.renderer = Some(renderer);
         self.window = Some(window);
+        // Start OpenXR (VR). Degrades gracefully to flat when unavailable.
+        match citrus_xr::XrContext::start(&self.config.title) {
+            Ok(Some(xr)) => {
+                tracing::info!("VR ready: {}", xr.system_name());
+                // Create the VR session sharing the renderer's Vulkan device.
+                let (vi, pd, dev, qfi) =
+                    self.renderer.as_ref().unwrap().vulkan_raw_handles();
+                match xr.create_session(vi, pd, dev, qfi) {
+                    Ok(session) => self.xr_session = Some(session),
+                    Err(e) => tracing::warn!("OpenXR session create failed: {e:#}"),
+                }
+                self.xr = Some(xr);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("OpenXR start failed: {e:#}"),
+        }
         self.start = Instant::now();
         self.last_frame = Instant::now();
         Ok(())
@@ -286,6 +313,28 @@ impl GameApp {
         // the editor preview.
         self.rt_gi.update(&mut renderer, &mut self.scene, dt);
 
+        // VR: pump the OpenXR session lifecycle + read tracker poses into a
+        // full-body target set for the IK solver. Avatar bone mapping (applying
+        // the solve to a humanoid skeleton) is the remaining step.
+        if let Some(session) = &mut self.xr_session {
+            session.poll();
+            let b = session.body_poses();
+            self.vr_targets = citrus_core::TrackerTargets {
+                head: b.head,
+                left_hand: b.left_hand,
+                right_hand: b.right_hand,
+                hips: b.hips,
+                left_foot: b.left_foot,
+                right_foot: b.right_foot,
+            };
+        }
+
+        // Feed VR tracker poses into the scene's humanoid IK targets (gameplay
+        // could set these too — IK isn't VR-specific). Then advance + CPU-skin.
+        self.scene
+            .set_ik_targets(self.xr_session.as_ref().map(|_| self.vr_targets));
+        self.scene.update_skinning(&mut renderer, dt);
+
         self.scene.sync_draws(None, 0.0);
 
         let (width, height) = self
@@ -381,6 +430,8 @@ impl GameApp {
             render_viewport: true,
             viewport_extent: None,
             postfx,
+            reflection_probe: self.scene.active_reflection_probe(cam_pos),
+            fog: self.scene.fog_params(),
             egui: None,
         };
         if let Err(e) = renderer.render(&frame) {
@@ -424,6 +475,19 @@ fn upload_probes(renderer: &mut Renderer, baked: Option<&crate::scene::BakedData
 
 /// Upload the scene's skybox (or clear it) on the renderer.
 fn apply_skybox(renderer: &mut Renderer, scene: &LoadedScene, assets_root: &Path) {
+    // Cubemap (6-face) skybox takes precedence over the equirect one.
+    if let Some(faces) = &scene.environment.skybox_faces {
+        match load_cube_faces(faces, assets_root) {
+            Ok(data) => {
+                let refs: [&citrus_render::TextureData; 6] = std::array::from_fn(|i| &data[i]);
+                if let Err(e) = renderer.set_skybox_cube(refs) {
+                    tracing::error!("setting cubemap skybox: {e:#}");
+                }
+                return;
+            }
+            Err(e) => tracing::error!("loading cubemap skybox: {e:#}"),
+        }
+    }
     match scene.skybox.clone() {
         Some(rel) => {
             let abs = assets_root.join(&rel);
@@ -443,6 +507,17 @@ fn apply_skybox(renderer: &mut Renderer, scene: &LoadedScene, assets_root: &Path
             let _ = renderer.set_skybox(None);
         }
     }
+}
+
+/// Load 6 cubemap face images (+X,-X,+Y,-Y,+Z,-Z) as sRGB textures.
+fn load_cube_faces(
+    faces: &[String; 6],
+    assets_root: &Path,
+) -> anyhow::Result<Vec<citrus_render::TextureData>> {
+    faces
+        .iter()
+        .map(|rel| citrus_assets::load_texture_file(assets_root.join(rel), true))
+        .collect()
 }
 
 /// Optionally start networking from env vars so a built game can host/join

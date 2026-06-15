@@ -126,6 +126,10 @@ impl RealtimeGiState {
             firefly_clamp: gi.firefly_clamp.max(0.5),
             smoothing: gi.smoothing.clamp(0.0, 1.0),
             intensity: gi.intensity.max(0.0),
+            ssr_enabled: gi.ssr_enabled,
+            ssr_intensity: gi.ssr_intensity.max(0.0),
+            ssr_max_distance: gi.ssr_max_distance.max(0.0),
+            ssr_roughness_cutoff: gi.ssr_roughness_cutoff.clamp(0.0, 1.0),
         });
         // Hardware (ray-query) mode needs RT cores; software (SDF) runs anywhere.
         if gi.mode == citrus_assets::GiMode::RayQuery && !renderer.supports_baking() {

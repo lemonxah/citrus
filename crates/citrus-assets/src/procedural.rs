@@ -212,6 +212,8 @@ pub fn test_scene() -> Scene {
         textures,
         materials,
         instances,
+        skeletons: Vec::new(),
+        animations: Vec::new(),
     }
 }
 

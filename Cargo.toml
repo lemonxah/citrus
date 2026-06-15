@@ -66,6 +66,7 @@ citrus-engine = { path = "crates/citrus-engine" }
 citrus-render = { path = "crates/citrus-render" }
 citrus-assets = { path = "crates/citrus-assets" }
 citrus-editor = { path = "crates/citrus-editor" }
+citrus-xr = { path = "crates/citrus-xr" }
 
 [profile.dev]
 # Vulkan bootstrap is slow in pure debug; optimize deps but keep our code debuggable.
