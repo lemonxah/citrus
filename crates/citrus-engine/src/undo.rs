@@ -95,16 +95,20 @@ pub struct UndoStack {
 }
 
 impl UndoStack {
-    /// Record an edit. Coalesces with the previous entry when it targets the
-    /// same thing within the merge window (one slider drag = one entry).
-    /// `Assign` entries never coalesce.
-    pub fn record(&mut self, entry: UndoEntry) {
+    /// Record an edit. Coalesces with the previous entry only while a continuous
+    /// gesture is active (`gesture_active`, e.g. a pointer-held slider/handle drag)
+    /// AND it targets the same thing within the merge window — so one drag is one
+    /// entry, but two DISCRETE edits (typed value, separate clicks) each get their
+    /// own entry instead of silently merging (which made them un-undoable). `Assign`
+    /// entries never coalesce.
+    pub fn record(&mut self, entry: UndoEntry, gesture_active: bool) {
         self.redo.clear();
         let now = Instant::now();
         let in_window = self
             .last_push
             .is_some_and(|t| now.duration_since(t) < MERGE_WINDOW);
-        let coalesce = !matches!(entry, UndoEntry::Assign { .. })
+        let coalesce = gesture_active
+            && !matches!(entry, UndoEntry::Assign { .. })
             && in_window
             && self
                 .undo

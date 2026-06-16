@@ -66,8 +66,8 @@ pub(crate) struct Accel {
     pub address: u64,
 }
 
-/// Run the full bake. Returns one lightmap per instance (same order) and SH
-/// per probe. Transient GPU resources are freed before returning.
+/// Run the full bake synchronously. Thin wrapper over the resumable `BakeJob`
+/// (single code path); used by callers that don't need progress/chunking.
 pub fn bake(
     ctx: &GpuContext,
     allocator: &Arc<Mutex<Allocator>>,
@@ -75,157 +75,334 @@ pub fn bake(
     meshes: &[GpuMesh],
     input: &BakeInput<'_>,
 ) -> Result<BakeOutput> {
-    let Some(accel_loader) = ctx.accel.as_ref() else {
-        bail!("ray tracing unavailable; cannot bake");
-    };
     if input.instances.is_empty() && input.probes.is_empty() {
         return Ok(BakeOutput::default());
     }
-
-    let device = &ctx.device;
-    let scratch_align = accel_scratch_alignment(ctx);
-
-    // Track everything we create so we can destroy it at the end.
-    let mut buffers: Vec<Buffer> = Vec::new();
-    let mut accels: Vec<Accel> = Vec::new();
-
-    // --- BLAS per unique mesh referenced by an instance --------------------
-    let mut blas_for_mesh: HashMap<usize, usize> = HashMap::new();
-    for inst in input.instances {
-        let mesh_idx = inst.mesh.0;
-        if blas_for_mesh.contains_key(&mesh_idx) {
-            continue;
+    let mut job = BakeJob::begin(ctx, allocator, command_pool, meshes, input)?;
+    loop {
+        match job.step(ctx, allocator, command_pool, meshes) {
+            Ok(BakeStep::Complete) => break,
+            Ok(_) => {}
+            Err(e) => {
+                let _ = job.finish(ctx, allocator);
+                return Err(e);
+            }
         }
-        let mesh = &meshes[mesh_idx];
-        let blas = build_blas(ctx, accel_loader, allocator, command_pool, mesh, scratch_align)
-            .with_context(|| format!("building BLAS for mesh {mesh_idx}"))?;
-        blas_for_mesh.insert(mesh_idx, accels.len());
-        accels.push(blas);
     }
+    Ok(job.finish(ctx, allocator))
+}
 
-    // --- Instance descriptors (for shading hits) + TLAS instances ----------
-    let mut gpu_instances = Vec::with_capacity(input.instances.len());
-    let mut tlas_instances: Vec<vk::AccelerationStructureInstanceKHR> =
-        Vec::with_capacity(input.instances.len());
-    for (i, inst) in input.instances.iter().enumerate() {
-        let mesh = &meshes[inst.mesh.0];
-        gpu_instances.push(GpuInstance {
-            vtx_addr: mesh.vertex_buffer.device_address(device),
-            idx_addr: mesh.index_buffer.device_address(device),
-            albedo: [inst.albedo[0], inst.albedo[1], inst.albedo[2], 0.0],
-            emission: [inst.emission[0], inst.emission[1], inst.emission[2], 0.0],
-        });
-        let blas = &accels[blas_for_mesh[&inst.mesh.0]];
-        tlas_instances.push(vk::AccelerationStructureInstanceKHR {
-            transform: transform_matrix(&inst.transform),
-            instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, 0xFF),
-            instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
-                0,
-                vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
-            ),
-            acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: blas.address,
-            },
-        });
-    }
+/// One unit of bake work completed by `BakeJob::step`.
+pub enum BakeStep {
+    /// A lightmap finished; `done`/`total` for progress.
+    Lightmap { done: usize, total: usize },
+    /// The probe batch finished.
+    Probes,
+    /// All work done — call `finish` to collect the output + free resources.
+    Complete,
+}
 
-    let tlas = if tlas_instances.is_empty() {
-        None
-    } else {
-        Some(
-            build_tlas(
-                ctx,
-                accel_loader,
-                allocator,
-                command_pool,
-                &tlas_instances,
-                scratch_align,
-                &mut buffers,
-            )
-            .context("building TLAS")?,
-        )
-    };
+/// A resumable lighting bake: builds the acceleration structure + SSBOs +
+/// pipelines once (`begin`), then traces one lightmap (or the probe batch) per
+/// `step` so the editor can chunk it across frames and show progress. `finish`
+/// tears down every GPU resource and returns the output — call it on completion
+/// AND on cancel (a partial output is fine). The GPU resources are held across
+/// frames, so the owning renderer's `meshes` must not be reallocated mid-bake
+/// (the TLAS embeds their device addresses) — the editor gates that.
+pub struct BakeJob {
+    accels: Vec<Accel>,
+    tlas: Option<Accel>,
+    buffers: Vec<Buffer>,
+    instance_ssbo: Buffer,
+    light_ssbo: Buffer,
+    /// Number of lights uploaded to `light_ssbo`. The per-step `BakeInput` is
+    /// rebuilt with empty borrowed slices (they can't outlive `begin`), so the
+    /// shader's `light_count` push constant MUST come from here, not from the
+    /// temporary input — otherwise the bake traces zero direct light.
+    light_count: u32,
+    gbuffer: Option<GbufferPipeline>,
+    lightmap: Option<LightmapPipeline>,
+    /// Owned per-instance work list (mesh index, transform, lightmap size) so no
+    /// borrow of the scene/`BakeInput` is held across frames.
+    units: Vec<(usize, Mat4, u32)>,
+    cursor: usize,
+    probes: Vec<glam::Vec3>,
+    probes_done: bool,
+    sky_color: [f32; 3],
+    bounces: u32,
+    samples: u32,
+    probes_only: bool,
+    output: BakeOutput,
+    destroyed: bool,
+}
 
-    // --- Shared SSBOs: instance descriptors + lights -----------------------
-    let mut alloc = allocator.lock().unwrap();
-    let instance_ssbo = host_ssbo(device, &mut alloc, bytes_of(&gpu_instances), "bake-instances")?;
-    let gpu_lights: Vec<GpuLight> = input.lights.iter().map(gpu_light).collect();
-    // A zero-length SSBO is invalid; pad to one element so the binding is live.
-    let light_bytes = if gpu_lights.is_empty() {
-        vec![0u8; size_of::<GpuLight>()]
-    } else {
-        bytes_of(&gpu_lights).to_vec()
-    };
-    let light_ssbo = host_ssbo(device, &mut alloc, &light_bytes, "bake-lights")?;
-    drop(alloc);
+impl BakeJob {
+    pub(crate) fn begin(
+        ctx: &GpuContext,
+        allocator: &Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        meshes: &[GpuMesh],
+        input: &BakeInput<'_>,
+    ) -> Result<BakeJob> {
+        let Some(accel_loader) = ctx.accel.as_ref() else {
+            bail!("ray tracing unavailable; cannot bake");
+        };
+        let device = &ctx.device;
+        let scratch_align = accel_scratch_alignment(ctx);
+        let mut buffers: Vec<Buffer> = Vec::new();
+        let mut accels: Vec<Accel> = Vec::new();
 
-    let mut output = BakeOutput::default();
+        // BLAS per unique mesh referenced by an instance.
+        let mut blas_for_mesh: HashMap<usize, usize> = HashMap::new();
+        for inst in input.instances {
+            let mesh_idx = inst.mesh.0;
+            if blas_for_mesh.contains_key(&mesh_idx) {
+                continue;
+            }
+            let mesh = &meshes[mesh_idx];
+            let blas = build_blas(ctx, accel_loader, allocator, command_pool, mesh, scratch_align)
+                .with_context(|| format!("building BLAS for mesh {mesh_idx}"))?;
+            blas_for_mesh.insert(mesh_idx, accels.len());
+            accels.push(blas);
+        }
 
-    // --- Lightmaps (Phase 3) ----------------------------------------------
-    if let Some(tlas) = &tlas
-        && !input.probes_only
-    {
-        let gbuffer = GbufferPipeline::new(ctx)?;
-        let lightmap = LightmapPipeline::new(ctx)?;
+        // Instance descriptors (for shading hits) + TLAS instances.
+        let mut gpu_instances = Vec::with_capacity(input.instances.len());
+        let mut tlas_instances: Vec<vk::AccelerationStructureInstanceKHR> =
+            Vec::with_capacity(input.instances.len());
         for (i, inst) in input.instances.iter().enumerate() {
             let mesh = &meshes[inst.mesh.0];
-            let size = inst.lightmap_size.clamp(8, 2048);
-            let lm = bake_one_lightmap(
-                ctx,
-                allocator,
-                command_pool,
-                &gbuffer,
-                &lightmap,
-                tlas,
-                &instance_ssbo,
-                &light_ssbo,
-                mesh,
-                &inst.transform,
-                size,
-                input,
-            )
-            .with_context(|| format!("baking lightmap {i}"))?;
-            output.lightmaps.push(lm);
+            gpu_instances.push(GpuInstance {
+                vtx_addr: mesh.vertex_buffer.device_address(device),
+                idx_addr: mesh.index_buffer.device_address(device),
+                albedo: [inst.albedo[0], inst.albedo[1], inst.albedo[2], 0.0],
+                emission: [inst.emission[0], inst.emission[1], inst.emission[2], 0.0],
+            });
+            let blas = &accels[blas_for_mesh[&inst.mesh.0]];
+            tlas_instances.push(vk::AccelerationStructureInstanceKHR {
+                transform: transform_matrix(&inst.transform),
+                instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, 0xFF),
+                instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
+                    0,
+                    vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+                ),
+                acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                    device_handle: blas.address,
+                },
+            });
         }
-        gbuffer.destroy(device);
-        lightmap.destroy(device);
+
+        let tlas = if tlas_instances.is_empty() {
+            None
+        } else {
+            Some(
+                build_tlas(
+                    ctx,
+                    accel_loader,
+                    allocator,
+                    command_pool,
+                    &tlas_instances,
+                    scratch_align,
+                    &mut buffers,
+                )
+                .context("building TLAS")?,
+            )
+        };
+
+        // Shared SSBOs: instance descriptors + lights.
+        let mut alloc = allocator.lock().unwrap();
+        let instance_ssbo =
+            host_ssbo(device, &mut alloc, bytes_of(&gpu_instances), "bake-instances")?;
+        let gpu_lights: Vec<GpuLight> = input.lights.iter().map(gpu_light).collect();
+        let light_bytes = if gpu_lights.is_empty() {
+            vec![0u8; size_of::<GpuLight>()]
+        } else {
+            bytes_of(&gpu_lights).to_vec()
+        };
+        let light_ssbo = host_ssbo(device, &mut alloc, &light_bytes, "bake-lights")?;
+        drop(alloc);
+
+        // Lightmap pipelines + work list only when we'll trace lightmaps.
+        let do_lightmaps = tlas.is_some() && !input.probes_only;
+        let (gbuffer, lightmap) = if do_lightmaps {
+            (Some(GbufferPipeline::new(ctx)?), Some(LightmapPipeline::new(ctx)?))
+        } else {
+            (None, None)
+        };
+        let units: Vec<(usize, Mat4, u32)> = if do_lightmaps {
+            input
+                .instances
+                .iter()
+                .map(|i| (i.mesh.0, i.transform, i.lightmap_size.clamp(8, 2048)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(BakeJob {
+            accels,
+            tlas,
+            buffers,
+            instance_ssbo,
+            light_ssbo,
+            light_count: input.lights.len() as u32,
+            gbuffer,
+            lightmap,
+            units,
+            cursor: 0,
+            probes: input.probes.to_vec(),
+            probes_done: false,
+            sky_color: input.sky_color,
+            bounces: input.bounces,
+            samples: input.samples,
+            probes_only: input.probes_only,
+            output: BakeOutput::default(),
+            destroyed: false,
+        })
     }
 
-    // --- Probes (Phase 4) --------------------------------------------------
-    if let Some(tlas) = &tlas {
-        if !input.probes.is_empty() {
-            output.probes = bake_probes(
-                ctx,
-                allocator,
-                command_pool,
-                tlas,
-                &instance_ssbo,
-                &light_ssbo,
-                input,
-            )
-            .context("baking probes")?;
+    /// Do one unit of work (one lightmap, then the probe batch as the final
+    /// step). Each per-unit fn takes the TLAS/SSBOs explicitly, so the temporary
+    /// `BakeInput` carries only the scalar params (its slices stay empty).
+    pub(crate) fn step(
+        &mut self,
+        ctx: &GpuContext,
+        allocator: &Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        meshes: &[GpuMesh],
+    ) -> Result<BakeStep> {
+        let (sky_color, bounces, samples, probes_only) =
+            (self.sky_color, self.bounces, self.samples, self.probes_only);
+
+        if self.lightmap.is_some() && self.cursor < self.units.len() {
+            let (mesh_idx, transform, size) = self.units[self.cursor];
+            let mesh = &meshes[mesh_idx];
+            let lm = {
+                let tlas = self.tlas.as_ref().unwrap();
+                let gbuffer = self.gbuffer.as_ref().unwrap();
+                let lightmap = self.lightmap.as_ref().unwrap();
+                let input = BakeInput {
+                    instances: &[],
+                    lights: &[],
+                    probes: &[],
+                    sky_color,
+                    bounces,
+                    samples,
+                    probes_only,
+                };
+                bake_one_lightmap(
+                    ctx,
+                    allocator,
+                    command_pool,
+                    gbuffer,
+                    lightmap,
+                    tlas,
+                    &self.instance_ssbo,
+                    &self.light_ssbo,
+                    mesh,
+                    &transform,
+                    size,
+                    self.light_count,
+                    &input,
+                )
+                .with_context(|| format!("baking lightmap {}", self.cursor))?
+            };
+            self.output.lightmaps.push(lm);
+            self.cursor += 1;
+            return Ok(BakeStep::Lightmap {
+                done: self.cursor,
+                total: self.units.len(),
+            });
         }
+
+        if !self.probes_done {
+            let probes_result = if let Some(tlas) = self.tlas.as_ref() {
+                if self.probes.is_empty() {
+                    None
+                } else {
+                    let input = BakeInput {
+                        instances: &[],
+                        lights: &[],
+                        probes: &self.probes,
+                        sky_color,
+                        bounces,
+                        samples,
+                        probes_only,
+                    };
+                    Some(
+                        bake_probes(
+                            ctx,
+                            allocator,
+                            command_pool,
+                            tlas,
+                            &self.instance_ssbo,
+                            &self.light_ssbo,
+                            self.light_count,
+                            &input,
+                        )
+                        .context("baking probes")?,
+                    )
+                }
+            } else {
+                None
+            };
+            if let Some(p) = probes_result {
+                self.output.probes = p;
+            }
+            self.probes_done = true;
+            return Ok(BakeStep::Probes);
+        }
+
+        Ok(BakeStep::Complete)
     }
 
-    // --- Teardown ----------------------------------------------------------
-    unsafe { device.device_wait_idle().ok() };
-    let mut alloc = allocator.lock().unwrap();
-    let mut instance_ssbo = instance_ssbo;
-    let mut light_ssbo = light_ssbo;
-    instance_ssbo.destroy(device, &mut alloc);
-    light_ssbo.destroy(device, &mut alloc);
-    if let Some(mut tlas) = tlas {
-        unsafe { accel_loader.destroy_acceleration_structure(tlas.handle, None) };
-        tlas.buffer.destroy(device, &mut alloc);
+    /// Lightmaps finished so far (one per completed instance, in unit order).
+    /// Used to live-preview the bake building up before it finishes.
+    pub fn lightmaps_so_far(&self) -> &[crate::types::BakedLightmap] {
+        &self.output.lightmaps
     }
-    for mut a in accels {
-        unsafe { accel_loader.destroy_acceleration_structure(a.handle, None) };
-        a.buffer.destroy(device, &mut alloc);
+
+    /// Tear down all GPU resources and return the (possibly partial) output.
+    pub(crate) fn finish(mut self, ctx: &GpuContext, allocator: &Arc<Mutex<Allocator>>) -> BakeOutput {
+        let device = &ctx.device;
+        unsafe { device.device_wait_idle().ok() };
+        let mut alloc = allocator.lock().unwrap();
+        self.instance_ssbo.destroy(device, &mut alloc);
+        self.light_ssbo.destroy(device, &mut alloc);
+        if let Some(g) = self.gbuffer.take() {
+            g.destroy(device);
+        }
+        if let Some(l) = self.lightmap.take() {
+            l.destroy(device);
+        }
+        let accel_loader = ctx.accel.as_ref();
+        if let Some(mut tlas) = self.tlas.take() {
+            if let Some(al) = accel_loader {
+                unsafe { al.destroy_acceleration_structure(tlas.handle, None) };
+            }
+            tlas.buffer.destroy(device, &mut alloc);
+        }
+        for mut a in std::mem::take(&mut self.accels) {
+            if let Some(al) = accel_loader {
+                unsafe { al.destroy_acceleration_structure(a.handle, None) };
+            }
+            a.buffer.destroy(device, &mut alloc);
+        }
+        for mut b in std::mem::take(&mut self.buffers) {
+            b.destroy(device, &mut alloc);
+        }
+        drop(alloc);
+        self.destroyed = true;
+        std::mem::take(&mut self.output)
     }
-    for mut b in buffers {
-        b.destroy(device, &mut alloc);
+}
+
+impl Drop for BakeJob {
+    fn drop(&mut self) {
+        if !self.destroyed {
+            tracing::error!("BakeJob dropped without finish(); GPU bake resources leaked");
+        }
     }
-    Ok(output)
 }
 
 fn gpu_light(l: &crate::types::BakeLight) -> GpuLight {
@@ -1102,6 +1279,7 @@ fn bake_one_lightmap(
     mesh: &GpuMesh,
     transform: &Mat4,
     size: u32,
+    light_count: u32,
     input: &BakeInput<'_>,
 ) -> Result<BakedLightmap> {
     let device = &ctx.device;
@@ -1187,7 +1365,7 @@ fn bake_one_lightmap(
     write_storage_image(device, set, 5, out_img.view);
 
     let push = LightmapPush {
-        light_count: input.lights.len() as u32,
+        light_count,
         sample_count: input.samples.max(1),
         bounces: input.bounces,
         frame_seed: 1,
@@ -1361,20 +1539,26 @@ fn bake_one_lightmap(
         let lum = |i: usize| 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
         let (mut lo, mut hi, mut acc) = (f32::INFINITY, 0.0f32, 0.0f64);
         let n = (size * size) as usize;
+        let mut covered = 0usize;
         for t in 0..n {
             if pixels[t * 4 + 3] <= 0.0 {
                 continue;
             }
+            covered += 1;
             let l = lum(t * 4);
             lo = lo.min(l);
             hi = hi.max(l);
             acc += l as f64;
         }
+        // `covered` = texels the g-buffer actually rasterized (i.e. the object has
+        // usable lightmap UVs). covered==0 → missing/degenerate lightmap UVs (the
+        // object never gets light), distinct from covered>0 but dark (shadowed/no
+        // light reaching). avg is over covered texels only.
         tracing::info!(
-            "lightmap {size}²: luminance min {:.3} max {:.3} avg {:.3}",
+            "lightmap {size}²: {covered}/{n} covered, luminance min {:.3} max {:.3} avg {:.3}",
             if lo.is_finite() { lo } else { 0.0 },
             hi,
-            acc / n.max(1) as f64
+            acc / covered.max(1) as f64
         );
     }
 
@@ -1388,6 +1572,7 @@ struct ProbePush {
     light_count: u32,
     sample_count: u32,
     frame_seed: u32,
+    bounces: u32,
     sky_color: [f32; 4],
 }
 
@@ -1398,6 +1583,7 @@ fn bake_probes(
     tlas: &Accel,
     instance_ssbo: &Buffer,
     light_ssbo: &Buffer,
+    light_count: u32,
     input: &BakeInput<'_>,
 ) -> Result<Vec<ProbeSh>> {
     let device = &ctx.device;
@@ -1511,9 +1697,10 @@ fn bake_probes(
 
     let push_data = ProbePush {
         probe_count: count as u32,
-        light_count: input.lights.len() as u32,
+        light_count,
         sample_count: input.samples.max(1),
         frame_seed: 1,
+        bounces: input.bounces,
         sky_color: [input.sky_color[0], input.sky_color[1], input.sky_color[2], 0.0],
     };
     let groups = (count as u32).div_ceil(64);

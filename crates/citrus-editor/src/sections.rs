@@ -220,6 +220,22 @@ pub fn material_editor_ui(
             property_row(ui, "Occlusion", changed, |ui| {
                 ui.add(Slider::new(&mut m.occlusion_strength, 0.0..=1.0))
             });
+            property_row(ui, "Reflection", changed, |ui| {
+                ui.add(Slider::new(&mut m.reflection_intensity, 0.0..=2.0))
+                    .on_hover_text(
+                        "Per-material reflection strength. Scales the environment / \
+                         reflection-probe cube AND screen-space/RT reflections for this \
+                         material (mix & match per material). 1 = default, 0 = matte.",
+                    )
+            });
+            property_row(ui, "Screen/RT Reflections", changed, |ui| {
+                ui.checkbox(&mut m.screen_reflections, "")
+                    .on_hover_text(
+                        "Reflection technique mix: ON = screen-space / ray-traced \
+                         reflections on top of the environment cube; OFF = environment / \
+                         reflection-probe cube only (cheaper, no SSR/RT for this material).",
+                    )
+            });
             *changed |= texture_row(
                 ui,
                 "ORM (Occl/Rough/Metal)",

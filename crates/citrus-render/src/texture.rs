@@ -6,7 +6,7 @@ use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 
 use crate::alloc::{Buffer, one_time_submit};
-use crate::types::TextureData;
+use crate::types::{CompressedTexture, TexFormat, TextureData};
 
 pub(crate) struct GpuTexture {
     pub image: vk::Image,
@@ -117,6 +117,146 @@ impl GpuTexture {
             );
         })?;
 
+        staging.destroy(device, allocator);
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(range);
+        let view = unsafe { device.create_image_view(&view_info, None)? };
+
+        Ok(Self {
+            image,
+            view,
+            allocation: Some(allocation),
+        })
+    }
+
+    /// Upload a pre-compressed (BC7/BC6H) or raw texture with a full mip chain.
+    /// All CPU work (decode, mip generation, block compression) already happened
+    /// off the main thread; this just stages each mip and copies it in.
+    pub fn upload_compressed(
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        pool: vk::CommandPool,
+        queue: vk::Queue,
+        tex: &CompressedTexture,
+    ) -> Result<Self> {
+        let format = match tex.format {
+            TexFormat::Bc7Srgb => vk::Format::BC7_SRGB_BLOCK,
+            TexFormat::Bc7Unorm => vk::Format::BC7_UNORM_BLOCK,
+            TexFormat::Bc6h => vk::Format::BC6H_UFLOAT_BLOCK,
+            TexFormat::RgbaSrgb => vk::Format::R8G8B8A8_SRGB,
+            TexFormat::RgbaUnorm => vk::Format::R8G8B8A8_UNORM,
+            TexFormat::RgbaF16 => vk::Format::R16G16B16A16_SFLOAT,
+        };
+        let mip_levels = tex.mips.len().max(1) as u32;
+        let extent = vk::Extent3D {
+            width: tex.width.max(1),
+            height: tex.height.max(1),
+            depth: 1,
+        };
+
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(extent)
+            .mip_levels(mip_levels)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name: "texture (bc)",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+
+        // Pack all mips contiguously into one staging buffer.
+        let total: usize = tex.mips.iter().map(|m| m.len()).sum();
+        let mut staging = Buffer::new(
+            device,
+            allocator,
+            total.max(1) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+            "texture bc staging",
+        )?;
+        let mut offsets = Vec::with_capacity(tex.mips.len());
+        let mut cursor = 0usize;
+        for mip in &tex.mips {
+            staging.write(cursor, mip);
+            offsets.push(cursor as u64);
+            cursor += mip.len();
+        }
+
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(mip_levels)
+            .layer_count(1);
+
+        one_time_submit(device, pool, queue, |cb| unsafe {
+            let to_transfer = vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[to_transfer]),
+            );
+
+            let copies: Vec<vk::BufferImageCopy> = (0..mip_levels)
+                .map(|level| {
+                    let w = (extent.width >> level).max(1);
+                    let h = (extent.height >> level).max(1);
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(offsets[level as usize])
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .mip_level(level)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: w,
+                            height: h,
+                            depth: 1,
+                        })
+                })
+                .collect();
+            device.cmd_copy_buffer_to_image(
+                cb,
+                staging.handle,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copies,
+            );
+
+            let to_sampled = vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[to_sampled]),
+            );
+        })?;
         staging.destroy(device, allocator);
 
         let view_info = vk::ImageViewCreateInfo::default()

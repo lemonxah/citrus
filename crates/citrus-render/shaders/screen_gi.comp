@@ -243,6 +243,10 @@ vec3 emitter_light(vec3 p, vec3 n, float eps) {
         // abrupt. A surface facing clearly away (more than ~17 deg past the
         // terminator) still gets nothing, so emission doesn't bleed onto back-faces.
         float ndl = clamp(dot(n, l) + 0.3, 0.0, 1.0) / 1.3;
+        if (ndl <= 0.0) continue;
+        // Occlusion: march the GDF to just before the sphere; skip if a solid
+        // occluder (e.g. the couch) blocks it, so the emitter can't leak through.
+        if (occluded(p + n * (eps * 2.0), l, max(dist - r, eps * 2.0), eps)) continue;
         float sa = sphere_solid_angle(r, max(dist, r * 1.001));
         sum += emitters[i].emission.rgb * (ndl * sa);
     }
@@ -437,6 +441,9 @@ void main() {
         float er = max(emitters[e].center_radius.w, 1e-3);
         vec3 ed = ec - origin; float edist = length(ed);
         vec3 el = edist > 1e-4 ? ed / edist : n;
+        // Occlusion (matches emitter_light): skip emitters hidden behind solid
+        // geometry so their directional SH doesn't leak through it.
+        if (occluded(origin + n * (eps * 2.0), el, max(edist - er, eps * 2.0), eps)) continue;
         vec3 Eem = emitters[e].emission.rgb * sphere_solid_angle(er, max(edist, er * 1.001));
         sh0 += Eem * ( 0.282095);
         sh1 += Eem * (-0.488603 * el.y);

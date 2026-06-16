@@ -61,6 +61,36 @@ pub struct TextureData {
     pub hdr: bool,
 }
 
+/// Pixel format of a (possibly block-compressed) prepared texture. BC variants
+/// carry one byte per texel (4x4 blocks, 16 bytes each); raw variants are the
+/// fallback for non-multiple-of-4 dimensions BC can't tile cleanly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TexFormat {
+    /// BC7 sRGB — color maps (albedo, emission).
+    Bc7Srgb,
+    /// BC7 UNORM — linear data maps (normal, ORM, roughness, AO, metal).
+    Bc7Unorm,
+    /// BC6H unsigned float — HDR sources (EXR).
+    Bc6h,
+    /// Uncompressed RGBA8 sRGB.
+    RgbaSrgb,
+    /// Uncompressed RGBA8 linear.
+    RgbaUnorm,
+    /// Uncompressed RGBA f16 linear (8 bytes/texel).
+    RgbaF16,
+}
+
+/// A texture decoded + (optionally) block-compressed off the main thread, with a
+/// full mip chain, ready to upload with no further CPU work. Produced by the
+/// asset import cache; consumed by `GpuTexture::upload_compressed`.
+pub struct CompressedTexture {
+    pub format: TexFormat,
+    pub width: u32,
+    pub height: u32,
+    /// Mip levels, largest first; each is the exact byte payload for that level.
+    pub mips: Vec<Vec<u8>>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AlphaMode {
     #[default]
@@ -87,6 +117,12 @@ pub struct MaterialParams {
     pub base_color: [f32; 4],
     pub emission_color: [f32; 3],
     pub emission_intensity: f32,
+    /// Mean LINEAR RGB of the emission map (1,1,1 = no map). Scales the per-
+    /// instance emission fed to the RT reflection + RT GI gather so a mostly-black
+    /// map (e.g. only a glowing visor) doesn't make the whole mesh reflect/bounce
+    /// as a uniform light. The per-pixel forward emission is unaffected (it
+    /// samples the actual map).
+    pub emission_map_mean: [f32; 3],
     pub metallic: f32,
     pub roughness: f32,
     pub toon_steps: f32,
@@ -135,6 +171,12 @@ pub struct MaterialParams {
     pub metallic_invert: bool,
     /// Parallax occlusion mapping strength (uv shift at full height). 0 = off.
     pub displacement_scale: f32,
+    /// Per-material reflection strength (1 = full, 0 = matte). Scales the env-cube
+    /// probe reflection AND the screen-space/RT reflection for this material.
+    pub reflection_intensity: f32,
+    /// Per-material screen-space/RT reflection toggle (true = on). Off keeps the
+    /// env-cube reflection but skips the deferred SSR/RT resolve for this material.
+    pub screen_reflections: bool,
 }
 
 impl Default for MaterialParams {
@@ -143,6 +185,7 @@ impl Default for MaterialParams {
             base_color: [1.0; 4],
             emission_color: [0.0; 3],
             emission_intensity: 1.0,
+            emission_map_mean: [1.0; 3],
             metallic: 0.0,
             roughness: 0.7,
             toon_steps: 3.0,
@@ -163,6 +206,8 @@ impl Default for MaterialParams {
             roughness_invert: false,
             metallic_invert: false,
             displacement_scale: 0.0,
+            reflection_intensity: 1.0,
+            screen_reflections: true,
             albedo_tiling: [1.0, 1.0],
             albedo_offset: [0.0, 0.0],
             normal_tiling: [1.0, 1.0],
@@ -255,7 +300,14 @@ impl MaterialFx {
                 p.metallic_invert as u32 as f32,
                 0.0,
             ],
-            parallax: [p.displacement_scale, 0.0, 0.0, 0.0],
+            // y = per-material reflection strength (scales env-cube + SSR/RT).
+            // z = screen-space/RT reflection toggle (1 = on, 0 = cube-only). w free.
+            parallax: [
+                p.displacement_scale,
+                p.reflection_intensity,
+                if p.screen_reflections { 1.0 } else { 0.0 },
+                0.0,
+            ],
         }
     }
 }
@@ -502,6 +554,20 @@ pub struct RenderStats {
     pub materials_drawn: u32,
     /// Compiled shader-variant pipelines in the cache.
     pub pipeline_variants: u32,
+    /// Total GPU time for the last completed frame (ms), from timestamp queries.
+    /// 0 when the device/queue does not support timestamps.
+    pub gpu_frame_ms: f32,
+    /// GPU time spent in the Flux GI trace (depth prepass + gather) last frame
+    /// (ms). 0 on frames where the trace was skipped (converged still camera).
+    pub gpu_gi_ms: f32,
+    /// GPU per-pass breakdown (ms) for the active path, from timestamp zones.
+    /// A pass that didn't run this frame reads 0.
+    pub gpu_shadows_ms: f32,
+    pub gpu_scene_ms: f32,
+    pub gpu_reflect_ms: f32,
+    pub gpu_post_ms: f32,
+    pub gpu_egui_ms: f32,
+    pub gpu_cam_preview_ms: f32,
 }
 
 pub struct FrameInput<'a> {
@@ -576,6 +642,8 @@ pub struct ReflectionProbeBox {
     pub intensity: f32,
     /// Box-projected parallax (Unity-style) vs. infinite/distant sampling.
     pub box_projection: bool,
+    /// Captured cubemap face resolution for this probe.
+    pub resolution: u32,
 }
 
 /// Resolved per-frame post-processing parameters (the blended profile flattened

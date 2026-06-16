@@ -19,6 +19,8 @@ editor = [
     "dep:image",
     "dep:serde_json",
     "dep:libc",
+    "dep:softbuffer",
+    "dep:ab_glyph",
 ]
 
 [dependencies]
@@ -43,6 +45,9 @@ transform-gizmo-egui = { workspace = true, optional = true }
 egui_dock = { workspace = true, optional = true }
 hecs = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+# CPU-drawn splash window (shown before the Vulkan renderer exists).
+softbuffer = { version = "0.4", optional = true }
+ab_glyph = { version = "0.2", optional = true }
 serde_json = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 rapier3d = "0.33.0"

@@ -392,6 +392,98 @@ fn probe_sh(
     }
 }
 
+/// Add a directional radiance `r` arriving from `dir` into an SH-L1 accumulator
+/// (the same basis the standard shader reconstructs). FluxVR's building block.
+fn add_sh(s: &mut [Vec3; 4], dir: Vec3, r: Vec3) {
+    s[0] += r * 0.282095;
+    s[1] += r * (0.488603 * dir.y);
+    s[2] += r * (0.488603 * dir.z);
+    s[3] += r * (0.488603 * dir.x);
+}
+
+/// Inject one light's contribution (distance/cone falloff, FULL L1 directionality
+/// — an L0-only term looks flat/translucent) into a probe's SH-L1 accumulator at
+/// world position `p`. The FluxVR per-voxel kernel.
+pub fn inject_light(s: &mut [Vec3; 4], p: Vec3, l: &BakeLight) {
+    let col = Vec3::from(l.color); // already × intensity
+    match l.kind {
+        LightKind::Directional => {
+            add_sh(s, (-l.direction).normalize_or(Vec3::NEG_Y), col);
+        }
+        _ => {
+            let to = l.position - p;
+            let dist = to.length();
+            let range = l.range.max(1e-3);
+            if dist >= range {
+                return;
+            }
+            let d = if dist > 1e-4 { to / dist } else { Vec3::Y };
+            let f = 1.0 - dist / range;
+            let mut atten = f * f;
+            if matches!(l.kind, LightKind::Spot) {
+                let ld = l.direction.normalize_or(Vec3::NEG_Y);
+                let cd = ld.dot(-d);
+                let ci = (l.spot_inner_deg.to_radians() * 0.5).cos();
+                let co = (l.spot_outer_deg.to_radians() * 0.5).cos();
+                let sp = ((cd - co) / (ci - co).max(1e-4)).clamp(0.0, 1.0);
+                atten *= sp * sp;
+            }
+            if atten > 0.0 {
+                add_sh(s, d, col * atten);
+            }
+        }
+    }
+}
+
+/// World-space probe positions for a FluxVR voxel volume (box centred at
+/// `center`, `size` meters, `counts` probes per axis), x-fastest then y then z —
+/// matching the `set_baked_probes` / shader indexing convention.
+pub fn flux_volume_positions(center: Vec3, size: Vec3, counts: [u32; 3]) -> Vec<Vec3> {
+    let [cx, cy, cz] = [counts[0].max(2), counts[1].max(2), counts[2].max(2)];
+    let denom = Vec3::new((cx - 1) as f32, (cy - 1) as f32, (cz - 1) as f32);
+    let mut out = Vec::with_capacity((cx * cy * cz) as usize);
+    for z in 0..cz {
+        for y in 0..cy {
+            for x in 0..cx {
+                let gn = Vec3::new(x as f32, y as f32, z as f32) / denom;
+                out.push(center + (gn - 0.5) * size);
+            }
+        }
+    }
+    out
+}
+
+/// Add every light's contribution to a parallel SH-L1 accumulator at each probe
+/// position. Used both to bake the static base once and to mix dynamic lights in
+/// each frame (the "fake GI on moving lights"). `acc` and `positions` are
+/// parallel and the same length.
+pub fn flux_inject(acc: &mut [[Vec3; 4]], positions: &[Vec3], lights: &[BakeLight]) {
+    for (s, &p) in acc.iter_mut().zip(positions) {
+        for l in lights {
+            inject_light(s, p, l);
+        }
+    }
+}
+
+/// Convert an SH-L1 accumulator into the engine's `ProbeSh` (no visibility data —
+/// FluxVR is an analytic volume, not a traced one).
+pub fn acc_to_probe(s: &[Vec3; 4]) -> ProbeSh {
+    let p = |v: Vec3| [v.x, v.y, v.z];
+    ProbeSh {
+        coeffs: [p(s[0]), p(s[1]), p(s[2]), p(s[3])],
+        dist: [0.0; 4],
+        dist2: [0.0; 4],
+    }
+}
+
+/// Inverse of [`acc_to_probe`]: lift a baked `ProbeSh` back into an SH-L1
+/// accumulator so dynamic Flux VR Lights can be added on top of a build-time
+/// baked static base (distance data is dropped — FluxVR is analytic).
+pub fn probe_to_acc(p: &ProbeSh) -> [Vec3; 4] {
+    let v = |c: [f32; 3]| Vec3::new(c[0], c[1], c[2]);
+    [v(p.coeffs[0]), v(p.coeffs[1]), v(p.coeffs[2]), v(p.coeffs[3])]
+}
+
 /// March every probe and return SH-L1 radiance coefficients (same layout as the
 /// ray-query probe bake). Parallelized across CPU cores; each probe is
 /// independent. `scene_size` sizes the march epsilon and reach.

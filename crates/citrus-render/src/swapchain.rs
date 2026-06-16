@@ -20,19 +20,32 @@ pub struct Swapchain {
 
 impl Swapchain {
     pub fn new(ctx: &GpuContext, width: u32, height: u32, vsync: bool) -> Result<Self> {
+        Self::new_for_surface(ctx, ctx.surface, width, height, vsync)
+    }
+
+    /// Build a swapchain for an arbitrary surface (the main window uses
+    /// `ctx.surface`; the profiler window passes its own). Shares the context's
+    /// device/queue so no extra GPU setup is needed.
+    pub fn new_for_surface(
+        ctx: &GpuContext,
+        surface: vk::SurfaceKHR,
+        width: u32,
+        height: u32,
+        vsync: bool,
+    ) -> Result<Self> {
         let loader = khr::swapchain::Device::new(&ctx.instance, &ctx.device);
 
         let caps = unsafe {
             ctx.surface_loader
-                .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)?
+                .get_physical_device_surface_capabilities(ctx.physical_device, surface)?
         };
         let formats = unsafe {
             ctx.surface_loader
-                .get_physical_device_surface_formats(ctx.physical_device, ctx.surface)?
+                .get_physical_device_surface_formats(ctx.physical_device, surface)?
         };
         let present_modes = unsafe {
             ctx.surface_loader
-                .get_physical_device_surface_present_modes(ctx.physical_device, ctx.surface)?
+                .get_physical_device_surface_present_modes(ctx.physical_device, surface)?
         };
         // FIFO (vsync) is always available. Without vsync prefer MAILBOX
         // (uncapped, no tearing), then IMMEDIATE (uncapped, may tear).
@@ -70,7 +83,7 @@ impl Swapchain {
         }
 
         let info = vk::SwapchainCreateInfoKHR::default()
-            .surface(ctx.surface)
+            .surface(surface)
             .min_image_count(image_count)
             .image_format(format.format)
             .image_color_space(format.color_space)

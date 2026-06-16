@@ -12,8 +12,10 @@ use std::collections::HashMap;
 
 use citrus_core::{
     AudioListener, AudioRolloff, AudioSource, Bob, BodyKind, BoxCollider, CameraComponent,
-    Component, ComponentRegistry, ControlMode, LightComponent, LightKind, LightMode,
-    LightProbeVolume, MeshCollider, ObjectId, ObjectRef, Pawn, RigidBody, ShadowType, Spin,
+    Component, ComponentRegistry, ControlMode, FluxVolume, FluxVrLight, LightComponent, LightKind,
+    LightMode, LightProbeVolume, MeshCollider, ObjectId, ObjectRef, Pawn, ReflectionProbe,
+    RigidBody, ShadowType,
+    Spin,
     SpawnPoint, SphereCollider, Sync, TypedComponent, VolumeComponent,
     COLLISION_LAYERS,
 };
@@ -159,25 +161,86 @@ pub trait Inspect {
     fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool;
 }
 
-/// Context for drawing a component's editor viewport gizmo.
-pub struct GizmoCtx<'a> {
-    pub painter: &'a egui::Painter,
-    /// World-space point -> screen position (None if behind the camera).
-    pub world_to_screen: &'a dyn Fn(glam::Vec3) -> Option<egui::Pos2>,
-    /// The owning object's world transform.
-    pub world: glam::Mat4,
-    /// True when the owning object is selected.
-    pub selected: bool,
+/// A viewport gizmo a component declares. The editor owns drawing + interaction
+/// for each kind (wireframe box with resize handles, an interior point cloud, a
+/// range sphere); a component just lists which it wants. Coordinates are in the
+/// owning object's LOCAL space (the editor applies the object world transform).
+#[derive(Clone)]
+pub enum GizmoSpec {
+    /// Resizable box. `object_anchored` = box is centered on the object origin
+    /// (resize moves the OBJECT to keep the opposite face fixed); otherwise it
+    /// has its own local `center` (resize moves that center, e.g. a collider).
+    /// `blend` draws a dimmer inner shell (reflection-probe blend distance; 0 = none).
+    Box {
+        center: glam::Vec3,
+        half_extents: glam::Vec3,
+        object_anchored: bool,
+        blend: f32,
+        color: egui::Color32,
+    },
+    /// A cloud of interior points (probe grid), display-only.
+    Points {
+        positions: Vec<glam::Vec3>,
+        color: egui::Color32,
+    },
+    /// A resizable range sphere (radius handle on the camera-right side).
+    Range {
+        center: glam::Vec3,
+        radius: f32,
+        color: egui::Color32,
+    },
 }
 
-/// Editor viewport gizmo for a component. Default draws nothing; components
-/// (and plugins) override to draw widgets when their object is selected.
+/// The result of dragging a gizmo handle, applied back to the component via
+/// [`Gizmo::apply_gizmo_edit`]. `index` is the position in the component's
+/// `gizmos()` list. Values are in the object's LOCAL space.
+#[derive(Clone, Copy, Debug)]
+pub enum GizmoEdit {
+    /// Box resize: new half-extents (+ new local center for non-object-anchored
+    /// boxes; object-anchored boxes get `center` unchanged and the editor moves
+    /// the object instead).
+    Box {
+        index: usize,
+        half_extents: glam::Vec3,
+        center: glam::Vec3,
+    },
+    /// Range-sphere resize: new radius.
+    Range { index: usize, radius: f32 },
+}
+
+/// Editor viewport gizmos for a component. Default = none. A component lists the
+/// gizmos it wants via [`gizmos`](Gizmo::gizmos) and writes back resize edits via
+/// [`apply_gizmo_edit`](Gizmo::apply_gizmo_edit). Plugins implement this to get
+/// the same handles as the built-ins.
 pub trait Gizmo {
-    fn draw_gizmo(&self, _ctx: &GizmoCtx) {}
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        Vec::new()
+    }
+    fn apply_gizmo_edit(&mut self, _edit: GizmoEdit) {}
+}
+
+/// Probe/voxel point cloud for a `Points` gizmo, capped for display: strided
+/// down to a budget so a DENSE volume still shows a representative grid instead
+/// of nothing (the old hard cap just hid all points past ~4096). `None` only for
+/// an empty or absurdly large grid (generation guard). `positions` is generated
+/// lazily so the guard avoids building a huge vec.
+fn display_points(count: usize, positions: impl FnOnce() -> Vec<glam::Vec3>) -> Option<Vec<glam::Vec3>> {
+    const GEN_CAP: usize = 300_000; // don't even build a vec larger than this
+    const BUDGET: usize = 16_384; // max points actually drawn
+    if count == 0 || count > GEN_CAP {
+        return None;
+    }
+    let mut p = positions();
+    if p.len() > BUDGET {
+        let stride = p.len().div_ceil(BUDGET);
+        p = p.into_iter().step_by(stride).collect();
+    }
+    Some(p)
 }
 
 type InspectFn = fn(&mut dyn Component, &mut Ui, &InspectCtx) -> bool;
-type GizmoFn = fn(&dyn Component, &GizmoCtx);
+type GizmosFn = fn(&dyn Component) -> Vec<GizmoSpec>;
+type GizmoEditFn = fn(&mut dyn Component, GizmoEdit);
 
 /// Editor-side dispatch: component name -> inspector / gizmo. Built-ins
 /// register in [`Self::with_builtins`]; plugins register through their
@@ -185,7 +248,8 @@ type GizmoFn = fn(&dyn Component, &GizmoCtx);
 #[derive(Default)]
 pub struct EditorComponents {
     inspect: HashMap<&'static str, InspectFn>,
-    gizmo: HashMap<&'static str, GizmoFn>,
+    gizmos: HashMap<&'static str, GizmosFn>,
+    gizmo_edit: HashMap<&'static str, GizmoEditFn>,
 }
 
 impl EditorComponents {
@@ -194,6 +258,9 @@ impl EditorComponents {
         e.register::<CameraComponent>();
         e.register::<LightComponent>();
         e.register::<LightProbeVolume>();
+        e.register::<ReflectionProbe>();
+        e.register::<FluxVrLight>();
+        e.register::<FluxVolume>();
         e.register::<AudioSource>();
         e.register::<AudioListener>();
         e.register::<BoxCollider>();
@@ -218,11 +285,32 @@ impl EditorComponents {
                 .downcast_mut::<T>()
                 .is_some_and(|t| t.inspector_ui(ui, ictx))
         });
-        self.gizmo.insert(T::NAME, |c, ctx| {
-            if let Some(t) = c.as_any().downcast_ref::<T>() {
-                t.draw_gizmo(ctx);
+        self.gizmos.insert(T::NAME, |c| {
+            c.as_any()
+                .downcast_ref::<T>()
+                .map(|t| t.gizmos())
+                .unwrap_or_default()
+        });
+        self.gizmo_edit.insert(T::NAME, |c, edit| {
+            if let Some(t) = c.as_any_mut().downcast_mut::<T>() {
+                t.apply_gizmo_edit(edit);
             }
         });
+    }
+
+    /// A component's declared viewport gizmos (empty if unregistered/none).
+    pub fn gizmos(&self, component: &dyn Component) -> Vec<GizmoSpec> {
+        match self.gizmos.get(component.type_name()) {
+            Some(f) => f(component),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply a gizmo resize edit back to a component.
+    pub fn apply_gizmo_edit(&self, component: &mut dyn Component, edit: GizmoEdit) {
+        if let Some(f) = self.gizmo_edit.get(component.type_name()) {
+            f(component, edit);
+        }
     }
 
     /// Draw a component's inspector (no-op if unregistered).
@@ -233,12 +321,6 @@ impl EditorComponents {
         }
     }
 
-    /// Draw a component's viewport gizmo (no-op if unregistered).
-    pub fn draw_gizmo(&self, component: &dyn Component, ctx: &GizmoCtx) {
-        if let Some(f) = self.gizmo.get(component.type_name()) {
-            f(component, ctx);
-        }
-    }
 }
 
 #[derive(Default)]
@@ -664,7 +746,190 @@ impl Inspect for LightProbeVolume {
         changed
     }
 }
-impl Gizmo for LightProbeVolume {}
+impl Gizmo for LightProbeVolume {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        let mut g = vec![GizmoSpec::Box {
+            center: glam::Vec3::ZERO,
+            half_extents: glam::Vec3::from(self.size) * 0.5,
+            object_anchored: true,
+            blend: 0.0,
+            color: egui::Color32::from_rgb(120, 200, 255),
+        }];
+        if let Some(positions) = display_points(self.probe_count(), || self.local_positions()) {
+            g.push(GizmoSpec::Points {
+                positions,
+                color: egui::Color32::from_rgb(180, 225, 255),
+            });
+        }
+        g
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Box { half_extents, .. } = edit {
+            self.size = (half_extents * 2.0).to_array();
+        }
+    }
+}
+
+impl Inspect for ReflectionProbe {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        axis_row(ui, "Size", &mut self.size, &mut changed);
+        ui.horizontal(|ui| {
+            ui.label("Resolution");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let res_label = |r: u32| match r {
+                    8192 => "8K".to_string(),
+                    4096 => "4K".to_string(),
+                    2048 => "2K".to_string(),
+                    1024 => "1K".to_string(),
+                    other => format!("{other}"),
+                };
+                egui::ComboBox::from_id_salt("citrus-refl-probe-res")
+                    .selected_text(res_label(self.resolution))
+                    .show_ui(ui, |ui| {
+                        for r in [8192u32, 4096, 2048, 1024, 512, 256, 128, 64, 32] {
+                            changed |= ui
+                                .selectable_value(&mut self.resolution, r, res_label(r))
+                                .changed();
+                        }
+                    });
+            });
+        });
+        if self.resolution >= 4096 {
+            ui.label(
+                RichText::new("High resolutions cost a lot of VRAM and bake time (8K ≈ GBs).")
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 170, 110)),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                use citrus_core::ReflectionProbeMode as M;
+                egui::ComboBox::from_id_salt("citrus-refl-probe-mode")
+                    .selected_text(match self.mode {
+                        M::Realtime => "Realtime",
+                        M::Baked => "Baked",
+                    })
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut self.mode, M::Realtime, "Realtime")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(&mut self.mode, M::Baked, "Baked")
+                            .changed();
+                    });
+            });
+        });
+        if ui
+            .button("✨ Bake This Probe")
+            .on_hover_text("Capture this probe's cubemap from the current scene and save it as a .reflprobe sidecar")
+            .clicked()
+        {
+            self.bake_now = true;
+            // Not a serialized edit, but return changed so the engine's per-frame
+            // poll runs this frame.
+            changed = true;
+        }
+        property_row(ui, "Intensity", &mut changed, |ui| {
+            ui.add(egui::Slider::new(&mut self.intensity, 0.0..=2.0))
+        });
+        property_row(ui, "Blend distance", &mut changed, |ui| {
+            ui.add(egui::Slider::new(&mut self.blend_distance, 0.0..=10.0).suffix(" m"))
+        });
+        property_row(ui, "Importance", &mut changed, |ui| {
+            ui.add(egui::DragValue::new(&mut self.importance).range(-8..=8))
+        });
+        property_row(ui, "Box projection", &mut changed, |ui| {
+            ui.checkbox(&mut self.box_projection, "")
+        });
+        ui.label(
+            RichText::new(
+                "Box-projected cubemap reflection. Blend distance fades the probe to the \
+                 skybox (and to overlapping probes) inside the box edge; importance breaks \
+                 overlap ties. Recapture/bake from FluxBaker after editing the scene.",
+            )
+            .small()
+            .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for ReflectionProbe {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        vec![GizmoSpec::Box {
+            center: glam::Vec3::ZERO,
+            half_extents: glam::Vec3::from(self.size) * 0.5,
+            object_anchored: true,
+            blend: self.blend_distance.max(0.0),
+            color: egui::Color32::from_rgb(150, 220, 255),
+        }]
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Box { half_extents, .. } = edit {
+            self.size = (half_extents * 2.0).to_array();
+        }
+    }
+}
+
+impl Inspect for FluxVrLight {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Color");
+            changed |= ui.color_edit_button_rgb(&mut self.color).changed();
+        });
+        property_row(ui, "Intensity", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.intensity).speed(0.05).range(0.0..=64.0))
+        });
+        property_row(ui, "Range (m)", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.range).speed(0.1).range(0.1..=256.0))
+        });
+        changed
+    }
+}
+impl Gizmo for FluxVrLight {}
+
+impl Inspect for FluxVolume {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        axis_row(ui, "Size", &mut self.size, &mut changed);
+        property_row(ui, "Density (/m)", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.density).speed(0.05).range(0.05..=8.0))
+        });
+        let [x, y, z] = self.counts();
+        ui.horizontal(|ui| {
+            ui.label("Voxels");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("{x} × {y} × {z} = {}", x * y * z)).weak());
+            });
+        });
+        changed
+    }
+}
+impl Gizmo for FluxVolume {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        let mut g = vec![GizmoSpec::Box {
+            center: glam::Vec3::ZERO,
+            half_extents: glam::Vec3::from(self.size) * 0.5,
+            object_anchored: true,
+            blend: 0.0,
+            color: egui::Color32::from_rgb(170, 140, 255),
+        }];
+        if let Some(positions) = display_points(self.probe_count(), || self.local_positions()) {
+            g.push(GizmoSpec::Points {
+                positions,
+                color: egui::Color32::from_rgb(200, 170, 255),
+            });
+        }
+        g
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Box { half_extents, .. } = edit {
+            self.size = (half_extents * 2.0).to_array();
+        }
+    }
+}
 
 impl Inspect for AudioSource {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
@@ -727,7 +992,32 @@ impl Inspect for AudioSource {
         changed
     }
 }
-impl Gizmo for AudioSource {}
+impl Gizmo for AudioSource {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        vec![
+            GizmoSpec::Range {
+                center: glam::Vec3::ZERO,
+                radius: self.min_distance,
+                color: egui::Color32::from_rgb(120, 200, 255),
+            },
+            GizmoSpec::Range {
+                center: glam::Vec3::ZERO,
+                radius: self.max_distance,
+                color: egui::Color32::from_rgb(90, 140, 200),
+            },
+        ]
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Range { index, radius } = edit {
+            let r = radius.max(0.0);
+            match index {
+                0 => self.min_distance = r.min(self.max_distance),
+                1 => self.max_distance = r.max(self.min_distance),
+                _ => {}
+            }
+        }
+    }
+}
 
 impl Inspect for AudioListener {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
@@ -753,7 +1043,28 @@ impl Inspect for BoxCollider {
         changed
     }
 }
-impl Gizmo for BoxCollider {}
+impl Gizmo for BoxCollider {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        vec![GizmoSpec::Box {
+            center: glam::Vec3::from(self.center),
+            half_extents: glam::Vec3::from(self.size) * 0.5,
+            object_anchored: false,
+            blend: 0.0,
+            color: egui::Color32::from_rgb(240, 220, 70),
+        }]
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Box {
+            half_extents,
+            center,
+            ..
+        } = edit
+        {
+            self.size = (half_extents * 2.0).to_array();
+            self.center = center.to_array();
+        }
+    }
+}
 
 impl Inspect for SphereCollider {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
@@ -766,7 +1077,20 @@ impl Inspect for SphereCollider {
         changed
     }
 }
-impl Gizmo for SphereCollider {}
+impl Gizmo for SphereCollider {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        vec![GizmoSpec::Range {
+            center: glam::Vec3::from(self.center),
+            radius: self.radius,
+            color: egui::Color32::from_rgb(240, 220, 70),
+        }]
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Range { radius, .. } = edit {
+            self.radius = radius.max(0.0);
+        }
+    }
+}
 
 impl Inspect for MeshCollider {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {

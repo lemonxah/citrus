@@ -25,6 +25,8 @@ pub enum SpawnKind {
     Light(citrus_core::LightKind),
     LightProbeVolume,
     PostFxVolume,
+    ReflectionProbe,
+    FluxVolume,
     AudioSource,
     BoxCollider,
     SphereCollider,
@@ -42,6 +44,8 @@ impl SpawnKind {
             Self::Light(kind) => kind.label(),
             Self::LightProbeVolume => "Light Probe Volume",
             Self::PostFxVolume => "Post FX Volume",
+            Self::ReflectionProbe => "Reflection Probe",
+            Self::FluxVolume => "Flux Volume",
             Self::AudioSource => "Audio Source",
             Self::BoxCollider => "Box Collider",
             Self::SphereCollider => "Sphere Collider",
@@ -118,9 +122,30 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             response.spawn = Some(SpawnKind::LightProbeVolume);
             ui.close();
         }
+        if ui.button("Reflection Probe").clicked() {
+            response.spawn = Some(SpawnKind::ReflectionProbe);
+            ui.close();
+        }
+        if ui.button("Flux Volume").clicked() {
+            response.spawn = Some(SpawnKind::FluxVolume);
+            ui.close();
+        }
         if ui.button("Post FX Volume").clicked() {
             response.spawn = Some(SpawnKind::PostFxVolume);
             ui.close();
+        }
+    });
+    ui.menu_button("3D Object", |ui| {
+        for kind in [
+            SpawnKind::Cube,
+            SpawnKind::Sphere,
+            SpawnKind::Capsule,
+            SpawnKind::Plane,
+        ] {
+            if ui.button(kind.label()).clicked() {
+                response.spawn = Some(kind);
+                ui.close();
+            }
         }
     });
     if ui.button("Audio Source").clicked() {
@@ -137,17 +162,6 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             ui.close();
         }
     });
-    for kind in [
-        SpawnKind::Cube,
-        SpawnKind::Sphere,
-        SpawnKind::Capsule,
-        SpawnKind::Plane,
-    ] {
-        if ui.button(kind.label()).clicked() {
-            response.spawn = Some(kind);
-            ui.close();
-        }
-    }
 }
 
 #[derive(Default)]
@@ -157,11 +171,38 @@ pub struct ScenePanel {
     root_collapsed: bool,
     /// Inline rename in progress: (object index, edit buffer, focus-on-first-frame).
     renaming: Option<(usize, String, bool)>,
+    /// Full multi-selection (object indices). Synced from the engine's canonical
+    /// selection each frame via [`set_multi`], mutated here on ctrl/shift clicks,
+    /// and read back after `ui` when `selection_changed`. The `selected` anchor
+    /// (last-clicked) is passed in/out separately and is always also in `multi`.
+    multi: HashSet<usize>,
 }
 
 impl ScenePanel {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sync the multi-selection from the engine's canonical set before drawing.
+    pub fn set_multi(&mut self, set: impl IntoIterator<Item = usize>) {
+        self.multi = set.into_iter().collect();
+    }
+
+    /// The current multi-selection (read after `ui` when `selection_changed`).
+    pub fn multi(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.multi.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Indices of currently-collapsed rows (for persisting tree state).
+    pub fn collapsed_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.collapsed.iter().copied()
+    }
+
+    /// Restore the collapsed-row set (from the saved scene tree state).
+    pub fn set_collapsed(&mut self, set: impl IntoIterator<Item = usize>) {
+        self.collapsed = set.into_iter().collect();
     }
 
     pub fn ui(
@@ -202,6 +243,12 @@ impl ScenePanel {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Background click sensor over the whole tree, registered BEFORE
+                // the rows so the rows (drawn after) take hit priority — a click
+                // that lands here (empty space) clears the selection. More
+                // reliable than a trailing rect, which can be mis-sized.
+                let deselect_bg =
+                    ui.interact(ui.max_rect(), ui.id().with("tree-deselect-bg"), Sense::click());
                 // Root "Scene" node: everything lives under it; dropping a
                 // row here unparents it, clicking toggles the whole tree.
                 let root = self.row_widget(
@@ -280,6 +327,15 @@ impl ScenePanel {
                         .unwrap_or(false)
                 {
                     response.import_model = Some((*payload).clone());
+                }
+                // A left-click on empty tree space (not on a row) clears the
+                // selection. `deselect_bg` covers the area around rows; `bg` is
+                // the trailing rect that fills the (often large) area BELOW the
+                // last row and sits on top there — so check both.
+                if deselect_bg.clicked() || bg.clicked() {
+                    *selected = None;
+                    self.multi.clear();
+                    response.selection_changed = true;
                 }
                 bg.context_menu(|ui| spawn_menu(ui, &mut response));
             });
@@ -440,7 +496,8 @@ impl ScenePanel {
         response: &mut ScenePanelResponse,
     ) {
         let row_data = &rows[index];
-        let is_selected = *selected == Some(index);
+        // Highlight the anchor AND every multi-selected row.
+        let is_selected = *selected == Some(index) || self.multi.contains(&index);
         let collapsed = self.collapsed.contains(&index);
 
         // Inline rename editor in place of the normal row.
@@ -543,7 +600,42 @@ impl ScenePanel {
                     self.collapsed.remove(&index);
                 }
             } else {
-                *selected = if is_selected { None } else { Some(index) };
+                let mods = ui.input(|i| i.modifiers);
+                if mods.command {
+                    // Ctrl/Cmd: toggle this row in/out of the multi-selection.
+                    if self.multi.contains(&index) && self.multi.len() > 1 {
+                        self.multi.remove(&index);
+                        // Keep the anchor valid (any remaining member).
+                        if *selected == Some(index) {
+                            *selected = self.multi.iter().next().copied();
+                        }
+                    } else {
+                        self.multi.insert(index);
+                        *selected = Some(index);
+                    }
+                } else if mods.shift {
+                    // Shift: select the index range between the anchor and here
+                    // (scene-order approximation of "everything in between").
+                    if let Some(a) = *selected {
+                        let (lo, hi) = (a.min(index), a.max(index));
+                        for i in lo..=hi {
+                            self.multi.insert(i);
+                        }
+                    }
+                    self.multi.insert(index);
+                    *selected = Some(index);
+                } else {
+                    // Plain click: single-select (clear the multi-selection). A
+                    // click on the lone selection toggles it off.
+                    let only = self.multi.len() <= 1 && *selected == Some(index);
+                    self.multi.clear();
+                    if only {
+                        *selected = None;
+                    } else {
+                        self.multi.insert(index);
+                        *selected = Some(index);
+                    }
+                }
                 response.selection_changed = true;
             }
         }

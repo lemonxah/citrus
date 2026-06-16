@@ -242,22 +242,32 @@ where
 /// How the realtime-GI probe trace is computed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum GiMode {
-    /// Hardware ray-query (RT cores) against the scene BVH. Most accurate.
+    /// FluxRT: hardware ray-query (RT cores) against the scene BVH. Most accurate.
+    /// (Legacy scenes named this `Hardware`/`RayQuery`.)
     #[default]
-    RayQuery,
-    /// Software ray-marching of per-mesh signed distance fields (no RT cores,
-    /// runs anywhere).
-    Software,
+    #[serde(alias = "Hardware", alias = "RayQuery")]
+    FluxRT,
+    /// Flux: software ray-marching of per-mesh signed distance fields (no RT
+    /// cores, runs anywhere). (Legacy scenes named this `Software`.)
+    #[serde(alias = "Software")]
+    Flux,
+    /// FluxVoxel: analytic voxel light volume (no ray tracing). Injects lights +
+    /// emissive into an SH-L1 probe grid every frame — cheapest backend, built
+    /// for VR. Static + dynamic meshes read it; dynamic lights mix in live.
+    /// (Older scenes named this `FluxVR`.)
+    #[serde(alias = "FluxVR")]
+    FluxVoxel,
 }
 
 impl GiMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::RayQuery => "Hardware (RT cores)",
-            Self::Software => "Software (SDF)",
+            Self::FluxRT => "FluxRT (hardware)",
+            Self::Flux => "Flux (software)",
+            Self::FluxVoxel => "FluxVoxel",
         }
     }
-    pub const ALL: [GiMode; 2] = [Self::RayQuery, Self::Software];
+    pub const ALL: [GiMode; 3] = [Self::FluxRT, Self::Flux, Self::FluxVoxel];
 }
 
 /// Flux quality preset. Drives per-frame samples-per-probe and the march step
@@ -392,7 +402,7 @@ impl Default for RealtimeGi {
             ssr_max_distance: 40.0,
             ssr_roughness_cutoff: 0.6,
             reflection_mode: 1,
-            mode: GiMode::Software,
+            mode: GiMode::Flux,
             samples: 64,
             probe_spacing: 1.0,
             temporal_blend: 0.12,
@@ -423,8 +433,11 @@ impl Default for BakeSettings {
     fn default() -> Self {
         Self {
             texel_density: 16.0,
-            bounces: 2,
-            samples: 128,
+            // High-quality multi-bounce by default (the FluxBaker slider goes to 8):
+            // 6 bounces + plenty of paths per texel so the indirect settles to a
+            // clean, good-looking lightmap rather than a noisy 1–2-bounce preview.
+            bounces: 6,
+            samples: 256,
             max_lightmap: 512,
         }
     }
@@ -479,6 +492,23 @@ pub struct SceneFile {
     /// Scene environment / world lighting.
     #[serde(default)]
     pub environment: WorldEnvironment,
+    /// Last editor (fly-cam) viewpoint, restored on open so the scene reopens
+    /// framed the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_camera: Option<EditorCamera>,
+    /// Object ids whose hierarchy row was COLLAPSED in the scene tree, so the
+    /// tree reopens in the same expanded/collapsed state. (Stored as collapsed
+    /// since the default is expanded.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<String>,
+}
+
+/// Saved editor fly-camera pose (mirrors `FlyCamera`'s position/yaw/pitch).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct EditorCamera {
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 #[cfg(test)]
@@ -503,7 +533,7 @@ mod rgi_compat_tests {
         let with_mode: WorldEnvironment =
             ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:(enabled:true,mode:Software,bounces:2,samples:64,intensity:1.0,probe_spacing:2.0,temporal_blend:0.12,update_interval:0.2))")
                 .expect("struct form with mode enum must parse");
-        assert_eq!(with_mode.realtime_gi.mode, GiMode::Software);
+        assert_eq!(with_mode.realtime_gi.mode, GiMode::Flux);
     }
 }
 

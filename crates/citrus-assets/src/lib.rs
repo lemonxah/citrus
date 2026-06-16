@@ -15,6 +15,7 @@ mod project_file;
 mod scene_file;
 mod shader_file;
 mod skeleton;
+mod tex_cache;
 
 pub use asset_meta::{
     AssetMeta, ImporterSettings, META_EXT, ModelImport, load_asset_meta,
@@ -42,10 +43,11 @@ pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
 pub use scene_file::{
-    ComponentData, FluxQuality, GiMode, MaterialRef, ObjectSource, PrimitiveShape, ProbeFallback,
-    RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile, WorldEnvironment,
-    load_scene_file, save_scene_file,
+    ComponentData, EditorCamera, FluxQuality, GiMode, MaterialRef, ObjectSource, PrimitiveShape,
+    ProbeFallback, RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile,
+    WorldEnvironment, load_scene_file, save_scene_file,
 };
+pub use tex_cache::load_texture_bc;
 pub use shader_file::{
     SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,
     ShaderSource, compile_shader, load_shader_file, parse_shader_source,

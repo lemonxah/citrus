@@ -3,3 +3,5 @@ example-game
 *.lightmap
 target
 **/*.spv
+.citrus_texcache
+**/.citrus_texcache

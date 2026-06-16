@@ -23,10 +23,13 @@ pub use code_editor::{
 // ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
 // citrus-core. Import those directly, not through the editor.
 pub use components::{
-    ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoCtx, Inspect,
-    InspectCtx, components_ui,
+    ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoEdit,
+    GizmoSpec, Inspect, InspectCtx, components_ui,
 };
 pub use file_browser::{FileBrowser, FileBrowserResponse};
+/// Re-export the icon font so the engine's editor UI can use the same glyphs
+/// (no emojis) the file browser does.
+pub use egui_phosphor;
 
 /// Register the Phosphor icon font with egui so the file browser (and any UI)
 /// can render its icon glyphs. Call once at startup.

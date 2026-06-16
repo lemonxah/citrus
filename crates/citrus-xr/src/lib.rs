@@ -24,6 +24,10 @@ pub struct XrContext {
     pub system_name: String,
     pub orientation_tracking: bool,
     pub position_tracking: bool,
+    /// `XR_KHR_convert_timespec_time` available → `Instance::now()` is safe.
+    time_supported: bool,
+    /// `XR_HTCX_vive_tracker_interaction` available → suggest tracker bindings.
+    tracker_supported: bool,
 }
 
 impl XrContext {
@@ -52,9 +56,18 @@ impl XrContext {
 
         let mut extensions = openxr::ExtensionSet::default();
         extensions.khr_vulkan_enable2 = true;
+        // Instance::now() (used to timestamp head/tracker pose lookups) needs the
+        // timespec-conversion extension on Linux runtimes; enabling it avoids the
+        // `KHR_convert_timespec_time not loaded` panic. Tracked so the pose readers
+        // can fall back gracefully if a runtime lacks it.
+        let time_supported = available.khr_convert_timespec_time;
+        if time_supported {
+            extensions.khr_convert_timespec_time = true;
+        }
         // SteamVR/Vive full-body trackers (waist/feet) come through this
         // extension; enable it when the runtime offers it.
-        if available.htcx_vive_tracker_interaction {
+        let tracker_supported = available.htcx_vive_tracker_interaction;
+        if tracker_supported {
             extensions.htcx_vive_tracker_interaction = true;
         }
 
@@ -98,6 +111,8 @@ impl XrContext {
             system_name: props.system_name.clone(),
             orientation_tracking: props.tracking_properties.orientation_tracking,
             position_tracking: props.tracking_properties.position_tracking,
+            time_supported,
+            tracker_supported,
         }))
     }
 
@@ -123,9 +138,32 @@ impl XrContext {
             .instance
             .graphics_requirements::<openxr::Vulkan>(self.system)
             .context("OpenXR Vulkan graphics requirements")?;
+        // With XR_KHR_vulkan_enable2 the runtime MANDATES a call to
+        // xrGetVulkanGraphicsDevice2KHR before xrCreateSession (it validates both
+        // that the call happened AND that the session uses the device it returns —
+        // the HMD's GPU). Skipping it is the `XR_ERROR_VALIDATION_FAILURE: Has not
+        // called xrGetVulkanGraphicsDevice2KHR` seen on WiVRn/Monado/SteamVR.
+        let vk_instance_ptr = vk_instance as usize as *const std::ffi::c_void;
+        let xr_physical_device = unsafe {
+            self.instance
+                .vulkan_graphics_device(self.system, vk_instance_ptr)
+        }
+        .context("xrGetVulkanGraphicsDevice2KHR")?;
+        // On a single-GPU machine this equals the renderer's pick. If it differs
+        // (multi-GPU laptop, HMD on the dGPU), the renderer's VkDevice was built on
+        // the wrong GPU and the session will still fail — the real fix is to create
+        // the renderer on this device. Warn so that's diagnosable.
+        let our_physical_device = vk_physical_device as usize as *const std::ffi::c_void;
+        if xr_physical_device != our_physical_device {
+            tracing::warn!(
+                "OpenXR requires a different Vulkan physical device than the renderer \
+                 selected (multi-GPU?). The renderer must be created on the HMD's GPU; \
+                 the session create below will likely fail until then."
+            );
+        }
         let info = openxr::vulkan::SessionCreateInfo {
-            instance: vk_instance as usize as *const std::ffi::c_void,
-            physical_device: vk_physical_device as usize as *const std::ffi::c_void,
+            instance: vk_instance_ptr,
+            physical_device: xr_physical_device,
             device: vk_device as usize as *const std::ffi::c_void,
             queue_family_index,
             queue_index: 0,
@@ -207,7 +245,8 @@ impl XrContext {
                 ],
             );
         }
-        if let (Ok(w), Ok(lf), Ok(rf)) = (
+        if let (true, Ok(w), Ok(lf), Ok(rf)) = (
+            self.tracker_supported,
             path("/user/vive_tracker_htcx/role/waist/input/grip/pose"),
             path("/user/vive_tracker_htcx/role/left_foot/input/grip/pose"),
             path("/user/vive_tracker_htcx/role/right_foot/input/grip/pose"),
@@ -231,7 +270,7 @@ impl XrContext {
             path("/user/hand/left/input/squeeze/value"),
             path("/user/hand/right/input/squeeze/value"),
             path("/user/hand/right/input/trigger/value"),
-            path("/user/hand/right/input/a/click"),
+            path("/user/hand/left/input/y/click"),
             path("/user/hand/left/input/aim/pose"),
             path("/user/hand/right/input/aim/pose"),
         ) {
@@ -289,6 +328,7 @@ impl XrContext {
             swap_images: Vec::new(),
             view_extent: (0, 0),
             blend_mode: openxr::EnvironmentBlendMode::OPAQUE,
+            time_supported: self.time_supported,
         })
     }
 }
@@ -350,6 +390,8 @@ pub struct XrSession {
     swap_images: Vec<Vec<u64>>,
     view_extent: (u32, u32),
     blend_mode: openxr::EnvironmentBlendMode,
+    /// `Instance::now()` is only safe when `XR_KHR_convert_timespec_time` loaded.
+    time_supported: bool,
 }
 
 /// One XR frame's per-eye render targets + view/projection (from [`begin_frame`]).
@@ -455,7 +497,7 @@ impl XrSession {
     /// All tracked full-body poses this frame (head + hands + waist + feet) in
     /// the stage space. Feed straight into `citrus_core::TrackerTargets`.
     pub fn body_poses(&self) -> BodyPoses {
-        if !self.running {
+        if !self.running || !self.time_supported {
             return BodyPoses::default();
         }
         let Ok(time) = self.instance.now() else {
@@ -634,7 +676,7 @@ impl XrSession {
     /// The headset pose (position + orientation) in the stage reference space, or
     /// `None` if not yet tracking. Feed into `citrus_core::TrackerTargets::head`.
     pub fn head_pose(&self) -> Option<(glam::Vec3, glam::Quat)> {
-        if !self.running {
+        if !self.running || !self.time_supported {
             return None;
         }
         let time = self.instance.now().ok()?;

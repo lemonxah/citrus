@@ -60,6 +60,15 @@ pub struct FileBrowser {
     /// Per-file LSP problem tally (errors, warnings), refreshed each frame from
     /// the engine. Used to badge files (and aggregate onto folders).
     diags: std::collections::HashMap<PathBuf, (u32, u32)>,
+    /// Multi-selection of grid entries (ctrl = add/toggle, shift = range from the
+    /// anchor). Synced from the engine each frame via [`set_multi`]; the anchor
+    /// (last single/ctrl click) is `response.clicked`.
+    multi: HashSet<PathBuf>,
+    /// Anchor for shift-range selection (last non-shift click).
+    last_click: Option<PathBuf>,
+    /// Current grid order (dirs then files) of the visible folder, so shift can
+    /// resolve the range between two entries. Rebuilt each frame in `grid_ui`.
+    order: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -83,6 +92,8 @@ pub struct FileBrowserResponse {
     pub delete: Option<PathBuf>,
     /// Image file requested to become the scene skybox.
     pub set_skybox: Option<PathBuf>,
+    /// Empty space in the grid was clicked — clear the current file selection.
+    pub clear_selection: bool,
 }
 
 impl FileBrowser {
@@ -99,7 +110,20 @@ impl FileBrowser {
             thumb_budget: 0,
             tile_px: TILE.x,
             diags: std::collections::HashMap::new(),
+            multi: HashSet::new(),
+            last_click: None,
+            order: Vec::new(),
         }
+    }
+
+    /// Sync the multi-selection from the engine's canonical set before drawing.
+    pub fn set_multi(&mut self, set: impl IntoIterator<Item = PathBuf>) {
+        self.multi = set.into_iter().collect();
+    }
+
+    /// The current multi-selection of files (read after `ui`).
+    pub fn multi(&self) -> Vec<PathBuf> {
+        self.multi.iter().cloned().collect()
     }
 
     /// Thumbnail texture for an image file, decoded + downscaled on first use
@@ -290,6 +314,11 @@ impl FileBrowser {
                             rest.set_height(rest.height().max(24.0));
                             ui.allocate_rect(rest, Sense::hover());
                         });
+                    // A click that landed on empty grid space (no tile consumed
+                    // it) clears the selection.
+                    if scope.response.clicked() && response.clicked.is_none() {
+                        response.clear_selection = true;
+                    }
                     scope.response.context_menu(|ui| {
                         self.paste_button(ui, &dir, &mut response);
                         self.create_menu(ui, &dir, &mut response);
@@ -439,6 +468,9 @@ impl FileBrowser {
             ui.label(RichText::new("Empty folder").weak());
             return;
         }
+        // Record the visible order (dirs then files) so shift-range can resolve
+        // the span between the anchor and the shift-clicked entry.
+        self.order = dirs.iter().chain(files.iter()).cloned().collect();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             for path in dirs {
@@ -466,7 +498,7 @@ impl FileBrowser {
         if !ui.is_rect_visible(rect) {
             return;
         }
-        let is_selected = selected == Some(path);
+        let is_selected = selected == Some(path) || self.multi.contains(path);
         if is_selected {
             ui.painter()
                 .rect_filled(rect, 6.0, ui.visuals().selection.bg_fill);
@@ -646,7 +678,33 @@ impl FileBrowser {
             // Single-click selects a file *or folder* (so folders can be
             // deleted / copied / duplicated / renamed); double-click still enters
             // a folder. The selection shows in the Inspector.
-            response.clicked = Some(path.to_owned());
+            //
+            // Ctrl/Cmd = toggle into the multi-selection; Shift = select the range
+            // between the anchor and here (in visible grid order); plain = single.
+            let mods = ui.input(|i| i.modifiers);
+            let owned = path.to_owned();
+            if mods.command {
+                if !self.multi.remove(&owned) {
+                    self.multi.insert(owned.clone());
+                }
+                self.last_click = Some(owned.clone());
+            } else if mods.shift {
+                if let Some(anchor) = &self.last_click {
+                    let ia = self.order.iter().position(|p| p == anchor);
+                    let ib = self.order.iter().position(|p| p == &owned);
+                    if let (Some(ia), Some(ib)) = (ia, ib) {
+                        let (lo, hi) = (ia.min(ib), ia.max(ib));
+                        let span: Vec<PathBuf> = self.order[lo..=hi].to_vec();
+                        self.multi.extend(span);
+                    }
+                }
+                self.multi.insert(owned.clone());
+            } else {
+                self.multi.clear();
+                self.multi.insert(owned.clone());
+                self.last_click = Some(owned.clone());
+            }
+            response.clicked = Some(owned);
         }
         if is_dir {
             if let Some(payload) = tile.dnd_release_payload::<PathBuf>() {
@@ -865,7 +923,14 @@ impl FileBrowser {
 /// Returns `None` for an unreadable / unsupported file (caller shows a glyph).
 fn decode_thumb(path: &Path) -> Option<egui::ColorImage> {
     let img = image::open(path).ok().or_else(|| decode_exr_fallback(path))?;
-    let rgba = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgba8();
+    let mut rgba = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgba8();
+    // EXR/HDR sources frequently decode with no alpha channel (alpha = 0), which
+    // would render the whole thumbnail transparent. Force opaque so the preview
+    // actually shows. (Data maps like normal/roughness preview as their raw
+    // linear values — fine for a thumbnail.)
+    for px in rgba.pixels_mut() {
+        px[3] = 255;
+    }
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }

@@ -12,6 +12,7 @@ gltf.workspace = true
 ufbx.workspace = true
 image.workspace = true
 half.workspace = true
+intel_tex_2.workspace = true
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true

@@ -97,6 +97,12 @@ pub struct MaterialEntry {
     pub model: MaterialModel,
     pub default: MaterialModel,
     pub handle: MaterialHandle,
+    /// Mean LINEAR RGB of the emission map, cached at apply_material. Scales the
+    /// GI emitter + RT-reflection emission so a mostly-black map (e.g. a glowing
+    /// visor only) doesn't act as a uniform full-mesh light. `[1,1,1]` = no map.
+    /// Derived/runtime only — deliberately NOT on `MaterialModel`, so it stays
+    /// out of edit/dirty detection (PartialEq) and undo snapshots.
+    pub emission_map_mean: [f32; 3],
     /// Set when this material came from (or was saved to) a `.material` file.
     pub file: Option<PathBuf>,
     /// True for imported-model materials whose textures came embedded in the
@@ -174,6 +180,11 @@ pub struct LoadedScene {
     model_mesh_base: HashMap<PathBuf, usize>,
     material_file_cache: HashMap<PathBuf, usize>,
     texture_file_cache: HashMap<(PathBuf, bool), TextureHandle>,
+    /// Mean LINEAR RGB per emission-map file, used to scale GI emitters so a
+    /// mostly-black map doesn't flood the scene. Computed once per file.
+    emission_mean_cache: HashMap<PathBuf, [f32; 3]>,
+    /// Mean `.r` coverage per emission-mask file (same purpose, scalar).
+    emission_mask_mean_cache: HashMap<PathBuf, f32>,
     /// Project-relative equirectangular skybox image (None = procedural sky).
     pub skybox: Option<String>,
     /// World lighting / environment (ambient + sun + skybox toggle).
@@ -196,6 +207,10 @@ pub struct ProbeVolumeMeta {
     pub counts: [usize; 3],
     /// First probe index (into `BakedData.probe_sh`) for this volume.
     pub sh_base: usize,
+    /// True for FluxVR voxel volumes (baked from Flux VR Lights). At runtime
+    /// these are owned by `realtime_gi::update_fluxvr` (it seeds its static base
+    /// from them, then adds dynamic lights), NOT uploaded as plain DDGI probes.
+    pub fluxvr: bool,
 }
 
 /// Baked lighting, kept on the scene and pushed to the renderer for runtime.
@@ -247,6 +262,8 @@ impl LoadedScene {
             model_mesh_base: HashMap::new(),
             material_file_cache: HashMap::new(),
             texture_file_cache: HashMap::new(),
+            emission_mean_cache: HashMap::new(),
+            emission_mask_mean_cache: HashMap::new(),
             skybox: None,
             environment: citrus_assets::WorldEnvironment::default(),
             baked: None,
@@ -274,11 +291,14 @@ impl LoadedScene {
     /// current bake settings: `texel_density × world AABB`, clamped to
     /// `max_lightmap`. 0 if it has no mesh. Used by the UV-checker preview and
     /// the bake.
-    pub fn lightmap_size_for(&self, i: usize) -> u32 {
+    /// Lightmap resolution for object `i`, reusing an already-computed world
+    /// matrix so the per-frame `sync_draws` pass doesn't re-walk each parent chain
+    /// just to re-derive a scale it already has (from `world_transforms`).
+    pub fn lightmap_size_for_world(&self, i: usize, world: Mat4) -> u32 {
         let Some(render) = self.objects[i].render else {
             return 0;
         };
-        let scale = self.world_transform(i).to_scale_rotation_translation().0;
+        let scale = world.to_scale_rotation_translation().0;
         let (min, max) = self.mesh_bounds[render.mesh];
         let extent = (max - min) * scale;
         let max_extent = extent.x.max(extent.y).max(extent.z).max(0.01);
@@ -304,6 +324,44 @@ impl LoadedScene {
             guard += 1;
         }
         m
+    }
+
+    /// World transform of every object, computed in ONE O(n) memoized pass
+    /// instead of `world_transform(i)` per object (which re-walks each parent
+    /// chain → O(n·depth) when called for the whole scene every frame). Each
+    /// entry is `parent_world * local`, resolving parents on demand with a
+    /// recursion guard (cycles / dangling parents fall back to the local
+    /// transform, matching `world_transform`'s break-out behaviour).
+    pub fn world_transforms(&self) -> Vec<Mat4> {
+        let n = self.objects.len();
+        // 0 = unvisited, 1 = in-progress (cycle sentinel), 2 = done.
+        let mut state = vec![0u8; n];
+        let mut out = vec![Mat4::IDENTITY; n];
+        for i in 0..n {
+            self.resolve_world(i, &mut state, &mut out);
+        }
+        out
+    }
+
+    fn resolve_world(&self, i: usize, state: &mut [u8], out: &mut [Mat4]) -> Mat4 {
+        if state[i] == 2 {
+            return out[i];
+        }
+        let local = self.objects[i].local_transform();
+        // Mark in-progress so a cycle reaching back to `i` falls back to local
+        // (the `state[p] != 1` guard below) instead of recursing forever.
+        state[i] = 1;
+        // In-progress parent (cycle) or root/dangling parent → treat local as world.
+        let world = match self.objects[i].parent {
+            Some(p) if p < out.len() && p != i && state[p] != 1 => {
+                let pw = self.resolve_world(p, state, out);
+                pw * local
+            }
+            _ => local,
+        };
+        state[i] = 2;
+        out[i] = world;
+        world
     }
 
     /// World-space bounds of an object: (center, radius). Used for F-focus.
@@ -482,6 +540,7 @@ impl LoadedScene {
             default: model.clone(),
             model,
             handle,
+            emission_map_mean: [1.0; 3],
             file: None,
             embedded_textures: false,
             base_textures: TexSlots::default(),
@@ -647,6 +706,7 @@ impl LoadedScene {
                 default: model.clone(),
                 model,
                 handle,
+                emission_map_mean: [1.0; 3],
                 file: None,
                 embedded_textures: material.albedo.is_some()
                     || material.normal.is_some()
@@ -726,6 +786,158 @@ impl LoadedScene {
         Ok(())
     }
 
+    /// Like `add_asset_scene` but the meshes/textures were already uploaded on a
+    /// loader thread and installed into the renderer at `mesh_base_g`/`tex_base_g`
+    /// (renderer-global indices), with `skinned` flagging skinned meshes. Builds
+    /// the scene metadata + materials + objects on the main thread (no uploads).
+    pub fn add_installed_asset(
+        &mut self,
+        renderer: &mut Renderer,
+        scene: &citrus_assets::Scene,
+        mesh_handles: &[MeshHandle],
+        tex_handles: &[TextureHandle],
+        skinned: &[bool],
+        source_path: Option<&Path>,
+    ) -> Result<()> {
+        let mesh_base = self.mesh_handles.len();
+        if let Some(path) = source_path {
+            self.model_mesh_base.insert(path.to_owned(), mesh_base);
+        }
+        let textures: &[TextureHandle] = tex_handles;
+        let skel_base = self.skeletons.len();
+        self.skeletons.extend(scene.skeletons.iter().cloned());
+        self.animations.extend(scene.animations.iter().cloned());
+        for (i, mesh) in scene.meshes.iter().enumerate() {
+            self.mesh_handles.push(mesh_handles[i]);
+            if skinned.get(i).copied().unwrap_or(false) {
+                self.skinned_meshes.push(SkinnedMesh {
+                    mesh_index: self.mesh_handles.len() - 1,
+                    base_vertices: mesh.vertices.clone(),
+                    skeleton: skel_base,
+                });
+            }
+            self.mesh_geometry.push((
+                mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
+                mesh.indices.clone(),
+            ));
+            self.mesh_sdf.push(None);
+            self.mesh_infos.push(MeshInfo {
+                vertices: mesh.vertices.len() as u32,
+                triangles: mesh.indices.len() as u32 / 3,
+            });
+            let mut min = Vec3::splat(f32::INFINITY);
+            let mut max = Vec3::splat(f32::NEG_INFINITY);
+            for v in &mesh.vertices {
+                min = min.min(Vec3::from(v.position));
+                max = max.max(Vec3::from(v.position));
+            }
+            self.mesh_bounds.push((min, max));
+        }
+
+        let material_base = self.materials.len();
+        for material in &scene.materials {
+            let desc = MaterialDesc {
+                name: material.name.clone(),
+                params: material.params,
+                features: material.features,
+                albedo: material.albedo.map(|i| textures[i]),
+                normal: material.normal.map(|i| textures[i]),
+                orm: material.orm.map(|i| textures[i]),
+                emission: material.emission.map(|i| textures[i]),
+                error: false,
+                ..Default::default()
+            };
+            let handle = renderer.create_material(&desc)?;
+            let model = model_from_material(
+                &material.name,
+                &material.params,
+                &material.features,
+                material.normal.is_some(),
+            );
+            let mut base_textures = TexSlots::default();
+            base_textures[0] = material.albedo.map(|i| textures[i]);
+            base_textures[1] = material.normal.map(|i| textures[i]);
+            base_textures[2] = material.orm.map(|i| textures[i]);
+            base_textures[3] = material.emission.map(|i| textures[i]);
+            self.materials.push(MaterialEntry {
+                default: model.clone(),
+                model,
+                handle,
+                emission_map_mean: [1.0; 3],
+                file: None,
+                embedded_textures: material.albedo.is_some()
+                    || material.normal.is_some()
+                    || material.orm.is_some()
+                    || material.emission.is_some(),
+                base_textures,
+                bound_textures: base_textures,
+            });
+        }
+
+        let root_index = self.objects.len();
+        let root_name = source_path
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Model".to_string());
+        self.objects.push(SceneObject {
+            id: ObjectId::new(),
+            name: root_name,
+            render: None,
+            extra_render: Vec::new(),
+            source: ObjectSource::Empty,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            parent: None,
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            components: Vec::new(),
+        });
+        for instance in &scene.instances {
+            let Some(&slot0) = instance.slots.first() else {
+                continue;
+            };
+            let (scale, rotation, translation) = instance.transform.to_scale_rotation_translation();
+            let render = RenderInfo {
+                mesh: mesh_base + slot0.mesh,
+                material: material_base + slot0.material,
+            };
+            let extra_render: Vec<RenderInfo> = instance.slots[1..]
+                .iter()
+                .map(|s| RenderInfo {
+                    mesh: mesh_base + s.mesh,
+                    material: material_base + s.material,
+                })
+                .collect();
+            let extra_meshes: Vec<usize> = instance.slots[1..].iter().map(|s| s.mesh).collect();
+            let source = match source_path {
+                Some(path) => ObjectSource::Model {
+                    path: path.to_string_lossy().into_owned(),
+                    mesh: slot0.mesh,
+                    extra_meshes,
+                },
+                None => ObjectSource::Builtin { mesh: slot0.mesh },
+            };
+            self.objects.push(SceneObject {
+                id: ObjectId::new(),
+                name: instance.name.clone(),
+                render: Some(render),
+                extra_render,
+                source,
+                enabled: true,
+                static_geometry: false,
+                lightmap_scale: 1.0,
+                parent: Some(root_index),
+                translation,
+                rotation,
+                scale,
+                components: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
     /// Load (or fetch cached) a `.material` file as a material entry.
     /// Returns the material index. Broken files yield an error-shader
     /// material so the problem is visible in the viewport.
@@ -769,6 +981,7 @@ impl LoadedScene {
                     default: model.clone(),
                     model,
                     handle,
+                    emission_map_mean: [1.0; 3],
                     file: Some(path.to_owned()),
                     embedded_textures: false,
                     base_textures: TexSlots::default(),
@@ -881,6 +1094,7 @@ impl LoadedScene {
             default: model.clone(),
             model,
             handle,
+            emission_map_mean: [1.0; 3],
             file: Some(path.to_owned()),
             embedded_textures: false,
             base_textures: TexSlots::default(),
@@ -940,6 +1154,43 @@ impl LoadedScene {
 
     /// Push one material's inspector model into the renderer, resolving its
     /// shader (compiling custom shaders on first use).
+    /// Mean LINEAR RGB of an emission map (project-relative), cached per file.
+    /// `None` (no map) → `[1,1,1]`: the whole surface emits, so the emitter uses
+    /// the full emission colour. A load error is treated the same (no scaling).
+    fn emission_map_mean(&mut self, project_root: &Path, rel: Option<&PathBuf>) -> [f32; 3] {
+        let Some(rel) = rel else { return [1.0; 3] };
+        let abs = project_root.join(rel);
+        if let Some(m) = self.emission_mean_cache.get(&abs) {
+            return *m;
+        }
+        // Emission maps are colour data (loaded sRGB), so decode to linear before
+        // averaging — matching what the shader samples.
+        let mean = match citrus_assets::load_texture_file(&abs, true) {
+            Ok(data) => texture_mean_linear(&data),
+            Err(_) => [1.0; 3],
+        };
+        self.emission_mean_cache.insert(abs, mean);
+        mean
+    }
+
+    /// Mean coverage of the emission MASK's `.r` channel (linear data, so no sRGB
+    /// decode), cached by path. `None` (no mask) → `1.0`: the whole emission map
+    /// applies. Multiplied into the emitter flux alongside the emission-map mean
+    /// so a small masked emissive region produces a proportionally dim GI light.
+    fn emission_mask_mean(&mut self, project_root: &Path, rel: Option<&PathBuf>) -> f32 {
+        let Some(rel) = rel else { return 1.0 };
+        let abs = project_root.join(rel);
+        if let Some(m) = self.emission_mask_mean_cache.get(&abs) {
+            return *m;
+        }
+        let mean = match citrus_assets::load_texture_file(&abs, false) {
+            Ok(data) => texture_mean_linear(&data)[0],
+            Err(_) => 1.0,
+        };
+        self.emission_mask_mean_cache.insert(abs, mean);
+        mean
+    }
+
     pub fn apply_material(
         &mut self,
         renderer: &mut Renderer,
@@ -962,6 +1213,23 @@ impl LoadedScene {
         // assigned (slot 1), and disables it again when cleared.
         self.materials[index].model.has_normal_texture = slots[1].is_some();
 
+        // Cache the emission map's mean linear colour so the GI emitter can scale
+        // its flux by how much of the surface actually emits (a mostly-black map
+        // → a dim, visor-tinted emitter, not a uniform full-mesh light). The
+        // emission MASK modulates emission the same way in the shader, so fold its
+        // coverage (mean of the .r channel) into the same factor — otherwise a
+        // small masked emissive region still acts as a full-flux GI emitter.
+        let emission_path = self.materials[index].model.textures.emission.clone();
+        let mask_path = self.materials[index].model.textures.emission_mask.clone();
+        let map_mean = self.emission_map_mean(project_root, emission_path.as_ref());
+        let mask_mean = self.emission_mask_mean(project_root, mask_path.as_ref());
+        let emission_mean = [
+            map_mean[0] * mask_mean,
+            map_mean[1] * mask_mean,
+            map_mean[2] * mask_mean,
+        ];
+        self.materials[index].emission_map_mean = emission_mean;
+
         let entry = &self.materials[index];
         let m = &entry.model;
         let params = renderer.material_params_mut(handle);
@@ -973,8 +1241,17 @@ impl LoadedScene {
         params.pbr_toon_blend = m.pbr_toon_blend;
         params.emission_color = m.emission_color;
         params.emission_intensity = m.emission_intensity;
+        params.emission_map_mean = emission_mean;
         params.alpha_cutoff = m.alpha_cutoff;
         params.normal_strength = m.normal_strength;
+        // Parallax-occlusion displacement: only active when a height map is bound
+        // (else POM would march a flat white map and shift nothing). Without this
+        // line the live param stayed 0 and displacement never applied.
+        params.displacement_scale = if m.textures.displacement.is_some() {
+            m.displacement_scale
+        } else {
+            0.0
+        };
         params.rim_color = m.rim_color;
         params.rim_power = m.rim_power;
         params.rim_strength = m.rim_strength;
@@ -1032,8 +1309,12 @@ impl LoadedScene {
         if let Some(&handle) = self.texture_file_cache.get(&(abs.clone(), srgb)) {
             return Ok(handle);
         }
-        let data = citrus_assets::load_texture_file(&abs, srgb)?;
-        let handle = renderer.upload_texture(&data)?;
+        // BC import cache: decode + compress once (cached to disk), then upload
+        // the compressed mip chain. The loader thread normally pre-seeds the
+        // cache for scene materials; this path covers the single-queue fallback
+        // and textures assigned at runtime (e.g. via the inspector).
+        let tex = citrus_assets::load_texture_bc(&abs, srgb)?;
+        let handle = renderer.upload_compressed_texture(&tex)?;
         self.texture_file_cache.insert((abs, srgb), handle);
         Ok(handle)
     }
@@ -1049,24 +1330,7 @@ impl LoadedScene {
         paths: &citrus_core::MaterialTexturePaths,
         base: &TexSlots,
     ) -> TexSlots {
-        let order: [(&Option<PathBuf>, bool); 16] = [
-            (&paths.albedo, true),
-            (&paths.normal, false),
-            (&paths.orm, false),
-            (&paths.emission, true),
-            (&paths.opacity, false),
-            (&paths.emission_mask, false),
-            (&paths.matcap[0], true),
-            (&paths.matcap_mask[0], false),
-            (&paths.matcap[1], true),
-            (&paths.matcap_mask[1], false),
-            (&paths.matcap[2], true),
-            (&paths.matcap_mask[2], false),
-            (&paths.ao, false),
-            (&paths.roughness, false),
-            (&paths.metallic, false),
-            (&paths.displacement, false),
-        ];
+        let order = texture_slot_order(paths);
         let mut slots = *base;
         for (i, (path, srgb)) in order.iter().enumerate() {
             let Some(rel) = path else { continue };
@@ -1076,6 +1340,48 @@ impl LoadedScene {
             }
         }
         slots
+    }
+
+    /// Collect every (absolute path, srgb) texture the scene's materials
+    /// reference, so a loader thread can decode + upload them off the main thread
+    /// (the 4K EXR/PNG decode is otherwise the longest blocking step on load).
+    /// Walks each entry's material refs (file + inline); model-embedded textures
+    /// are handled separately via the model `PreparedScene`. De-duplicated by
+    /// (path, srgb) — the same key `load_texture_cached` uses.
+    pub fn collect_material_texture_refs(
+        file: &SceneFile,
+        project_root: &Path,
+    ) -> Vec<(PathBuf, bool)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut add = |paths: &citrus_core::MaterialTexturePaths| {
+            for (rel, srgb) in texture_slot_order(paths)
+                .into_iter()
+                .filter_map(|(p, s)| p.map(|p| (p, s)))
+            {
+                let abs = project_root.join(&rel);
+                if seen.insert((abs.clone(), srgb)) {
+                    out.push((abs, srgb));
+                }
+            }
+        };
+        for entry in &file.entries {
+            let refs = std::iter::once(&entry.material).chain(entry.extra_materials.iter());
+            for mref in refs {
+                match mref {
+                    MaterialRef::File(path) => {
+                        let abs = project_root.join(path);
+                        if let Ok(mf) = citrus_assets::load_material_file(&abs) {
+                            add(&tex_paths_from_file(&mf.textures));
+                        }
+                    }
+                    MaterialRef::Inline { textures, .. } => {
+                        add(&tex_paths_from_file(textures));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Link a material to a `.material` file it was saved to (auto-save of
@@ -1226,8 +1532,7 @@ impl LoadedScene {
         // Read-only world snapshot for object references (computed once at the
         // start of the pass; parallel to `objects`). Stale-by-one-frame for
         // objects updated earlier this pass, which is fine for references.
-        let world_transforms: Vec<Mat4> =
-            (0..self.objects.len()).map(|i| self.world_transform(i)).collect();
+        let world_transforms: Vec<Mat4> = self.world_transforms();
         let object_names: Vec<String> = self.objects.iter().map(|o| o.name.clone()).collect();
         let object_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
         // Spawn points (2, spawn points): object index + tag for every object
@@ -1479,6 +1784,7 @@ impl LoadedScene {
                     size: v.size,
                     counts: [v.counts[0] as usize, v.counts[1] as usize, v.counts[2] as usize],
                     sh_base: v.sh_base as usize,
+                    fluxvr: v.fluxvr,
                 })
                 .collect();
             baked.probe_sh = ld
@@ -1552,12 +1858,17 @@ impl LoadedScene {
             // Floor at 64 so multi-chart atlases (cube) keep ≥2-texel gutters.
             let lightmap_size = size.clamp(64, settings.max_lightmap.max(64));
 
-            let model = &self.materials[render.material].model;
+            let entry = &self.materials[render.material];
+            let model = &entry.model;
+            // Emitter flux = emission colour × intensity × emission-map mean, so a
+            // mostly-black map contributes a dim, visor-tinted light instead of a
+            // uniform full-mesh emitter (map mean defaults to 1 = no map).
             let emission = if model.emission_enabled {
+                let m = entry.emission_map_mean;
                 [
-                    model.emission_color[0] * model.emission_intensity,
-                    model.emission_color[1] * model.emission_intensity,
-                    model.emission_color[2] * model.emission_intensity,
+                    model.emission_color[0] * model.emission_intensity * m[0],
+                    model.emission_color[1] * model.emission_intensity * m[1],
+                    model.emission_color[2] * model.emission_intensity * m[2],
                 ]
             } else {
                 [0.0; 3]
@@ -1642,6 +1953,7 @@ impl LoadedScene {
                 size: vol.size,
                 counts: vol.counts(),
                 sh_base,
+                fluxvr: false,
             });
         }
 
@@ -1667,6 +1979,29 @@ impl LoadedScene {
 
         let amb = self.environment.ambient;
         let ai = self.environment.ambient_intensity;
+        // Diagnostic: what the bake actually received. An all-black bake usually
+        // means zero lights here (none Baked/Mixed, sun off) or a static-instance
+        // mismatch — this line shows which.
+        tracing::info!(
+            "bake gather: {} lights, {} static instances, sun_enabled={}, sky=[{:.3},{:.3},{:.3}]",
+            lights.len(),
+            instances.len(),
+            self.environment.sun_enabled,
+            amb[0] * ai,
+            amb[1] * ai,
+            amb[2] * ai,
+        );
+        for (n, l) in lights.iter().enumerate() {
+            tracing::info!(
+                "  bake light {n}: {:?} color=[{:.2},{:.2},{:.2}] pos={:?} range={:.1}",
+                l.kind,
+                l.color[0],
+                l.color[1],
+                l.color[2],
+                l.position,
+                l.range,
+            );
+        }
         BakeGather {
             // The bake only includes static geometry.
             instance_static: vec![true; instances.len()],
@@ -1679,7 +2014,191 @@ impl LoadedScene {
         }
     }
 
+    /// Build-time FluxVR bake input: the FluxVolume grids are the probe points,
+    /// the STATIC Flux VR Lights are the light sources, and the scene's static
+    /// geometry is the occluder/bouncer set (so the voxels carry real multi-bounce
+    /// GI, not analytic direct-only). Reuses [`gather_bake`] for the geometry +
+    /// sky, then swaps in FluxVR probes + lights. Returns `None` when there are no
+    /// FluxVolumes or no static Flux VR Lights (nothing to bake). The returned
+    /// `probe_volumes` are flagged `fluxvr = true` so the runtime knows to feed
+    /// them to `update_fluxvr` (static base + live dynamic add) instead of
+    /// uploading them as plain DDGI probes.
+    pub fn gather_fluxvr_bake(&self) -> Option<BakeGather> {
+        let volumes = self.fluxvr_volumes();
+        if volumes.is_empty() {
+            return None;
+        }
+        let static_lights: Vec<citrus_render::BakeLight> = self
+            .fluxvr_lights()
+            .into_iter()
+            .filter(|(_, s)| *s)
+            .map(|(l, _)| l)
+            .collect();
+        if static_lights.is_empty() {
+            return None;
+        }
+        let base = self.gather_bake();
+        let mut probes = Vec::new();
+        let mut probe_volumes = Vec::new();
+        for (center, size, counts) in &volumes {
+            let sh_base = probes.len();
+            let positions = crate::sw_gi::flux_volume_positions(*center, *size, *counts);
+            probes.extend(positions);
+            probe_volumes.push(ProbeVolumeMeta {
+                world_to_local: Mat4::from_translation(-*center),
+                size: size.to_array(),
+                counts: [counts[0] as usize, counts[1] as usize, counts[2] as usize],
+                sh_base,
+                fluxvr: true,
+            });
+        }
+        Some(BakeGather {
+            instance_static: base.instance_static,
+            instances: base.instances,
+            instance_objects: base.instance_objects,
+            lights: static_lights,
+            probes,
+            probe_volumes,
+            sky_color: base.sky_color,
+        })
+    }
+
     /// Gather inputs for the realtime-GI preview: every active mesh object as a
+    /// FluxVR light sources: every active object bearing a `FluxVrLight`
+    /// component, as a point-light contribution at its CURRENT world position,
+    /// tagged with whether the object is static. Static ones are baked into the
+    /// volume once; dynamic ones (`false`) mix in live so a moving FluxVR light
+    /// lights up static objects sharing the volume. Only components participate,
+    /// so the author chooses what feeds FluxVR.
+    pub fn fluxvr_lights(&self) -> Vec<(citrus_render::BakeLight, bool)> {
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(f) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::FluxVrLight>())
+            else {
+                continue;
+            };
+            let pos = self.world_transform(i).w_axis.truncate();
+            let light = citrus_render::BakeLight {
+                kind: citrus_render::LightKind::Point,
+                position: pos,
+                direction: Vec3::NEG_Y,
+                color: [
+                    f.color[0] * f.intensity,
+                    f.color[1] * f.intensity,
+                    f.color[2] * f.intensity,
+                ],
+                range: f.range.max(0.1),
+                spot_inner_deg: 0.0,
+                spot_outer_deg: 0.0,
+                radius: 0.0,
+            };
+            out.push((light, self.objects[i].static_geometry));
+        }
+        out
+    }
+
+    /// The build-time baked FluxVR static base, if a bake exists with FluxVR
+    /// volumes. Returns the flattened SH accumulators, world positions, and the
+    /// `set_baked_probes` meta tuples — exactly the three parallel arrays
+    /// `realtime_gi::update_fluxvr` keeps, so it can seed its static base from
+    /// disk-baked voxels instead of recomputing them analytically each load.
+    #[allow(clippy::type_complexity)]
+    pub fn fluxvr_baked(
+        &self,
+    ) -> Option<(
+        Vec<[glam::Vec3; 4]>,
+        Vec<Vec3>,
+        Vec<(Mat4, [f32; 3], [u32; 3], u32)>,
+    )> {
+        let baked = self.baked.as_ref()?;
+        if !baked.probe_volumes.iter().any(|v| v.fluxvr) {
+            return None;
+        }
+        let mut acc = Vec::new();
+        let mut positions = Vec::new();
+        let mut meta = Vec::new();
+        let mut base = 0u32;
+        for v in baked.probe_volumes.iter().filter(|v| v.fluxvr) {
+            // The bake stored world_to_local as translate(-center); recover center.
+            let center = -v.world_to_local.w_axis.truncate();
+            let size = Vec3::from(v.size);
+            let counts = [v.counts[0] as u32, v.counts[1] as u32, v.counts[2] as u32];
+            let pos = crate::sw_gi::flux_volume_positions(center, size, counts);
+            let n = pos.len();
+            for i in 0..n {
+                let sh = &baked.probe_sh[v.sh_base + i];
+                acc.push(crate::sw_gi::probe_to_acc(sh));
+            }
+            positions.extend(pos);
+            meta.push((v.world_to_local, v.size, counts, base));
+            base += n as u32;
+        }
+        Some((acc, positions, meta))
+    }
+
+    /// FluxVR voxel volumes: each author-placed `FluxVolume` component as
+    /// `(world center, box size, probe counts)`. Falls back to a single volume
+    /// covering the whole scene (so FluxVR works without an explicit volume).
+    pub fn fluxvr_volumes(&self) -> Vec<(Vec3, Vec3, [u32; 3])> {
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(v) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::FluxVolume>())
+            else {
+                continue;
+            };
+            let center = self.world_transform(i).w_axis.truncate();
+            out.push((center, Vec3::from(v.size), v.counts()));
+        }
+        if out.is_empty() {
+            // No author-placed volume → cover the whole scene at a default density.
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for i in 0..self.objects.len() {
+                if !self.is_active(i) || self.objects[i].render.is_none() {
+                    continue;
+                }
+                let world = self.world_transform(i);
+                for render in self.objects[i].render_slots() {
+                    let (min, max) = self.mesh_bounds[render.mesh];
+                    for cx in [min.x, max.x] {
+                        for cy in [min.y, max.y] {
+                            for cz in [min.z, max.z] {
+                                let p = world.transform_point3(Vec3::new(cx, cy, cz));
+                                lo = lo.min(p);
+                                hi = hi.max(p);
+                            }
+                        }
+                    }
+                }
+            }
+            if lo.is_finite() {
+                let pad = ((hi - lo).length() * 0.1).max(1.0);
+                let (lo, hi) = (lo - pad, hi + pad);
+                let center = (lo + hi) * 0.5;
+                let size = (hi - lo).max(Vec3::splat(0.5));
+                let spacing = self.environment.realtime_gi.probe_spacing.max(0.5);
+                let counts = [
+                    ((size.x / spacing).round() as u32 + 1).clamp(2, 48),
+                    ((size.y / spacing).round() as u32 + 1).clamp(2, 48),
+                    ((size.z / spacing).round() as u32 + 1).clamp(2, 48),
+                ];
+                out.push((center, size, counts));
+            }
+        }
+        out
+    }
+
     /// bouncer/occluder, the realtime lights (+ env sun), and an automatic probe
     /// grid covering the scene bounds. Unlike `gather_bake` this includes
     /// non-static objects and the realtime lights, so the un-baked scene shows
@@ -1690,7 +2209,12 @@ impl LoadedScene {
         let mut instances = Vec::new();
         let mut instance_objects = Vec::new();
         let mut instance_static = Vec::new();
+        // The probe volume + GDF bounds are sized from STATIC geometry only, so
+        // moving a dynamic object (e.g. a freshly-added primitive) doesn't resize
+        // the volume and perturb every other surface's GI. `flo/fhi` is a
+        // full-scene fallback used only when the scene has no static geometry.
         let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        let (mut flo, mut fhi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
                 continue;
@@ -1703,22 +2227,32 @@ impl LoadedScene {
             // Every material slot contributes geometry + emission to the trace.
             for render in self.objects[i].render_slots() {
                 let (min, max) = self.mesh_bounds[render.mesh];
-                // Expand the scene AABB by this slot's 8 transformed corners.
+                // Expand the volume AABB by this slot's 8 transformed corners.
+                // Static geometry sizes the real volume; everything feeds the
+                // full-scene fallback (used only if nothing static exists).
                 for cx in [min.x, max.x] {
                     for cy in [min.y, max.y] {
                         for cz in [min.z, max.z] {
                             let p = world.transform_point3(Vec3::new(cx, cy, cz));
-                            lo = lo.min(p);
-                            hi = hi.max(p);
+                            flo = flo.min(p);
+                            fhi = fhi.max(p);
+                            if is_static {
+                                lo = lo.min(p);
+                                hi = hi.max(p);
+                            }
                         }
                     }
                 }
-                let model = &self.materials[render.material].model;
+                let entry = &self.materials[render.material];
+                let model = &entry.model;
+                // Scale emitter flux by the emission-map mean (see the bake-gather
+                // path above): a mostly-black map → a dim, correctly-tinted light.
                 let emission = if model.emission_enabled {
+                    let m = entry.emission_map_mean;
                     [
-                        model.emission_color[0] * model.emission_intensity,
-                        model.emission_color[1] * model.emission_intensity,
-                        model.emission_color[2] * model.emission_intensity,
+                        model.emission_color[0] * model.emission_intensity * m[0],
+                        model.emission_color[1] * model.emission_intensity * m[1],
+                        model.emission_color[2] * model.emission_intensity * m[2],
                     ]
                 } else {
                     [0.0; 3]
@@ -1735,6 +2269,13 @@ impl LoadedScene {
                 instance_objects.push(i);
                 instance_static.push(is_static);
             }
+        }
+        // No static geometry → fall back to the full-scene bounds so an all-dynamic
+        // scene still gets a volume (it just isn't movement-stable until something
+        // is marked static).
+        if !lo.is_finite() {
+            lo = flo;
+            hi = fhi;
         }
         if instances.is_empty() || !lo.is_finite() {
             return None;
@@ -1805,7 +2346,7 @@ impl LoadedScene {
         // cascade that contains a fragment (volumes are emitted finest-first), so
         // the center gets fine GI while the edges/sky stay cheap. Each cascade is
         // another full grid to march, so the count is capped.
-        let software = self.environment.realtime_gi.mode == citrus_assets::GiMode::Software;
+        let software = self.environment.realtime_gi.mode == citrus_assets::GiMode::Flux;
         let spacing = self.environment.realtime_gi.probe_spacing.max(0.25);
         // Margin so geometry (esp. a large floor) sits well inside the outermost
         // cascade. Its edge fades to ambient, so too little pad lands that fade
@@ -1875,6 +2416,7 @@ impl LoadedScene {
                 size: cs.to_array(),
                 counts,
                 sh_base,
+                fluxvr: false,
             });
         }
 
@@ -2146,6 +2688,7 @@ impl LoadedScene {
                 half_extents: half.to_array(),
                 intensity: probe.intensity.max(0.0),
                 box_projection: probe.box_projection,
+                resolution: probe.resolution,
             };
             if best.as_ref().is_none_or(|(d, _)| outside < *d) {
                 best = Some((outside, candidate));
@@ -2309,7 +2852,18 @@ impl LoadedScene {
 
     /// Sync all draw transforms from object TRS (cheap; runs every frame).
     pub fn sync_draws(&mut self, selected: Option<usize>, highlight: f32) {
+        match selected {
+            Some(i) => self.sync_draws_multi(&[i], highlight),
+            None => self.sync_draws_multi(&[], highlight),
+        }
+    }
+
+    /// Like [`sync_draws`] but highlights every object in `selected` (multi-select
+    /// outlines). The first entry is the anchor; all get the same highlight.
+    pub fn sync_draws_multi(&mut self, selected: &[usize], highlight: f32) {
         self.draws.clear();
+        // One O(n) memoized pass instead of re-walking each parent chain per object.
+        let world = self.world_transforms();
         for i in 0..self.objects.len() {
             if self.objects[i].render.is_none() {
                 continue;
@@ -2326,12 +2880,12 @@ impl LoadedScene {
             // For the UV-checker preview: the would-be lightmap resolution for
             // static objects (0 otherwise).
             let lightmap_size = if self.objects[i].static_geometry {
-                self.lightmap_size_for(i)
+                self.lightmap_size_for_world(i, world[i])
             } else {
                 0
             };
-            let transform = self.world_transform(i);
-            let highlight = if selected == Some(i) { highlight } else { 0.0 };
+            let transform = world[i];
+            let highlight = if selected.contains(&i) { highlight } else { 0.0 };
             // One draw per material slot (slot 0 + extras), all at this transform.
             for render in self.objects[i].render_slots().collect::<Vec<_>>() {
                 self.draws.push(DrawCmd {
@@ -2466,6 +3020,33 @@ impl LoadedScene {
     }
 
     /// Ray-pick the closest object (ray vs object-space AABB).
+    /// World-space distance to the nearest object the ray hits (AABB test, same
+    /// as `pick`), or `None` if it hits nothing. Used to stop the VR lasers on
+    /// whatever they're pointing at.
+    pub fn ray_hit(&self, origin: Vec3, dir: Vec3) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for (i, object) in self.objects.iter().enumerate() {
+            if object.render.is_none() || !self.is_active(i) {
+                continue;
+            }
+            let world = self.world_transform(i);
+            let inv = world.inverse();
+            let local_origin = inv.transform_point3(origin);
+            let local_dir = inv.transform_vector3(dir);
+            for render in object.render_slots() {
+                let (min, max) = self.mesh_bounds[render.mesh];
+                if let Some(t_local) = ray_aabb(local_origin, local_dir, min, max) {
+                    let hit_world = world.transform_point3(local_origin + local_dir * t_local);
+                    let t = (hit_world - origin).length();
+                    if best.is_none_or(|b| t < b) {
+                        best = Some(t);
+                    }
+                }
+            }
+        }
+        best
+    }
+
     pub fn pick(&self, origin: Vec3, dir: Vec3) -> Option<usize> {
         let mut best: Option<(usize, f32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
@@ -2578,6 +3159,8 @@ impl LoadedScene {
             entries,
             skybox: self.skybox.clone(),
             environment: self.environment.clone(),
+            editor_camera: None,
+            collapsed: Vec::new(),
         }
     }
 
@@ -2628,6 +3211,30 @@ impl LoadedScene {
 
     /// Rebuild the whole scene from a SceneFile. The renderer's scene
     /// resources must have been reset by the caller.
+    /// Parse every model a scene file references (the slow, CPU-only part) so it
+    /// can run on a worker thread; the result feeds `load_scene_file_with_models`
+    /// on the main thread for the GPU upload. `Scene` is `Send`.
+    pub fn parse_scene_models(
+        file: &SceneFile,
+        project_root: &Path,
+    ) -> Result<HashMap<String, citrus_assets::Scene>> {
+        let mut models = HashMap::new();
+        for entry in &file.entries {
+            if let ObjectSource::Model { path, .. } = &entry.source {
+                if models.contains_key(path) {
+                    continue;
+                }
+                let abs = project_root.join(path);
+                let asset = citrus_assets::load_model_with_meta(&abs)
+                    .with_context(|| format!("importing {path} for scene"))?;
+                models.insert(path.clone(), asset);
+            }
+        }
+        Ok(models)
+    }
+
+    /// Synchronous load: parse models then upload. Kept for callers that don't
+    /// background the parse (most scene loads).
     pub fn load_scene_file(
         renderer: &mut Renderer,
         file: &SceneFile,
@@ -2635,9 +3242,52 @@ impl LoadedScene {
         registry: &ComponentRegistry,
         shaders: &mut ShaderLibrary,
     ) -> Result<Self> {
+        let models = Self::parse_scene_models(file, project_root)?;
+        Self::load_scene_file_with_models(
+            renderer,
+            file,
+            project_root,
+            registry,
+            shaders,
+            &models,
+            None,
+            None,
+            |_| {},
+        )
+    }
+
+    /// GPU-side load using pre-parsed models (from `parse_scene_models`). When
+    /// `prepared` is Some, the model meshes/textures were already uploaded on a
+    /// loader thread and are just installed here (no main-thread upload);
+    /// otherwise they're uploaded now. `progress` is called per model/material so
+    /// the caller can pump the splash/modal during the (main-thread) build.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_scene_file_with_models(
+        renderer: &mut Renderer,
+        file: &SceneFile,
+        project_root: &Path,
+        registry: &ComponentRegistry,
+        shaders: &mut ShaderLibrary,
+        models: &HashMap<String, citrus_assets::Scene>,
+        mut prepared: Option<HashMap<String, citrus_render::PreparedScene>>,
+        material_textures: Option<(Vec<(PathBuf, bool)>, citrus_render::PreparedScene)>,
+        mut progress: impl FnMut(&str),
+    ) -> Result<Self> {
         let mut scene = Self::empty();
         scene.skybox = file.skybox.clone();
         scene.environment = file.environment.clone();
+
+        // Material textures decoded + uploaded on the loader thread: install the
+        // GPU handles and seed the file cache keyed by (abs path, srgb), so the
+        // per-material bind below hits the cache instead of decoding 4K EXR/PNG
+        // on the main thread. When None (single-queue GPU), the bind falls back
+        // to a synchronous decode.
+        if let Some((refs, prep)) = material_textures {
+            let (_mh, th, _sk) = renderer.install_prepared(prep);
+            for ((abs, srgb), handle) in refs.into_iter().zip(th) {
+                scene.texture_file_cache.insert((abs, srgb), handle);
+            }
+        }
 
         // Import each referenced model (and the builtin set) once.
         let mut model_object_template: HashMap<String, Vec<usize>> = HashMap::new();
@@ -2675,12 +3325,19 @@ impl LoadedScene {
 
         let mut model_info: HashMap<String, (usize, Vec<usize>)> = HashMap::new();
         for path in model_object_template.keys() {
-            let abs = project_root.join(path);
-            let asset = citrus_assets::load_model_with_meta(&abs)
-                .with_context(|| format!("importing {path} for scene"))?;
+            let asset = models
+                .get(path)
+                .with_context(|| format!("model {path} was not pre-parsed"))?;
+            progress(&format!("Uploading {path}…"));
             let mesh_base = scene.mesh_handles.len();
             let object_start = scene.objects.len();
-            scene.add_asset_scene(renderer, &asset, Some(Path::new(path)))?;
+            match prepared.as_mut().and_then(|m| m.remove(path)) {
+                Some(prep) => {
+                    let (mh, th, sk) = renderer.install_prepared(prep);
+                    scene.add_installed_asset(renderer, asset, &mh, &th, &sk, Some(Path::new(path)))?;
+                }
+                None => scene.add_asset_scene(renderer, asset, Some(Path::new(path)))?,
+            }
             // Template: per model-local mesh index → material index (all slots).
             let mut per_mesh_material = vec![0usize; asset.meshes.len()];
             for object in &scene.objects[object_start..] {
@@ -2786,12 +3443,49 @@ impl LoadedScene {
             }
         }
 
-        // Push all material models (incl. inline overrides) to the renderer.
+        // Push all material models (incl. inline overrides) to the renderer
+        // (shader compiles happen here, so report per material).
         for i in 0..scene.materials.len() {
+            progress(&format!("Compiling materials… ({}/{})", i + 1, scene.materials.len()));
             scene.apply_material(renderer, shaders, project_root, i);
         }
         Ok(scene)
     }
+}
+
+/// sRGB → linear for a single normalized channel (the standard IEC transfer).
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Mean of an emission texture's RGB in LINEAR space. RGBA8 sRGB is decoded
+/// per channel; HDR (f16 linear) maps return `[1,1,1]` (no scaling) since their
+/// values can exceed 1 and aren't a simple coverage factor. Empty → `[1,1,1]`.
+fn texture_mean_linear(data: &citrus_render::TextureData) -> [f32; 3] {
+    if data.hdr || data.pixels.len() < 4 {
+        return [1.0; 3];
+    }
+    let mut acc = [0.0f64; 3];
+    let mut n = 0u64;
+    for px in data.pixels.chunks_exact(4) {
+        for c in 0..3 {
+            let s = px[c] as f32 / 255.0;
+            acc[c] += if data.srgb { srgb_to_linear(s) } else { s } as f64;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return [1.0; 3];
+    }
+    [
+        (acc[0] / n as f64) as f32,
+        (acc[1] / n as f64) as f32,
+        (acc[2] / n as f64) as f32,
+    ]
 }
 
 pub fn model_from_material(
@@ -2842,6 +3536,8 @@ pub fn model_from_material(
         roughness_invert: p.roughness_invert,
         metallic_invert: p.metallic_invert,
         displacement_scale: p.displacement_scale,
+        reflection_intensity: p.reflection_intensity,
+        screen_reflections: p.screen_reflections,
         matcap_strength: p.matcap_strength,
         matcap_blend: [
             citrus_core::MatcapBlend::from_f32(p.matcap_blend[0]),
@@ -2859,6 +3555,33 @@ pub fn model_from_material(
 }
 
 /// Convert an asset-file texture set into the editable model paths.
+/// The (relative path, srgb) for the 16 material texture slots, in slot order.
+/// Shared by the main-thread bind (`resolve_texture_slots`) and the worker-side
+/// pre-decode (`collect_material_texture_refs`) so both agree on colour space.
+/// Colour slots (albedo/emission/matcaps) are sRGB; data slots are linear.
+fn texture_slot_order(
+    paths: &citrus_core::MaterialTexturePaths,
+) -> [(Option<PathBuf>, bool); 16] {
+    [
+        (paths.albedo.clone(), true),
+        (paths.normal.clone(), false),
+        (paths.orm.clone(), false),
+        (paths.emission.clone(), true),
+        (paths.opacity.clone(), false),
+        (paths.emission_mask.clone(), false),
+        (paths.matcap[0].clone(), true),
+        (paths.matcap_mask[0].clone(), false),
+        (paths.matcap[1].clone(), true),
+        (paths.matcap_mask[1].clone(), false),
+        (paths.matcap[2].clone(), true),
+        (paths.matcap_mask[2].clone(), false),
+        (paths.ao.clone(), false),
+        (paths.roughness.clone(), false),
+        (paths.metallic.clone(), false),
+        (paths.displacement.clone(), false),
+    ]
+}
+
 pub fn tex_paths_from_file(
     t: &citrus_assets::MaterialTextures,
 ) -> citrus_core::MaterialTexturePaths {
@@ -2909,6 +3632,8 @@ pub fn material_from_model(m: &MaterialModel) -> (MaterialParams, MaterialFeatur
             pbr_toon_blend: m.pbr_toon_blend,
             emission_color: m.emission_color,
             emission_intensity: m.emission_intensity,
+            // Derived at apply_material from the actual map; 1 = no scaling here.
+            emission_map_mean: [1.0; 3],
             alpha_cutoff: m.alpha_cutoff,
             normal_strength: m.normal_strength,
             rim_color: m.rim_color,
@@ -2937,6 +3662,8 @@ pub fn material_from_model(m: &MaterialModel) -> (MaterialParams, MaterialFeatur
             } else {
                 0.0
             },
+            reflection_intensity: m.reflection_intensity,
+            screen_reflections: m.screen_reflections,
             matcap_strength: m.matcap_strength,
             matcap_blend: [
                 m.matcap_blend[0].to_f32(),

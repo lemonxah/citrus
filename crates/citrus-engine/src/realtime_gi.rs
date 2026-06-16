@@ -21,6 +21,36 @@ const SETTLE_UPDATES: u32 = 96;
 /// Probe-grid layout (`world_to_local`, size, counts, sh_base) for an upload.
 type VolUpload = (glam::Mat4, [f32; 3], [u32; 3], u32);
 
+/// Hash of the FluxVR static inputs (volumes + static-light positions/colors/
+/// ranges) so the baked base is recomputed only when they actually change.
+fn fluxvr_static_hash(
+    volumes: &[(glam::Vec3, glam::Vec3, [u32; 3])],
+    lights: &[citrus_render::BakeLight],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (c, s, n) in volumes {
+        for v in [c.x, c.y, c.z, s.x, s.y, s.z] {
+            v.to_bits().hash(&mut h);
+        }
+        n.hash(&mut h);
+    }
+    for l in lights {
+        for v in [
+            l.position.x,
+            l.position.y,
+            l.position.z,
+            l.color[0],
+            l.color[1],
+            l.color[2],
+            l.range,
+        ] {
+            v.to_bits().hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 #[derive(Default)]
 pub struct RealtimeGiState {
     /// Temporally-accumulated probe SH (blended toward each new trace).
@@ -35,6 +65,12 @@ pub struct RealtimeGiState {
     hash: u64,
     /// Remaining blended re-traces after a change; 0 = converged, skip work.
     settle: u32,
+    /// Consecutive converged polls with no input change. Once past a threshold the
+    /// scene is "settled" and the per-frame gather+hash (CPU) throttles to ~12 Hz —
+    /// a static scene doesn't need its whole GI input rebuilt every frame just to
+    /// notice nothing changed. Reset to 0 the instant a change is detected, so a
+    /// moving light still tracks within ~one throttle tick.
+    idle_polls: u32,
     /// Set externally (e.g. a material edit) to force the next trace even when
     /// the input hash is unchanged. Cleared the moment it's consumed.
     force: bool,
@@ -75,6 +111,18 @@ pub struct RealtimeGiState {
     /// Volume layout, counts, and cascade index for an in-flight async GPU march
     /// (collected via `gi_march_poll` next frame, so it never blocks the frame).
     gpu_pending: Option<(Vec<VolUpload>, [usize; 3], usize)>,
+    /// FluxVR BAKED static base: SH-L1 accumulator per probe (all volumes
+    /// concatenated), rebuilt only when volumes / static Flux VR Lights change.
+    fluxvr_static: Vec<[glam::Vec3; 4]>,
+    /// World position per FluxVR probe (parallel to `fluxvr_static`), so dynamic
+    /// Flux VR Lights can be mixed into the baked base each frame.
+    fluxvr_positions: Vec<glam::Vec3>,
+    /// FluxVR volume metas to upload with the probes (world_to_local, size,
+    /// counts, base offset).
+    fluxvr_meta: Vec<VolUpload>,
+    /// Hash of (volumes + static lights); the static base is re-baked only when
+    /// this changes.
+    fluxvr_hash: u64,
 }
 
 impl RealtimeGiState {
@@ -85,13 +133,100 @@ impl RealtimeGiState {
         self.force = true;
     }
 
-    /// Tick the realtime-GI update. Call once per frame with the frame delta.
-    pub fn update(&mut self, renderer: &mut Renderer, scene: &mut LoadedScene, dt: f32) {
-        // Flux is the realtime GI path: always run the Software (SDF/GDF) march
-        // that feeds the screen-space gather, regardless of any legacy mode an
-        // older scene file carried. (Baking is separate, via the Baker's Man.)
+    /// Drop the cached FluxVR static base so the next `update_fluxvr` reseeds it
+    /// (from a freshly completed build-time bake, or from the analytic fallback).
+    pub fn invalidate_fluxvr(&mut self) {
+        self.fluxvr_hash = 0;
+    }
+
+    /// FluxVR backend. Injects the scene's Flux VR Lights into author-placed
+    /// FluxVolume voxel grids (or one auto whole-scene volume). STATIC sources are
+    /// BAKED into a cached base (rebuilt only when volumes/static lights change);
+    /// DYNAMIC sources mix into a clone of that base every frame (the cheap "fake
+    /// GI on moving lights"). The standard shader samples the result via
+    /// `sample_probes`. No ray tracing.
+    fn update_fluxvr(&mut self, renderer: &mut Renderer, scene: &mut LoadedScene) {
+        let volumes = scene.fluxvr_volumes();
+        if volumes.is_empty() {
+            renderer.set_baked_probes(&[], &[]);
+            self.fluxvr_hash = 0;
+            return;
+        }
+        let lights = scene.fluxvr_lights();
+        let static_lights: Vec<citrus_render::BakeLight> =
+            lights.iter().filter(|(_, s)| *s).map(|(l, _)| *l).collect();
+        let dynamic_lights: Vec<citrus_render::BakeLight> =
+            lights.iter().filter(|(_, s)| !*s).map(|(l, _)| *l).collect();
+
+        // Prefer the BUILD-TIME baked static base (multi-bounce voxels persisted to
+        // .lightdata): seed the static SH straight from disk so runtime does zero
+        // per-voxel range/falloff work — just the additive dynamic-light pass below.
+        // Falls back to the analytic direct-only injection when no bake exists.
+        let baked = scene.fluxvr_baked();
+        let h = match &baked {
+            // Content-derived hash so a different bake (or a freshly reloaded scene)
+            // reseeds the static base; identical baked voxels keep the cache warm.
+            // `invalidate_fluxvr` (called after a bake) zeroes the hash to be safe.
+            Some((acc, _, _)) => {
+                let mut hh = 0x9E37_79B9_u64 ^ acc.len() as u64;
+                if let Some(f) = acc.first() {
+                    hh ^= (f[0].x.to_bits() as u64) << 1 ^ f[1].y.to_bits() as u64;
+                }
+                if let Some(l) = acc.last() {
+                    hh = hh.rotate_left(13) ^ l[0].z.to_bits() as u64;
+                }
+                hh | 1 // never collide with a "disabled" 0
+            }
+            None => fluxvr_static_hash(&volumes, &static_lights),
+        };
+        if h != self.fluxvr_hash {
+            self.fluxvr_hash = h;
+            self.fluxvr_static.clear();
+            self.fluxvr_positions.clear();
+            self.fluxvr_meta.clear();
+            if let Some((acc, positions, meta)) = baked {
+                self.fluxvr_static = acc;
+                self.fluxvr_positions = positions;
+                self.fluxvr_meta = meta;
+            } else {
+                let mut base = 0u32;
+                for (center, size, counts) in &volumes {
+                    let positions = crate::sw_gi::flux_volume_positions(*center, *size, *counts);
+                    let mut acc = vec![[glam::Vec3::ZERO; 4]; positions.len()];
+                    crate::sw_gi::flux_inject(&mut acc, &positions, &static_lights);
+                    let n = positions.len() as u32;
+                    self.fluxvr_static.extend(acc);
+                    self.fluxvr_positions.extend(positions);
+                    self.fluxvr_meta.push((
+                        glam::Mat4::from_translation(-*center),
+                        size.to_array(),
+                        *counts,
+                        base,
+                    ));
+                    base += n;
+                }
+            }
+        }
+
+        // Mix dynamic lights into a clone of the baked base, then upload.
+        let mut acc = self.fluxvr_static.clone();
+        crate::sw_gi::flux_inject(&mut acc, &self.fluxvr_positions, &dynamic_lights);
+        let probes: Vec<citrus_render::ProbeSh> =
+            acc.iter().map(crate::sw_gi::acc_to_probe).collect();
+        renderer.set_baked_probes(&probes, &self.fluxvr_meta);
+    }
+
+    pub fn update(
+        &mut self,
+        renderer: &mut Renderer,
+        scene: &mut LoadedScene,
+        dt: f32,
+        vr_active: bool,
+    ) {
+        // The realtime GI backend the scene selected: Flux (software SDF march),
+        // FluxRT (hardware ray-query), or FluxVR (analytic voxel volume).
         let mut gi = scene.environment.realtime_gi;
-        gi.mode = citrus_assets::GiMode::Software;
+        let backend = gi.mode;
         // The GDF + emitter feed Flux samples must refresh every frame so moving
         // emitters track without lag (the field is no longer user-facing).
         gi.update_interval = 0.0;
@@ -103,7 +238,34 @@ impl RealtimeGiState {
         } else {
             None
         };
+        // FluxVR backend: fill the probe grid from the FluxVolume voxels and skip
+        // the Flux march entirely. No GDF is built, so the screen-space gather stays
+        // off and the forward shader samples THESE probes directly (desktop preview
+        // and VR eye render). This runs even when a bake exists (unlike Flux/FluxRT)
+        // BECAUSE the build-time baked voxels ARE its static base — `update_fluxvr`
+        // seeds from them, then adds dynamic Flux VR Lights live each frame.
+        if backend == citrus_assets::GiMode::FluxVoxel {
+            // FluxVoxel fills the probe grid directly; the screen-space GDF trace
+            // never runs, so keep its gate off.
+            renderer.set_gi_enabled(false);
+            self.job = None;
+            self.gpu_pending = None;
+            if gi.enabled {
+                self.update_fluxvr(renderer, scene);
+                self.active = true;
+            } else if self.active {
+                renderer.set_baked_probes(&[], &[]);
+                self.fluxvr_hash = 0;
+                self.active = false;
+            }
+            return;
+        }
         if !on {
+            // GI disabled (or a bake is active): stop the screen-space trace.
+            // The GDF stays cached so re-enabling is instant, but the gate below
+            // is what actually halts the per-frame gather — otherwise disabling
+            // GI left the camera-gated trace running (the FPS cliff on move).
+            renderer.set_gi_enabled(false);
             if self.active {
                 renderer.set_baked_probes(&[], &[]);
                 self.accum.clear();
@@ -117,6 +279,8 @@ impl RealtimeGiState {
             self.gpu_pending = None; // drop the polled GPU result above
             return;
         }
+        // GI is on: allow the screen-space gather (gated also on a built GDF).
+        renderer.set_gi_enabled(true);
         // Push the runtime Flux trace params (Environment tab → Flux GI). Cheap;
         // a changed setting re-traces. Quality preset → samples/probe.
         renderer.set_flux_settings(citrus_render::FluxSettings {
@@ -133,10 +297,10 @@ impl RealtimeGiState {
             reflection_mode: gi.reflection_mode.min(2) as u32,
             // The existing "Ray Query" GI mode selects the hardware trace backend
             // (screen_gi_rt); falls back to software when the device lacks it.
-            rt_trace: gi.mode == citrus_assets::GiMode::RayQuery,
+            rt_trace: gi.mode == citrus_assets::GiMode::FluxRT,
         });
         // Hardware (ray-query) mode needs RT cores; software (SDF) runs anywhere.
-        if gi.mode == citrus_assets::GiMode::RayQuery && !renderer.supports_baking() {
+        if gi.mode == citrus_assets::GiMode::FluxRT && !renderer.supports_baking() {
             return;
         }
 
@@ -168,7 +332,7 @@ impl RealtimeGiState {
             // emitter/light would block every frame, so floor it to ~10 Hz so a
             // continuously animated GI input can't tank the framerate. Static
             // scenes settle and stop tracing regardless of mode.
-            let interval_floor = if gi.mode == citrus_assets::GiMode::RayQuery {
+            let interval_floor = if gi.mode == citrus_assets::GiMode::FluxRT {
                 0.1
             } else {
                 0.0
@@ -181,6 +345,16 @@ impl RealtimeGiState {
                 if changed {
                     self.hash = hash;
                     self.settle = SETTLE_UPDATES;
+                    self.idle_polls = 0;
+                } else if self.settle == 0 {
+                    self.idle_polls = self.idle_polls.saturating_add(1);
+                }
+                // Settled (converged + idle for a while): throttle the per-frame
+                // gather+hash to ~12 Hz. A change is then noticed within ~one tick
+                // (≤80 ms), which is imperceptible, but a static scene stops paying
+                // the full O(n) gather every frame. FluxRT already floors at 0.1 s.
+                if self.idle_polls > 24 {
+                    self.timer = self.timer.max(0.08);
                 }
                 // Track motion so the ingest below snaps to the latest trace
                 // while things move, then settles smoothly once they stop.
@@ -204,7 +378,7 @@ impl RealtimeGiState {
                     };
                     let cend = (cbase + cn).min(gather.probes.len());
                     let cascade_probes = gather.probes[cbase..cend].to_vec();
-                    if gi.mode == citrus_assets::GiMode::Software {
+                    if gi.mode == citrus_assets::GiMode::Flux {
                         let (insts, scene_size) = scene.software_gi_inputs(&gather);
                         // GDF bounds/dims over the coarsest cascade (full-scene box).
                         let coarsest = gather.probe_volumes.last().unwrap();
@@ -308,8 +482,12 @@ impl RealtimeGiState {
                             // the in-game camera / off-screen fallback, so skip it
                             // entirely when the fallback is Off. That's the "only
                             // Flux runs" path, and it kills the redundant march cost.
+                            // VR renders per-eye in world space and can't use the
+                            // (camera-space) Flux screen gather, so it samples the
+                            // world-probe DDGI volume instead — force the march that
+                            // populates it whenever a headset is active.
                             let run_probes =
-                                gi.probe_fallback != citrus_assets::ProbeFallback::Off;
+                                gi.probe_fallback != citrus_assets::ProbeFallback::Off || vr_active;
                             let march = citrus_render::GpuGiMarch {
                                 lights: &gather.lights,
                                 emitters: &emitters,
@@ -331,7 +509,8 @@ impl RealtimeGiState {
                         }
                         // No GPU compute (or the march failed): CPU march thread.
                         // Also gated: Off = Flux-only, no world-probe fallback.
-                        let run_probes = gi.probe_fallback != citrus_assets::ProbeFallback::Off;
+                        let run_probes =
+                            gi.probe_fallback != citrus_assets::ProbeFallback::Off || vr_active;
                         if run_probes
                             && let Some((vols, counts)) = pending.take()
                         {
@@ -431,7 +610,7 @@ impl RealtimeGiState {
                 // Spatially filter this cascade (from raw into target). Recomputed
                 // from raw each time so repeated frames don't over-blur. Software
                 // grids are coarser, so blur harder (also softens trilinear facets).
-                let iters = if gi.mode == citrus_assets::GiMode::Software { 6 } else { 2 };
+                let iters = if gi.mode == citrus_assets::GiMode::Flux { 6 } else { 2 };
                 let mut filtered = self.raw[base..base + n].to_vec();
                 crate::sw_gi::blur_probe_grid(&mut filtered, cnt, iters);
                 self.target[base..base + n].copy_from_slice(&filtered);

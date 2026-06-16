@@ -176,6 +176,16 @@ pub struct MaterialModel {
     pub metallic_invert: bool,
     /// Parallax occlusion mapping strength for the displacement map (0 = off).
     pub displacement_scale: f32,
+    /// Per-material reflection strength (1 = full, 0 = matte/no reflections).
+    /// Scales BOTH the environment-cube probe reflection and the screen-space /
+    /// ray-traced reflection for this material, so reflection technique + look can
+    /// be mixed and matched per material without changing the global model.
+    pub reflection_intensity: f32,
+    /// Per-material screen-space / ray-traced reflection toggle. When false this
+    /// material still gets the environment / reflection-probe CUBE reflection but
+    /// the deferred SSR/RT resolve skips it (reflectivity 0 in the G-buffer) — so
+    /// reflection TECHNIQUE can be mixed per material (cube-only vs cube + SSR/RT).
+    pub screen_reflections: bool,
     /// Per-texture UV tiling (xy scale, default 1) + offset (default 0) for the
     /// main maps; masks follow their parent map.
     pub albedo_tiling: [f32; 2],

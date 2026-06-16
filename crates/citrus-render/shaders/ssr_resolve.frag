@@ -174,7 +174,12 @@ vec4 trace(vec3 P, vec3 N) {
                  * strideFrac;
 
     float prevT = 0.0;
-    bool wasInFront = true;
+    // Start NOT-in-front: a hit is only accepted once the ray has been seen
+    // clearly in front of the scene (dz <= 0) at least once. Without this the
+    // first steps sit on the originating surface (dz ~ 0, immediately "behind")
+    // and register a false hit at the base — the vertical column smeared from the
+    // object down to its reflection.
+    bool wasInFront = false;
     for (int i = 1; i <= MAX_STEPS; ++i) {
         float t = float(i) * strideFrac + jitter;
         if (t > 1.0) break;

@@ -552,6 +552,8 @@ impl ComponentRegistry {
         registry.register::<CameraComponent>();
         registry.register::<LightComponent>();
         registry.register::<LightProbeVolume>();
+        registry.register::<FluxVrLight>();
+        registry.register::<FluxVolume>();
         registry.register::<ReflectionProbe>();
         registry.register::<AudioSource>();
         registry.register::<AudioListener>();
@@ -914,31 +916,167 @@ impl TypedComponent for LightProbeVolume {
     const NAME: &'static str = "Light Probe Volume";
 }
 
+/// Marks an object as a FluxVR light source. With the FluxVR GI backend active,
+/// the object casts `color × intensity` into the FluxVR voxel light volume with
+/// smooth distance falloff out to `range`, from the object's (possibly moving)
+/// world position. Put it on a light or an emissive prop, static OR dynamic — a
+/// dynamic FluxVR light mixes into the same voxel grid live, so it lights up
+/// static objects sharing the volume. Only objects bearing this component feed
+/// FluxVR, so you choose exactly which lights/props participate.
+#[derive(Serialize, Deserialize)]
+pub struct FluxVrLight {
+    pub color: [f32; 3],
+    pub intensity: f32,
+    /// World-space distance at which the contribution reaches zero.
+    pub range: f32,
+}
+
+impl Default for FluxVrLight {
+    fn default() -> Self {
+        Self {
+            color: [1.0, 1.0, 1.0],
+            intensity: 1.0,
+            range: 8.0,
+        }
+    }
+}
+
+impl TypedComponent for FluxVrLight {
+    const NAME: &'static str = "Flux VR Light";
+}
+
+/// A FluxVR voxel light volume: a box (centred on the object, `size` local
+/// meters) filled with a regular grid of SH-L1 light probes at `density` probes
+/// per meter. FluxVR injects every Flux VR Light into these voxels (static ones
+/// baked once, dynamic ones mixed live) and the standard shader reads them to
+/// light static + dynamic meshes inside the box. Place one (or several) over the
+/// play space; configurable size + density trade quality for memory/cost.
+#[derive(Serialize, Deserialize)]
+pub struct FluxVolume {
+    /// Full box size in local meters (grid spans -size/2 .. +size/2).
+    pub size: [f32; 3],
+    /// Probes per meter along each axis.
+    pub density: f32,
+}
+
+impl Default for FluxVolume {
+    fn default() -> Self {
+        Self {
+            size: [8.0, 4.0, 8.0],
+            density: 0.75,
+        }
+    }
+}
+
+impl FluxVolume {
+    /// Probe count along each axis (>= 2 so a cell always has 8 corners),
+    /// clamped so a huge/dense box can't explode the probe buffer.
+    pub fn counts(&self) -> [u32; 3] {
+        let mut out = [2u32; 3];
+        for (i, c) in out.iter_mut().enumerate() {
+            let n = (self.size[i].max(0.0) * self.density).round() as i64 + 1;
+            *c = n.clamp(2, 64) as u32;
+        }
+        out
+    }
+
+    pub fn probe_count(&self) -> usize {
+        let [x, y, z] = self.counts();
+        (x * y * z) as usize
+    }
+
+    /// Voxel-grid positions in local space (x-fastest then y then z) — the
+    /// points FluxVoxel injects light into.
+    pub fn local_positions(&self) -> Vec<Vec3> {
+        let [nx, ny, nz] = self.counts();
+        let half = Vec3::from(self.size) * 0.5;
+        let step = |n: u32, axis: usize| {
+            if n > 1 {
+                self.size[axis] / (n - 1) as f32
+            } else {
+                0.0
+            }
+        };
+        let (sx, sy, sz) = (step(nx, 0), step(ny, 1), step(nz, 2));
+        let mut out = Vec::with_capacity((nx * ny * nz) as usize);
+        for iz in 0..nz {
+            for iy in 0..ny {
+                for ix in 0..nx {
+                    out.push(Vec3::new(
+                        -half.x + sx * ix as f32,
+                        -half.y + sy * iy as f32,
+                        -half.z + sz * iz as f32,
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl TypedComponent for FluxVolume {
+    const NAME: &'static str = "Flux Volume";
+}
+
 /// A precomputed reflection capture: a box zone whose surroundings are captured
 /// into a roughness-prefiltered cubemap (Unreal reflection-capture / Unity
 /// reflection-probe style) and sampled at runtime for specular environment
 /// reflection. The object's transform places it; `size` is the box influence
 /// region (used for box-projected parallax + blend between probes).
+/// How a reflection probe's cubemap is produced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ReflectionProbeMode {
+    /// Captured live (recaptured on demand / scene changes); not saved to disk.
+    #[default]
+    Realtime,
+    /// Baked to a `.reflprobe` sidecar and loaded from disk (static, cheapest).
+    Baked,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ReflectionProbe {
     /// Full box influence size in local meters (centered on the object).
     pub size: [f32; 3],
-    /// Captured cubemap face resolution (per side). 64 / 128 / 256.
+    /// Captured cubemap face resolution (per side): 32 … 8192.
     pub resolution: u32,
+    /// Realtime (live capture) vs Baked (loaded from a `.reflprobe` sidecar).
+    #[serde(default)]
+    pub mode: ReflectionProbeMode,
+    /// Transient: set by the inspector's "Bake This Probe" button, consumed by
+    /// the engine to capture + save this probe. Never serialized.
+    #[serde(skip)]
+    pub bake_now: bool,
     /// Reflection strength multiplier applied when sampled.
     pub intensity: f32,
     /// Box-projected parallax correction (Unity-style): reproject the reflection
     /// ray onto the box so flat surfaces line up. Off = treat as distant (infinite).
     pub box_projection: bool,
+    /// Blend-zone thickness (local meters) just inside the box edge. The probe's
+    /// weight ramps 0→1 across this shell, so overlapping probes cross-fade and
+    /// the edge fades to the skybox instead of popping. 0 = hard cutoff at the box.
+    #[serde(default = "default_blend_distance")]
+    pub blend_distance: f32,
+    /// Overlap priority: higher-importance probes consume blend weight first, so a
+    /// small specific probe wins over a large surrounding one where they overlap.
+    #[serde(default)]
+    pub importance: i32,
+}
+
+fn default_blend_distance() -> f32 {
+    1.0
 }
 
 impl Default for ReflectionProbe {
     fn default() -> Self {
         Self {
             size: [10.0, 6.0, 10.0],
-            resolution: 128,
+            resolution: 256,
             intensity: 1.0,
             box_projection: true,
+            blend_distance: default_blend_distance(),
+            importance: 0,
+            mode: ReflectionProbeMode::Realtime,
+            bake_now: false,
         }
     }
 }

@@ -86,6 +86,13 @@ struct RtGiParams {
     counts: [u32; 4],
     march: [f32; 4],
     misc: [u32; 4],
+    // World SH radiance cache (DDGI probe volumes), so a reflection-ray hit reads
+    // converged multi-bounce outgoing radiance instead of re-shading single-bounce
+    // — matching the software gather's surface-cache model.
+    gdf_min: [f32; 4],
+    gdf_max: [f32; 4],
+    probe_info: [f32; 4], // x = probe volume count
+    volumes: [GiVolume; GI_MAX_VOLUMES],
 }
 
 impl RtGiParams {
@@ -100,6 +107,10 @@ impl RtGiParams {
             counts: p.counts,
             march: p.march,
             misc: p.misc,
+            gdf_min: p.gdf_min,
+            gdf_max: p.gdf_max,
+            probe_info: p.probe_info,
+            volumes: p.volumes,
         }
     }
 }
@@ -124,6 +135,8 @@ pub struct ScreenGiTransient {
     light_buf: Buffer,
     emitter_buf: Buffer,
     param_buf: Buffer,
+    /// RtGiParams UBO for the hardware gather (only when the RT backend ran).
+    rt_param_buf: Option<Buffer>,
 }
 
 impl ScreenGiTransient {
@@ -132,6 +145,9 @@ impl ScreenGiTransient {
         self.light_buf.destroy(device, alloc);
         self.emitter_buf.destroy(device, alloc);
         self.param_buf.destroy(device, alloc);
+        if let Some(mut b) = self.rt_param_buf.take() {
+            b.destroy(device, alloc);
+        }
     }
 }
 
@@ -150,7 +166,7 @@ pub struct GpuGiMaterial {
 
 /// An emissive instance reduced to a sphere area-light, sampled directly (NEE) by
 /// the march so emitter fill is smooth instead of blotchy Monte-Carlo noise.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct GpuGiEmitter {
     pub center: [f32; 3],
     pub radius: f32,
@@ -536,6 +552,7 @@ impl GpuGi {
             let rt_bindings = [
                 sampled(0), storage_img(1), sampled(2), accel(3),
                 ssbo(4), ssbo(5), ssbo(6), ssbo(7), ssbo(8), ubo(9),
+                ssbo(10), // world SH radiance cache (probe SSBO)
             ];
             let rt_set_layout = unsafe {
                 device.create_descriptor_set_layout(
@@ -890,6 +907,9 @@ impl GpuGi {
         final_view: vk::ImageView,
         full_extent: vk::Extent2D,
         extent: vk::Extent2D,
+        // Hardware ray-query backend: when Some + the device has ray-query, the
+        // gather is screen_gi_rt (TLAS trace) instead of the SDF march. (tlas, instance SSBO).
+        rt: Option<(vk::AccelerationStructureKHR, vk::Buffer)>,
         lights: &[BakeLight],
         emitters: &[GpuGiEmitter],
         history_valid: bool,
@@ -955,30 +975,51 @@ impl GpuGi {
             "sgi params",
         )?;
         param_buf.write(0, bytemuck::bytes_of(&params));
+        // Hardware RT gather active only when a TLAS was supplied AND the device
+        // built the RT pipeline. Its own RtGiParams UBO (subset of the SDF params).
+        let rt_active = rt.is_some() && self.rt_pipeline.is_some();
+        let rt_param_buf = if rt_active {
+            let mut b = Buffer::new(
+                device,
+                &mut alloc,
+                size_of::<RtGiParams>() as u64,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                MemoryLocation::CpuToGpu,
+                "sgi rt params",
+            )?;
+            b.write(0, bytemuck::bytes_of(&RtGiParams::from_screen(&params)));
+            Some(b)
+        } else {
+            None
+        };
         drop(alloc);
 
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 7, // gather:4 + denoise:1 + integrate:2(scalar,depth)
+                descriptor_count: 9, // SDF gather:4 + RT gather:2 + denoise:1 + integrate:2
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 8, // gather:6 (insts,lights,emitters,cache,sh-cur,sh-prev) + integrate:1
+                descriptor_count: 14, // SDF gather:6 + RT gather:6 (+probe cache) + integrate:1 (+1 slack)
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 3, // gather out + denoise out + integrate out
+                descriptor_count: 4, // SDF/RT gather out + denoise out + integrate out
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 1,
+                descriptor_count: 2, // SDF params + RT params
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+                descriptor_count: 1, // RT gather TLAS
             },
         ];
         let desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(3) // gather + denoise + integrate sets
+                    .max_sets(4) // SDF or RT gather + denoise + integrate (+slack)
                     .pool_sizes(&pool_sizes),
                 None,
             )?
@@ -1031,6 +1072,62 @@ impl GpuGi {
             .image_info(&hist_info);
         unsafe { device.update_descriptor_sets(&[img_write, buf_write, hist_write], &[]) };
 
+        // Hardware RT gather descriptor set (when active): mirrors screen_gi_rt.comp
+        // bindings — depth, out(storage), history, TLAS, instances, lights, emitters,
+        // sh-out, sh-prev, params. Allocated from the same per-frame pool.
+        let rt_set = if let (true, Some((tlas, inst_buf)), Some(rtl)) =
+            (rt_active, rt, self.rt_set_layout)
+        {
+            let layouts = [rtl];
+            let rs = unsafe {
+                device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(desc_pool)
+                        .set_layouts(&layouts),
+                )?[0]
+            };
+            self.write_image(device, rs, 0, depth_sampler, depth_view); // depth (sampled)
+            let rt_out_info = [vk::DescriptorImageInfo::default()
+                .image_view(out_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let rt_out_w = vk::WriteDescriptorSet::default()
+                .dst_set(rs)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&rt_out_info);
+            self.write_image(device, rs, 2, depth_sampler, history_view); // history (sampled)
+            // TLAS (binding 3): acceleration-structure descriptor via push_next.
+            let tlas_arr = [tlas];
+            let mut accel_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                .acceleration_structures(&tlas_arr);
+            let mut tlas_w = vk::WriteDescriptorSet::default()
+                .dst_set(rs)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .push_next(&mut accel_info);
+            tlas_w.descriptor_count = 1; // not set by image/buffer_info; required for accel
+            unsafe { device.update_descriptor_sets(&[rt_out_w, tlas_w], &[]) };
+            write_ssbo(device, rs, 4, inst_buf); // instances (vtx/idx addrs + albedo/emission)
+            write_ssbo(device, rs, 5, light_buf.handle);
+            write_ssbo(device, rs, 6, emitter_buf.handle);
+            write_ssbo(device, rs, 7, sh_buf);
+            write_ssbo(device, rs, 8, prev_sh_buf);
+            write_ssbo(device, rs, 10, probe_buffer); // world SH radiance cache
+            let rt_pbuf = rt_param_buf.as_ref().unwrap().handle;
+            let rt_buf_info = [vk::DescriptorBufferInfo::default()
+                .buffer(rt_pbuf)
+                .range(vk::WHOLE_SIZE)];
+            let rt_buf_w = vk::WriteDescriptorSet::default()
+                .dst_set(rs)
+                .dst_binding(9)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&rt_buf_info);
+            unsafe { device.update_descriptor_sets(&[rt_buf_w], &[]) };
+            Some(rs)
+        } else {
+            None
+        };
+
         let groups_x = extent.width.div_ceil(8);
         let groups_y = extent.height.div_ceil(8);
         unsafe {
@@ -1057,15 +1154,27 @@ impl GpuGi {
                 &[],
                 &[to_general],
             );
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.screen_pipeline);
-            device.cmd_bind_descriptor_sets(
-                cb,
-                vk::PipelineBindPoint::COMPUTE,
-                self.screen_pipeline_layout,
-                0,
-                &[set],
-                &[],
-            );
+            // Gather backend: hardware ray-query (TLAS) when active, else SDF march.
+            // Both write `out_image` + `sh_buf` with identical layout, so the denoise
+            // + integrate below are backend-agnostic.
+            if let (Some(rs), Some(rtp), Some(rtl)) =
+                (rt_set, self.rt_pipeline, self.rt_pipeline_layout)
+            {
+                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, rtp);
+                device.cmd_bind_descriptor_sets(
+                    cb, vk::PipelineBindPoint::COMPUTE, rtl, 0, &[rs], &[],
+                );
+            } else {
+                device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.screen_pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.screen_pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+            }
             device.cmd_dispatch(cb, groups_x, groups_y, 1);
             // Gather out: GENERAL -> SHADER_READ_ONLY so the DENOISE compute can
             // sample it (and the forward as a fallback). Made available to compute.
@@ -1289,6 +1398,7 @@ impl GpuGi {
             light_buf,
             emitter_buf,
             param_buf,
+            rt_param_buf,
         }))
     }
 

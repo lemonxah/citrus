@@ -310,8 +310,10 @@ impl GameApp {
         }
 
         // Realtime GI (if the scene enables it): live indirect bounce, same as
-        // the editor preview.
-        self.rt_gi.update(&mut renderer, &mut self.scene, dt);
+        // the editor preview. VR samples the world-probe volume (it can't use the
+        // camera-space Flux gather), so flag the march to populate it.
+        let vr_active = self.xr_session.is_some();
+        self.rt_gi.update(&mut renderer, &mut self.scene, dt, vr_active);
 
         // VR: pump the OpenXR session lifecycle + read tracker poses into a
         // full-body target set for the IK solver. Avatar bone mapping (applying

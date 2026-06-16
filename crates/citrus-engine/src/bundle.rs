@@ -108,6 +108,8 @@ fn starter_scene() -> SceneFile {
         ],
         skybox: None,
         environment: Default::default(),
+        editor_camera: None,
+        collapsed: Vec::new(),
     }
 }
 

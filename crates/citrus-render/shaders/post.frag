@@ -37,44 +37,60 @@ void main() {
         color = texture(u_hdr, uv).rgb;
     }
 
-    // Bloom (UE-style): a soft-knee brightness threshold isolates the bright
-    // part of the linear-HDR scene, which is then spread WIDE and added back.
-    // UE does this with a downsample/upsample mip pyramid for a cheap, very wide
-    // soft glow; we approximate the pyramid in one pass by summing Gaussian rings
-    // at several radii (a true mip-chain is the perf/quality follow-up). The key
-    // fixes vs. the old version: (1) soft-knee threshold (no hard cutoff banding),
-    // (2) a spread of ~25% of the screen (the old 2% was imperceptible).
+    // Exposure (EV). Applied BEFORE bloom so the bright-pass threshold operates in
+    // post-exposure space (UE order: exposure → bloom → tonemap). Applying it after
+    // bloom made the threshold exposure-inconsistent (a dim scene cranked up with
+    // +EV never bloomed; a bright scene pulled down still bloomed). Bloom samples
+    // are exposed by the same factor below so the glow tracks the displayed scene.
+    float ev = exp2(pc.p0.y);
+    color *= ev;
+
+    // Bloom (UE-style): a soft-knee brightness threshold isolates the bright part
+    // of the (exposed) linear-HDR scene, spread WIDE and added back. UE uses a
+    // downsample/upsample mip pyramid for a cheap, very wide soft glow; we
+    // approximate the pyramid in one pass by summing Gaussian rings at several
+    // radii (a true mip-chain is the perf/quality follow-up). Soft-knee threshold
+    // (no hard cutoff banding); spread ~25% of screen; aspect-corrected so the
+    // glow stays circular on wide viewports.
     if (pc.p4.x > 0.5) {
         float thr = max(pc.p4.y, 0.0);
         float knee = thr * 0.5 + 1e-4;          // soft knee width
         float maxR = clamp(pc.p4.w, 0.0, 1.0) * 0.25; // spread, fraction of screen
+        // Aspect correction: UV offsets are isotropic in UV but the screen isn't
+        // square, so scale x by height/width to keep rings circular.
+        vec2 texel = 1.0 / vec2(textureSize(u_hdr, 0));
+        vec2 aspect = vec2(texel.y / max(texel.x, 1e-6), 1.0);
         vec3 sum = vec3(0.0);
         float wsum = 0.0;
-        // 3 octaves × 8 directions: rings at 0.4/0.7/1.0 of maxR, Gaussian-weighted
-        // by radius so the inner rings dominate (soft, energy-tapered glow).
-        const int DIRS = 8;
-        for (int oct = 0; oct < 3; ++oct) {
-            float rr = maxR * (0.4 + 0.3 * float(oct));
+        // 4 octaves × 12 directions (was 3×8): denser taps + a golden-angle phase
+        // per octave so the rings interleave into a smoother, less banded glow.
+        const int DIRS = 12;
+        for (int oct = 0; oct < 4; ++oct) {
+            float rr = maxR * (0.3 + 0.233 * float(oct));
             float ow = exp(-float(oct) * 0.6);   // outer octaves contribute less
+            float phase = float(oct) * 2.39996323; // golden angle, radians
             for (int i = 0; i < DIRS; ++i) {
-                float a = (float(i) + 0.5) / float(DIRS) * 6.2831853;
-                vec2 o = vec2(cos(a), sin(a)) * rr;
-                vec3 s = texture(u_hdr, uv + o).rgb;
+                float a = (float(i) + 0.5) / float(DIRS) * 6.2831853 + phase;
+                vec2 o = vec2(cos(a), sin(a)) * rr * aspect;
+                vec3 s = texture(u_hdr, uv + o).rgb * ev;
                 float br = max(s.r, max(s.g, s.b));
                 float soft = clamp(br - thr + knee, 0.0, 2.0 * knee);
                 soft = soft * soft / (4.0 * knee);
                 float contrib = max(soft, br - thr) / max(br, 1e-4);
-                sum += s * contrib * ow;
-                wsum += ow;
+                vec3 bright = s * contrib;
+                // Karis average (UE's bloom firefly fix): weight each bright tap by
+                // 1/(1+luma) so one ultra-bright pixel can't dominate the glow and
+                // sparkle. This is a luminance-weighted mean, not a plain sum.
+                float blum = dot(bright, vec3(0.2126, 0.7152, 0.0722));
+                float kw = ow / (1.0 + blum);
+                sum += bright * kw;
+                wsum += kw;
             }
         }
         if (wsum > 0.0) {
             color += (sum / wsum) * pc.p4.z;
         }
     }
-
-    // Exposure (EV).
-    color *= exp2(pc.p0.y);
 
     // Color grading (linear).
     if (pc.p1.w > 0.5) {

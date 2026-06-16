@@ -11,6 +11,7 @@ mod frame;
 mod gpu_gi;
 mod pipeline;
 mod post;
+mod profiler_window;
 pub mod sdf;
 mod rt_reflect;
 mod ssr;
@@ -19,10 +20,53 @@ mod vr_overlay;
 mod texture;
 mod types;
 
+/// GPU timestamp zones (a begin/end pair each) for the per-pass profiler
+/// breakdown. Zone Z occupies query slots `2*Z` (begin) and `2*Z+1` (end).
+/// `FRAME` wraps the whole command buffer; the rest are the major passes of the
+/// active path (editor viewport or game). Mutually exclusive passes (e.g. the
+/// editor GI vs the game GI) share a zone — only whichever ran writes it.
+mod gpu_zone {
+    pub const FRAME: usize = 0;
+    pub const SHADOWS: usize = 1;
+    pub const GI: usize = 2;
+    pub const SCENE: usize = 3;
+    pub const REFLECT: usize = 4;
+    pub const POST: usize = 5;
+    pub const EGUI: usize = 6;
+    pub const CAM_PREVIEW: usize = 7;
+    pub const COUNT: usize = 8;
+}
+
+/// One GPU timestamp query read back with availability (TYPE_64 layout: the
+/// value followed by a non-zero flag when the query was written this frame).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TsResult {
+    value: u64,
+    available: u64,
+}
+
+pub use bake::{BakeJob, BakeStep};
 pub use gpu_gi::{GpuGiEmitter, GpuGiMarch, GpuGiMaterial};
 pub use types::*;
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the active device enabled `textureCompressionBC`. Set once at device
+/// creation; the texture import cache reads it to decide between BC and an
+/// uncompressed fallback. Defaults true (assume supported until told otherwise).
+static BC_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
+/// Record BC compression support (called from device creation).
+pub fn set_bc_supported(v: bool) {
+    BC_SUPPORTED.store(v, Ordering::Relaxed);
+}
+
+/// True if the device supports BC compressed textures (see [`set_bc_supported`]).
+pub fn bc_supported() -> bool {
+    BC_SUPPORTED.load(Ordering::Relaxed)
+}
 
 use anyhow::{Context as _, Result};
 use ash::vk;
@@ -384,6 +428,149 @@ struct GpuMesh {
     vertex_count: u32,
 }
 
+/// Pre-uploaded GPU resources for a scene, produced off-thread by [`Uploader`]
+/// and consumed by [`Renderer::install_prepared`]. Opaque to callers, and `Send`
+/// (Vulkan handles + `Allocation`) so it can cross the thread boundary.
+pub struct PreparedScene {
+    meshes: Vec<GpuMesh>,
+    textures: Vec<GpuTexture>,
+    skinned: Vec<bool>,
+}
+
+/// Background asset uploader bound to the transfer queue + its own command pool.
+/// `Send` — move it to a loader thread, `prepare` there, then `install_prepared`
+/// on the main thread. A second VkQueue means transfers run concurrently with
+/// the render thread; same queue family means no resource ownership transfer.
+pub struct Uploader {
+    device: ash::Device,
+    allocator: Arc<Mutex<Allocator>>,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    rt: bool,
+}
+
+impl Uploader {
+    /// Upload meshes + textures on the transfer queue. `has_skeleton` mirrors the
+    /// main-thread path: a mesh with skin weights + a skeleton becomes a
+    /// host-visible skinned mesh.
+    pub fn prepare(
+        &self,
+        meshes: &[MeshData],
+        textures: &[TextureData],
+        has_skeleton: bool,
+    ) -> Result<PreparedScene> {
+        let gpu_textures = {
+            let mut alloc = self.allocator.lock().unwrap();
+            textures
+                .iter()
+                .map(|t| {
+                    GpuTexture::upload(&self.device, &mut alloc, self.command_pool, self.queue, t)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut gpu_meshes = Vec::with_capacity(meshes.len());
+        let mut skinned = Vec::with_capacity(meshes.len());
+        for mesh in meshes {
+            let is_skinned = has_skeleton
+                && mesh.vertices.iter().any(|v| v.weights.iter().sum::<f32>() > 0.0);
+            gpu_meshes.push(if is_skinned {
+                self.upload_skinned(mesh)?
+            } else {
+                self.upload_static(mesh)?
+            });
+            skinned.push(is_skinned);
+        }
+        Ok(PreparedScene {
+            meshes: gpu_meshes,
+            textures: gpu_textures,
+            skinned,
+        })
+    }
+
+    /// Upload pre-compressed (BC) textures on the transfer queue — the material
+    /// texture path, where decode + block compression already ran on the loader
+    /// thread (or were read straight from the import cache). Returns a
+    /// textures-only `PreparedScene` to be installed on the main thread.
+    pub fn prepare_compressed(&self, textures: &[CompressedTexture]) -> Result<PreparedScene> {
+        let gpu_textures = {
+            let mut alloc = self.allocator.lock().unwrap();
+            textures
+                .iter()
+                .map(|t| {
+                    GpuTexture::upload_compressed(
+                        &self.device,
+                        &mut alloc,
+                        self.command_pool,
+                        self.queue,
+                        t,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(PreparedScene {
+            meshes: Vec::new(),
+            textures: gpu_textures,
+            skinned: Vec::new(),
+        })
+    }
+
+    fn upload_static(&self, data: &MeshData) -> Result<GpuMesh> {
+        let rt = if self.rt {
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                | vk::BufferUsageFlags::STORAGE_BUFFER
+        } else {
+            vk::BufferUsageFlags::empty()
+        };
+        let mut alloc = self.allocator.lock().unwrap();
+        let vertex_buffer = alloc::upload_buffer(
+            &self.device, &mut alloc, self.command_pool, self.queue,
+            bytemuck::cast_slice(&data.vertices),
+            vk::BufferUsageFlags::VERTEX_BUFFER | rt, "vertices",
+        )?;
+        let index_buffer = alloc::upload_buffer(
+            &self.device, &mut alloc, self.command_pool, self.queue,
+            bytemuck::cast_slice(&data.indices),
+            vk::BufferUsageFlags::INDEX_BUFFER | rt, "indices",
+        )?;
+        Ok(GpuMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: data.indices.len() as u32,
+            vertex_count: data.vertices.len() as u32,
+        })
+    }
+
+    fn upload_skinned(&self, data: &MeshData) -> Result<GpuMesh> {
+        let mut alloc = self.allocator.lock().unwrap();
+        let mut vertex_buffer = Buffer::new(
+            &self.device, &mut alloc,
+            std::mem::size_of_val(&data.vertices[..]) as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER, MemoryLocation::CpuToGpu, "skinned vertices",
+        )?;
+        vertex_buffer.write(0, bytemuck::cast_slice(&data.vertices));
+        let index_buffer = alloc::upload_buffer(
+            &self.device, &mut alloc, self.command_pool, self.queue,
+            bytemuck::cast_slice(&data.indices),
+            vk::BufferUsageFlags::INDEX_BUFFER, "skinned indices",
+        )?;
+        Ok(GpuMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: data.indices.len() as u32,
+            vertex_count: data.vertices.len() as u32,
+        })
+    }
+}
+
+impl Drop for Uploader {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
 /// Unity-style render queue: draws are ordered by this number, with named
 /// breakpoints and gaps for fine-tuning. Transparent (≥ TRANSPARENT) sorts
 /// back-to-front within the queue.
@@ -636,6 +823,23 @@ fn create_cube_face_view(
     Ok(unsafe { device.create_image_view(&info, None)? })
 }
 
+/// An in-progress reflection cubemap capture, advanced one face per frame so the
+/// 6-face scene render (and the first-time pipeline compile it triggers) never
+/// stalls a single frame. After all 6 faces, one more step does the mip-gen +
+/// swap. Owned GPU handles are freed in the finish step (or `destroy`).
+struct ReflCaptureJob {
+    center: glam::Vec3,
+    cube: vk::Image,
+    cube_alloc: Option<Allocation>,
+    mips: u32,
+    size: u32,
+    depth_img: vk::Image,
+    depth_alloc: Option<Allocation>,
+    depth_view: vk::ImageView,
+    /// Faces rendered so far (0..6); at 6 the next step finalizes.
+    next_face: usize,
+}
+
 /// A prefiltered environment reflection cubemap (the runtime side of a
 /// reflection probe). Built once from the scene's skybox: a mirror cube at mip 0
 /// that box-blurs toward rougher mips, sampled by reflection direction +
@@ -645,6 +849,8 @@ struct ReflectionEnv {
     image: vk::Image,
     view: vk::ImageView,
     alloc: Option<Allocation>,
+    /// Mip-0 face size (pixels). Stored so the cube can be read back for baking.
+    size: u32,
 }
 
 const ENV_CUBE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -879,6 +1085,7 @@ impl ReflectionEnv {
             image,
             view,
             alloc: Some(alloc),
+            size,
         })
     }
 
@@ -942,7 +1149,7 @@ const SCREEN_PROBE_DIV: u32 = 4;
 /// Runtime-tunable Flux (screen-space GI) parameters, set from the Environment
 /// tab via [`Renderer::set_flux_settings`]. These drive the per-frame trace that
 /// was previously hardcoded.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct FluxSettings {
     /// Rays per screen probe per frame (temporal accumulation smooths the rest).
     pub samples: u32,
@@ -975,6 +1182,25 @@ pub struct FluxSettings {
     /// triangle hits, no SDF thickness/leak. Ignored (stays software) when the
     /// device lacks ray-query. Off by default so the SDF path is unaffected.
     pub rt_trace: bool,
+}
+
+/// Build/refresh the shared scene TLAS for the Flux-RT GI gather (free function so
+/// it borrows only the disjoint renderer fields it needs — a `&mut self` method
+/// would clash with the `device` borrow held across the GI-trace call sites).
+/// Returns the TLAS + instance SSBO, or None when ray-query/instances are absent.
+fn build_gi_rt_tlas(
+    ctx: &GpuContext,
+    allocator: Option<Arc<Mutex<Allocator>>>,
+    command_pool: vk::CommandPool,
+    meshes: &[GpuMesh],
+    rt_reflect: &mut Option<rt_reflect::RtReflect>,
+    instances: &[rt_reflect::RtInstance],
+) -> Option<(vk::AccelerationStructureKHR, vk::Buffer)> {
+    let allocator = allocator?;
+    let rt = rt_reflect.as_mut()?;
+    rt.ensure_tlas(ctx, &allocator, command_pool, meshes, instances)
+        .ok()
+        .flatten()
 }
 
 impl Default for FluxSettings {
@@ -1214,12 +1440,33 @@ struct XrRender {
 }
 
 /// What to draw for the VR UI overlay in an eye pass: the left-hand panel's world
-/// transform (position + orientation + size) and the right-pointer cursor hit
-/// point. The panel samples the overlay UI texture (`render_vr_ui`).
+/// transform (when the hand menu is up), the right-pointer cursor hit point, and
+/// the tracked controller markers (always shown so you can see your hands). The
+/// panel samples the overlay UI texture (`render_vr_ui`).
+/// One floating UI panel in VR: a world-space quad showing a sub-region of the
+/// editor UI texture (so the desktop layout splits into separate 3D panels, the
+/// viewport region omitted).
+#[derive(Clone, Copy, Debug)]
+pub struct VrPanel {
+    pub model: glam::Mat4,
+    /// UV sub-rect of the UI texture this panel shows: [u_min, v_min, u_max, v_max].
+    pub uv_rect: [f32; 4],
+}
+
+pub const VR_MAX_PANELS: usize = 4;
+
 #[derive(Clone, Copy, Debug)]
 pub struct VrOverlayDraw {
-    pub panel_model: glam::Mat4,
-    pub cursor_world: Option<glam::Vec3>,
+    /// The floating panels to draw this frame (empty = menu hidden).
+    pub panels: [Option<VrPanel>; VR_MAX_PANELS],
+    /// World-space controller transforms (rotation + position); the laser origin.
+    /// `None` when a controller isn't tracking.
+    pub left_hand: Option<glam::Mat4>,
+    pub right_hand: Option<glam::Mat4>,
+    /// World-space endpoint each hand's laser stops at (the surface/object hit, or
+    /// a far point). The laser is drawn from the controller to here.
+    pub left_laser_end: Option<glam::Vec3>,
+    pub right_laser_end: Option<glam::Vec3>,
 }
 
 impl XrRender {
@@ -1941,8 +2188,12 @@ pub struct Renderer {
     refl_capture_ubo: Buffer,
     /// World-space center for the next scene reflection capture; `Some` requests a
     /// (re)capture on the next frame (the scene reflects its surroundings, not just
-    /// the sky). Consumed once, then cleared.
-    recapture_reflection: Option<glam::Vec3>,
+    /// the sky). Consumed once into `refl_job`, then cleared.
+    recapture_reflection: Option<(glam::Vec3, u32)>,
+    /// In-progress reflection capture, stepped one cube face per frame so the
+    /// 6-face render (plus first-time pipeline compile) never stalls a single
+    /// frame. `None` when idle.
+    refl_job: Option<ReflCaptureJob>,
     /// Flip Y in the screen-GI depth→world reconstruction (runtime toggle so the
     /// Y-flipped-viewport convention can be corrected without a rebuild).
     screen_gi_flip_y: bool,
@@ -2051,7 +2302,29 @@ pub struct Renderer {
     /// 1x1 black single layer until a bake is loaded.
     lightmaps: GpuTexture,
     last_stats: RenderStats,
+    /// Draw stats from the editor viewport scene pass (`record_viewport_scene`),
+    /// captured because the editor renders the scene there (not the swapchain
+    /// path), so otherwise the reported draw counts would be 0.
+    viewport_draw_stats: RenderStats,
     vsync: bool,
+    /// Nanoseconds per GPU timestamp tick (`limits.timestamp_period`), or 0 when
+    /// the device/queue cannot timestamp — disables GPU pass profiling.
+    gpu_ts_period: f32,
+    /// Per-frame-slot flag: whether this slot's timestamp pool has been written
+    /// at least once, so the readback after the fence wait has valid data.
+    gpu_ts_primed: Vec<bool>,
+    /// Whether GPU timestamp zones are recorded this frame (period supported AND
+    /// the profiler window is open). Set once per frame, read by `gpu_zone_*`.
+    ts_active: bool,
+    /// Latest per-zone GPU timings (ms), indexed by `gpu_zone::*`, read back from
+    /// the retired frame slot each frame.
+    gpu_zone_ms: [f32; gpu_zone::COUNT],
+    /// Whether realtime GI tracing is enabled. Gates `gi_has_gdf` so toggling
+    /// GI off stops the screen trace while keeping the GDF cached.
+    gi_enabled: bool,
+    /// Optional second OS window rendering the profiler egui UI (its own
+    /// surface/swapchain/egui, sharing this context). None until opened.
+    profiler_window: Option<profiler_window::ProfilerWindow>,
     /// GPU software-GI march pipeline (None if compute init failed → CPU march).
     gpu_gi: Option<gpu_gi::GpuGi>,
 
@@ -2066,9 +2339,41 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self> {
+        Self::new_with_xr(window, None)
+    }
+
+    /// Like [`Renderer::new`], but routes Vulkan instance/device creation through
+    /// OpenXR when a headset is present, so a VR session can share this device.
+    /// Pass `Some((&xr_instance, system))` from `citrus_xr::XrContext`.
+    pub fn new_with_xr(
+        window: Arc<Window>,
+        xr: Option<(&openxr::Instance, openxr::SystemId)>,
+    ) -> Result<Self> {
         let display = window.display_handle()?.as_raw();
         let handle = window.window_handle()?.as_raw();
-        let ctx = GpuContext::new(display, handle, c"citrus")?;
+        let xr = xr.map(|(instance, system)| context::XrBootstrap { instance, system });
+        let ctx = GpuContext::new(display, handle, c"citrus", xr)?;
+
+        // GPU timestamp profiling support: `timestamp_period` is ns/tick (0 if
+        // the device can't timestamp); the queue family must also report
+        // non-zero valid bits. Either missing → GPU pass timings stay at 0.
+        let gpu_ts_period = unsafe {
+            let limits = ctx
+                .instance
+                .get_physical_device_properties(ctx.physical_device)
+                .limits;
+            let valid_bits = ctx
+                .instance
+                .get_physical_device_queue_family_properties(ctx.physical_device)
+                .get(ctx.queue_family as usize)
+                .map(|q| q.timestamp_valid_bits)
+                .unwrap_or(0);
+            if valid_bits > 0 {
+                limits.timestamp_period
+            } else {
+                0.0
+            }
+        };
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: ctx.instance.clone(),
@@ -2620,6 +2925,7 @@ impl Renderer {
             refl_capture_set,
             refl_capture_ubo,
             recapture_reflection: None,
+            refl_job: None,
             screen_gi_flip_y: true,
             sgi_history_valid: false,
             gi_emitters: Vec::new(),
@@ -2666,7 +2972,14 @@ impl Renderer {
             probe_volumes: Vec::new(),
             lightmaps,
             last_stats: RenderStats::default(),
+            viewport_draw_stats: RenderStats::default(),
             vsync: true,
+            gpu_ts_period,
+            gpu_ts_primed: vec![false; FRAMES_IN_FLIGHT],
+            ts_active: false,
+            gpu_zone_ms: [0.0; gpu_zone::COUNT],
+            gi_enabled: true,
+            profiler_window: None,
             gpu_gi,
         })
     }
@@ -2939,6 +3252,25 @@ impl Renderer {
         )
     }
 
+    /// Begin a chunked bake: builds the acceleration structure + pipelines once;
+    /// step it one unit per frame with `bake_step`, then `bake_finish`.
+    pub fn bake_begin(&self, input: &BakeInput<'_>) -> Result<bake::BakeJob> {
+        let allocator = self.allocator();
+        bake::BakeJob::begin(&self.ctx, &allocator, self.command_pool, &self.meshes, input)
+    }
+
+    /// Advance a chunked bake by one unit (one lightmap, or the probe batch).
+    pub fn bake_step(&self, job: &mut bake::BakeJob) -> Result<bake::BakeStep> {
+        let allocator = self.allocator();
+        job.step(&self.ctx, &allocator, self.command_pool, &self.meshes)
+    }
+
+    /// Tear down a chunked bake and collect its (possibly partial) output.
+    pub fn bake_finish(&self, job: bake::BakeJob) -> BakeOutput {
+        let allocator = self.allocator();
+        job.finish(&self.ctx, &allocator)
+    }
+
     /// (Re)upload the cached Global Distance Field for the GPU GI march. Call only
     /// when geometry changes; `gi_march` then reuses it every trace. No-op if the
     /// GPU pipeline is unavailable.
@@ -2972,28 +3304,122 @@ impl Renderer {
         self.gpu_gi.as_ref().is_some_and(|g| g.is_marching())
     }
 
-    /// True once a GDF is uploaded, so screen-space GI can run its gather.
+    /// True once a GDF is uploaded AND realtime GI is enabled, so the
+    /// screen-space gather should run. The GDF stays cached when GI is toggled
+    /// off (so re-enabling is instant), so the `gi_enabled` gate is what
+    /// actually stops the per-frame trace — without it, disabling GI in the UI
+    /// left the camera-gated screen trace running (the static/moving FPS cliff).
     pub fn gi_has_gdf(&self) -> bool {
-        self.gpu_gi.as_ref().is_some_and(|g| g.has_gdf())
+        self.gi_enabled && self.gpu_gi.as_ref().is_some_and(|g| g.has_gdf())
+    }
+
+    /// Enable/disable the realtime screen-space GI trace without dropping the
+    /// cached GDF. Called by the GI driver each frame from the scene's GI state.
+    pub fn set_gi_enabled(&mut self, enabled: bool) {
+        self.gi_enabled = enabled;
+    }
+
+    /// Write a GPU timestamp into `slot` of this frame's pool (no-op when timing
+    /// is inactive). Stage = ALL_COMMANDS so the stamp lands after everything
+    /// recorded before it has completed — clean zone brackets.
+    fn gpu_ts(&self, cb: vk::CommandBuffer, slot: u32) {
+        if self.ts_active {
+            unsafe {
+                self.ctx.device.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    self.frames[self.frame_index].timestamps,
+                    slot,
+                );
+            }
+        }
+    }
+
+    fn gpu_zone_begin(&self, cb: vk::CommandBuffer, zone: usize) {
+        self.gpu_ts(cb, (2 * zone) as u32);
+    }
+
+    fn gpu_zone_end(&self, cb: vk::CommandBuffer, zone: usize) {
+        self.gpu_ts(cb, (2 * zone + 1) as u32);
+    }
+
+    /// Open the profiler as a second OS window (raw handles from the editor's
+    /// winit window). No-op if one is already open.
+    pub fn open_profiler_window(
+        &mut self,
+        display: raw_window_handle::RawDisplayHandle,
+        window: raw_window_handle::RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if self.profiler_window.is_some() {
+            return Ok(());
+        }
+        let allocator = self.allocator();
+        let pw = profiler_window::ProfilerWindow::new(
+            &self.ctx, allocator, display, window, width.max(1), height.max(1), self.vsync,
+        )?;
+        self.profiler_window = Some(pw);
+        // Timestamps were disabled while closed; discard any stale primed flags
+        // so the first readback waits for fresh writes (no garbage frame).
+        for p in self.gpu_ts_primed.iter_mut() {
+            *p = false;
+        }
+        Ok(())
+    }
+
+    pub fn profiler_window_open(&self) -> bool {
+        self.profiler_window.is_some()
+    }
+
+    pub fn resize_profiler_window(&mut self, width: u32, height: u32) {
+        if let Some(pw) = self.profiler_window.as_mut() {
+            pw.request_resize(width, height);
+        }
+    }
+
+    pub fn close_profiler_window(&mut self) {
+        if let Some(mut pw) = self.profiler_window.take() {
+            pw.destroy(&self.ctx);
+        }
+    }
+
+    /// Render the profiler egui UI to its window. Caller passes the tessellated
+    /// output from the profiler's own egui context. No-op if not open.
+    pub fn render_profiler(&mut self, draw: &EguiDraw) -> Result<()> {
+        if let Some(pw) = self.profiler_window.as_mut() {
+            pw.render(&self.ctx, draw)?;
+        }
+        Ok(())
     }
 
     /// Cache the emissive sphere area-lights the screen-GI gather samples (NEE).
     /// A changed emitter set also invalidates the idle-skip so it re-traces.
     pub fn gi_set_emitters(&mut self, emitters: &[GpuGiEmitter]) {
-        if self.gi_emitters.len() != emitters.len() {
-            self.sgi_last_view_proj = None; // emitter count changed, re-trace
+        // Only invalidate the converged GI when the emitter set ACTUALLY changed.
+        // The realtime-GI driver re-feeds emitters every frame; resetting
+        // unconditionally kept `sgi_still_frames` from ever reaching the converge
+        // cap, so the gather re-traced every frame with a rotating sample seed —
+        // perpetual GI shimmer on a fully static scene. Comparing first means a
+        // moved/toggled/recoloured emitter still re-traces, while a steady scene
+        // converges and idles.
+        if self.gi_emitters.as_slice() != emitters {
+            self.gi_emitters.clear();
+            self.gi_emitters.extend_from_slice(emitters);
+            self.sgi_last_view_proj = None; // emitter set changed → re-trace
         }
-        self.gi_emitters.clear();
-        self.gi_emitters.extend_from_slice(emitters);
-        // Any emitter change should re-trace (emissive moved/toggled).
-        self.sgi_last_view_proj = None;
     }
 
     /// Set the runtime Flux trace parameters (Environment tab → Flux GI). A
     /// changed setting re-traces so the new quality/intensity takes effect.
     pub fn set_flux_settings(&mut self, s: FluxSettings) {
-        self.flux_settings = s;
-        self.sgi_last_view_proj = None;
+        // Gate the re-trace on an actual change: the driver pushes settings every
+        // frame, so resetting unconditionally would (like gi_set_emitters) stop the
+        // GI ever converging — endless shimmer on a static scene.
+        if self.flux_settings != s {
+            self.flux_settings = s;
+            self.sgi_last_view_proj = None;
+        }
     }
 
     /// Toggle the screen-GI depth→world Y-flip (corrects a flipped gather without
@@ -3062,6 +3488,69 @@ impl Renderer {
         )?;
         self.textures.push(texture);
         Ok(TextureHandle(self.textures.len() - 1))
+    }
+
+    /// Main-thread upload of a pre-compressed (BC) texture — the single-queue
+    /// fallback for the material texture path (no transfer queue available).
+    pub fn upload_compressed_texture(
+        &mut self,
+        tex: &CompressedTexture,
+    ) -> Result<TextureHandle> {
+        let allocator = self.allocator();
+        let texture = GpuTexture::upload_compressed(
+            &self.ctx.device,
+            &mut allocator.lock().unwrap(),
+            self.command_pool,
+            self.ctx.queue,
+            tex,
+        )?;
+        self.textures.push(texture);
+        Ok(TextureHandle(self.textures.len() - 1))
+    }
+
+    /// Create a background asset uploader (loader thread). Returns None when the
+    /// device exposes no second queue (uploads then stay on the main thread).
+    /// The uploader is `Send`: move it to a worker, call `prepare`, then hand the
+    /// `PreparedScene` back to `install_prepared` on the main thread.
+    pub fn uploader(&self) -> Option<Uploader> {
+        let queue = self.ctx.transfer_queue?;
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(self.ctx.queue_family);
+        let command_pool = unsafe { self.ctx.device.create_command_pool(&pool_info, None).ok()? };
+        Some(Uploader {
+            device: self.ctx.device.clone(),
+            allocator: self.allocator(),
+            queue,
+            command_pool,
+            rt: self.ctx.ray_tracing(),
+        })
+    }
+
+    /// Install pre-uploaded resources from a worker into the renderer's arrays,
+    /// returning the per-resource handles (in upload order) + per-mesh skinned
+    /// flags so the scene can reference them. Main thread only.
+    pub fn install_prepared(
+        &mut self,
+        prepared: PreparedScene,
+    ) -> (Vec<MeshHandle>, Vec<TextureHandle>, Vec<bool>) {
+        let meshes = prepared
+            .meshes
+            .into_iter()
+            .map(|m| {
+                self.meshes.push(m);
+                MeshHandle(self.meshes.len() - 1)
+            })
+            .collect();
+        let textures = prepared
+            .textures
+            .into_iter()
+            .map(|t| {
+                self.textures.push(t);
+                TextureHandle(self.textures.len() - 1)
+            })
+            .collect();
+        (meshes, textures, prepared.skinned)
     }
 
     pub fn create_material(&mut self, desc: &MaterialDesc) -> Result<MaterialHandle> {
@@ -3359,8 +3848,130 @@ impl Renderer {
     /// frame: the scene's surroundings are rendered into the reflection cube (not
     /// just the sky), so reflective surfaces show real geometry. Call after a
     /// scene loads / lighting settles.
-    pub fn request_reflection_capture(&mut self, center: glam::Vec3) {
-        self.recapture_reflection = Some(center);
+    pub fn request_reflection_capture(&mut self, center: glam::Vec3, resolution: u32) {
+        self.recapture_reflection = Some((center, resolution.clamp(32, 8192)));
+    }
+
+    /// Read back the current reflection-env cube (mip 0, all 6 faces) to CPU as
+    /// RGBA8, in (+X,-X,+Y,-Y,+Z,-Z) order — for BAKING the probe to disk. Uses
+    /// `one_time_submit` (full GPU sync, never the in-frame command buffer), so a
+    /// failure is contained (returns None) and can't hang the render loop. Call a
+    /// frame or two after `request_reflection_capture` so the cube holds the
+    /// captured scene, not the sky.
+    pub fn read_reflection_faces(&self) -> Option<Vec<TextureData>> {
+        let device = self.ctx.device.clone();
+        let queue = self.ctx.queue;
+        let pool = self.command_pool;
+        let size = self.reflection_env.size;
+        let image = self.reflection_env.image;
+        let bytes_per_face = (size * size * 4) as u64;
+        let allocator = self.allocator();
+        let mut faces = Vec::with_capacity(6);
+        for layer in 0..6u32 {
+            let mut readback = {
+                let mut alloc = allocator.lock().unwrap();
+                crate::alloc::Buffer::new(
+                    &device,
+                    &mut alloc,
+                    bytes_per_face,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                    "reflprobe-readback",
+                )
+                .ok()?
+            };
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(layer)
+                .layer_count(1);
+            let copy = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(layer)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D { width: size, height: size, depth: 1 });
+            let submit = crate::alloc::one_time_submit(&device, pool, queue, |cb| unsafe {
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_src],
+                );
+                device.cmd_copy_image_to_buffer(
+                    cb,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    readback.handle,
+                    &[copy],
+                );
+                let back = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(range);
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[back],
+                );
+            });
+            let pixels = readback.read();
+            {
+                let mut alloc = allocator.lock().unwrap();
+                readback.destroy(&device, &mut alloc);
+            }
+            if submit.is_err() || pixels.len() < bytes_per_face as usize {
+                return None;
+            }
+            faces.push(TextureData {
+                width: size,
+                height: size,
+                pixels: pixels[..bytes_per_face as usize].to_vec(),
+                srgb: false,
+                hdr: false,
+            });
+        }
+        Some(faces)
+    }
+
+    /// Upload 6 baked face images (RGBA8, +X,-X,+Y,-Y,+Z,-Z) as the reflection
+    /// env — the LOAD path for a disk-baked reflection probe (skips re-rendering
+    /// the capture). Rebuilds the prefiltered roughness mip chain via `from_faces`.
+    pub fn set_reflection_faces(&mut self, faces: &[TextureData; 6]) -> Result<()> {
+        let device = self.ctx.device.clone();
+        let queue = self.ctx.queue;
+        let pool = self.command_pool;
+        let env = {
+            let allocator = self.allocator();
+            let mut alloc = allocator.lock().unwrap();
+            let refs: [&TextureData; 6] = [
+                &faces[0], &faces[1], &faces[2], &faces[3], &faces[4], &faces[5],
+            ];
+            ReflectionEnv::from_faces(&device, &mut alloc, pool, queue, &refs)?
+        };
+        self.swap_reflection_env(env);
+        Ok(())
     }
 
     /// Render the scene into the reflection cube from `center` (6 faces, 90° FOV)
@@ -3368,23 +3979,12 @@ impl Renderer {
     /// Reuses the frame's lights/shadows. NOTE: face orientation + prefilter want
     /// on-device verification.
     #[allow(clippy::too_many_arguments)]
-    fn do_reflection_capture(
-        &mut self,
-        center: glam::Vec3,
-        lights: [GpuLight; MAX_LIGHTS],
-        count: usize,
-        shadow_vp: [[[f32; 4]; 4]; MAX_SHADOW_VIEWS],
-        cascade_splits: [f32; 4],
-        input: &FrameInput,
-        order: &[usize],
-    ) -> Result<()> {
-        use glam::{Mat4, Vec3};
-        let size = 128u32;
+    /// Allocate the capture cube + depth target for a new per-frame reflection
+    /// capture job; faces are rendered one per frame by `step_refl_capture`.
+    fn begin_refl_capture(&mut self, center: glam::Vec3, resolution: u32) -> Result<ReflCaptureJob> {
+        let size = resolution.clamp(32, 8192);
         let device = self.ctx.device.clone();
-        let queue = self.ctx.queue;
-        let pool = self.command_pool;
         let ext = vk::Extent2D { width: size, height: size };
-
         let (cube, cube_alloc, mips) = {
             let allocator = self.allocator();
             let mut alloc = allocator.lock().unwrap();
@@ -3403,6 +4003,50 @@ impl Renderer {
             )?
         };
         let depth_view = create_view(&device, depth_img, DEPTH_FORMAT, vk::ImageAspectFlags::DEPTH)?;
+        Ok(ReflCaptureJob {
+            center,
+            cube,
+            cube_alloc: Some(cube_alloc),
+            mips,
+            size,
+            depth_img,
+            depth_alloc: Some(depth_alloc),
+            depth_view,
+            next_face: 0,
+        })
+    }
+
+    /// Advance the active reflection capture by one cube face; after the 6th face
+    /// the next call finalizes (mip-gen + swap). One face/frame keeps any single
+    /// frame cheap, so the editor never stalls building reflections.
+    fn step_refl_capture(
+        &mut self,
+        lights: [GpuLight; MAX_LIGHTS],
+        count: usize,
+        shadow_vp: [[[f32; 4]; 4]; MAX_SHADOW_VIEWS],
+        cascade_splits: [f32; 4],
+        input: &FrameInput,
+        order: &[usize],
+    ) -> Result<()> {
+        use glam::{Mat4, Vec3};
+        let Some(job) = self.refl_job.as_ref() else {
+            return Ok(());
+        };
+        let size = job.size;
+        let cube = job.cube;
+        let depth_img = job.depth_img;
+        let depth_view = job.depth_view;
+        let face_i = job.next_face;
+        let center = job.center;
+        let device = self.ctx.device.clone();
+        let queue = self.ctx.queue;
+        let pool = self.command_pool;
+        let ext = vk::Extent2D { width: size, height: size };
+
+        // All 6 faces rendered: finalize on this step instead.
+        if face_i >= 6 {
+            return self.finish_refl_capture();
+        }
 
         // Face look directions (+X,-X,+Y,-Y,+Z,-Z) matching the cube sampling.
         let faces = [
@@ -3416,7 +4060,9 @@ impl Renderer {
         let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 2000.0);
         let capture_set = self.refl_capture_set;
 
-        for (i, (dir, up)) in faces.iter().enumerate() {
+        {
+            let i = face_i;
+            let (dir, up) = &faces[face_i];
             let cam = CameraData {
                 view: Mat4::look_at_rh(center, center + *dir, *up),
                 proj,
@@ -3531,6 +4177,22 @@ impl Renderer {
             })?;
             unsafe { device.destroy_image_view(face_view, None) };
         }
+        self.refl_job.as_mut().unwrap().next_face += 1;
+        Ok(())
+    }
+
+    /// Finalize the reflection capture: generate the roughness mip chain, swap
+    /// the new cube into the live reflection env, and free the depth target.
+    fn finish_refl_capture(&mut self) -> Result<()> {
+        let Some(job) = self.refl_job.as_ref() else {
+            return Ok(());
+        };
+        let size = job.size;
+        let cube = job.cube;
+        let mips = job.mips;
+        let device = self.ctx.device.clone();
+        let queue = self.ctx.queue;
+        let pool = self.command_pool;
 
         // Generate the roughness mip chain by successive linear blits (all 6
         // layers at once), then leave the whole cube shader-readable.
@@ -3621,19 +4283,23 @@ impl Renderer {
         })?;
 
         let cube_view = create_cube_view(&device, cube, ENV_CUBE_FORMAT, mips)?;
+        let mut job = self.refl_job.take().unwrap();
         {
             let allocator = self.allocator();
             let mut alloc = allocator.lock().unwrap();
             unsafe {
-                device.destroy_image_view(depth_view, None);
-                device.destroy_image(depth_img, None);
+                device.destroy_image_view(job.depth_view, None);
+                device.destroy_image(job.depth_img, None);
             }
-            let _ = alloc.free(depth_alloc);
+            if let Some(d) = job.depth_alloc.take() {
+                let _ = alloc.free(d);
+            }
         }
         self.swap_reflection_env(ReflectionEnv {
             image: cube,
             view: cube_view,
-            alloc: Some(cube_alloc),
+            alloc: job.cube_alloc.take(),
+            size,
         });
         Ok(())
     }
@@ -3923,6 +4589,50 @@ impl Renderer {
 
         unsafe { device.wait_for_fences(&[in_flight], true, u64::MAX)? };
 
+        // This frame slot's submission has retired, so its GPU timestamps are
+        // ready. Read them back (TS_COUNT u64 ticks) and convert to ms. This is
+        // the only place GPU pass cost is attributed: the CPU-side "realtime GI"
+        // timer only covers the trace's CPU prep, while the actual march runs on
+        // the GPU and otherwise surfaces only as a longer fence wait above.
+        if self.gpu_ts_period > 0.0
+            && self.profiler_window.is_some()
+            && self.gpu_ts_primed[self.frame_index]
+        {
+            let pool = self.frames[self.frame_index].timestamps;
+            // WITH_AVAILABILITY so zones a frame didn't record (their queries were
+            // reset but never written) report available=0 instead of failing the
+            // whole read. Each query yields {value, available} (TsResult).
+            //
+            // IMPORTANT: when any query in the range is unavailable (e.g. a pass
+            // that didn't run this frame), vkGetQueryPoolResults returns NOT_READY
+            // *even with WITH_AVAILABILITY* — but it still writes the availability
+            // flags + values for the queries that ARE ready. So NOT_READY is
+            // expected and fine; only a hard error should skip processing. (WAIT
+            // is NOT an option: it would hang forever on a never-written query.)
+            let mut res = [TsResult::default(); frame::TS_COUNT as usize];
+            let result = unsafe {
+                device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut res,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+                )
+            };
+            let ok = matches!(result, Ok(()) | Err(vk::Result::NOT_READY));
+            if ok {
+                let period = self.gpu_ts_period as f64;
+                for z in 0..gpu_zone::COUNT {
+                    let b = res[2 * z];
+                    let e = res[2 * z + 1];
+                    self.gpu_zone_ms[z] = if b.available != 0 && e.available != 0 {
+                        (e.value.wrapping_sub(b.value) as f64 * period / 1.0e6) as f32
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+
         // This frame slot's prior submission has retired, so the Flux trace
         // resources it referenced (descriptor pool + host buffers, folded into
         // that submission's command buffer) are now safe to free.
@@ -4016,12 +4726,13 @@ impl Renderer {
         // active. The per-pass binding writes (below / in record_viewport_scene)
         // point bindings 5/6 at the active camera's depth + colour history.
         let fs = self.flux_settings;
-        // Reflection model: 1 = SSR, 2 = ray-traced (needs the accel loader).
-        let rt_on = fs.reflection_mode == 2 && self.rt_reflect.is_some() && sgi_active;
-        let ssr_on = fs.reflection_mode == 1 && fs.ssr_enabled && sgi_active;
-        // Volumetric fog runs in the same resolve pass; it needs the depth prepass
-        // too, so it also rides on sgi_active.
-        let fog_on = sgi_active && input.fog.map_or(false, |f| f.density > 0.0);
+        // Reflections are UNCOUPLED from the GI backend: they run purely from their
+        // own settings (the game path always renders the depth prepass + G-buffer),
+        // so changing or disabling GI never turns reflections off. 1 = SSR, 2 = RT.
+        let rt_on = fs.reflection_mode == 2 && self.rt_reflect.is_some();
+        let ssr_on = fs.reflection_mode == 1 && fs.ssr_enabled;
+        // Volumetric fog runs in the same resolve pass off the depth prepass.
+        let fog_on = input.fog.map_or(false, |f| f.density > 0.0);
         ubo.ssr = if ssr_on {
             [1.0, fs.ssr_intensity, fs.ssr_max_distance, fs.ssr_roughness_cutoff]
         } else {
@@ -4236,6 +4947,15 @@ impl Renderer {
                     vk::Extent2D { width: vw, height: vh },
                     self.egui.as_mut().unwrap(),
                 )?);
+                // The viewport Flux trace shares the main-camera temporal state
+                // (sgi_history_valid/parity/last_view_proj) but writes into the
+                // viewport target's OWN sgi images, which we just recreated with
+                // undefined contents. Reprojecting from that stale-but-new
+                // history reads garbage (flickering colour bars on resize), so
+                // reset the temporal state exactly as recreate_swapchain does.
+                self.sgi_history_valid = false;
+                self.sgi_parity = 0;
+                self.sgi_last_view_proj = None;
             }
         }
 
@@ -4266,16 +4986,30 @@ impl Renderer {
             })
         });
 
-        // Precomputed scene reflection capture (once, on request): render the
-        // scene into the reflection cube from the requested center, reusing this
-        // frame's lights/shadows. Uses its own submits, before the main cb.
-        if let Some(center) = self.recapture_reflection.take() {
-            if let Err(e) =
-                self.do_reflection_capture(center, lights, count, shadow_vp, cascade_splits, input, &order)
-            {
-                tracing::warn!("reflection capture failed: {e:#}");
+        // Precomputed scene reflection capture: render the scene into the env
+        // cube from the requested center, ONE face per frame (plus a final
+        // mip-gen step), so the 6-face render + first-time pipeline compile never
+        // stall a frame. A new request waits until the current job finishes.
+        if self.refl_job.is_none()
+            && let Some((center, res)) = self.recapture_reflection.take()
+        {
+            match self.begin_refl_capture(center, res) {
+                Ok(job) => self.refl_job = Some(job),
+                Err(e) => tracing::warn!("reflection capture begin failed: {e:#}"),
             }
         }
+        if self.refl_job.is_some() {
+            if let Err(e) =
+                self.step_refl_capture(lights, count, shadow_vp, cascade_splits, input, &order)
+            {
+                tracing::warn!("reflection capture step failed: {e:#}");
+                self.refl_job = None;
+            }
+        }
+
+        // GPU timestamp zones only while the profiler window is open, so a closed
+        // profiler adds zero timestamp/readback overhead per frame.
+        self.ts_active = self.gpu_ts_period > 0.0 && self.profiler_window.is_some();
 
         unsafe {
             device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
@@ -4285,32 +5019,49 @@ impl Renderer {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
 
+            // GPU timestamps: reset the pool (required before reuse) and stamp
+            // the frame start. The pool is read back next time this slot's fence
+            // has retired (see above).
+            if self.ts_active {
+                let ts_pool = self.frames[self.frame_index].timestamps;
+                device.cmd_reset_query_pool(cb, ts_pool, 0, frame::TS_COUNT);
+            }
+            self.gpu_zone_begin(cb, gpu_zone::FRAME);
+
             // Shadow maps first: both the camera-preview and the main scene
             // pass sample them, so they must be rendered + made readable up
             // front.
+            self.gpu_zone_begin(cb, gpu_zone::SHADOWS);
             self.record_shadows(&device, cb, &shadow_views, input.draws)?;
+            self.gpu_zone_end(cb, gpu_zone::SHADOWS);
 
-            // Flux GI: depth prepass + GDF trace, folded into this frame's cb so
-            // there are no extra submits or fence stalls. Writes the gather image
-            // that binding 4 (set above) now points at; transitions it to
-            // SHADER_READ before the forward pass samples it.
+            // Flux GI (game/swapchain path): depth prepass + GDF trace, folded
+            // into this frame's cb. The editor viewport path records its own GI
+            // inside record_viewport_scene; they're mutually exclusive per frame,
+            // so the GI zone is written by whichever actually runs (never twice,
+            // which would be an invalid double-write of the same query).
             if let Some((dp, hist_valid, cur, prev_vp, prev_cam, alpha)) = sgi_record {
+                self.gpu_zone_begin(cb, gpu_zone::GI);
                 if let Err(e) =
                     self.record_screen_gi(&device, cb, dp, input, hist_valid, cur, prev_vp, prev_cam, alpha)
                 {
                     tracing::warn!("Flux GI record failed: {e:#}");
                 }
+                self.gpu_zone_end(cb, gpu_zone::GI);
             }
 
             // Offscreen main-camera pass next, so the swapchain's egui pass
             // can sample the result this frame.
             if render_camera_preview && self.camera_preview.is_some() {
+                self.gpu_zone_begin(cb, gpu_zone::CAM_PREVIEW);
                 self.record_camera_preview(&device, cb, &order, input, input.clear_color)?;
+                self.gpu_zone_end(cb, gpu_zone::CAM_PREVIEW);
             }
 
             // Editor RTT: render the viewport 3D into its offscreen texture (the
             // swapchain pass below skips the scene because the editor sets
-            // render_viewport=false, and egui shows this texture).
+            // render_viewport=false, and egui shows this texture). It records its
+            // own GI/scene/reflect/post GPU zones internally.
             if input.viewport_extent.is_some() && self.viewport_target.is_some() {
                 if let Err(e) = self.record_viewport_scene(&device, cb, &order, input) {
                     tracing::warn!("viewport RTT failed: {e:#}");
@@ -4596,11 +5347,13 @@ impl Renderer {
             // draws egui in the post pass below (on the tonemapped image).
             if !game {
                 if let Some(egui_draw) = &input.egui {
+                    self.gpu_zone_begin(cb, gpu_zone::EGUI);
                     self.egui
                         .as_mut()
                         .unwrap()
                         .cmd_draw(cb, extent, egui_draw.pixels_per_point, &egui_draw.primitives)
                         .map_err(|e| anyhow::anyhow!("recording egui draw: {e}"))?;
+                    self.gpu_zone_end(cb, gpu_zone::EGUI);
                 }
             }
 
@@ -4635,7 +5388,10 @@ impl Renderer {
                             fs.ssr_roughness_cutoff,
                             fs.ssr_intensity,
                             lights.len() as f32,
-                            0.0,
+                            // env IBL intensity (skybox-enabled gate): 0 when the
+                            // skybox is off, so RT reflection misses don't pull in
+                            // the sky cube (matches the forward env_scale).
+                            ubo.ambient[3],
                         ],
                         screen: [extent.width as f32, extent.height as f32, 0.0, 0.0],
                     };
@@ -4711,11 +5467,13 @@ impl Renderer {
                 }
                 // egui on top of the tonemapped image.
                 if let Some(egui_draw) = &input.egui {
+                    self.gpu_zone_begin(cb, gpu_zone::EGUI);
                     self.egui
                         .as_mut()
                         .unwrap()
                         .cmd_draw(cb, extent, egui_draw.pixels_per_point, &egui_draw.primitives)
                         .map_err(|e| anyhow::anyhow!("recording egui draw: {e}"))?;
+                    self.gpu_zone_end(cb, gpu_zone::EGUI);
                 }
                 device.cmd_end_rendering(cb);
             }
@@ -4733,8 +5491,37 @@ impl Renderer {
                 vk::AccessFlags2::empty(),
             );
 
+            // Editor path: the scene was drawn in record_viewport_scene, so fold
+            // its draw counts in (the swapchain `stats` here is otherwise empty,
+            // which is why draw calls read 0).
+            if !game {
+                let v = self.viewport_draw_stats;
+                stats.draw_calls += v.draw_calls;
+                stats.opaque_draws += v.opaque_draws;
+                stats.transparent_draws += v.transparent_draws;
+                stats.error_draws += v.error_draws;
+                stats.pipeline_binds += v.pipeline_binds;
+                stats.materials_drawn = stats.materials_drawn.max(v.materials_drawn);
+            }
+
             stats.pipeline_variants = self.pipeline_cache.variant_count();
+            // GPU per-pass timings carry over from this slot's previous frame
+            // (read back above); attach them for the profiler breakdown.
+            stats.gpu_frame_ms = self.gpu_zone_ms[gpu_zone::FRAME];
+            stats.gpu_gi_ms = self.gpu_zone_ms[gpu_zone::GI];
+            stats.gpu_shadows_ms = self.gpu_zone_ms[gpu_zone::SHADOWS];
+            stats.gpu_scene_ms = self.gpu_zone_ms[gpu_zone::SCENE];
+            stats.gpu_reflect_ms = self.gpu_zone_ms[gpu_zone::REFLECT];
+            stats.gpu_post_ms = self.gpu_zone_ms[gpu_zone::POST];
+            stats.gpu_egui_ms = self.gpu_zone_ms[gpu_zone::EGUI];
+            stats.gpu_cam_preview_ms = self.gpu_zone_ms[gpu_zone::CAM_PREVIEW];
             self.last_stats = stats;
+
+            // Frame-end stamp last, then mark this slot primed for readback.
+            self.gpu_zone_end(cb, gpu_zone::FRAME);
+            if self.ts_active {
+                self.gpu_ts_primed[self.frame_index] = true;
+            }
 
             device.end_command_buffer(cb)?;
 
@@ -4931,6 +5718,17 @@ impl Renderer {
         alpha: f32,
     ) -> Result<()> {
         let prev = cur ^ 1;
+        // Hardware ray-query GI gather when the Ray-Query mode is on AND the device
+        // supports it; build/refresh the shared scene TLAS for it (else SDF gather).
+        let gi_rt = if self.flux_settings.rt_trace && self.ctx.ray_tracing() {
+            let (rt_insts, _) = self.rt_scene(input);
+            build_gi_rt_tlas(
+                &self.ctx, self.allocator.clone(), self.command_pool, &self.meshes,
+                &mut self.rt_reflect, &rt_insts,
+            )
+        } else {
+            None
+        };
         let t = self.record_flux_trace(
             device,
             cb,
@@ -4949,6 +5747,7 @@ impl Renderer {
             self.sgi.sh_buf[prev].handle,
             self.sgi.gi_final,
             self.sgi.gi_final_view,
+            gi_rt,
             self.swapchain.extent,
             history_valid,
             prev_vp,
@@ -4987,6 +5786,7 @@ impl Renderer {
         gi_sh_prev_buf: vk::Buffer,
         gi_final_image: vk::Image,
         gi_final_view: vk::ImageView,
+        gi_rt: Option<(vk::AccelerationStructureKHR, vk::Buffer)>,
         full_extent: vk::Extent2D,
         history_valid: bool,
         prev_vp: glam::Mat4,
@@ -5192,6 +5992,7 @@ impl Renderer {
             gi_final_view,
             full_extent,
             probe_extent,
+            gi_rt,
             &lights,
             &self.gi_emitters,
             history_valid,
@@ -5428,6 +6229,7 @@ impl Renderer {
                 sgi_sh_buf[prev],
                 sgi_final_image,
                 sgi_final_view,
+                None, // gi_rt
                 pextent,
                 hist_valid,
                 prev_vp,
@@ -5796,10 +6598,13 @@ impl Renderer {
                     mesh: d.mesh.0,
                     transform: d.transform,
                     albedo: [p.base_color[0], p.base_color[1], p.base_color[2]],
+                    // Scale by the emission-map mean so a sparse map (e.g. only a
+                    // glowing visor) doesn't reflect/bounce as a uniform full-mesh
+                    // light. The RT gather shares this same instance buffer.
                     emission: [
-                        p.emission_color[0] * p.emission_intensity,
-                        p.emission_color[1] * p.emission_intensity,
-                        p.emission_color[2] * p.emission_intensity,
+                        p.emission_color[0] * p.emission_intensity * p.emission_map_mean[0],
+                        p.emission_color[1] * p.emission_intensity * p.emission_map_mean[1],
+                        p.emission_color[2] * p.emission_intensity * p.emission_map_mean[2],
                     ],
                 })
             })
@@ -5916,8 +6721,25 @@ impl Renderer {
                 device.cmd_set_viewport(cb, 0, &[viewport]);
                 device.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ui_extent }]);
             }
+            // The VR egui renderer only holds the managed (font/shape) textures,
+            // not the editor's USER textures — the embedded 3D viewport image, the
+            // camera preview, file thumbnails — which are registered with the main
+            // renderer. A primitive referencing one fails the whole draw ("Bad
+            // texture ID: User(..)"), blanking the panel. Drop those (the embedded
+            // 3D view is redundant in VR) and any paint callbacks (can't run here).
+            let primitives: Vec<egui::ClippedPrimitive> = draw
+                .primitives
+                .iter()
+                .filter(|p| match &p.primitive {
+                    egui::epaint::Primitive::Mesh(m) => {
+                        !matches!(m.texture_id, egui::TextureId::User(_))
+                    }
+                    _ => false,
+                })
+                .cloned()
+                .collect();
             vr_egui
-                .cmd_draw(cb, ui_extent, draw.pixels_per_point, &draw.primitives)
+                .cmd_draw(cb, ui_extent, draw.pixels_per_point, &primitives)
                 .map_err(|e| anyhow::anyhow!("VR egui draw: {e}"))?;
             unsafe { device.cmd_end_rendering(cb) };
             image_barrier(
@@ -6186,30 +7008,50 @@ impl Renderer {
                 self.record_skybox(&device, cb, xr_set, false, false)?;
             }
             self.record_scene_draws(&device, cb, &order, input, xr_set, false)?;
-            // VR UI overlay: the left-hand panel (sampling the UI texture) + the
-            // right-pointer cursor, drawn on top of the scene (no depth test).
+            // VR UI panel + hand lasers, drawn on top of the scene. The panel only
+            // shows when the hand menu is up; the lasers always show so you can see
+            // what each controller points at (they stop on the surface/object hit).
             if let Some(ov) = overlay {
                 if let Some(panel) = self.vr_overlay.as_ref() {
                     let vp = proj * view;
-                    let panel_push = vr_overlay::QuadPush {
-                        mvp: (vp * ov.panel_model).to_cols_array_2d(),
-                        params: [0.0; 4],
-                    };
-                    panel.record_quad(&device, cb, &panel_push);
-                    if let Some(cur) = ov.cursor_world {
-                        let cam = inv_view.w_axis.truncate();
-                        let to_cam = (cam - cur).normalize_or(glam::Vec3::Z);
-                        let right = glam::Vec3::Y.cross(to_cam).normalize_or(glam::Vec3::X);
-                        let up = to_cam.cross(right);
-                        let rot = glam::Mat3::from_cols(right, up, to_cam);
-                        let model = glam::Mat4::from_translation(cur)
-                            * glam::Mat4::from_mat3(rot)
-                            * glam::Mat4::from_scale(glam::Vec3::splat(0.012));
-                        let cur_push = vr_overlay::QuadPush {
-                            mvp: (vp * model).to_cols_array_2d(),
-                            params: [1.0, 1.0, 0.85, 0.2],
+                    for p in ov.panels.iter().flatten() {
+                        let panel_push = vr_overlay::QuadPush {
+                            mvp: (vp * p.model).to_cols_array_2d(),
+                            params: [0.0; 4],
+                            uv_rect: p.uv_rect,
                         };
-                        panel.record_quad(&device, cb, &cur_push);
+                        panel.record_quad(&device, cb, &panel_push);
+                    }
+                    // Hand lasers: a thin camera-facing quad from each controller to
+                    // its precomputed hit point (UI/object, or far). Left = cyan,
+                    // right = orange. params = [mode=1, r, g, b].
+                    let cam = inv_view.w_axis.truncate();
+                    for (hand, end, rgb) in [
+                        (ov.left_hand, ov.left_laser_end, [0.15, 0.8, 1.0]),
+                        (ov.right_hand, ov.right_laser_end, [1.0, 0.5, 0.1]),
+                    ] {
+                        if let (Some(m), Some(b)) = (hand, end) {
+                            let a = m.w_axis.truncate();
+                            let seg = b - a;
+                            let len = seg.length();
+                            if len > 1e-3 {
+                                let d = seg / len;
+                                let mid = (a + b) * 0.5;
+                                let to_cam = (cam - mid).normalize_or(glam::Vec3::Z);
+                                let thin = d.cross(to_cam).normalize_or(glam::Vec3::Y);
+                                let nrm = thin.cross(d).normalize_or(to_cam);
+                                let rot = glam::Mat3::from_cols(d, thin, nrm);
+                                let model = glam::Mat4::from_translation(mid)
+                                    * glam::Mat4::from_mat3(rot)
+                                    * glam::Mat4::from_scale(glam::Vec3::new(len, 0.004, 1.0));
+                                let push = vr_overlay::QuadPush {
+                                    mvp: (vp * model).to_cols_array_2d(),
+                                    params: [1.0, rgb[0], rgb[1], rgb[2]],
+                                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                                };
+                                panel.record_quad(&device, cb, &push);
+                            }
+                        }
                     }
                 }
             }
@@ -6261,15 +7103,14 @@ impl Renderer {
         let frame_set = self.frame_sets[self.frame_index];
 
         // Deferred resolve for the viewport: render the reflectance G-buffer
-        // (gbuf=true variants) and resolve SSR + volumetric fog. Runs when either
-        // SSR or fog is on (both need the depth prepass / G-buffer pass).
-        let rt_on = self.flux_settings.reflection_mode == 2
-            && self.rt_reflect.is_some()
-            && self.gi_has_gdf();
-        let ssr_on = self.flux_settings.reflection_mode == 1
-            && self.flux_settings.ssr_enabled
-            && self.gi_has_gdf();
-        let fog_on = self.gi_has_gdf() && input.fog.map_or(false, |f| f.density > 0.0);
+        // (gbuf=true variants) and resolve SSR + volumetric fog. UNCOUPLED from the
+        // GI backend — reflections/fog run from their own settings off the
+        // viewport's own depth + G-buffer, so changing/disabling GI never turns
+        // them off. (The screen-GI Flux trace below stays GI-gated.)
+        let rt_on = self.flux_settings.reflection_mode == 2 && self.rt_reflect.is_some();
+        let ssr_on =
+            self.flux_settings.reflection_mode == 1 && self.flux_settings.ssr_enabled;
+        let fog_on = input.fog.map_or(false, |f| f.density > 0.0);
         let vt_gbuf = (rt_on || ssr_on || fog_on) && self.viewport_ssr.is_some();
         let (vp_gbuf_image, vp_gbuf_view) = self
             .viewport_ssr
@@ -6315,12 +7156,14 @@ impl Renderer {
                 };
                 let seed = self.sgi_frame;
                 let flip = self.screen_gi_flip_y;
+                self.gpu_zone_begin(cb, gpu_zone::GI);
                 let t = self.record_flux_trace(
                     device, cb, dp, input, &input.camera, s_depth_img, s_depth_view, s_probe,
                     s_img[cur], s_view[cur], s_view[cur ^ 1], s_filtered_img, s_filtered_view,
-                    s_sh_buf[cur], s_sh_buf[cur ^ 1], s_final_img, s_final_view, ext, hist_valid, prev_vp, prev_cam,
+                    s_sh_buf[cur], s_sh_buf[cur ^ 1], s_final_img, s_final_view, None, ext, hist_valid, prev_vp, prev_cam,
                     alpha, seed, flip,
                 )?;
+                self.gpu_zone_end(cb, gpu_zone::GI);
                 if let Some(t) = t {
                     self.sgi_transients[self.frame_index] = Some(t);
                 }
@@ -6369,6 +7212,7 @@ impl Renderer {
 
         // 2) Scene color pass into the viewport's HDR target (post pass tonemaps
         //    + blooms into `color` afterwards).
+        self.gpu_zone_begin(cb, gpu_zone::SCENE);
         unsafe {
             image_barrier(
                 device, cb, hdr_img, vk::ImageAspectFlags::COLOR,
@@ -6440,8 +7284,12 @@ impl Renderer {
         if input.draw_skybox {
             self.record_skybox(device, cb, frame_set, false, vt_gbuf)?;
         }
-        self.record_scene_draws(device, cb, order, input, frame_set, vt_gbuf)?;
+        // Capture the draw counts: the editor renders the scene HERE, so this is
+        // where the profiler's draw-call stats come from.
+        self.viewport_draw_stats =
+            self.record_scene_draws(device, cb, order, input, frame_set, vt_gbuf)?;
         unsafe { device.cmd_end_rendering(cb) };
+        self.gpu_zone_end(cb, gpu_zone::SCENE);
         // HDR -> shader-read; then the SSR resolve (if active) + post pass into `color`.
         image_barrier(
             device, cb, hdr_img, vk::ImageAspectFlags::COLOR,
@@ -6451,6 +7299,7 @@ impl Renderer {
         );
         // Reflection resolve into the viewport's resolved HDR target: ray-traced
         // (mode 2) takes precedence, else the SSR/fog resolve.
+        self.gpu_zone_begin(cb, gpu_zone::REFLECT);
         let vp_post_set = if rt_on {
             image_barrier(
                 device, cb, vp_gbuf_image, vk::ImageAspectFlags::COLOR,
@@ -6522,6 +7371,8 @@ impl Renderer {
         } else {
             post_set
         };
+        self.gpu_zone_end(cb, gpu_zone::REFLECT);
+        self.gpu_zone_begin(cb, gpu_zone::POST);
         image_barrier(
             device, cb, col_img, vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -6549,6 +7400,7 @@ impl Renderer {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
         );
+        self.gpu_zone_end(cb, gpu_zone::POST);
         Ok(())
     }
 }
@@ -6581,6 +7433,11 @@ fn make_fx_ubo(
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        // Profiler window (its own surface/swapchain/egui) frees through the
+        // shared allocator, so tear it down first while everything is still
+        // alive. Done before binding `device` to avoid a borrow conflict.
+        self.close_profiler_window();
+
         let device = &self.ctx.device;
         unsafe {
             let _ = device.device_wait_idle();
@@ -6686,7 +7543,7 @@ impl Drop for Renderer {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn image_barrier(
+pub(crate) fn image_barrier(
     device: &ash::Device,
     cb: vk::CommandBuffer,
     image: vk::Image,

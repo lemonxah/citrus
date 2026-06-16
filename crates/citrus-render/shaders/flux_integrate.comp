@@ -92,7 +92,16 @@ void main() {
             ScreenProbe sp = sh_in[idx];
             float cd = sp.c[0].w;
             if (cd <= 0.0) continue; // no-GI probe
-            float sw = exp(-float(i * i + j * j) * 0.5);                  // spatial gaussian
+            // Spatial gaussian on the CONTINUOUS probe-space distance to this pixel
+            // (pf), not the integer offset from the nearest probe. The integer form
+            // gave every pixel in a probe cell the SAME weights → a constant SH per
+            // cell → blocky GI on flat surfaces. Using pf makes the weights shift
+            // smoothly within a cell, so the SH interpolates between probes. The
+            // wider falloff (0.3, vs a tight 0.5) keeps several neighbours weighted
+            // so the 5×5 still averages — recovering grain reduction without the
+            // per-cell blockiness.
+            vec2 dpf = vec2(pc2) - pf;
+            float sw = exp(-dot(dpf, dpf) * 0.3);                         // spatial gaussian
             float dw = exp(-abs(cd - pixel_cd) / max(pixel_cd * 0.08, 0.1)); // depth edge-stop
             float w = sw * dw;
             if (w <= 0.0) continue;

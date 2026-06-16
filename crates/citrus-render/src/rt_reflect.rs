@@ -58,7 +58,7 @@ pub(crate) struct RtUniforms {
     pub camera_pos: [f32; 4],
     pub refl_center: [f32; 4],
     pub refl_extents: [f32; 4],
-    pub params: [f32; 4], // x rough cutoff, y intensity, z light count, w _
+    pub params: [f32; 4], // x rough cutoff, y intensity, z light count, w env IBL intensity (skybox gate)
     pub screen: [f32; 4],
 }
 

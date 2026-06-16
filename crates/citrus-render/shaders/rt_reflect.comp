@@ -36,7 +36,7 @@ layout(set = 0, binding = 8, scalar) uniform RtData {
     vec4 camera_pos;
     vec4 refl_center;  // xyz box centre, w probe intensity (0 = none)
     vec4 refl_extents; // xyz half-extents, w box-projection enabled
-    vec4 params;       // x roughness cutoff, y intensity, z light count, w sky_mip
+    vec4 params;       // x roughness cutoff, y intensity, z light count, w env IBL intensity (skybox gate)
     vec4 screen;       // x width, y height, z _, w _
 } u;
 
@@ -105,7 +105,11 @@ vec3 sample_env(vec3 worldPos, vec3 R, float roughness) {
         vec3 tmax = max(t1, t2);
         R = (worldPos + R * min(min(tmax.x, tmax.y), tmax.z)) - u.refl_center.xyz;
     }
-    float scale = intensity > 0.0 ? intensity : 1.0;
+    // No probe zone → fall back to the skybox cube scaled by the env IBL
+    // intensity (params.w), which is 0 when the skybox is disabled. This keeps
+    // RT reflection misses AND the env fill on reflected hits from pulling in
+    // the sky when it's off, matching the forward pass's env_scale.
+    float scale = intensity > 0.0 ? intensity : u.params.w;
     return textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * scale;
 }
 

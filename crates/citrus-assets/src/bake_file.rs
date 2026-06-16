@@ -17,7 +17,7 @@ pub const LIGHTMAP_EXTENSION: &str = "lightmap";
 pub const LIGHTDATA_EXTENSION: &str = "lightdata";
 
 const LIGHTMAP_MAGIC: &[u8; 8] = b"CITRSLM1";
-const LIGHTDATA_MAGIC: &[u8; 8] = b"CITRSLD1";
+const LIGHTDATA_MAGIC: &[u8; 8] = b"CITRSLD2";
 
 /// One static object's baked lightmap (size×size RGBA32F).
 pub struct LightmapEntry {
@@ -39,6 +39,8 @@ pub struct ProbeVolumeData {
     pub size: [f32; 3],
     pub counts: [u32; 3],
     pub sh_base: u32,
+    /// True for FluxVR voxel volumes (build-time baked from Flux VR Lights).
+    pub fluxvr: bool,
 }
 
 #[derive(Default)]
@@ -138,6 +140,7 @@ pub fn save_lightdata(path: impl AsRef<Path>, file: &LightDataFile) -> Result<()
             wr_u32(&mut out, c);
         }
         wr_u32(&mut out, v.sh_base);
+        wr_u32(&mut out, v.fluxvr as u32);
     }
     wr_u32(&mut out, file.probes.len() as u32);
     for p in &file.probes {
@@ -165,11 +168,13 @@ pub fn load_lightdata(path: impl AsRef<Path>) -> Result<LightDataFile> {
         let size = r.array::<3>()?;
         let counts = [r.u32()?, r.u32()?, r.u32()?];
         let sh_base = r.u32()?;
+        let fluxvr = r.u32()? != 0;
         volumes.push(ProbeVolumeData {
             world_to_local,
             size,
             counts,
             sh_base,
+            fluxvr,
         });
     }
     let probe_count = r.u32()? as usize;

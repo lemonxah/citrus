@@ -98,8 +98,39 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Selection outline (inverted hull, depth-prepass, always-on-top)
 - [done] Error shader (animated swirl for broken/missing/unknown shaders)
 - [done] VSync toggle (FIFO / MAILBOX / IMMEDIATE)
-- [done] Stats overlay (frame time, draw-call breakdown, pipeline binds, shader variants)
+- [done] **Profiler window** (View → Profiler window): a *separate OS window* (own
+  surface/swapchain/egui, sharing the GpuContext — `profiler_window.rs`) you can drag to
+  another monitor (opens 2× wide), so stats never fill the viewport. Shows **one combined
+  realtime graph** (20 s history, time-bucketed so it's stable at any frame rate; shared linear
+  axis with value labels left+right and a time axis along the bottom; hover a line to highlight
+  it, dim the rest, and read its value + age) with a **clickable legend** below to show/hide any
+  series. Series: frame time / FPS; **GPU per-pass timestamp breakdown** — total GPU frame plus
+  Flux GI, shadows, scene, reflections, post, egui, camera-preview (so you can see *which* pass
+  dominates, not just total); GPU utilization %; per-phase CPU breakdown; and draw calls. Plus
+  static draw/pipeline counts. **Zero per-frame cost when closed.** Note the CPU "realtime
+  GI" timer only covers the trace's CPU prep; the actual march cost is GPU work (read via
+  `VK_QUERY_TYPE_TIMESTAMP`, see `RenderStats`). **Zero per-frame cost when closed**: GPU
+  timestamp queries + readback and all history bookkeeping are skipped unless the window is open.
 - [done] Camera preview tab (renders scene from the main camera to an offscreen target)
+- [done] **Startup splash** (`splash.rs`): a borderless CPU-drawn window (softbuffer) shown
+  before the Vulkan renderer exists, with a scaled background + bottom status line (ab_glyph).
+  Shows the embedded `assets/splash.png` **instantly** as a placeholder while the animated
+  `splash.webp` (embedded `citrus-editor/assets/splash.webp`, or an override in the project
+  root) is **decoded on a worker thread** (streamed frame-by-frame to bound memory) and
+  swapped in, looped by elapsed time. The Vulkan renderer build also runs on a worker thread
+  (it's `Send`; the scene with non-`Send` `dyn Component`s can't be, so it stays on main) so
+  the splash animates during the build; the status line updates across later plugin/scene
+  phases. Closed after the first editor frame.
+- [done] **Background-task system** (`tasks.rs` + status bar): heavy CPU work runs on worker
+  threads (parse off-thread, GPU-apply on main); the status bar gets a **Background Tasks**
+  button with aggregate progress that expands to a per-task list with progress bars + **Cancel**,
+  plus an auto-expiring **notifications** line. Wired tasks: **threaded model import**
+  (`load_model_with_meta` on a worker → `add_asset_scene` on main); **chunked light bake**
+  (`bake.rs` `BakeJob` begin/step/finish — one lightmap/probe-volume per frame on the main
+  thread with live progress: lights, bounces, lightmaps, probe volumes, FluxVR; cancellable
+  between units, partial result discarded); and **focus re-import** (FS scan on a worker behind
+  a **blocking modal**, GPU reload on main). Imports that finish during a bake defer their GPU
+  upload until it ends (the bake's TLAS embeds mesh device addresses).
 
 ### Assets & formats
 - [done] glTF import (PBR factors + textures, lightmap UV via TEXCOORD_1)
@@ -115,6 +146,19 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   GI covers every slot.
 - [done] Procedural primitives (cube/sphere/capsule/plane)
 - [done] `.material` files (RON): save/load/assign, per-path texture cache
+- [done] **Off-thread material textures on scene load**: the loader thread decodes + uploads
+  every material texture a scene references (via the transfer-queue `Uploader`), keyed by
+  (abs path, srgb), so the main thread only installs handles — the heavy 4K EXR/PNG/JPG decode
+  no longer freezes the splash. `LoadedScene::collect_material_texture_refs` gathers the refs
+  (file + inline materials); single-queue GPUs fall back to a synchronous main-thread decode.
+- [done] **BC texture import cache** (`citrus-assets/tex_cache.rs`, `intel_tex_2`): each source
+  image is decoded, mip-chained, and block-compressed **once** (BC7 sRGB for colour, BC7 UNORM
+  for data maps, BC6H for HDR/EXR), persisted to a sibling `.citrus_texcache/` keyed by
+  (filename, srgb) and invalidated on source mtime/size change. Later loads skip decode +
+  recompress entirely and upload the compressed mips straight from cache (`upload_compressed`),
+  cutting load time and VRAM. Non-multiple-of-4 sources and GPUs without `textureCompressionBC`
+  fall back to an uncompressed-but-cached path. The `textureCompressionBC` device feature is
+  enabled when reported.
 - [done] `.scene` files: full save/load (objects, transforms, parents, components, materials)
 - [done] `project.citrus` (RON): project name, last scene, per-project settings
 - [done] `.lightmap` / `.lightdata` sidecars (baked GI + probe SH)
@@ -286,6 +330,18 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   normal-mapped reflectors lose bump detail in the reflection, and it rides on the Flux depth prepass
   so it's active only while realtime GI is on. Off-screen GDF fallback, temporal accumulation and a
   roughness blur are the planned follow-ups.
+- [done] **Reflection env-cube capture, chunked one face/frame**: the scene reflection cubemap
+  (rendered from a probe centre into the env cube) is captured **one cube face per frame** plus a
+  final mip-gen/swap step (`ReflCaptureJob`, `begin/step/finish_refl_capture`), instead of all 6
+  faces + first-time pipeline compile in a single frame. The editor opens immediately and the
+  reflection fills in over ~7 frames with no stall. The old env cube stays sampled until the swap,
+  so no half-built cube is ever shown.
+- [done] **Reflection Probe object + baking UI**: add a `ReflectionProbe` to the scene from the
+  hierarchy context menu (**Light → Reflection Probe**); its world position is the capture centre,
+  `size`×`scale` the box influence (box-projection optional). **FluxBaker** has a **✨ Bake
+  Reflections** button (capture + write the `.reflprobe` sidecar, loaded on scene open) and a
+  **Recapture** (session-only); both disabled until the scene has a probe. Same actions still live
+  in the Environment panel.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
   even cube-face packing). The seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.
@@ -345,6 +401,8 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Unified Inspector (object transform/mesh/material slots, `.material` editor,
   component list with Add/Remove)
 - [done] Orbit / pan / scroll-dolly editor camera, F to frame, Escape to deselect
+- [done] Editor camera viewpoint persisted in the `.scene` file (`editor_camera`:
+  position/yaw/pitch) — reopening a scene restores the last framing
 - [done] Play mode (Play/Stop): components run, transforms + state restored on Stop
 - [done] Undo/redo (move/rotate/scale/rename, material edits + assignments; delete is
   intentionally non-undoable)

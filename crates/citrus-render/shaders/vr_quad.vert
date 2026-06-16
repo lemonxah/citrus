@@ -6,7 +6,8 @@
 
 layout(push_constant) uniform Push {
     mat4 mvp;
-    vec4 params; // x = mode (0 textured / 1 solid), yzw = solid colour
+    vec4 params;  // x = mode (0 textured / 1 solid), yzw = solid colour
+    vec4 uv_rect; // xy = uv min, zw = uv max (screen-region this quad samples)
 } pc;
 
 layout(location = 0) out vec2 v_uv;
@@ -19,6 +20,6 @@ const vec2 P[6] = vec2[6](
 
 void main() {
     vec2 p = P[gl_VertexIndex];
-    v_uv = p + 0.5;
+    v_uv = mix(pc.uv_rect.xy, pc.uv_rect.zw, p + 0.5);
     gl_Position = pc.mvp * vec4(p, 0.0, 1.0);
 }

@@ -27,6 +27,9 @@ pub(crate) struct QuadPush {
     pub mvp: [[f32; 4]; 4],
     /// x = mode (0 textured UI, 1 solid), yzw = solid colour.
     pub params: [f32; 4],
+    /// xy = UV min, zw = UV max — the sub-region of the UI texture this quad
+    /// shows. `[0,0,1,1]` for the whole texture (and for solid quads, unused).
+    pub uv_rect: [f32; 4],
 }
 
 pub(crate) struct VrOverlay {

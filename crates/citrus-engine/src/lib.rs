@@ -33,6 +33,10 @@ mod icon;
 #[cfg(feature = "editor")]
 mod lsp;
 #[cfg(feature = "editor")]
+mod splash;
+#[cfg(feature = "editor")]
+mod tasks;
+#[cfg(feature = "editor")]
 mod undo;
 
 pub use runtime::{GameConfig, run_game};

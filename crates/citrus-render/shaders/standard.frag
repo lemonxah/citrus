@@ -808,13 +808,21 @@ void main() {
     // roughness-correct specular that doesn't blow out to a harsh mirror band at
     // grazing angles on rough/dielectric surfaces.
     vec2 env_ab = env_brdf_approx(roughness, NdotV);
-    vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao;
+    // Per-material reflection strength (fx.parallax.y, default 1). Scales the env
+    // reflection here AND the gbuffer reflectivity below, so the deferred SSR/RT
+    // resolve tracks it too — letting reflections be mixed/dialled per material.
+    float refl_strength = fx.parallax.y;
+    vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao * refl_strength;
     color += reflectance * spec_env;
     // SSR G-buffer: octahedral view-space normal (rg) + roughness (b) + a scalar
     // reflectivity (a, the env-reflection weight's luminance). The resolve pass
     // uses the stored normal directly for an exact reflection ray.
     vec3 Nv = normalize(mat3(frame.view) * N);
-    float reflectivity = dot(reflectance, vec3(0.2126, 0.7152, 0.0722));
+    // Per-material screen-space/RT toggle (fx.parallax.z, default 1). When 0 the
+    // deferred SSR/RT resolve skips this material (reflectivity 0) but the forward
+    // env-cube reflection above stays — so reflection TECHNIQUE mixes per material.
+    float reflectivity =
+        dot(reflectance, vec3(0.2126, 0.7152, 0.0722)) * fx.parallax.z;
     o_gbuf = vec4(oct_encode(Nv), roughness, reflectivity);
 
     if (FEAT_EMISSION) {
@@ -847,14 +855,17 @@ void main() {
         color += rim * rim_strength * fx.rim.rgb;
     }
 
-    // GI debug views (frame.debug.y): 1 = world normals, 2 = indirect/GI term
-    // only (isolates the probe-grid blockiness on screen).
+    // Viewport render modes (frame.debug.y): 1 = world normals, 2 = indirect/GI
+    // term only, 3 = unlit (raw albedo, no lighting/post).
     int gi_dbg = int(frame.debug.y + 0.5);
     if (gi_dbg == 1) {
         o_color = vec4(N * 0.5 + 0.5, 1.0);
         return;
     } else if (gi_dbg == 2) {
         o_color = vec4(indirect, 1.0);
+        return;
+    } else if (gi_dbg == 3) {
+        o_color = vec4(albedo.rgb, 1.0);
         return;
     }
 
