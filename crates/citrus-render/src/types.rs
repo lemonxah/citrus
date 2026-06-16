@@ -47,14 +47,18 @@ pub struct MeshData {
     pub indices: Vec<u32>,
 }
 
-/// RGBA8 pixel data ready for upload.
+/// Pixel data ready for upload. RGBA8 by default; when `hdr` is set, `pixels`
+/// holds RGBA **f16** (8 bytes/texel) and uploads as R16G16B16A16_SFLOAT — the
+/// native HDR-float path for EXR/HDR sources (no LDR clamp, linear).
 pub struct TextureData {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
     /// True for color data (albedo, emission), false for data maps
-    /// (normal, ORM).
+    /// (normal, ORM). Ignored when `hdr` (float is always linear).
     pub srgb: bool,
+    /// `pixels` is RGBA f16 linear (R16G16B16A16_SFLOAT) rather than RGBA8.
+    pub hdr: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -113,6 +117,24 @@ pub struct MaterialParams {
     /// Per-layer matcap blend mode encoded as a float: 0 = Add, 1 = Multiply,
     /// 2 = Replace.
     pub matcap_blend: [f32; 3],
+    // --- Per-texture UV transform for the main maps. `*_tiling` scales the UVs
+    // (Unity tiling; default 1), `*_offset` shifts them (default 0). Mask slots
+    // follow their parent map (opacity→albedo, emission_mask→emission). ---
+    pub albedo_tiling: [f32; 2],
+    pub albedo_offset: [f32; 2],
+    pub normal_tiling: [f32; 2],
+    pub normal_offset: [f32; 2],
+    pub orm_tiling: [f32; 2],
+    pub orm_offset: [f32; 2],
+    pub emission_tiling: [f32; 2],
+    pub emission_offset: [f32; 2],
+    // Invert a split AO / Roughness / Metallic map (e.g. a smoothness map used in
+    // the roughness slot). Only meaningful when the matching map is assigned.
+    pub ao_invert: bool,
+    pub roughness_invert: bool,
+    pub metallic_invert: bool,
+    /// Parallax occlusion mapping strength (uv shift at full height). 0 = off.
+    pub displacement_scale: f32,
 }
 
 impl Default for MaterialParams {
@@ -137,6 +159,18 @@ impl Default for MaterialParams {
             emission_pulse: 0.0,
             matcap_strength: [0.0, 0.0, 0.0],
             matcap_blend: [0.0, 0.0, 0.0],
+            ao_invert: false,
+            roughness_invert: false,
+            metallic_invert: false,
+            displacement_scale: 0.0,
+            albedo_tiling: [1.0, 1.0],
+            albedo_offset: [0.0, 0.0],
+            normal_tiling: [1.0, 1.0],
+            normal_offset: [0.0, 0.0],
+            orm_tiling: [1.0, 1.0],
+            orm_offset: [0.0, 0.0],
+            emission_tiling: [1.0, 1.0],
+            emission_offset: [0.0, 0.0],
         }
     }
 }
@@ -156,6 +190,16 @@ pub struct MaterialFx {
     pub matcap: [f32; 4],
     /// xyz matcap layer blend modes (0 Add / 1 Multiply / 2 Replace), w unused.
     pub matcap_blend: [f32; 4],
+    /// Per-map UV transform: xy = tiling (scale), zw = offset.
+    pub albedo_st: [f32; 4],
+    pub normal_st: [f32; 4],
+    pub orm_st: [f32; 4],
+    pub emission_st: [f32; 4],
+    /// Invert a split AO/Roughness/Metallic map: x = ao, y = roughness,
+    /// z = metallic (0 = as-is, 1 = 1 - value). w unused.
+    pub orm_invert: [f32; 4],
+    /// Parallax occlusion mapping: x = displacement scale (0 = off). yzw unused.
+    pub parallax: [f32; 4],
 }
 
 impl MaterialFx {
@@ -181,6 +225,37 @@ impl MaterialFx {
                 p.matcap_blend[2],
                 0.0,
             ],
+            albedo_st: [
+                p.albedo_tiling[0],
+                p.albedo_tiling[1],
+                p.albedo_offset[0],
+                p.albedo_offset[1],
+            ],
+            normal_st: [
+                p.normal_tiling[0],
+                p.normal_tiling[1],
+                p.normal_offset[0],
+                p.normal_offset[1],
+            ],
+            orm_st: [
+                p.orm_tiling[0],
+                p.orm_tiling[1],
+                p.orm_offset[0],
+                p.orm_offset[1],
+            ],
+            emission_st: [
+                p.emission_tiling[0],
+                p.emission_tiling[1],
+                p.emission_offset[0],
+                p.emission_offset[1],
+            ],
+            orm_invert: [
+                p.ao_invert as u32 as f32,
+                p.roughness_invert as u32 as f32,
+                p.metallic_invert as u32 as f32,
+                0.0,
+            ],
+            parallax: [p.displacement_scale, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -209,6 +284,14 @@ pub struct MaterialDesc {
     pub emission_mask: Option<TextureHandle>,
     pub matcap: [Option<TextureHandle>; 3],
     pub matcap_mask: [Option<TextureHandle>; 3],
+    /// Split AO / Roughness / Metallic maps (bindings 13-15). When assigned each
+    /// multiplies the corresponding packed-ORM channel (default white = no-op),
+    /// so a material can use a packed ORM, separate maps, or a mix.
+    pub ao: Option<TextureHandle>,
+    pub roughness: Option<TextureHandle>,
+    pub metallic: Option<TextureHandle>,
+    /// Height / displacement map (binding 16) for parallax occlusion mapping.
+    pub displacement: Option<TextureHandle>,
     /// Render with the error swirl shader (broken/missing material).
     pub error: bool,
 }
@@ -229,6 +312,13 @@ pub struct LightData {
     pub color: [f32; 3],
     pub intensity: f32,
     pub ambient: [f32; 3],
+    /// Environment / skylight intensity that scales the fallback skybox IBL
+    /// (the specular reflection of the environment cubemap on metallic/smooth
+    /// surfaces). 0 = the skybox does NOT light the scene, so with no analytic
+    /// lights and no ambient the scene is black instead of showing skybox
+    /// reflections on metals. Explicit reflection probes set their own intensity
+    /// and are unaffected. Defaults to 1 (full skybox IBL).
+    pub env_intensity: f32,
 }
 
 impl Default for LightData {
@@ -238,6 +328,7 @@ impl Default for LightData {
             color: [1.0, 0.98, 0.92],
             intensity: 3.0,
             ambient: [0.13, 0.14, 0.18],
+            env_intensity: 1.0,
         }
     }
 }
@@ -315,6 +406,15 @@ pub struct BakeInstance {
     pub albedo: [f32; 3],
     /// Emitted radiance (color × intensity, linear); surfaces glow into GI.
     pub emission: [f32; 3],
+    /// Metalness [0,1]. The diffuse bounce uses albedo·(1−metallic): a metal has
+    /// no diffuse albedo (its energy is specular/F0), so it absorbs the diffuse
+    /// GI bounce instead of re-radiating it — what stops light pooling/growing in
+    /// metal-on-metal contact cavities.
+    pub metallic: f32,
+    /// Roughness [0,1]. Carried for the surface cache / specular GI; the diffuse
+    /// bounce magnitude is roughness-independent (Lambert), so it only modulates
+    /// the (future) specular trace, not the diffuse albedo.
+    pub roughness: f32,
 }
 
 /// A light contributing to the bake. Baked lights contribute their full
@@ -369,6 +469,10 @@ pub struct BakedLightmap {
 pub struct ProbeSh {
     pub coeffs: [[f32; 3]; 4],
     pub dist: [f32; 4],
+    /// SH-L1 of the SQUARED first-hit distance (second moment), for a two-moment
+    /// Chebyshev visibility test (DDGI-style) — smooth occlusion instead of a
+    /// hard threshold. Zero = no data (the test falls back to single-moment).
+    pub dist2: [f32; 4],
 }
 
 /// Result of a bake: a lightmap per instance (same order) and SH per probe.

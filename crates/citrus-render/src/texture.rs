@@ -22,7 +22,9 @@ impl GpuTexture {
         queue: vk::Queue,
         data: &TextureData,
     ) -> Result<Self> {
-        let format = if data.srgb {
+        let format = if data.hdr {
+            vk::Format::R16G16B16A16_SFLOAT // native HDR float (RGBA f16)
+        } else if data.srgb {
             vk::Format::R8G8B8A8_SRGB
         } else {
             vk::Format::R8G8B8A8_UNORM

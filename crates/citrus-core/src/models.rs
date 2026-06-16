@@ -44,11 +44,17 @@ pub struct MaterialTexturePaths {
     pub emission_mask: Option<std::path::PathBuf>,
     pub matcap: [Option<std::path::PathBuf>; 3],
     pub matcap_mask: [Option<std::path::PathBuf>; 3],
+    /// Split AO / Roughness / Metallic maps (slots 12/13/14).
+    pub ao: Option<std::path::PathBuf>,
+    pub roughness: Option<std::path::PathBuf>,
+    pub metallic: Option<std::path::PathBuf>,
+    /// Height / displacement map (slot 15) for parallax occlusion mapping.
+    pub displacement: Option<std::path::PathBuf>,
 }
 
-/// Display labels for the 12 texture slots, in binding order. Index matches
+/// Display labels for the 15 texture slots, in binding order. Index matches
 /// [`MaterialTexturePaths::slot_mut`].
-pub const TEXTURE_SLOT_LABELS: [&str; 12] = [
+pub const TEXTURE_SLOT_LABELS: [&str; 16] = [
     "Albedo",
     "Normal Map",
     "ORM (Occl/Rough/Metal)",
@@ -61,10 +67,14 @@ pub const TEXTURE_SLOT_LABELS: [&str; 12] = [
     "Matcap 2 Mask",
     "Matcap 3",
     "Matcap 3 Mask",
+    "Ambient Occlusion",
+    "Roughness",
+    "Metallic",
+    "Displacement",
 ];
 
 impl MaterialTexturePaths {
-    /// Mutable access to slot `i` (0..12) in binding order; `None` if out of range.
+    /// Mutable access to slot `i` (0..15) in binding order; `None` if out of range.
     pub fn slot_mut(&mut self, i: usize) -> Option<&mut Option<std::path::PathBuf>> {
         Some(match i {
             0 => &mut self.albedo,
@@ -79,6 +89,10 @@ impl MaterialTexturePaths {
             9 => &mut self.matcap_mask[1],
             10 => &mut self.matcap[2],
             11 => &mut self.matcap_mask[2],
+            12 => &mut self.ao,
+            13 => &mut self.roughness,
+            14 => &mut self.metallic,
+            15 => &mut self.displacement,
             _ => return None,
         })
     }
@@ -156,6 +170,22 @@ pub struct MaterialModel {
     pub ramp_smoothness: f32,
     pub emission_scroll: [f32; 2],
     pub emission_pulse: f32,
+    /// Invert a split AO / Roughness / Metallic map (e.g. smoothness→roughness).
+    pub ao_invert: bool,
+    pub roughness_invert: bool,
+    pub metallic_invert: bool,
+    /// Parallax occlusion mapping strength for the displacement map (0 = off).
+    pub displacement_scale: f32,
+    /// Per-texture UV tiling (xy scale, default 1) + offset (default 0) for the
+    /// main maps; masks follow their parent map.
+    pub albedo_tiling: [f32; 2],
+    pub albedo_offset: [f32; 2],
+    pub normal_tiling: [f32; 2],
+    pub normal_offset: [f32; 2],
+    pub orm_tiling: [f32; 2],
+    pub orm_offset: [f32; 2],
+    pub emission_tiling: [f32; 2],
+    pub emission_offset: [f32; 2],
     /// Additive matcap layer strengths (0 = off). Matcap textures are assigned
     /// via the `.material` file's texture slots.
     pub matcap_strength: [f32; 3],

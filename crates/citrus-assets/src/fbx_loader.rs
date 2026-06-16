@@ -562,6 +562,7 @@ fn texture_data(texture: &ufbx::Texture, base_dir: &Path, srgb: bool) -> Result<
         height: img.height(),
         pixels: img.into_raw(),
         srgb,
+        hdr: false,
     })
 }
 

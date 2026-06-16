@@ -1,5 +1,5 @@
 #version 450
-// Software (Lumen-style) GI probe march on the GPU. One invocation per probe:
+// Software GI probe march on the GPU. One invocation per probe:
 // uniform-sphere Monte-Carlo with multi-bounce diffuse paths, sphere-marched
 // against the merged Global Distance Field (one 3D distance texture plus a
 // nearest-instance index texture for material lookup) instead of looping per-mesh SDFs.

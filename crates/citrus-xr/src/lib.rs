@@ -169,6 +169,28 @@ impl XrContext {
         let a_left_foot = mk("left_foot", "Left Foot")?;
         let a_right_foot = mk("right_foot", "Right Foot")?;
 
+        // Locomotion / interaction inputs (analog sticks + grips, digital trigger +
+        // menu button). Bound to the Oculus Touch profile below (the common case);
+        // a runtime with a different controller just ignores the suggestions.
+        let mkf = |name: &str, label: &str| -> Result<openxr::Action<f32>> {
+            action_set
+                .create_action::<f32>(name, label, &[])
+                .map_err(|e| anyhow::anyhow!("creating action {name}: {e}"))
+        };
+        let mkb = |name: &str, label: &str| -> Result<openxr::Action<bool>> {
+            action_set
+                .create_action::<bool>(name, label, &[])
+                .map_err(|e| anyhow::anyhow!("creating action {name}: {e}"))
+        };
+        let a_lstick_x = mkf("left_stick_x", "Left Stick X")?;
+        let a_lstick_y = mkf("left_stick_y", "Left Stick Y")?;
+        let a_rstick_x = mkf("right_stick_x", "Right Stick X")?;
+        let a_rstick_y = mkf("right_stick_y", "Right Stick Y")?;
+        let a_lgrip = mkf("left_grip", "Left Grip")?;
+        let a_rgrip = mkf("right_grip", "Right Grip")?;
+        let a_rtrigger = mkb("right_trigger", "Right Trigger")?;
+        let a_menu = mkb("menu", "Menu")?;
+
         // Suggested bindings. Hands map to the cross-vendor simple controller;
         // waist/feet to Vive tracker role paths (best-effort — ignored if the
         // runtime lacks the tracker extension). Failures here are non-fatal.
@@ -199,6 +221,36 @@ impl XrContext {
                 ],
             );
         }
+        // Locomotion/interaction bindings on the Oculus Touch profile (Quest, Rift;
+        // the most common runtime). Pose hands also bind here so controllers track.
+        if let (Ok(lsx), Ok(lsy), Ok(rsx), Ok(rsy), Ok(lg), Ok(rg), Ok(rt), Ok(mn), Ok(lhp), Ok(rhp)) = (
+            path("/user/hand/left/input/thumbstick/x"),
+            path("/user/hand/left/input/thumbstick/y"),
+            path("/user/hand/right/input/thumbstick/x"),
+            path("/user/hand/right/input/thumbstick/y"),
+            path("/user/hand/left/input/squeeze/value"),
+            path("/user/hand/right/input/squeeze/value"),
+            path("/user/hand/right/input/trigger/value"),
+            path("/user/hand/right/input/a/click"),
+            path("/user/hand/left/input/aim/pose"),
+            path("/user/hand/right/input/aim/pose"),
+        ) {
+            let _ = self.instance.suggest_interaction_profile_bindings(
+                path("/interaction_profiles/oculus/touch_controller").unwrap_or(openxr::Path::NULL),
+                &[
+                    openxr::Binding::new(&a_left_hand, lhp),
+                    openxr::Binding::new(&a_right_hand, rhp),
+                    openxr::Binding::new(&a_lstick_x, lsx),
+                    openxr::Binding::new(&a_lstick_y, lsy),
+                    openxr::Binding::new(&a_rstick_x, rsx),
+                    openxr::Binding::new(&a_rstick_y, rsy),
+                    openxr::Binding::new(&a_lgrip, lg),
+                    openxr::Binding::new(&a_rgrip, rg),
+                    openxr::Binding::new(&a_rtrigger, rt),
+                    openxr::Binding::new(&a_menu, mn),
+                ],
+            );
+        }
         session
             .attach_action_sets(&[&action_set])
             .context("attaching OpenXR action set")?;
@@ -224,6 +276,14 @@ impl XrContext {
             hips,
             left_foot,
             right_foot,
+            a_lstick_x,
+            a_lstick_y,
+            a_rstick_x,
+            a_rstick_y,
+            a_lgrip,
+            a_rgrip,
+            a_rtrigger,
+            a_menu,
             running: false,
             swapchains: Vec::new(),
             swap_images: Vec::new(),
@@ -231,6 +291,18 @@ impl XrContext {
             blend_mode: openxr::EnvironmentBlendMode::OPAQUE,
         })
     }
+}
+
+/// Controller inputs read this frame (analog sticks/grips + digital trigger/menu).
+/// Bound to the Oculus Touch profile; zero/false when unbound or not tracking.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VrInput {
+    pub left_stick: (f32, f32),
+    pub right_stick: (f32, f32),
+    pub left_grip: f32,
+    pub right_grip: f32,
+    pub right_trigger: bool,
+    pub menu: bool,
 }
 
 /// Tracked full-body poses (stage space) read from the VR session this frame.
@@ -264,6 +336,14 @@ pub struct XrSession {
     hips: openxr::Space,
     left_foot: openxr::Space,
     right_foot: openxr::Space,
+    a_lstick_x: openxr::Action<f32>,
+    a_lstick_y: openxr::Action<f32>,
+    a_rstick_x: openxr::Action<f32>,
+    a_rstick_y: openxr::Action<f32>,
+    a_lgrip: openxr::Action<f32>,
+    a_rgrip: openxr::Action<f32>,
+    a_rtrigger: openxr::Action<bool>,
+    a_menu: openxr::Action<bool>,
     pub running: bool,
     // Stereo render: per-eye swapchains + their VkImage handles, render extent.
     swapchains: Vec<openxr::Swapchain<openxr::Vulkan>>,
@@ -388,6 +468,32 @@ impl XrSession {
             hips: self.locate(&self.hips, time),
             left_foot: self.locate(&self.left_foot, time),
             right_foot: self.locate(&self.right_foot, time),
+        }
+    }
+
+    /// Read this frame's controller inputs (call after [`poll`], which syncs the
+    /// action set). All zero/false when not running.
+    pub fn input(&self) -> VrInput {
+        if !self.running {
+            return VrInput::default();
+        }
+        let f = |a: &openxr::Action<f32>| {
+            a.state(&self.session, openxr::Path::NULL)
+                .map(|s| s.current_state)
+                .unwrap_or(0.0)
+        };
+        let b = |a: &openxr::Action<bool>| {
+            a.state(&self.session, openxr::Path::NULL)
+                .map(|s| s.current_state)
+                .unwrap_or(false)
+        };
+        VrInput {
+            left_stick: (f(&self.a_lstick_x), f(&self.a_lstick_y)),
+            right_stick: (f(&self.a_rstick_x), f(&self.a_rstick_y)),
+            left_grip: f(&self.a_lgrip),
+            right_grip: f(&self.a_rgrip),
+            right_trigger: b(&self.a_rtrigger),
+            menu: b(&self.a_menu),
         }
     }
 

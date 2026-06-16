@@ -231,6 +231,7 @@ fn checker_texture(size: u32, cell: u32) -> TextureData {
         height: size,
         pixels,
         srgb: true,
+        hdr: false,
     }
 }
 

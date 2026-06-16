@@ -401,6 +401,8 @@ impl GameApp {
                 env.ambient[1] * env.ambient_intensity,
                 env.ambient[2] * env.ambient_intensity,
             ]),
+            // Skybox IBL gated by the Enable-skybox toggle (see editor_app).
+            env_intensity: if env.skybox_enabled { 1.0 } else { 0.0 },
         };
 
         let shadow_res = env.shadow_resolution.clamp(256, 8192);

@@ -41,6 +41,10 @@ pub(crate) struct PipelineKey {
     pub skybox: bool,
     /// Shadow depth pass: vertex-only, depth into a shadow map (no color).
     pub shadow: bool,
+    /// Deferred-SSR G-buffer variant: adds a second color attachment
+    /// (reflectance.rgb + roughness.a) so a fullscreen resolve pass can do
+    /// current-frame screen-space reflections. Off = single color attachment.
+    pub gbuf: bool,
     /// 0 = standard shader; otherwise a custom fragment shader
     /// (`ShaderId` + 1). Custom variants skip specialization constants.
     pub shader: u32,
@@ -63,6 +67,7 @@ impl PipelineKey {
             depth_only: false,
             skybox: false,
             shadow: false,
+            gbuf: false,
             shader: 0,
         }
     }
@@ -79,6 +84,7 @@ impl PipelineKey {
             depth_only: false,
             skybox: false,
             shadow: false,
+            gbuf: false,
             shader: 0,
         }
     }
@@ -95,6 +101,7 @@ impl PipelineKey {
             depth_only: false,
             skybox: false,
             shadow: false,
+            gbuf: false,
             shader: 0,
         }
     }
@@ -111,6 +118,7 @@ impl PipelineKey {
             depth_only: true,
             skybox: false,
             shadow: false,
+            gbuf: false,
             shader: 0,
         }
     }
@@ -127,6 +135,7 @@ impl PipelineKey {
             depth_only: false,
             skybox: true,
             shadow: false,
+            gbuf: false,
             shader: 0,
         }
     }
@@ -143,6 +152,7 @@ impl PipelineKey {
             depth_only: false,
             skybox: false,
             shadow: true,
+            gbuf: false,
             shader: 0,
         }
     }
@@ -164,6 +174,8 @@ pub(crate) struct PipelineCache {
     pub layout: vk::PipelineLayout,
     color_format: vk::Format,
     depth_format: vk::Format,
+    /// Second color attachment format for `gbuf` variants (deferred SSR).
+    gbuf_format: vk::Format,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
 }
 
@@ -172,6 +184,7 @@ impl PipelineCache {
         device: &ash::Device,
         color_format: vk::Format,
         depth_format: vk::Format,
+        gbuf_format: vk::Format,
     ) -> Result<Self> {
         let vert_code = ash::util::read_spv(&mut Cursor::new(VERT_SPV))?;
         let frag_code = ash::util::read_spv(&mut Cursor::new(FRAG_SPV))?;
@@ -288,11 +301,13 @@ impl PipelineCache {
         };
 
         // set 1: material textures (albedo, normal, ORM, emission)
-        // Texture samplers at bindings 0-3 (albedo/normal/orm/emission) and 5-12
-        // (opacity, emission mask, 3 matcaps + 3 matcap masks). Binding 4 is the
-        // FX uniform block. Every material set writes all of these (create_material
-        // and the skybox set), so they're always valid.
-        let sampler_bindings: [u32; 12] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+        // Texture samplers at bindings 0-3 (albedo/normal/orm/emission), 5-12
+        // (opacity, emission mask, 3 matcaps + 3 matcap masks), and 13-15 (split
+        // AO/Roughness/Metallic). Binding 4 is the FX uniform block. Every
+        // material set writes all of these (create_material and the skybox set),
+        // so they're always valid.
+        let sampler_bindings: [u32; 16] =
+            [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let mut tex_bindings: Vec<_> = sampler_bindings
             .iter()
             .map(|&i| {
@@ -348,6 +363,7 @@ impl PipelineCache {
             layout,
             color_format,
             depth_format,
+            gbuf_format,
             pipelines: HashMap::new(),
         })
     }
@@ -571,8 +587,16 @@ impl PipelineCache {
             vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
         };
-        // The shadow pass has no color attachment.
-        let blend_attachments = [blend_attachment];
+        // The G-buffer attachment (deferred SSR) always writes RGBA so the
+        // resolve pass reads valid reflectance/roughness; it never alpha-blends.
+        let gbuf_blend = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        // The shadow pass has no color attachment; gbuf variants add a second.
+        let blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = if key.gbuf {
+            vec![blend_attachment, gbuf_blend]
+        } else {
+            vec![blend_attachment]
+        };
         let color_blend = if key.shadow {
             vk::PipelineColorBlendStateCreateInfo::default()
         } else {
@@ -582,7 +606,11 @@ impl PipelineCache {
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
-        let color_formats = [self.color_format];
+        let color_formats: Vec<vk::Format> = if key.gbuf {
+            vec![self.color_format, self.gbuf_format]
+        } else {
+            vec![self.color_format]
+        };
         let mut rendering = if key.shadow {
             // Depth-only target: no color attachments.
             vk::PipelineRenderingCreateInfo::default().depth_attachment_format(self.depth_format)

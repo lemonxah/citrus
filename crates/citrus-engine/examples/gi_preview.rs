@@ -49,6 +49,8 @@ fn scene_instances() -> Vec<SdfInstance> {
             sdf: plane_sdf,
             albedo: [0.8, 0.8, 0.8],
             emission: [0.0, 0.0, 0.0],
+            metallic: 0.0,
+            roughness: 0.7,
             static_geometry: true,
         },
         SdfInstance {
@@ -57,6 +59,8 @@ fn scene_instances() -> Vec<SdfInstance> {
             sdf: sphere_sdf,
             albedo: [0.1, 0.1, 0.1],
             emission: EMISSION.to_array(),
+            metallic: 0.0,
+            roughness: 0.7,
             static_geometry: true,
         },
     ]

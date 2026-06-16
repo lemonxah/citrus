@@ -1,4 +1,4 @@
-//! Per-mesh signed distance field generation for the software (Lumen-style) GI
+//! Per-mesh signed distance field generation for the software GI
 //! path. A mesh is voxelized once into a local-space SDF grid: each voxel stores
 //! the signed distance to the nearest triangle (negative inside). The software
 //! GI marches these instead of a hardware BVH, so it needs no RT cores.

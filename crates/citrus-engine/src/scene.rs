@@ -117,7 +117,7 @@ pub struct MaterialEntry {
 /// The 12 material texture slots in binding order: albedo, normal, orm,
 /// emission, opacity, emission_mask, matcap0, matcap0_mask, matcap1,
 /// matcap1_mask, matcap2, matcap2_mask.
-pub type TexSlots = [Option<TextureHandle>; 12];
+pub type TexSlots = [Option<TextureHandle>; 16];
 
 #[derive(Clone, Copy)]
 pub struct MeshInfo {
@@ -149,6 +149,12 @@ pub struct LoadedScene {
     /// procedural, or network). When set + the rig is humanoid, the avatar is
     /// IK-posed instead of playing the clip. Not VR-specific.
     ik_targets: Option<citrus_core::IkTargets>,
+    /// When set, humanoid avatars get terrain foot IK applied on top of their
+    /// animated/IK pose each skinning update (feet plant on uneven ground).
+    foot_ik: Option<crate::humanoid::FootIkParams>,
+    /// Captured full-body tracker calibration (from a T-pose alignment). When set,
+    /// raw tracker poses are remapped through it before driving IK.
+    vr_calibration: Option<crate::humanoid::BodyCalibration>,
     mesh_handles: Vec<MeshHandle>,
     mesh_infos: Vec<MeshInfo>,
     mesh_bounds: Vec<(Vec3, Vec3)>,
@@ -228,6 +234,8 @@ impl LoadedScene {
             skinned_meshes: Vec::new(),
             anim_time: 0.0,
             ik_targets: None,
+            foot_ik: None,
+            vr_calibration: None,
             mesh_geometry: Vec::new(),
             mesh_sdf: Vec::new(),
             postfx_cache: std::collections::HashMap::new(),
@@ -808,6 +816,10 @@ impl LoadedScene {
             load_tex(&file.textures.matcap_mask[1], false)?,
             load_tex(&file.textures.matcap_mask[2], false)?,
         ];
+        let ao = load_tex(&file.textures.ao, false)?;
+        let roughness = load_tex(&file.textures.roughness, false)?;
+        let metallic = load_tex(&file.textures.metallic, false)?;
+        let displacement = load_tex(&file.textures.displacement, false)?;
 
         let desc = MaterialDesc {
             name: file.name.clone(),
@@ -821,6 +833,10 @@ impl LoadedScene {
             emission_mask,
             matcap,
             matcap_mask,
+            ao,
+            roughness,
+            metallic,
+            displacement,
             error: false,
         };
         let handle = renderer.create_material(&desc)?;
@@ -856,6 +872,10 @@ impl LoadedScene {
             matcap_mask[1],
             matcap[2],
             matcap_mask[2],
+            ao,
+            roughness,
+            metallic,
+            displacement,
         ];
         self.materials.push(MaterialEntry {
             default: model.clone(),
@@ -937,6 +957,10 @@ impl LoadedScene {
             renderer.set_material_textures(handle, &slots);
             self.materials[index].bound_textures = slots;
         }
+        // Keep the model's normal-map flag in sync with the resolved slot so the
+        // inspector enables the Normal Strength slider once a normal map is
+        // assigned (slot 1), and disables it again when cleared.
+        self.materials[index].model.has_normal_texture = slots[1].is_some();
 
         let entry = &self.materials[index];
         let m = &entry.model;
@@ -1025,7 +1049,7 @@ impl LoadedScene {
         paths: &citrus_core::MaterialTexturePaths,
         base: &TexSlots,
     ) -> TexSlots {
-        let order: [(&Option<PathBuf>, bool); 12] = [
+        let order: [(&Option<PathBuf>, bool); 16] = [
             (&paths.albedo, true),
             (&paths.normal, false),
             (&paths.orm, false),
@@ -1038,6 +1062,10 @@ impl LoadedScene {
             (&paths.matcap_mask[1], false),
             (&paths.matcap[2], true),
             (&paths.matcap_mask[2], false),
+            (&paths.ao, false),
+            (&paths.roughness, false),
+            (&paths.metallic, false),
+            (&paths.displacement, false),
         ];
         let mut slots = *base;
         for (i, (path, srgb)) in order.iter().enumerate() {
@@ -1465,6 +1493,7 @@ impl LoadedScene {
                     ],
                     // Baked sidecars carry no visibility moments, so disabled.
                     dist: [0.0; 4],
+                    dist2: [0.0; 4],
                 })
                 .collect();
         }
@@ -1539,6 +1568,8 @@ impl LoadedScene {
                 lightmap_size,
                 albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
                 emission,
+                metallic: model.metallic,
+                roughness: model.roughness,
             });
             instance_objects.push(i);
         }
@@ -1698,6 +1729,8 @@ impl LoadedScene {
                     lightmap_size: 8, // unused: probes_only skips lightmap tracing
                     albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
                     emission,
+                    metallic: model.metallic,
+                    roughness: model.roughness,
                 });
                 instance_objects.push(i);
                 instance_static.push(is_static);
@@ -1794,7 +1827,11 @@ impl LoadedScene {
         // 32768 probes is ~9ms/trace; cap it to 24³ (~13k) for realtime; the
         // probe-grid blur keeps the soft look at the lower resolution.
         let max_axis = if software { 32 } else { 24 };
-        let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(2, max_axis) as usize;
+        // Minimum 4 probes per axis: a shallow scene (e.g. a floor + objects with
+        // a small vertical extent) otherwise gets only 2 probes on the Y axis, so
+        // moving an object vertically swings the trilinear blend hugely (the
+        // position-dependent under-mesh bounce). 4 gives a real vertical gradient.
+        let axis_count = |e: f32| ((e / spacing).round() as i32).clamp(4, max_axis) as usize;
         let counts = [axis_count(size.x), axis_count(size.y), axis_count(size.z)];
 
         // Number of cascades: enough 2x refinements to bring the coarsest cell
@@ -1897,6 +1934,8 @@ impl LoadedScene {
                 sdf: sdf.clone(),
                 albedo: instance.albedo,
                 emission: instance.emission,
+                metallic: instance.metallic,
+                roughness: instance.roughness,
                 static_geometry,
             });
         }
@@ -1920,6 +1959,97 @@ impl LoadedScene {
     /// procedural, …). `None` clears them so avatars play their clips.
     pub fn set_ik_targets(&mut self, targets: Option<citrus_core::IkTargets>) {
         self.ik_targets = targets;
+    }
+
+    /// Enable/disable terrain foot IK for humanoid avatars (applied on top of the
+    /// animated/IK pose so feet plant on uneven ground). `None` disables it.
+    pub fn set_foot_ik(&mut self, params: Option<crate::humanoid::FootIkParams>) {
+        self.foot_ik = params;
+    }
+
+    /// Whether terrain foot IK is currently enabled.
+    pub fn foot_ik_enabled(&self) -> bool {
+        self.foot_ik.is_some()
+    }
+
+    /// The first humanoid skeleton in the scene (the avatar driven by full-body
+    /// tracking), if any.
+    fn first_humanoid(&self) -> Option<&citrus_assets::Skeleton> {
+        self.skeletons
+            .iter()
+            .find(|s| crate::humanoid::HumanoidRig::map(s).is_humanoid())
+    }
+
+    /// Capture a full-body tracker calibration: the player holds a T-pose matching
+    /// the avatar's rest pose; `raw` is the live tracker poses (head/hands/hips/
+    /// feet) at that instant. After this, [`vr_apply_calibration`] remaps live
+    /// poses so each tracker drives its bone naturally. Returns false if there's no
+    /// humanoid avatar to calibrate against.
+    pub fn calibrate_vr_tpose(&mut self, raw: &citrus_core::TrackerTargets) -> bool {
+        let Some(skel) = self.first_humanoid() else {
+            return false;
+        };
+        let poses = tracker_poses_from_targets(raw);
+        self.vr_calibration = Some(crate::humanoid::calibrate_tpose(skel, &poses));
+        true
+    }
+
+    /// Clear any captured T-pose calibration (back to raw tracker poses).
+    pub fn clear_vr_calibration(&mut self) {
+        self.vr_calibration = None;
+    }
+
+    /// True once a T-pose calibration has been captured.
+    pub fn has_vr_calibration(&self) -> bool {
+        self.vr_calibration.is_some()
+    }
+
+    /// Remap raw tracker poses through the captured calibration into IK targets.
+    /// Returns the raw targets unchanged when no calibration is set, so the caller
+    /// can always feed the result straight into [`set_ik_targets`].
+    pub fn vr_apply_calibration(
+        &self,
+        raw: &citrus_core::TrackerTargets,
+    ) -> citrus_core::TrackerTargets {
+        match &self.vr_calibration {
+            Some(cal) => {
+                crate::humanoid::targets_from_calibrated(cal, &tracker_poses_from_targets(raw))
+            }
+            None => *raw,
+        }
+    }
+
+    /// Approximate ground height + up-ish normal under a world point, from a
+    /// downward ray against static render objects' AABBs. Only hits at or below
+    /// `ceiling` count, which keeps a foot from grounding on the avatar's own AABB
+    /// (its top sits at head height, far above the foot). `None` = no ground.
+    ///
+    /// AABB-coarse for now (box tops, flat normals) — a triangle-accurate raycast
+    /// against the terrain mesh is the follow-up; the foot-IK math already takes a
+    /// real `(height, normal)` so only this sampler needs upgrading.
+    pub fn ground_height(&self, x: f32, z: f32, ceiling: f32) -> Option<(f32, Vec3)> {
+        let origin = Vec3::new(x, 1.0e4, z);
+        let dir = Vec3::NEG_Y;
+        let mut best: Option<f32> = None;
+        for (i, object) in self.objects.iter().enumerate() {
+            if object.render.is_none() || !self.is_active(i) {
+                continue;
+            }
+            let world = self.world_transform(i);
+            let inv = world.inverse();
+            let lo = inv.transform_point3(origin);
+            let ld = inv.transform_vector3(dir);
+            for render in object.render_slots() {
+                let (min, max) = self.mesh_bounds[render.mesh];
+                if let Some(t_local) = ray_aabb(lo, ld, min, max) {
+                    let hit = world.transform_point3(lo + ld * t_local);
+                    if hit.y <= ceiling {
+                        best = Some(best.map_or(hit.y, |b| b.max(hit.y)));
+                    }
+                }
+            }
+        }
+        best.map(|y| (y, Vec3::Y))
     }
 
     pub fn update_skinning(&mut self, renderer: &mut Renderer, dt: f32) {
@@ -1947,7 +2077,7 @@ impl LoadedScene {
             let Some(skel) = self.skeletons.get(sm.skeleton) else {
                 continue;
             };
-            let locals = match ik {
+            let mut locals = match ik {
                 Some(targets)
                     if ik_active && crate::humanoid::HumanoidRig::map(skel).is_humanoid() =>
                 {
@@ -1955,6 +2085,17 @@ impl LoadedScene {
                 }
                 _ => self.animations[0].sample(skel, self.anim_time),
             };
+            // Terrain foot IK: plant the feet on the ground under them. The ground
+            // sampler caps hits at the foot height + max_lift so the avatar never
+            // grounds on its own AABB.
+            if let Some(params) = self.foot_ik {
+                if crate::humanoid::HumanoidRig::map(skel).is_humanoid() {
+                    let max_lift = params.max_lift;
+                    crate::humanoid::apply_foot_ik(skel, &mut locals, &params, |p| {
+                        self.ground_height(p.x, p.z, p.y + max_lift)
+                    });
+                }
+            }
             let palette = skel.palette(&locals);
             let mut verts = sm.base_vertices.clone();
             for v in &mut verts {
@@ -2331,6 +2472,11 @@ impl LoadedScene {
             if object.render.is_none() {
                 continue;
             }
+            // A disabled object (or one under a disabled parent) is "not there":
+            // it isn't rendered and must not be pickable in the viewport either.
+            if !self.is_active(i) {
+                continue;
+            }
             let world = self.world_transform(i);
             let inv = world.inverse();
             let local_origin = inv.transform_point3(origin);
@@ -2684,6 +2830,18 @@ pub fn model_from_material(
         ramp_smoothness: p.ramp_smoothness,
         emission_scroll: p.emission_scroll,
         emission_pulse: p.emission_pulse,
+        albedo_tiling: p.albedo_tiling,
+        albedo_offset: p.albedo_offset,
+        normal_tiling: p.normal_tiling,
+        normal_offset: p.normal_offset,
+        orm_tiling: p.orm_tiling,
+        orm_offset: p.orm_offset,
+        emission_tiling: p.emission_tiling,
+        emission_offset: p.emission_offset,
+        ao_invert: p.ao_invert,
+        roughness_invert: p.roughness_invert,
+        metallic_invert: p.metallic_invert,
+        displacement_scale: p.displacement_scale,
         matcap_strength: p.matcap_strength,
         matcap_blend: [
             citrus_core::MatcapBlend::from_f32(p.matcap_blend[0]),
@@ -2713,6 +2871,10 @@ pub fn tex_paths_from_file(
         emission_mask: t.emission_mask.clone(),
         matcap: t.matcap.clone(),
         matcap_mask: t.matcap_mask.clone(),
+        ao: t.ao.clone(),
+        roughness: t.roughness.clone(),
+        metallic: t.metallic.clone(),
+        displacement: t.displacement.clone(),
     }
 }
 
@@ -2729,6 +2891,10 @@ pub fn tex_file_from_paths(
         emission_mask: t.emission_mask.clone(),
         matcap: t.matcap.clone(),
         matcap_mask: t.matcap_mask.clone(),
+        ao: t.ao.clone(),
+        roughness: t.roughness.clone(),
+        metallic: t.metallic.clone(),
+        displacement: t.displacement.clone(),
     }
 }
 
@@ -2752,6 +2918,25 @@ pub fn material_from_model(m: &MaterialModel) -> (MaterialParams, MaterialFeatur
             base_scroll: [0.0, 0.0],
             emission_scroll: m.emission_scroll,
             emission_pulse: m.emission_pulse,
+            albedo_tiling: m.albedo_tiling,
+            albedo_offset: m.albedo_offset,
+            normal_tiling: m.normal_tiling,
+            normal_offset: m.normal_offset,
+            orm_tiling: m.orm_tiling,
+            orm_offset: m.orm_offset,
+            emission_tiling: m.emission_tiling,
+            emission_offset: m.emission_offset,
+            // Invert only has meaning with the matching split map assigned;
+            // gate it so an invert toggle left on with no map can't zero a
+            // channel (1 - default-white = 0).
+            ao_invert: m.ao_invert && m.textures.ao.is_some(),
+            roughness_invert: m.roughness_invert && m.textures.roughness.is_some(),
+            metallic_invert: m.metallic_invert && m.textures.metallic.is_some(),
+            displacement_scale: if m.textures.displacement.is_some() {
+                m.displacement_scale
+            } else {
+                0.0
+            },
             matcap_strength: m.matcap_strength,
             matcap_blend: [
                 m.matcap_blend[0].to_f32(),
@@ -2782,6 +2967,20 @@ pub fn relative_to(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
+}
+
+/// Convert per-role `(position, rotation)` tracker targets into the `Mat4`-based
+/// `TrackerPoses` the calibration math takes.
+fn tracker_poses_from_targets(t: &citrus_core::TrackerTargets) -> crate::humanoid::TrackerPoses {
+    let m = |p: Option<(Vec3, glam::Quat)>| p.map(|(pos, rot)| Mat4::from_rotation_translation(rot, pos));
+    crate::humanoid::TrackerPoses {
+        head: m(t.head),
+        left_hand: m(t.left_hand),
+        right_hand: m(t.right_hand),
+        hips: m(t.hips),
+        left_foot: m(t.left_foot),
+        right_foot: m(t.right_foot),
+    }
 }
 
 fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {

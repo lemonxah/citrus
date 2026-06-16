@@ -105,6 +105,30 @@ fn texture_row(
     cleared
 }
 
+/// Per-texture UV transform: tiling (scale) + offset, two compact rows. Returns
+/// true if either changed.
+fn uv_transform_row(ui: &mut Ui, tiling: &mut [f32; 2], offset: &mut [f32; 2]) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Tiling").small().weak());
+        changed |= ui
+            .add(DragValue::new(&mut tiling[0]).speed(0.01).prefix("x "))
+            .changed();
+        changed |= ui
+            .add(DragValue::new(&mut tiling[1]).speed(0.01).prefix("y "))
+            .changed();
+        ui.separator();
+        ui.label(RichText::new("Offset").small().weak());
+        changed |= ui
+            .add(DragValue::new(&mut offset[0]).speed(0.005).prefix("x "))
+            .changed();
+        changed |= ui
+            .add(DragValue::new(&mut offset[1]).speed(0.005).prefix("y "))
+            .changed();
+    });
+    changed
+}
+
 fn section_matches(search: &str, index: usize) -> bool {
     if search.is_empty() {
         return true;
@@ -166,6 +190,9 @@ pub fn material_editor_ui(
                 ui.checkbox(&mut m.double_sided, "")
             });
         });
+        // Render queue is the last entry for every shader (draw-order priority).
+        ui.separator();
+        render_queue_ui(ui, m, &mut changed);
         return changed;
     }
 
@@ -183,6 +210,7 @@ pub fn material_editor_ui(
                 ui.color_edit_button_rgba_unmultiplied(&mut m.base_color)
             });
             *changed |= texture_row(ui, "Albedo", 0, m.textures.slot_mut(0).unwrap(), tex_dropped);
+            *changed |= uv_transform_row(ui, &mut m.albedo_tiling, &mut m.albedo_offset);
             property_row(ui, "Metallic", changed, |ui| {
                 ui.add(Slider::new(&mut m.metallic, 0.0..=1.0))
             });
@@ -199,9 +227,36 @@ pub fn material_editor_ui(
                 m.textures.slot_mut(2).unwrap(),
                 tex_dropped,
             );
+            *changed |= uv_transform_row(ui, &mut m.orm_tiling, &mut m.orm_offset);
+            ui.label(
+                RichText::new(
+                    "Or split maps below — each multiplies its packed-ORM channel \
+                     (leave ORM empty to use them alone). They share the ORM tiling.",
+                )
+                .small()
+                .weak(),
+            );
+            *changed |= texture_row(ui, "Ambient Occlusion", 12, m.textures.slot_mut(12).unwrap(), tex_dropped);
+            let has_ao = m.textures.ao.is_some();
+            ui.add_enabled_ui(has_ao, |ui| {
+                *changed |= ui.checkbox(&mut m.ao_invert, "Invert").changed();
+            });
+            *changed |= texture_row(ui, "Roughness", 13, m.textures.slot_mut(13).unwrap(), tex_dropped);
+            let has_rough = m.textures.roughness.is_some();
+            ui.add_enabled_ui(has_rough, |ui| {
+                *changed |= ui
+                    .checkbox(&mut m.roughness_invert, "Invert (smoothness → roughness)")
+                    .changed();
+            });
+            *changed |= texture_row(ui, "Metallic", 14, m.textures.slot_mut(14).unwrap(), tex_dropped);
+            let has_metal = m.textures.metallic.is_some();
+            ui.add_enabled_ui(has_metal, |ui| {
+                *changed |= ui.checkbox(&mut m.metallic_invert, "Invert").changed();
+            });
             ui.separator();
             *changed |=
                 texture_row(ui, "Normal Map", 1, m.textures.slot_mut(1).unwrap(), tex_dropped);
+            *changed |= uv_transform_row(ui, &mut m.normal_tiling, &mut m.normal_offset);
             ui.add_enabled_ui(m.has_normal_texture, |ui| {
                 property_row(ui, "Use Normal Map", changed, |ui| {
                     ui.checkbox(&mut m.normal_map_enabled, "")
@@ -213,6 +268,24 @@ pub fn material_editor_ui(
             ui.separator();
             *changed |=
                 texture_row(ui, "Opacity", 4, m.textures.slot_mut(4).unwrap(), tex_dropped);
+            ui.separator();
+            *changed |= texture_row(
+                ui,
+                "Displacement (height)",
+                15,
+                m.textures.slot_mut(15).unwrap(),
+                tex_dropped,
+            );
+            let has_disp = m.textures.displacement.is_some();
+            ui.add_enabled_ui(has_disp, |ui| {
+                property_row(ui, "Displacement Scale", changed, |ui| {
+                    ui.add(Slider::new(&mut m.displacement_scale, 0.0..=0.1))
+                        .on_hover_text(
+                            "Parallax occlusion depth (0 = off). Height samples in the \
+                             albedo UV tiling; all maps shift together.",
+                        )
+                });
+            });
         });
     }
 
@@ -275,6 +348,7 @@ pub fn material_editor_ui(
                     m.textures.slot_mut(3).unwrap(),
                     tex_dropped,
                 );
+                *changed |= uv_transform_row(ui, &mut m.emission_tiling, &mut m.emission_offset);
                 property_row(ui, "Intensity", changed, |ui| {
                     ui.add(
                         DragValue::new(&mut m.emission_intensity)
@@ -385,6 +459,10 @@ pub fn material_editor_ui(
         });
     }
 
+    // Render queue is the last entry for every shader (draw-order priority).
+    ui.separator();
+    render_queue_ui(ui, m, &mut changed);
+
     changed
 }
 
@@ -424,7 +502,6 @@ fn alpha_mode_ui(ui: &mut Ui, m: &mut MaterialModel, changed: &mut bool) {
             ui.add(Slider::new(&mut m.base_color[3], 0.0..=1.0))
         });
     }
-    render_queue_ui(ui, m, changed);
 }
 
 /// Render-queue (draw-order priority) control: a value plus Unity-style

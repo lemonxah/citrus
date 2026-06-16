@@ -62,6 +62,18 @@ pub fn run(config: AppConfig) -> Result<()> {
         xr: None,
         xr_session: None,
         vr_targets: citrus_core::TrackerTargets::default(),
+        vr_rig: citrus_core::VrRig::default(),
+        xr_stereo_ready: false,
+        vr_grab_anchor: None,
+        vr_prev_hand_dist: None,
+        vr_prev_trigger: false,
+        vr_move_dist: 0.0,
+        vr_menu_open: false,
+        vr_prev_menu: false,
+        vr_ui_pointer: None,
+        vr_ui_pressed: false,
+        vr_ui_prev_pressed: false,
+        vr_overlay_draw: None,
         scene: LoadedScene::empty(),
         egui_ctx: egui::Context::default(),
         egui_state: None,
@@ -165,6 +177,28 @@ enum Selection {
     Object(usize),
     File(PathBuf),
 }
+
+/// One action on the VR left-hand menu. The desktop editor keeps its full egui
+/// UI; this is the VR-only quick menu pointed at with the right controller.
+#[derive(Clone, Copy)]
+enum VrAction {
+    CalibrateTpose,
+    ClearCalibration,
+    ToggleFootIk,
+    ResetRig,
+    DeleteSelected,
+}
+
+/// VR tool actions, surfaced as a "VR Tools" egui window so they're reachable
+/// from the in-VR UI panel (and the desktop). The full editor UI is otherwise
+/// shown as-is on the panel.
+const VR_TOOLS: &[(&str, VrAction)] = &[
+    ("Calibrate T-pose", VrAction::CalibrateTpose),
+    ("Clear Calibration", VrAction::ClearCalibration),
+    ("Toggle Foot IK", VrAction::ToggleFootIk),
+    ("Reset View/Scale", VrAction::ResetRig),
+    ("Delete Selected", VrAction::DeleteSelected),
+];
 
 /// Pre-frame snapshot of the selection's editable state (undo diffing).
 enum EditSnapshot {
@@ -352,6 +386,10 @@ enum EditorAction {
     DeleteFile(PathBuf),
     SetSkybox(PathBuf),
     ClearSkybox,
+    /// Assign one face of the 6-image cubemap skybox (index 0..6 = +X,-X,+Y,-Y,+Z,-Z).
+    SetSkyboxFace(usize, PathBuf),
+    /// Clear the cubemap faces (fall back to the equirect / procedural sky).
+    ClearSkyboxFaces,
     /// Re-parent an object (None = unparent).
     SetParent(usize, Option<usize>),
     /// Enter / leave Play mode (components run while playing).
@@ -539,6 +577,9 @@ struct WidgetFilter {
     cameras: WidgetSetting,
     probes: WidgetSetting,
     audio: WidgetSetting,
+    /// The selected object's grey orientation cross (own toggle, separate from the
+    /// transform handles). Hidden when the master toggle is off too.
+    cross: bool,
 }
 
 impl Default for WidgetFilter {
@@ -549,6 +590,7 @@ impl Default for WidgetFilter {
             cameras: WidgetSetting::default(),
             probes: WidgetSetting::default(),
             audio: WidgetSetting::default(),
+            cross: true,
         }
     }
 }
@@ -565,6 +607,29 @@ struct EngineApp {
     /// avatar-IK application step — humanoid bone mapping).
     #[allow(dead_code)]
     vr_targets: citrus_core::TrackerTargets,
+    /// VR play-space rig (fly / scale / drag locomotion); identity until driven.
+    vr_rig: citrus_core::VrRig,
+    /// True once the per-eye XR swapchains have been created (`setup_stereo`).
+    xr_stereo_ready: bool,
+    /// Grab-drag anchor (world point under the grabbing controller at grab start).
+    vr_grab_anchor: Option<glam::Vec3>,
+    /// Inter-hand distance last frame (for two-handed scale).
+    vr_prev_hand_dist: Option<f32>,
+    /// Right trigger state last frame (edge detection for pointer select).
+    vr_prev_trigger: bool,
+    /// Distance along the pointer ray to hold a grabbed object.
+    vr_move_dist: f32,
+    /// Whether the VR hand menu is open (toggled by the menu button).
+    vr_menu_open: bool,
+    /// Menu button state last frame (edge detection).
+    vr_prev_menu: bool,
+    /// VR UI cursor position in egui points (from the right pointer on the panel).
+    vr_ui_pointer: Option<egui::Pos2>,
+    /// VR UI click state (right trigger over the panel) + last-frame edge.
+    vr_ui_pressed: bool,
+    vr_ui_prev_pressed: bool,
+    /// What to draw for the VR UI overlay this frame (panel transform + cursor).
+    vr_overlay_draw: Option<citrus_render::VrOverlayDraw>,
     scene: LoadedScene,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
@@ -1013,6 +1078,195 @@ impl EngineApp {
             Some(i) => Selection::Object(i),
             None => Selection::None,
         };
+    }
+
+    /// VR locomotion + pointer interaction, driven by controller input. Tracker/
+    /// controller poses are stage-space (from `body_poses`); the `VrRig` maps them
+    /// to world. Left stick = fly, right stick = turn + vertical, left grip =
+    /// grab-drag the world, both grips = scale yourself, right trigger = pick/move,
+    /// menu button = toggle the hand menu. All relative to the player rig.
+    fn update_vr(&mut self, input: citrus_xr::VrInput, dt: f32) {
+        use glam::Vec3;
+        let head = self.vr_targets.head;
+        let lhand = self.vr_targets.left_hand;
+        let rhand = self.vr_targets.right_hand;
+        let speed = 3.0 * self.vr_rig.scale; // bigger player covers more ground
+
+        // Fly relative to the head's facing (projected onto the ground plane).
+        if let Some((_, hrot)) = head {
+            let wr = self.vr_rig.stage_rot_to_world(hrot);
+            let fwd = (wr * Vec3::NEG_Z * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero();
+            let right = (wr * Vec3::X * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero();
+            let (lx, ly) = input.left_stick;
+            let delta = (right * lx + fwd * ly) * speed * dt;
+            if delta.length_squared() > 0.0 {
+                self.vr_rig.fly(delta);
+            }
+            let (rx, ry) = input.right_stick;
+            if ry.abs() > 0.05 {
+                self.vr_rig.fly(Vec3::new(0.0, ry * speed * dt, 0.0));
+            }
+            if rx.abs() > 0.05 {
+                let pivot = head
+                    .map(|(p, _)| self.vr_rig.stage_to_world(p))
+                    .unwrap_or(self.vr_rig.origin);
+                self.vr_rig.turn_about(pivot, -rx * 1.5 * dt);
+            }
+        }
+
+        // Two-handed scale: change by the inter-hand distance ratio about the
+        // midpoint (pull apart = world grows / you shrink).
+        let both_grip = input.left_grip > 0.5 && input.right_grip > 0.5;
+        if both_grip {
+            if let (Some((lp, _)), Some((rp, _))) = (lhand, rhand) {
+                let lw = self.vr_rig.stage_to_world(lp);
+                let rw = self.vr_rig.stage_to_world(rp);
+                let dist = (lw - rw).length();
+                if let Some(prev) = self.vr_prev_hand_dist {
+                    if prev > 1e-3 && dist > 1e-3 {
+                        self.vr_rig.scale_about((lw + rw) * 0.5, prev / dist);
+                    }
+                }
+                self.vr_prev_hand_dist = Some(dist);
+            }
+        } else {
+            self.vr_prev_hand_dist = None;
+        }
+
+        // Grab-drag the world with the left grip (when not scaling).
+        if !both_grip && input.left_grip > 0.5 {
+            if let Some((lp, _)) = lhand {
+                match self.vr_grab_anchor {
+                    None => self.vr_grab_anchor = Some(self.vr_rig.grab_anchor(lp)),
+                    Some(anchor) => self.vr_rig.drag_to(anchor, lp),
+                }
+            }
+        } else {
+            self.vr_grab_anchor = None;
+        }
+
+        // Right-hand pointer.
+        let trigger_edge = input.right_trigger && !self.vr_prev_trigger;
+        self.vr_overlay_draw = None;
+        self.vr_ui_pointer = None;
+        self.vr_ui_pressed = false;
+        if let Some((rp, rr)) = rhand {
+            let ray = {
+                let (wp, wr) = self.vr_rig.stage_pose_to_world((rp, rr));
+                citrus_core::pointer_ray(wp, wr)
+            };
+            if self.vr_menu_open {
+                // UI-panel mode: the whole editor egui UI floats off the left hand,
+                // pointed at with the right controller (trigger = click).
+                if let Some(lstage) = lhand {
+                    use glam::{Mat4, Vec3};
+                    let (lp, lr) = self.vr_rig.stage_pose_to_world(lstage);
+                    let rect = self.egui_ctx.content_rect();
+                    let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
+                    let ph = 0.3_f32;
+                    let pw = ph * aspect;
+                    let panel_pos = lp + lr * Vec3::new(0.0, 0.10, -0.02);
+                    let panel_model =
+                        Mat4::from_scale_rotation_translation(Vec3::new(pw, ph, 1.0), lr, panel_pos);
+                    let normal = lr * Vec3::Z;
+                    let mut cursor_world = None;
+                    if let Some(hit) = citrus_core::ray_plane(ray, panel_pos, normal) {
+                        let local = panel_model.inverse().transform_point3(hit);
+                        if local.x.abs() <= 0.5 && local.y.abs() <= 0.5 {
+                            let u = local.x + 0.5;
+                            let v = local.y + 0.5;
+                            let px = rect.min.x + u * rect.width();
+                            let py = rect.min.y + (1.0 - v) * rect.height();
+                            self.vr_ui_pointer = Some(egui::pos2(px, py));
+                            self.vr_ui_pressed = input.right_trigger;
+                            cursor_world = Some(hit);
+                        }
+                    }
+                    self.vr_overlay_draw = Some(citrus_render::VrOverlayDraw {
+                        panel_model,
+                        cursor_world,
+                    });
+                }
+            } else {
+                // Object mode: pick on press, then drag the selection along the ray.
+                if trigger_edge {
+                    if let Some(idx) = self.scene.pick(ray.origin, ray.dir) {
+                        self.select_object(Some(idx));
+                        let obj_pos = self.scene.world_transform(idx).w_axis.truncate();
+                        self.vr_move_dist = (obj_pos - ray.origin).length();
+                    }
+                }
+                if input.right_trigger {
+                    if let Selection::Object(idx) = self.selection {
+                        if idx < self.scene.objects.len() {
+                            let target = ray.origin + ray.dir * self.vr_move_dist;
+                            let id = self.scene.objects[idx].id;
+                            self.scene.set_local_transform(id, Some(target), None, None);
+                        }
+                    }
+                }
+            }
+        }
+        self.vr_prev_trigger = input.right_trigger;
+
+        // Toggle the UI panel on the menu button's rising edge.
+        if input.menu && !self.vr_prev_menu {
+            self.vr_menu_open = !self.vr_menu_open;
+        }
+        self.vr_prev_menu = input.menu;
+    }
+
+    /// Run a VR tool action (the in-VR egui "VR Tools" window calls these; they
+    /// mirror operations that have no desktop button yet).
+    fn dispatch_vr_action(&mut self, action: VrAction) {
+        match action {
+            VrAction::CalibrateTpose => {
+                if self.scene.calibrate_vr_tpose(&self.vr_targets) {
+                    tracing::info!("VR: captured T-pose calibration");
+                }
+            }
+            VrAction::ClearCalibration => self.scene.clear_vr_calibration(),
+            VrAction::ToggleFootIk => {
+                let on = self.scene.foot_ik_enabled();
+                self.scene
+                    .set_foot_ik((!on).then(crate::humanoid::FootIkParams::default));
+            }
+            VrAction::ResetRig => self.vr_rig = citrus_core::VrRig::default(),
+            VrAction::DeleteSelected => {
+                if let Selection::Object(idx) = self.selection {
+                    if idx < self.scene.objects.len() {
+                        self.scene.remove_object(idx);
+                        self.selection = Selection::None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A small "VR Tools" egui window (only while a VR session is active) so the
+    /// VR-specific actions are reachable from the in-headset UI panel as well as
+    /// the desktop. The rest of the editor UI is shown on the panel unchanged.
+    fn vr_tools_window(&mut self, ctx: &egui::Context) {
+        if self.xr_session.is_none() {
+            return;
+        }
+        let mut action = None;
+        egui::Window::new("VR Tools")
+            .default_open(true)
+            .show(ctx, |ui| {
+                ui.label(format!("Calibrated: {}", self.scene.has_vr_calibration()));
+                ui.label(format!("Foot IK: {}", self.scene.foot_ik_enabled()));
+                ui.label(format!("Player scale: {:.2}x", self.vr_rig.scale));
+                ui.separator();
+                for (label, act) in VR_TOOLS {
+                    if ui.button(*label).clicked() {
+                        action = Some(*act);
+                    }
+                }
+            });
+        if let Some(a) = action {
+            self.dispatch_vr_action(a);
+        }
     }
 
     fn process_actions(&mut self) {
@@ -1741,6 +1995,26 @@ impl EngineApp {
                 }
                 EditorAction::ClearSkybox => {
                     self.scene.skybox = None;
+                    self.apply_skybox();
+                }
+                EditorAction::SetSkyboxFace(i, path) => {
+                    let rel = path
+                        .strip_prefix(&self.project_root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    let faces = self
+                        .scene
+                        .environment
+                        .skybox_faces
+                        .get_or_insert_with(|| std::array::from_fn(|_| String::new()));
+                    if i < 6 {
+                        faces[i] = rel;
+                    }
+                    self.apply_skybox();
+                }
+                EditorAction::ClearSkyboxFaces => {
+                    self.scene.environment.skybox_faces = None;
                     self.apply_skybox();
                 }
                 EditorAction::TogglePlay => self.toggle_play(),
@@ -3170,8 +3444,9 @@ impl EngineApp {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        // Cubemap (6-face) skybox takes precedence over the equirect one.
-        if let Some(faces) = faces {
+        // Cubemap (6-face) skybox takes precedence over the equirect one — but only
+        // once ALL six faces are assigned (a partial set falls back to equirect).
+        if let Some(faces) = faces.filter(|f| f.iter().all(|s| !s.is_empty())) {
             let loaded: Result<Vec<_>, _> = faces
                 .iter()
                 .map(|rel| citrus_assets::load_texture_file(project_root.join(rel), true))
@@ -3364,9 +3639,31 @@ impl EngineApp {
             .map(|(m, _, s)| (m.clone(), *s));
         let project = self.project.name.clone();
         let objects = self.scene.objects.len();
+        // Full name + project-relative path of the selected file, so the user
+        // can read the whole filename the grid tiles crop with an ellipsis.
+        let selected_file = if let Selection::File(path) = &self.selection {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let rel = path
+                .strip_prefix(&self.project_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            Some((name, rel))
+        } else {
+            None
+        };
         egui::TopBottomPanel::bottom("citrus-status-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("{project}  ·  {objects} objects")).size(14.0));
+                if let Some((name, rel)) = selected_file {
+                    ui.separator();
+                    ui.label(egui::RichText::new("File:").size(14.0).weak());
+                    ui.label(egui::RichText::new(name).size(14.0))
+                        .on_hover_text(rel);
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if lsp_busy {
                         ui.add(egui::Spinner::new().size(14.0));
@@ -3903,6 +4200,28 @@ impl EngineApp {
                 modifiers: egui::Modifiers::default(),
             });
         }
+        // VR pointer: feed the right-controller-on-panel position into egui as the
+        // mouse, so the whole desktop UI is clickable from inside the headset.
+        if let Some(pos) = self.vr_ui_pointer {
+            raw_input.events.push(egui::Event::PointerMoved(pos));
+            if self.vr_ui_pressed != self.vr_ui_prev_pressed {
+                raw_input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: self.vr_ui_pressed,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+        } else if self.vr_ui_prev_pressed {
+            // Pointer left the panel while pressed: release so egui doesn't stick.
+            raw_input.events.push(egui::Event::PointerButton {
+                pos: egui::Pos2::ZERO,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        self.vr_ui_prev_pressed = self.vr_ui_pressed;
         let size = window.inner_size();
         // The editor viewport renders to an offscreen texture sized to the dock
         // rect (RTT), so the camera aspect comes from that rect, not the window.
@@ -3946,6 +4265,7 @@ impl EngineApp {
         let egui_ctx = self.egui_ctx.clone();
         let output = egui_ctx.run(raw_input, |ctx| {
             self.menu_bar(ctx);
+            self.vr_tools_window(ctx);
             self.project_windows(ctx);
             self.bindings_window(ctx);
             self.network_window(ctx);
@@ -4184,6 +4504,10 @@ impl EngineApp {
                 env.ambient[1] * env.ambient_intensity,
                 env.ambient[2] * env.ambient_intensity,
             ]),
+            // Skybox IBL (the env-cube specular reflection on metallic/smooth
+            // surfaces) is gated by the Enable-skybox toggle: off → metals stop
+            // mirroring the sky, so with no lights the scene is black.
+            env_intensity: if env.skybox_enabled { 1.0 } else { 0.0 },
         };
 
         // Render the camera preview only when the Camera tab is actually VISIBLE
@@ -4212,13 +4536,11 @@ impl EngineApp {
         let shadow_res = env.shadow_resolution.clamp(256, 8192);
         let shadow_pcf_texel = env.shadow_softness.max(0.0) / shadow_res as f32;
 
-        let Some(renderer) = self.renderer.as_mut() else {
-            return;
-        };
-        if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
-            tracing::error!("setting shadow resolution: {e:#}");
-        }
-        // VR: pump the OpenXR session + read tracker poses for the IK solver.
+        // VR: pump the OpenXR session + read tracker poses for the IK solver and
+        // controller inputs for locomotion/interaction. Done before binding the
+        // renderer so `update_vr` (which mutates the scene/selection) doesn't clash
+        // with the renderer borrow held below.
+        let mut vr_input = citrus_xr::VrInput::default();
         if let Some(session) = &mut self.xr_session {
             session.poll();
             let b = session.body_poses();
@@ -4230,11 +4552,25 @@ impl EngineApp {
                 left_foot: b.left_foot,
                 right_foot: b.right_foot,
             };
+            vr_input = session.input();
+        }
+        if self.xr_session.is_some() {
+            self.update_vr(vr_input, dt);
+        }
+
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
+            tracing::error!("setting shadow resolution: {e:#}");
         }
         // Feed VR tracker poses into the scene's humanoid IK targets (any source
-        // can; IK isn't VR-specific), then advance + CPU-skin (previews in-editor).
+        // can; IK isn't VR-specific). Remap through the captured T-pose calibration
+        // when one exists so each tracker drives its bone naturally. Then advance +
+        // CPU-skin (previews in-editor).
+        let vr_targets = self.scene.vr_apply_calibration(&self.vr_targets);
         self.scene
-            .set_ik_targets(self.xr_session.as_ref().map(|_| self.vr_targets));
+            .set_ik_targets(self.xr_session.as_ref().map(|_| vr_targets));
         self.scene.update_skinning(renderer, dt);
         let postfx = self
             .scene
@@ -4273,6 +4609,63 @@ impl EngineApp {
         if let Err(e) = renderer.render(&frame) {
             tracing::error!("render failed: {e:#}");
             event_loop.exit();
+        }
+
+        // VR stereo: also render the scene into the headset's per-eye images. Gated
+        // on an active XR session, so the desktop editor is unaffected when flat.
+        // The eye view = the XR stage-space view composed with the play-space rig
+        // (fly/scale/drag), so locomotion moves the player through the world.
+        if self.xr_session.is_some() {
+            if !self.xr_stereo_ready {
+                let fmt = renderer.color_format_raw();
+                if let Some(session) = self.xr_session.as_mut() {
+                    match session.setup_stereo(fmt) {
+                        Ok((w, h)) => {
+                            self.xr_stereo_ready = true;
+                            tracing::info!("XR stereo swapchains ready ({w}x{h})");
+                        }
+                        Err(e) => tracing::warn!("XR setup_stereo failed: {e:#}"),
+                    }
+                }
+            }
+            if self.xr_stereo_ready {
+                let fmt = renderer.color_format_raw();
+                let world_to_stage = self.vr_rig.stage_to_world_mat().inverse();
+                // Render the editor UI into the overlay texture when the panel is up.
+                let overlay = self.vr_overlay_draw;
+                if overlay.is_some() {
+                    if let Some(egui_draw) = frame.egui.as_ref() {
+                        if let Err(e) = renderer.render_vr_ui(egui_draw) {
+                            tracing::error!("VR UI render: {e:#}");
+                        }
+                    }
+                }
+                let begun = self
+                    .xr_session
+                    .as_mut()
+                    .map(|s| s.begin_frame())
+                    .unwrap_or(Ok(None));
+                match begun {
+                    Ok(Some(xr_frame)) => {
+                        for eye in &xr_frame.eyes {
+                            let world_view = eye.view * world_to_stage;
+                            if let Err(e) = renderer.render_xr_eye(
+                                eye.image, fmt, eye.width, eye.height, world_view, eye.proj,
+                                &frame, overlay,
+                            ) {
+                                tracing::error!("XR eye render: {e:#}");
+                            }
+                        }
+                        if let Some(session) = self.xr_session.as_mut() {
+                            if let Err(e) = session.end_frame(xr_frame) {
+                                tracing::error!("XR end_frame: {e:#}");
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("XR begin_frame: {e:#}"),
+                }
+            }
         }
         FrameTimings::ema(
             &mut self.frame_timings.render,
@@ -5322,7 +5715,7 @@ impl EditorTabs<'_> {
                     let gi = &mut env.realtime_gi;
                     ui.add_enabled_ui(!baked, |ui| {
                         ui.checkbox(&mut gi.enabled, "Enabled").on_hover_text(
-                            "Flux: Lumen-style realtime global illumination. Screen-space probes \
+                            "Flux: realtime global illumination. Screen-space probes \
                              march the scene distance field every frame for live indirect bounce \
                              — no bake, runs anywhere (no RT cores needed).",
                         );
@@ -5405,16 +5798,38 @@ impl EditorTabs<'_> {
                                             });
                                     });
                                 });
-                            egui::CollapsingHeader::new("Reflections (SSR)")
+                            egui::CollapsingHeader::new("Reflections")
                                 .id_salt("citrus-flux-ssr")
                                 .show(ui, |ui| {
-                                    ui.checkbox(&mut gi.ssr_enabled, "Screen-space reflections")
-                                        .on_hover_text(
-                                            "Trace specular rays against the depth prepass + last \
-                                             frame's colour. Rides on Flux (the depth prepass), so \
-                                             it only runs while realtime GI is on.",
+                                    ui.horizontal(|ui| {
+                                        ui.label("Model");
+                                        let label = match gi.reflection_mode {
+                                            0 => "Environment only",
+                                            2 => "Ray-traced (1 bounce)",
+                                            _ => "Screen-space (SSR)",
+                                        };
+                                        egui::ComboBox::from_id_salt("citrus-refl-model")
+                                            .selected_text(label)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(&mut gi.reflection_mode, 0, "Environment only");
+                                                ui.selectable_value(&mut gi.reflection_mode, 1, "Screen-space (SSR)");
+                                                ui.selectable_value(&mut gi.reflection_mode, 2, "Ray-traced (1 bounce)");
+                                            });
+                                    });
+                                    if gi.reflection_mode == 2 {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Ray-traced traces real geometry (no SSR artifacts). \
+                                                 Needs a GPU with ray query; falls back to SSR if \
+                                                 unavailable. Rides on Flux (the depth prepass).",
+                                            )
+                                            .small()
+                                            .weak(),
                                         );
-                                    ui.add_enabled_ui(gi.ssr_enabled, |ui| {
+                                    }
+                                    // SSR-specific knobs (shared intensity/roughness also tune RT).
+                                    gi.ssr_enabled = gi.reflection_mode == 1;
+                                    ui.add_enabled_ui(gi.reflection_mode != 0, |ui| {
                                         ui.horizontal(|ui| {
                                             ui.label("Intensity");
                                             ui.add(egui::Slider::new(&mut gi.ssr_intensity, 0.0..=2.0))
@@ -5491,10 +5906,6 @@ impl EditorTabs<'_> {
                     );
 
                     ui.separator();
-                    ui.label(RichText::new("Skybox").strong());
-                    ui.checkbox(&mut env.skybox_enabled, "Draw skybox");
-
-                    ui.separator();
                     egui::CollapsingHeader::new("Fog")
                         .id_salt("citrus-env-fog")
                         .show(ui, |ui| {
@@ -5542,17 +5953,37 @@ impl EditorTabs<'_> {
                         });
                 }
 
-                // Skybox texture slot: drop an image from the Files panel.
+                // ---- Skybox section: enable toggle + the texture sources (a single
+                // 360° equirect image, OR a 6-face cubemap that overrides it). The
+                // toggle also gates whether the skybox lights the scene (IBL): off →
+                // metals stop reflecting it, so with no lights the scene is black.
+                ui.separator();
+                ui.label(RichText::new("Skybox").strong());
+                ui.checkbox(&mut self.scene.environment.skybox_enabled, "Enable skybox")
+                    .on_hover_text(
+                        "Draw the skybox AND let it light the scene (image-based lighting): \
+                         metallic/smooth surfaces reflect it. Off = no skybox reflection, so \
+                         with no lights the scene is black.",
+                    );
+                let is_image = |p: &std::path::Path| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .is_some_and(|e| {
+                            matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tga" | "hdr" | "exr")
+                        })
+                };
+
+                // 360° equirectangular image slot (used when no full cubemap is set).
                 let slot = egui::Frame::group(ui.style())
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        ui.label("360° image (equirectangular)");
                         match &self.scene.skybox {
                             Some(path) => {
-                                ui.label("Skybox texture");
                                 ui.label(RichText::new(path).small().weak());
                             }
                             None => {
-                                ui.label("Skybox texture");
                                 ui.label(
                                     RichText::new("Procedural gradient — drop an image here")
                                         .small()
@@ -5562,14 +5993,6 @@ impl EditorTabs<'_> {
                         }
                     })
                     .response;
-                let is_image = |p: &std::path::Path| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.to_ascii_lowercase())
-                        .is_some_and(|e| {
-                            matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tga")
-                        })
-                };
                 if slot
                     .dnd_hover_payload::<std::path::PathBuf>()
                     .is_some_and(|p| is_image(&p))
@@ -5586,9 +6009,79 @@ impl EditorTabs<'_> {
                 {
                     self.actions.push(EditorAction::SetSkybox((*p).clone()));
                 }
-                if self.scene.skybox.is_some() && ui.button("Clear Skybox").clicked() {
+                if self.scene.skybox.is_some() && ui.button("Clear 360° image").clicked() {
                     self.actions.push(EditorAction::ClearSkybox);
                 }
+
+                // 6-face cubemap. When all six faces are assigned they OVERRIDE the
+                // 360° image; a partial set falls back to the equirect/procedural sky.
+                egui::CollapsingHeader::new("Cubemap (6 faces)")
+                    .id_salt("citrus-skybox-cube")
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Drop an image on each face. All six together override the \
+                                 360° image above.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        const FACE_LABELS: [&str; 6] =
+                            ["+X right", "-X left", "+Y top", "-Y bottom", "+Z front", "-Z back"];
+                        for i in 0..6 {
+                            let assigned = self
+                                .scene
+                                .environment
+                                .skybox_faces
+                                .as_ref()
+                                .map(|f| f[i].clone())
+                                .filter(|s| !s.is_empty());
+                            let face = egui::Frame::group(ui.style())
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(FACE_LABELS[i]);
+                                        match &assigned {
+                                            Some(p) => {
+                                                ui.label(RichText::new(p).small().weak());
+                                            }
+                                            None => {
+                                                ui.label(
+                                                    RichText::new("drop image")
+                                                        .small()
+                                                        .weak(),
+                                                );
+                                            }
+                                        }
+                                    });
+                                })
+                                .response;
+                            if face
+                                .dnd_hover_payload::<std::path::PathBuf>()
+                                .is_some_and(|p| is_image(&p))
+                            {
+                                ui.painter().rect_stroke(
+                                    face.rect,
+                                    4.0,
+                                    egui::Stroke::new(
+                                        2.0,
+                                        ui.visuals().selection.stroke.color,
+                                    ),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            if let Some(p) = face.dnd_release_payload::<std::path::PathBuf>()
+                                && is_image(&p)
+                            {
+                                self.actions.push(EditorAction::SetSkyboxFace(i, (*p).clone()));
+                            }
+                        }
+                        if self.scene.environment.skybox_faces.is_some()
+                            && ui.button("Clear faces").clicked()
+                        {
+                            self.actions.push(EditorAction::ClearSkyboxFaces);
+                        }
+                    });
 
                 ui.add_space(8.0);
                 ui.label(
@@ -6373,7 +6866,10 @@ impl EditorTabs<'_> {
         // Orientation cross: three short gray lines along the selected
         // object's LOCAL axes, crossing at the pivot, so its orientation is
         // readable under the move/scale gizmo. Editor-camera overlay only.
-        if let Selection::Object(i) = *self.selection
+        // Hidden when gizmos are globally off (eye button) or its own toggle is off.
+        if self.widget_filter.enabled
+            && self.widget_filter.cross
+            && let Selection::Object(i) = *self.selection
             && matches!(self.gizmo.tool, GizmoTool::Move | GizmoTool::Scale)
             && self.scene.is_active(i)
         {
@@ -6559,6 +7055,12 @@ impl EditorTabs<'_> {
                                     .on_hover_text("Widget size");
                                 });
                             }
+                            ui.separator();
+                            ui.checkbox(&mut filter.cross, "Orientation cross")
+                                .on_hover_text(
+                                    "The grey axis cross at the selected object's pivot \
+                                     (Move/Scale tools). Independent of the transform handles.",
+                                );
                             ui.separator();
                             ui.label(
                                 egui::RichText::new("Move/Rotate/Scale always shown · selected objects ignore this")

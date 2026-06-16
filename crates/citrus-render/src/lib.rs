@@ -12,14 +12,16 @@ mod gpu_gi;
 mod pipeline;
 mod post;
 pub mod sdf;
+mod rt_reflect;
+mod ssr;
 mod swapchain;
+mod vr_overlay;
 mod texture;
 mod types;
 
 pub use gpu_gi::{GpuGiEmitter, GpuGiMarch, GpuGiMaterial};
 pub use types::*;
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
@@ -41,9 +43,13 @@ use swapchain::Swapchain;
 use texture::GpuTexture;
 
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+/// Deferred-SSR G-buffer attachment: reflectance.rgb (Fresnel*ao*spec weight)
+/// in the colour lanes, surface roughness in alpha. RGBA16F so the resolve pass
+/// reads HDR-safe reflectance with no banding.
+const GBUF_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const MAX_MATERIALS: u32 = 1024;
 /// set-1 sampler binding indices in texture-slot order (binding 4 is the FX UBO).
-const TEXTURE_BINDINGS: [u32; 12] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12];
+const TEXTURE_BINDINGS: [u32; 16] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// Maximum scene lights evaluated per frame by the standard shader. Matches
 /// `MAX_LIGHTS` in standard.frag; the array lives in the frame UBO.
@@ -115,10 +121,13 @@ struct GpuProbeVolume {
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct GpuProbe {
-    coeffs: [[f32; 4]; 4],
+    // c[0..3].xyz = RGB SH-L1; c[0..3].w = distance SH-L1 (mean, visibility);
+    // c[4].xyzw = squared-distance SH-L1 (second moment, two-moment Chebyshev).
+    coeffs: [[f32; 4]; 5],
 }
 
-/// Pack a `ProbeSh` into its GPU form: RGB SH in xyz, distance SH in the w lanes.
+/// Pack a `ProbeSh` into its GPU form: RGB SH in xyz, distance SH in the w lanes,
+/// squared-distance SH in the 5th vec4 (for two-moment Chebyshev visibility).
 fn gpu_probe(p: &ProbeSh) -> GpuProbe {
     GpuProbe {
         coeffs: [
@@ -126,6 +135,7 @@ fn gpu_probe(p: &ProbeSh) -> GpuProbe {
             [p.coeffs[1][0], p.coeffs[1][1], p.coeffs[1][2], p.dist[1]],
             [p.coeffs[2][0], p.coeffs[2][1], p.coeffs[2][2], p.dist[2]],
             [p.coeffs[3][0], p.coeffs[3][1], p.coeffs[3][2], p.dist[3]],
+            [p.dist2[0], p.dist2[1], p.dist2[2], p.dist2[3]],
         ],
     }
 }
@@ -925,7 +935,7 @@ impl ReflectionEnv {
 
 /// Screen-probe tile size: one screen-space GI probe is traced per
 /// `SCREEN_PROBE_DIV × SCREEN_PROBE_DIV` block of pixels, then bilinearly
-/// upsampled to full resolution in the forward shader (Lumen screen-probe
+/// upsampled to full resolution in the forward shader (screen-probe
 /// scheme). Larger is cheaper and softer; smaller is sharper and uses more rays.
 const SCREEN_PROBE_DIV: u32 = 4;
 
@@ -956,6 +966,15 @@ pub struct FluxSettings {
     /// SSR roughness cutoff: surfaces rougher than this skip the march (the cheap
     /// ambient-specular env approximation carries them instead).
     pub ssr_roughness_cutoff: f32,
+    /// Reflection model: 0 = environment cube only, 1 = screen-space (SSR),
+    /// 2 = ray-traced (1 bounce, needs GPU ray-query support). Ray-traced reflects
+    /// real geometry so it has none of SSR's screen-edge/silhouette artifacts.
+    pub reflection_mode: u32,
+    /// GI trace backend: false = software (GDF march, screen_gi.comp), true =
+    /// hardware ray-query against the scene TLAS (screen_gi_rt.comp) — exact
+    /// triangle hits, no SDF thickness/leak. Ignored (stays software) when the
+    /// device lacks ray-query. Off by default so the SDF path is unaffected.
+    pub rt_trace: bool,
 }
 
 impl Default for FluxSettings {
@@ -965,13 +984,15 @@ impl Default for FluxSettings {
             samples: 10,
             bounces: 2,
             march_distance: 0.0,
-            firefly_clamp: 4.0,
+            firefly_clamp: 2.0,
             smoothing: 0.5,
             intensity: 1.0,
             ssr_enabled: true,
             ssr_intensity: 1.0,
             ssr_max_distance: 40.0,
             ssr_roughness_cutoff: 0.6,
+            reflection_mode: 1,
+            rt_trace: false,
         }
     }
 }
@@ -991,6 +1012,29 @@ struct ScreenGiTargets {
     gi_image: [vk::Image; 2],
     gi_view: [vk::ImageView; 2],
     gi_alloc: [Option<Allocation>; 2],
+    /// Per-probe SH-L1 radiance (octahedral-gather denoiser): the
+    /// gather projects its rays to SH here instead of a single irradiance, so a
+    /// resolve/forward pass can integrate against each PIXEL's own normal —
+    /// fixing curved-surface grain (neighbours blend in normal-independent SH).
+    /// Layout: 4 vec4 per probe (c0..c3 = RGB SH-L1; c0.w = cam distance).
+    /// Ping-pong (same parity as gi_image): the gather writes [cur] and reads
+    /// [prev] for temporal accumulation of the SH (ScreenProbeTemporal on the SH).
+    sh_buf: [Buffer; 2],
+    /// Probe-res denoised gather (flux_denoise.comp output). The forward shader
+    /// samples THIS, not the raw gather — so the wide edge-aware filter runs once
+    /// per probe (16× cheaper than per screen pixel). Not ping-ponged: it's a
+    /// display-only product regenerated each traced frame; temporal history still
+    /// feeds back through the raw `gi_image` ping-pong (avoids over-blur).
+    gi_filtered: vk::Image,
+    gi_filtered_view: vk::ImageView,
+    gi_filtered_alloc: Option<Allocation>,
+    /// FULL-resolution screen-probe integrate output (flux_integrate.comp): the
+    /// denoised probe GI re-pointed to each pixel's own normal via the per-probe
+    /// SH-L1. The forward samples THIS (per-pixel-normal resolve fixes curved-
+    /// surface grain). Regenerated each traced frame; persists across skip frames.
+    gi_final: vk::Image,
+    gi_final_view: vk::ImageView,
+    gi_final_alloc: Option<Allocation>,
 }
 
 impl ScreenGiTargets {
@@ -1035,6 +1079,59 @@ impl ScreenGiTargets {
             gi_image[k] = img;
             gi_alloc[k] = Some(alloc);
         }
+        // Per-probe SH-L1 radiance buffer (4 vec4 = 64 bytes/probe), written by
+        // the gather, GPU-only (compute read/write).
+        let probe_count = (probe_extent.width as u64) * (probe_extent.height as u64);
+        let sh_buf = [
+            Buffer::new(
+                &ctx.device,
+                allocator,
+                probe_count.max(1) * 64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuOnly,
+                "sgi probe sh 0",
+            )?,
+            Buffer::new(
+                &ctx.device,
+                allocator,
+                probe_count.max(1) * 64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuOnly,
+                "sgi probe sh 1",
+            )?,
+        ];
+        // Probe-res denoised gather (storage write by flux_denoise, sampled by the
+        // forward). Same format/extent as gi_image.
+        let (gi_filtered, gi_filtered_alloc) = create_image(
+            &ctx.device,
+            allocator,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            probe_extent,
+            "sgi denoised",
+        )?;
+        let gi_filtered_view = create_view(
+            &ctx.device,
+            gi_filtered,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        // Full-res integrate output (storage write by flux_integrate, sampled by
+        // the forward). Full screen extent, not probe extent.
+        let (gi_final, gi_final_alloc) = create_image(
+            &ctx.device,
+            allocator,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            extent,
+            "sgi integrated",
+        )?;
+        let gi_final_view = create_view(
+            &ctx.device,
+            gi_final,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageAspectFlags::COLOR,
+        )?;
         Ok(Self {
             probe_extent,
             depth_image,
@@ -1043,6 +1140,13 @@ impl ScreenGiTargets {
             gi_image,
             gi_view,
             gi_alloc,
+            sh_buf,
+            gi_filtered,
+            gi_filtered_view,
+            gi_filtered_alloc: Some(gi_filtered_alloc),
+            gi_final,
+            gi_final_view,
+            gi_final_alloc: Some(gi_final_alloc),
         })
     }
 
@@ -1063,19 +1167,73 @@ impl ScreenGiTargets {
                 let _ = allocator.free(a);
             }
         }
+        unsafe {
+            device.destroy_image_view(self.gi_filtered_view, None);
+            device.destroy_image(self.gi_filtered, None);
+            device.destroy_image_view(self.gi_final_view, None);
+            device.destroy_image(self.gi_final, None);
+        }
+        if let Some(a) = self.gi_filtered_alloc.take() {
+            let _ = allocator.free(a);
+        }
+        if let Some(a) = self.gi_final_alloc.take() {
+            let _ = allocator.free(a);
+        }
+        for b in &mut self.sh_buf {
+            b.destroy(device, allocator);
+        }
     }
 }
 
-/// A persistent copy of the previous frame's lit colour, sampled by SSR. The
-/// scene's final colour is copied into this each frame (after the scene pass)
-/// so the next frame's reflection march has a colour source. `ready` is false
-/// until the first copy lands, gating SSR off for one frame after (re)creation.
+/// A persistent copy of the previous frame's lit colour. This fed the OLD
+/// last-frame SSR march; deferred SSR reads the current frame instead, so this is
+/// now dead weight pending removal (see BUGS.md). Kept allocated for now to avoid
+/// churn in the create/resize/destroy paths.
+#[allow(dead_code)]
 struct ColorHistory {
     image: vk::Image,
     view: vk::ImageView,
     alloc: Option<Allocation>,
     extent: vk::Extent2D,
     ready: bool,
+}
+
+/// Per-eye stereo render resources for the VR (OpenXR) path: a dedicated set-0
+/// (camera UBO + the shared shadow/probe/lightmap/env bindings copied from the
+/// frame set) and a depth target sized to the eye. Color is the XR-provided
+/// swapchain image (wrapped in a transient view per frame). Created lazily on the
+/// first `render_xr_eye` and resized when the eye extent changes.
+struct XrRender {
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    ubo: Buffer,
+    depth_image: vk::Image,
+    depth_view: vk::ImageView,
+    depth_alloc: Option<Allocation>,
+    extent: vk::Extent2D,
+}
+
+/// What to draw for the VR UI overlay in an eye pass: the left-hand panel's world
+/// transform (position + orientation + size) and the right-pointer cursor hit
+/// point. The panel samples the overlay UI texture (`render_vr_ui`).
+#[derive(Clone, Copy, Debug)]
+pub struct VrOverlayDraw {
+    pub panel_model: glam::Mat4,
+    pub cursor_world: Option<glam::Vec3>,
+}
+
+impl XrRender {
+    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        unsafe {
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.depth_image, None);
+            device.destroy_descriptor_pool(self.pool, None);
+        }
+        if let Some(a) = self.depth_alloc.take() {
+            let _ = allocator.free(a);
+        }
+        self.ubo.destroy(device, allocator);
+    }
 }
 
 impl ColorHistory {
@@ -1134,6 +1292,7 @@ impl ColorHistory {
     /// Copy `src` (a scene colour image, same format + extent) into the history.
     /// `src_before`/`src_after` are the source's layout around the copy so the
     /// caller's pass state is preserved. Leaves the history in SHADER_READ_ONLY.
+    #[allow(dead_code)] // dead since deferred SSR; pending ColorHistory removal
     fn record_copy(
         &mut self,
         device: &ash::Device,
@@ -1757,6 +1916,21 @@ pub struct Renderer {
     /// HDR scene target + fullscreen post pass (tonemap + bloom) for the game
     /// swapchain path. The editor viewport keeps inline tonemap for now.
     post_pass: post::PostPass,
+    /// Deferred screen-space-reflection resolve pass (shared pipeline) + the game
+    /// swapchain path's per-frame G-buffer/resolved targets.
+    ssr_resolve: ssr::SsrResolve,
+    ssr_targets: Vec<ssr::SsrTarget>,
+    /// Editor-viewport deferred-SSR target (recreated with `viewport_target`).
+    viewport_ssr: Option<ssr::SsrTarget>,
+    /// Ray-traced reflections (1 bounce); `None` when the GPU lacks ray query.
+    rt_reflect: Option<rt_reflect::RtReflect>,
+    /// VR stereo render resources (lazily created on the first `render_xr_eye`).
+    xr_render: Option<XrRender>,
+    /// VR UI overlay: egui→texture + the hand-panel/pointer quads (lazy).
+    vr_overlay: Option<vr_overlay::VrOverlay>,
+    /// The most recent desktop frame UBO (lights/shadows/probes), reused per VR
+    /// eye with only the camera matrices swapped.
+    last_frame_ubo: Option<FrameUbo>,
     /// Prefiltered environment reflection cubemap (reflection probe), rebuilt
     /// from the skybox. Sampled in the forward shader's specular term.
     reflection_env: ReflectionEnv,
@@ -1845,8 +2019,18 @@ pub struct Renderer {
     materials: Vec<Material>,
 
     egui: Option<egui_ash_renderer::Renderer>,
-    /// Texture frees deferred until those frames can no longer be in flight.
-    egui_free_queue: VecDeque<Vec<egui::TextureId>>,
+    /// A second egui renderer dedicated to the VR UI panel (its own in-flight
+    /// buffers, so re-drawing the UI for VR can't race the desktop egui draw).
+    /// Kept texture-synced with `egui`. None on the game runtime.
+    vr_egui: Option<egui_ash_renderer::Renderer>,
+    /// egui texture ids freed last frame, released at the START of the next
+    /// frame (behind a full device idle) BEFORE that frame's `set_textures`.
+    /// egui recycles TextureIds, so a freed id can be reused by a new texture in
+    /// the very next frame's `set`; freeing-before-set means a reused id is
+    /// destroyed then cleanly recreated. Deferring past the `set` (the old
+    /// approach) instead destroyed the live reused texture -> use-after-free ->
+    /// SIGSEGV in egui's next draw (seen on window resize / thumbnail churn).
+    egui_pending_free: Vec<egui::TextureId>,
     /// Offscreen main-camera target, created lazily the first frame the Camera
     /// tab asks for it.
     camera_preview: Option<CameraPreview>,
@@ -1926,6 +2110,35 @@ impl Renderer {
             swapchain.extent,
             FRAMES_IN_FLIGHT,
         )?;
+        // Deferred SSR: one resolve pipeline + per-frame G-buffer/resolved targets
+        // sized to the swapchain (the game path). The viewport owns its own.
+        let ssr_resolve = ssr::SsrResolve::new(&ctx.device)?;
+        // Ray-traced reflections (only on GPUs with ray query / the bake's accel
+        // loader). Falls back to SSR when absent.
+        let rt_reflect = if ctx.accel.is_some() {
+            match rt_reflect::RtReflect::new(&ctx.device) {
+                Ok(rt) => Some(rt),
+                Err(e) => {
+                    tracing::warn!("ray-traced reflections unavailable: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let ssr_targets = {
+            let mut alloc = allocator.lock().unwrap();
+            (0..FRAMES_IN_FLIGHT)
+                .map(|_| {
+                    ssr_resolve.create_target(
+                        &ctx.device,
+                        &mut alloc,
+                        post_pass.set_layout(),
+                        swapchain.extent,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         let reflection_env = ReflectionEnv::neutral(
             &ctx.device,
             &mut allocator.lock().unwrap(),
@@ -1944,7 +2157,7 @@ impl Renderer {
             .collect::<Result<Vec<_>>>()?;
 
         let pipeline_cache =
-            PipelineCache::new(&ctx.device, swapchain.format.format, DEPTH_FORMAT)?;
+            PipelineCache::new(&ctx.device, swapchain.format.format, DEPTH_FORMAT, GBUF_FORMAT)?;
 
         // Frame UBOs live in their own pool; the material pool is reset
         // wholesale when a scene is unloaded. Each frame set 0 also carries the
@@ -1978,7 +2191,7 @@ impl Renderer {
         let material_pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: material_sets * 12,
+                descriptor_count: material_sets * 16,
             },
             // One FX uniform buffer per material set (+ the skybox set).
             vk::DescriptorPoolSize {
@@ -2269,6 +2482,10 @@ impl Renderer {
             ([255, 255, 255, 255], false),   // 9 matcap 2 mask
             ([0, 0, 0, 255], true),          // 10 matcap 3
             ([255, 255, 255, 255], false),   // 11 matcap 3 mask
+            ([255, 255, 255, 255], false),   // 12 ao (white = no occlusion)
+            ([255, 255, 255, 255], false),   // 13 roughness (white, slider scales)
+            ([255, 255, 255, 255], false),   // 14 metallic (white, slider scales)
+            ([255, 255, 255, 255], false),   // 15 displacement (constant = flat)
         ];
         let mut default_textures = Vec::new();
         {
@@ -2284,6 +2501,7 @@ impl Renderer {
                         height: 1,
                         pixels: pixel.to_vec(),
                         srgb,
+                        hdr: false,
                     },
                 )?);
             }
@@ -2306,10 +2524,10 @@ impl Renderer {
                     .descriptor_pool(material_pool)
                     .set_layouts(&layouts),
             )?[0];
-            // Fill all 12 sampler slots with defaults (the skybox shader only
+            // Fill all 15 sampler slots with defaults (the skybox shader only
             // reads slot 0, but every binding must be valid). set_skybox writes
             // the real equirect into binding 0 later.
-            let infos: Vec<[vk::DescriptorImageInfo; 1]> = (0..12)
+            let infos: Vec<[vk::DescriptorImageInfo; 1]> = (0..16)
                 .map(|i| {
                     [vk::DescriptorImageInfo::default()
                         .sampler(sampler)
@@ -2357,6 +2575,23 @@ impl Renderer {
             },
         )
         .map_err(|e| anyhow::anyhow!("creating egui renderer: {e}"))?;
+        // Dedicated VR-UI egui renderer (renders the editor UI into the overlay
+        // texture; no depth attachment there). Texture-synced with `egui`.
+        let vr_egui = egui_ash_renderer::Renderer::with_gpu_allocator(
+            allocator.clone(),
+            ctx.device.clone(),
+            egui_ash_renderer::DynamicRendering {
+                color_attachment_format: swapchain.format.format,
+                depth_attachment_format: None,
+            },
+            egui_ash_renderer::Options {
+                in_flight_frames: FRAMES_IN_FLIGHT,
+                enable_depth_test: false,
+                enable_depth_write: false,
+                srgb_framebuffer: true,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("creating VR egui renderer: {e}"))?;
 
         // GPU software-GI march pipeline; None falls back to the CPU march.
         let gpu_gi = gpu_gi::GpuGi::new(&ctx)
@@ -2372,6 +2607,14 @@ impl Renderer {
             sgi,
             ssr_color,
             post_pass,
+            ssr_resolve,
+            ssr_targets,
+            viewport_ssr: None,
+            rt_reflect,
+            xr_render: None,
+            vr_overlay: None,
+            vr_egui: Some(vr_egui),
+            last_frame_ubo: None,
             reflection_env,
             refl_capture_pool,
             refl_capture_set,
@@ -2415,7 +2658,7 @@ impl Renderer {
             textures: Vec::new(),
             materials: Vec::new(),
             egui: Some(egui),
-            egui_free_queue: VecDeque::new(),
+            egui_pending_free: Vec::new(),
             camera_preview: None,
             viewport_target: None,
             probe_buffer,
@@ -2801,6 +3044,13 @@ impl Renderer {
         )
     }
 
+    /// The swapchain colour format as a raw `VkFormat` (u32). The VR (OpenXR)
+    /// swapchains must use this so the scene pipelines match; pass it to
+    /// `XrSession::setup_stereo` and `render_xr_eye`.
+    pub fn color_format_raw(&self) -> u32 {
+        self.swapchain.format.format.as_raw() as u32
+    }
+
     pub fn upload_texture(&mut self, data: &TextureData) -> Result<TextureHandle> {
         let allocator = self.allocator();
         let texture = GpuTexture::upload(
@@ -2838,6 +3088,10 @@ impl Renderer {
             desc.matcap_mask[1],
             desc.matcap[2],
             desc.matcap_mask[2],
+            desc.ao,
+            desc.roughness,
+            desc.metallic,
+            desc.displacement,
         ];
         let bindings = TEXTURE_BINDINGS;
         let image_infos: Vec<[vk::DescriptorImageInfo; 1]> = slots
@@ -2922,7 +3176,7 @@ impl Renderer {
     /// is untouched). `None` in a slot binds the 1×1 default for that slot.
     /// Waits for device idle first since the set may be in use by an in-flight
     /// frame; texture edits are user-initiated and rare, so the stall is fine.
-    pub fn set_material_textures(&mut self, handle: MaterialHandle, slots: &[Option<TextureHandle>; 12]) {
+    pub fn set_material_textures(&mut self, handle: MaterialHandle, slots: &[Option<TextureHandle>; 16]) {
         let Some(material) = self.materials.get(handle.0) else {
             return;
         };
@@ -3252,9 +3506,9 @@ impl Renderer {
                     );
                 }
                 if input.draw_skybox {
-                    let _ = self.record_skybox(&device, cb, capture_set, false);
+                    let _ = self.record_skybox(&device, cb, capture_set, false, false);
                 }
-                let _ = self.record_scene_draws(&device, cb, order, input, capture_set);
+                let _ = self.record_scene_draws(&device, cb, order, input, capture_set, false);
                 unsafe {
                     device.cmd_end_rendering(cb);
                     // Face -> shader-read so the mip-gen blit can read it.
@@ -3392,8 +3646,11 @@ impl Renderer {
         cb: vk::CommandBuffer,
         frame_set: vk::DescriptorSet,
         hdr: bool,
+        gbuf: bool,
     ) -> Result<()> {
-        let pipeline = self.pipeline_cache.get(device, PipelineKey::skybox())?;
+        let mut sky_key = PipelineKey::skybox();
+        sky_key.gbuf = gbuf;
+        let pipeline = self.pipeline_cache.get(device, sky_key)?;
         let mut push = PushData {
             model: glam::Mat4::IDENTITY.to_cols_array_2d(),
             base_color: [0.0; 4],
@@ -3557,6 +3814,23 @@ impl Renderer {
             self.swapchain.extent,
         )?;
         self.post_pass.resize(&self.ctx.device, &mut alloc, self.swapchain.extent)?;
+        // Recreate the deferred-SSR targets at the new size.
+        for mut t in self.ssr_targets.drain(..) {
+            t.destroy(&self.ctx.device, &mut alloc);
+        }
+        self.ssr_targets = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                self.ssr_resolve.create_target(
+                    &self.ctx.device,
+                    &mut alloc,
+                    self.post_pass.set_layout(),
+                    self.swapchain.extent,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(overlay) = self.vr_overlay.as_mut() {
+            overlay.resize(&self.ctx.device, &mut alloc, self.swapchain.extent)?;
+        }
         self.sgi_history_valid = false; // recreated target has no history yet
         self.sgi_parity = 0;
         self.sgi_last_view_proj = None;
@@ -3587,6 +3861,27 @@ impl Renderer {
             self.recreate_swapchain()?;
         }
 
+        // Release last frame's egui texture frees BEFORE applying this frame's
+        // uploads. egui recycles TextureIds, so an id freed last frame can be
+        // reused by a texture in this frame's `set`; freeing first (behind a
+        // full idle so no in-flight frame still binds them) destroys the old id
+        // then lets `set_textures` cleanly recreate it. Frees are rare (texture
+        // drops / font-atlas rebuilds), so the idle is effectively free.
+        if !self.egui_pending_free.is_empty() {
+            unsafe {
+                let _ = self.ctx.device.device_wait_idle();
+            }
+            let ids = std::mem::take(&mut self.egui_pending_free);
+            self.egui
+                .as_mut()
+                .unwrap()
+                .free_textures(&ids)
+                .map_err(|e| anyhow::anyhow!("freeing egui textures: {e}"))?;
+            if let Some(vr) = self.vr_egui.as_mut() {
+                let _ = vr.free_textures(&ids);
+            }
+        }
+
         // Upload any new/changed egui textures before recording the frame.
         if let Some(egui_draw) = &input.egui
             && !egui_draw.textures_delta.set.is_empty()
@@ -3600,6 +3895,15 @@ impl Renderer {
                     &egui_draw.textures_delta.set,
                 )
                 .map_err(|e| anyhow::anyhow!("uploading egui textures: {e}"))?;
+            // Keep the VR-UI egui renderer's textures in lockstep so it always has
+            // the font atlas etc. (it may start mid-run when VR is entered).
+            if let Some(vr) = self.vr_egui.as_mut() {
+                let _ = vr.set_textures(
+                    self.ctx.queue,
+                    self.command_pool,
+                    &egui_draw.textures_delta.set,
+                );
+            }
         }
 
         let device = self.ctx.device.clone();
@@ -3629,17 +3933,6 @@ impl Renderer {
         if let Some(mut t) = self.preview_sgi_transients[self.frame_index].take() {
             let alloc = self.allocator();
             t.destroy(&device, &mut alloc.lock().unwrap());
-        }
-
-        // This frame's prior submission has retired; egui textures freed two
-        // frames ago are safe to release now.
-        while self.egui_free_queue.len() >= FRAMES_IN_FLIGHT {
-            let ids = self.egui_free_queue.pop_front().unwrap();
-            self.egui
-                .as_mut()
-                .unwrap()
-                .free_textures(&ids)
-                .map_err(|e| anyhow::anyhow!("freeing egui textures: {e}"))?;
         }
 
         let image_index = match self.swapchain.acquire(image_available) {
@@ -3723,7 +4016,12 @@ impl Renderer {
         // active. The per-pass binding writes (below / in record_viewport_scene)
         // point bindings 5/6 at the active camera's depth + colour history.
         let fs = self.flux_settings;
-        let ssr_on = fs.ssr_enabled && sgi_active;
+        // Reflection model: 1 = SSR, 2 = ray-traced (needs the accel loader).
+        let rt_on = fs.reflection_mode == 2 && self.rt_reflect.is_some() && sgi_active;
+        let ssr_on = fs.reflection_mode == 1 && fs.ssr_enabled && sgi_active;
+        // Volumetric fog runs in the same resolve pass; it needs the depth prepass
+        // too, so it also rides on sgi_active.
+        let fog_on = sgi_active && input.fog.map_or(false, |f| f.density > 0.0);
         ubo.ssr = if ssr_on {
             [1.0, fs.ssr_intensity, fs.ssr_max_distance, fs.ssr_roughness_cutoff]
         } else {
@@ -3743,6 +4041,9 @@ impl Renderer {
             ubo.fog_params = [f.height_falloff.max(0.0), f.height_ref, f.start_distance.max(0.0), 0.0];
         }
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
+        // Keep this frame's lights/shadows/probes so the VR eyes can reuse them
+        // (only the camera matrices differ per eye).
+        self.last_frame_ubo = Some(ubo);
 
         // Decide whether to trace the screen-GI gather this frame, then point
         // the forward sampler (binding 4) at the image that will hold the latest
@@ -3764,7 +4065,7 @@ impl Renderer {
             } else {
                 self.sgi_still_frames = self.sgi_still_frames.saturating_add(1);
             }
-            const SGI_CONVERGE_FRAMES: u32 = 48;
+            const SGI_CONVERGE_FRAMES: u32 = 96;
             if camera_moved || self.sgi_still_frames < SGI_CONVERGE_FRAMES {
                 // New seed every trace so each frame samples different directions
                 // and temporal accumulation can converge the noise.
@@ -3780,17 +4081,27 @@ impl Renderer {
                 } else {
                     input.camera.position
                 };
-                // Motion-aware temporal blend, scaled by the Flux smoothing
-                // setting (0 = responsive and sharper, 1 = smooth with more lag):
-                // snap on the first frame, trust the fresh trace more while moving
-                // (cuts reprojection-residual smear), converge gently when still.
+                // Temporal blend (screen-probe temporal model): we do
+                // NOT crank alpha up while the camera moves — reprojection + the
+                // per-probe disocclusion reject in screen_gi.comp handle camera
+                // motion, so accumulating ~1/alpha frames stays valid in motion
+                // (cranking alpha to 0.5 was the source of the motion noise). The engine
+                // caps accumulation at MaxFramesAccumulated≈10 (alpha≈0.09); we use
+                // a fixed low alpha as the equivalent, tuned by the smoothing slider
+                // (0 = ~10 frames, 1 = ~25 frames). A slightly higher floor while
+                // moving guards against reprojection-residual smear (no neighbourhood
+                // clamp yet — that's the next denoiser phase).
                 let s = self.flux_settings.smoothing.clamp(0.0, 1.0);
                 let alpha = if !hist_valid {
                     1.0
                 } else if camera_moved {
-                    0.5 - 0.4 * s
+                    0.16 - 0.10 * s
                 } else {
-                    0.12 - 0.10 * s
+                    // Strong accumulation when still (~14-25 frames): curved/untextured
+                    // surfaces (spheres) rely almost entirely on temporal since the
+                    // plane-aware spatial filter can't blend across their curvature
+                    // until the per-probe SH gather lands.
+                    0.07 - 0.04 * s
                 };
                 sgi_record = Some((dp, hist_valid, cur, prev_vp, prev_cam, alpha));
                 // Advance temporal state for next frame; the swap makes this
@@ -3800,10 +4111,11 @@ impl Renderer {
                 self.sgi_last_cam = input.camera.position;
                 self.sgi_parity ^= 1;
             }
-            // After the swap, gi[parity ^ 1] is the slot written this frame (or
-            // the last-written one on a skip frame); sample that.
-            let cur = (self.sgi_parity ^ 1) & 1;
-            let cur_view = self.sgi.gi_view[cur];
+            // Forward samples the INTEGRATED full-res GI (flux_integrate output:
+            // denoised + per-pixel-normal SH resolve), which persists across skip
+            // frames; the raw ping-pong still feeds temporal.
+            let _ = (self.sgi_parity ^ 1) & 1;
+            let cur_view = self.sgi.gi_final_view;
             let info = [vk::DescriptorImageInfo::default()
                 .sampler(self.lightmap_sampler)
                 .image_view(cur_view)
@@ -3900,6 +4212,15 @@ impl Renderer {
                 if let Some(mut old) = self.viewport_target.take() {
                     old.destroy(&self.ctx.device, &mut alloc);
                 }
+                if let Some(mut old) = self.viewport_ssr.take() {
+                    old.destroy(&self.ctx.device, &mut alloc);
+                }
+                self.viewport_ssr = Some(self.ssr_resolve.create_target(
+                    &self.ctx.device,
+                    &mut alloc,
+                    self.post_pass.set_layout(),
+                    vk::Extent2D { width: vw, height: vh },
+                )?);
                 let fmt = self.swapchain.format.format;
                 let post_layout = self.post_pass.set_layout();
                 let post_sampler = self.post_pass.sampler();
@@ -4037,6 +4358,30 @@ impl Renderer {
                 vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             );
 
+            // Deferred-SSR G-buffer: a second MRT attachment for the game path
+            // (the scene draws use gbuf=true pipeline variants). Cleared to zero
+            // reflectance so untouched/sky pixels reflect nothing.
+            let (gbuf_image, gbuf_view) = if game {
+                let t = &self.ssr_targets[self.frame_index];
+                (t.gbuf_image, t.gbuf_view)
+            } else {
+                (vk::Image::null(), vk::ImageView::null())
+            };
+            if game {
+                image_barrier(
+                    &device,
+                    cb,
+                    gbuf_image,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                );
+            }
+
             let color_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(scene_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -4046,6 +4391,14 @@ impl Renderer {
                     color: vk::ClearColorValue {
                         float32: input.clear_color,
                     },
+                });
+            let gbuf_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(gbuf_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0; 4] },
                 });
             let depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(self.depth.view)
@@ -4058,7 +4411,11 @@ impl Renderer {
                         stencil: 0,
                     },
                 });
-            let color_attachments = [color_attachment];
+            let color_attachments: Vec<vk::RenderingAttachmentInfo> = if game {
+                vec![color_attachment, gbuf_attachment]
+            } else {
+                vec![color_attachment]
+            };
             let rendering_info = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
@@ -4094,9 +4451,9 @@ impl Renderer {
             let mut stats = RenderStats::default();
             if input.render_viewport {
                 if input.draw_skybox {
-                    self.record_skybox(&device, cb, frame_set, true)?;
+                    self.record_skybox(&device, cb, frame_set, true, true)?;
                 }
-                stats = self.record_scene_draws(&device, cb, &order, input, frame_set)?;
+                stats = self.record_scene_draws(&device, cb, &order, input, frame_set, true)?;
             }
 
             // Selection outlines: inverted hull pass over highlighted draws.
@@ -4137,9 +4494,9 @@ impl Renderer {
                 // (also needed for transparent objects, which never write
                 // depth in the main pass — without it the hull's interior
                 // shows through and the whole object turns purple).
-                let depth_pipeline = self
-                    .pipeline_cache
-                    .get(&device, PipelineKey::depth_only())?;
+                let mut depth_key = PipelineKey::depth_only();
+                depth_key.gbuf = true;
+                let depth_pipeline = self.pipeline_cache.get(&device, depth_key)?;
                 device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, depth_pipeline);
                 device.cmd_bind_descriptor_sets(
                     cb,
@@ -4185,7 +4542,9 @@ impl Renderer {
                     device.cmd_draw_indexed(cb, mesh.index_count, 1, 0, 0, 0);
                 }
 
-                let pipeline = self.pipeline_cache.get(&device, PipelineKey::outline())?;
+                let mut outline_key = PipelineKey::outline();
+                outline_key.gbuf = true;
+                let pipeline = self.pipeline_cache.get(&device, outline_key)?;
                 device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 device.cmd_bind_descriptor_sets(
                     cb,
@@ -4248,22 +4607,86 @@ impl Renderer {
             device.cmd_end_rendering(cb);
 
             if game {
-                // SSR colour history: copy this frame's HDR scene colour so next
-                // frame's reflection march has a source.
-                self.ssr_color.record_copy(
-                    &device,
-                    cb,
-                    scene_image,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                );
-                // HDR scene -> shader-read for the post pass.
+                // HDR scene -> shader-read so the resolve + post passes sample it.
                 image_barrier(
                     &device, cb, scene_image, vk::ImageAspectFlags::COLOR,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                     vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
                 );
+                // Reflections + fog write a resolved HDR image the post pass reads.
+                // Ray-traced (mode 2) takes precedence; else SSR/fog resolve.
+                let post_src = if rt_on {
+                    // G-buffer -> read for the RT compute pass.
+                    image_barrier(
+                        &device, cb, gbuf_image, vk::ImageAspectFlags::COLOR,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
+                    );
+                    let (instances, lights) = self.rt_scene(input);
+                    let rt_uniforms = rt_reflect::RtUniforms {
+                        inv_proj: ubo.inv_proj,
+                        inv_view: ubo.inv_view,
+                        camera_pos: ubo.camera_pos,
+                        refl_center: ubo.refl_center,
+                        refl_extents: ubo.refl_extents,
+                        params: [
+                            fs.ssr_roughness_cutoff,
+                            fs.ssr_intensity,
+                            lights.len() as f32,
+                            0.0,
+                        ],
+                        screen: [extent.width as f32, extent.height as f32, 0.0, 0.0],
+                    };
+                    let env_view = self.reflection_env.view;
+                    let depth_view = self.sgi.depth_view;
+                    let resolved_image = self.ssr_targets[self.frame_index].resolved_image();
+                    let resolved_view = self.ssr_targets[self.frame_index].resolved_view();
+                    let post_set = self.ssr_targets[self.frame_index].post_set;
+                    let allocator = self.allocator.clone();
+                    let frame_index = self.frame_index;
+                    let command_pool = self.command_pool;
+                    if let (Some(rt), Some(allocator)) = (self.rt_reflect.as_mut(), allocator) {
+                        if let Err(e) = rt.record(
+                            &self.ctx, &allocator, command_pool, cb, frame_index, &self.meshes,
+                            &instances, &lights, resolved_image, resolved_view, scene_view,
+                            depth_view, gbuf_view, env_view, &rt_uniforms, extent,
+                        ) {
+                            tracing::warn!("RT reflection record failed: {e:#}");
+                        }
+                    }
+                    // Resolved image GENERAL -> shader read for the post pass.
+                    image_barrier(
+                        &device, cb, resolved_image, vk::ImageAspectFlags::COLOR,
+                        vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+                    );
+                    Some(post_set)
+                } else if ssr_on || fog_on {
+                    image_barrier(
+                        &device, cb, gbuf_image, vk::ImageAspectFlags::COLOR,
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+                    );
+                    let uniforms = self.ssr_uniforms(input, extent, ssr_on);
+                    let env_view = self.reflection_env.view;
+                    let depth_view = self.sgi.depth_view;
+                    self.ssr_resolve.record(
+                        &device,
+                        cb,
+                        &mut self.ssr_targets[self.frame_index],
+                        scene_view,
+                        depth_view,
+                        env_view,
+                        &uniforms,
+                    );
+                    Some(self.ssr_targets[self.frame_index].post_set)
+                } else {
+                    None
+                };
                 // Swapchain -> color attachment for the post pass.
                 image_barrier(
                     &device, cb, image, vk::ImageAspectFlags::COLOR,
@@ -4282,8 +4705,10 @@ impl Renderer {
                     .layer_count(1)
                     .color_attachments(&post_attachments);
                 device.cmd_begin_rendering(cb, &post_info);
-                self.post_pass
-                    .record(&device, cb, self.frame_index, extent, &input.postfx);
+                match post_src {
+                    Some(set) => self.post_pass.record_set(&device, cb, set, extent, &input.postfx),
+                    None => self.post_pass.record(&device, cb, self.frame_index, extent, &input.postfx),
+                }
                 // egui on top of the tonemapped image.
                 if let Some(egui_draw) = &input.egui {
                     self.egui
@@ -4340,11 +4765,16 @@ impl Renderer {
             Err(e) => return Err(e).context("presenting swapchain image"),
         }
 
+        // Queue this frame's egui frees; they're released at the start of the
+        // next frame (behind an idle, before that frame's `set_textures`). The
+        // freed ids are no longer in this frame's primitives, but this frame's
+        // (and the prior frame's) draw may still be in flight, so we can't free
+        // them now — and freeing before the next `set` avoids the id-reuse UAF.
         if let Some(egui_draw) = &input.egui
             && !egui_draw.textures_delta.free.is_empty()
         {
-            self.egui_free_queue
-                .push_back(egui_draw.textures_delta.free.clone());
+            self.egui_pending_free
+                .extend_from_slice(&egui_draw.textures_delta.free);
         }
 
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
@@ -4422,7 +4852,9 @@ fn frame_ubo(
             input.light.ambient[0],
             input.light.ambient[1],
             input.light.ambient[2],
-            1.0,
+            // .w = skylight/env IBL intensity: gates the fallback skybox reflection
+            // so ambient-off → metals don't mirror the sky (scene black, no lights).
+            input.light.env_intensity,
         ],
         misc: [input.time, count as f32, input.shadow_pcf_texel, nv as f32],
         cascade_splits,
@@ -4511,6 +4943,12 @@ impl Renderer {
             self.sgi.gi_image[cur],
             self.sgi.gi_view[cur],
             self.sgi.gi_view[prev],
+            self.sgi.gi_filtered,
+            self.sgi.gi_filtered_view,
+            self.sgi.sh_buf[cur].handle,
+            self.sgi.sh_buf[prev].handle,
+            self.sgi.gi_final,
+            self.sgi.gi_final_view,
             self.swapchain.extent,
             history_valid,
             prev_vp,
@@ -4543,6 +4981,12 @@ impl Renderer {
         gi_out_image: vk::Image,
         gi_out_view: vk::ImageView,
         gi_hist_view: vk::ImageView,
+        gi_filtered_image: vk::Image,
+        gi_filtered_view: vk::ImageView,
+        gi_sh_buf: vk::Buffer,
+        gi_sh_prev_buf: vk::Buffer,
+        gi_final_image: vk::Image,
+        gi_final_view: vk::ImageView,
         full_extent: vk::Extent2D,
         history_valid: bool,
         prev_vp: glam::Mat4,
@@ -4694,6 +5138,21 @@ impl Renderer {
         // fills it from the GDF diagonal. sky.w carries the indirect intensity;
         // march.w the firefly clamp.
         let fs = self.flux_settings;
+        // World SH radiance cache volumes (the realtime/baked probe grid the
+        // gather reads at ray hits). Mirror up to GI_MAX_VOLUMES into the params.
+        let mut volumes = [gpu_gi::GiVolume {
+            world_to_local: [[0.0; 4]; 4],
+            size_base: [0.0; 4],
+            counts: [0.0; 4],
+        }; gpu_gi::GI_MAX_VOLUMES];
+        let vcount = self.probe_volumes.len().min(gpu_gi::GI_MAX_VOLUMES);
+        for (i, v) in self.probe_volumes.iter().take(gpu_gi::GI_MAX_VOLUMES).enumerate() {
+            volumes[i] = gpu_gi::GiVolume {
+                world_to_local: v.world_to_local,
+                size_base: v.size_base,
+                counts: v.counts,
+            };
+        }
         let params = gpu_gi::ScreenGiParams {
             inv_view_proj: inv_vp.to_cols_array_2d(),
             prev_view_proj: prev_vp.to_cols_array_2d(),
@@ -4710,6 +5169,8 @@ impl Renderer {
                 full_extent.height,
                 if flip_y { 1 } else { 0 },
             ],
+            probe_info: [vcount as f32, 0.0, 0.0, 0.0],
+            volumes,
         };
         // Trace at probe resolution (one probe per SCREEN_PROBE_DIV² pixels);
         // the depth is full-res but sampled by normalized UV, so this is
@@ -4723,10 +5184,18 @@ impl Renderer {
             gi_out_image,
             gi_out_view,
             gi_hist_view,
+            gi_filtered_image,
+            gi_filtered_view,
+            gi_sh_buf,
+            gi_sh_prev_buf,
+            gi_final_image,
+            gi_final_view,
+            full_extent,
             probe_extent,
             &lights,
             &self.gi_emitters,
             history_valid,
+            self.probe_buffer.handle,
             params,
         )?;
         Ok(transient)
@@ -4741,6 +5210,7 @@ impl Renderer {
         order: &[usize],
         input: &FrameInput,
         frame_set: vk::DescriptorSet,
+        gbuf: bool,
     ) -> Result<RenderStats> {
         let mut stats = RenderStats::default();
         let mut materials_seen: Vec<bool> = vec![false; self.materials.len()];
@@ -4766,12 +5236,15 @@ impl Renderer {
             }
 
             let key = if material.error {
-                PipelineKey::error()
+                let mut key = PipelineKey::error();
+                key.gbuf = gbuf;
+                key
             } else {
                 let mut key = PipelineKey::from_features(&material.features);
                 if let Some(shader) = material.custom_shader {
                     key.shader = shader.0 as u32 + 1;
                 }
+                key.gbuf = gbuf;
                 key
             };
             let pipeline = self.pipeline_cache.get(device, key)?;
@@ -4886,7 +5359,19 @@ impl Renderer {
         if self.gi_has_gdf()
             && let Some(pcam) = input.camera_preview.as_ref()
         {
-            let (sgi_depth_image, sgi_depth_view, sgi_probe_extent, sgi_gi_image, sgi_gi_view, pextent) = {
+            let (
+                sgi_depth_image,
+                sgi_depth_view,
+                sgi_probe_extent,
+                sgi_gi_image,
+                sgi_gi_view,
+                sgi_filtered_image,
+                sgi_filtered_view,
+                sgi_sh_buf,
+                sgi_final_image,
+                sgi_final_view,
+                pextent,
+            ) = {
                 let p = self.camera_preview.as_ref().unwrap();
                 (
                     p.sgi.depth_image,
@@ -4894,6 +5379,11 @@ impl Renderer {
                     p.sgi.probe_extent,
                     p.sgi.gi_image,
                     p.sgi.gi_view,
+                    p.sgi.gi_filtered,
+                    p.sgi.gi_filtered_view,
+                    [p.sgi.sh_buf[0].handle, p.sgi.sh_buf[1].handle],
+                    p.sgi.gi_final,
+                    p.sgi.gi_final_view,
                     p.extent,
                 )
             };
@@ -4932,6 +5422,12 @@ impl Renderer {
                 sgi_gi_image[cur],
                 sgi_gi_view[cur],
                 sgi_gi_view[prev],
+                sgi_filtered_image,
+                sgi_filtered_view,
+                sgi_sh_buf[cur],
+                sgi_sh_buf[prev],
+                sgi_final_image,
+                sgi_final_view,
                 pextent,
                 hist_valid,
                 prev_vp,
@@ -4948,8 +5444,8 @@ impl Renderer {
                     self.preview_sgi_last_view_proj = Some(vp);
                     self.preview_sgi_last_cam = pcam.position;
                     self.preview_sgi_parity ^= 1;
-                    // Point the preview's binding 4 at the gather just written.
-                    let view = sgi_gi_view[cur];
+                    // Point the preview's binding 4 at the INTEGRATED full-res GI.
+                    let view = sgi_final_view;
                     let set = self.camera_preview.as_ref().unwrap().sets[self.frame_index];
                     let info = [vk::DescriptorImageInfo::default()
                         .sampler(self.lightmap_sampler)
@@ -5053,9 +5549,9 @@ impl Renderer {
         }
 
         if input.draw_skybox {
-            self.record_skybox(device, cb, frame_set, false)?;
+            self.record_skybox(device, cb, frame_set, false, false)?;
         }
-        self.record_scene_draws(device, cb, order, input, frame_set)?;
+        self.record_scene_draws(device, cb, order, input, frame_set, false)?;
 
         unsafe {
             device.cmd_end_rendering(cb);
@@ -5230,6 +5726,515 @@ impl Renderer {
         })
     }
 
+    /// Build the deferred-SSR resolve uniforms for a camera + frame. Matches the
+    /// values `frame_ubo` writes (plain matrix inverses), so the resolve re-derives
+    /// the exact env reflection the forward pass added.
+    fn ssr_uniforms(
+        &self,
+        input: &FrameInput,
+        ext: vk::Extent2D,
+        ssr_on: bool,
+    ) -> ssr::SsrUniforms {
+        let cam = &input.camera;
+        let fs = self.flux_settings;
+        let ssr = if ssr_on {
+            [1.0, fs.ssr_intensity, fs.ssr_max_distance, fs.ssr_roughness_cutoff]
+        } else {
+            [0.0; 4]
+        };
+        let mut refl_center = [0.0; 4];
+        let mut refl_extents = [0.0; 4];
+        if let Some(p) = input.reflection_probe {
+            refl_center = [p.center[0], p.center[1], p.center[2], p.intensity.max(0.0)];
+            refl_extents = [
+                p.half_extents[0],
+                p.half_extents[1],
+                p.half_extents[2],
+                if p.box_projection { 1.0 } else { 0.0 },
+            ];
+        }
+        let mut fog_color = [0.0; 4];
+        let mut fog_params = [0.0; 4];
+        if let Some(f) = input.fog {
+            fog_color = [f.color[0], f.color[1], f.color[2], f.density.max(0.0)];
+            fog_params = [f.height_falloff.max(0.0), f.height_ref, f.start_distance.max(0.0), 0.0];
+        }
+        let l = &input.light;
+        let sun = (-l.direction).normalize_or(Vec3::Y);
+        ssr::SsrUniforms {
+            proj: cam.proj.to_cols_array_2d(),
+            inv_proj: cam.proj.inverse().to_cols_array_2d(),
+            view: cam.view.to_cols_array_2d(),
+            inv_view: cam.view.inverse().to_cols_array_2d(),
+            camera_pos: cam.position.extend(0.0).to_array(),
+            ssr,
+            refl_center,
+            refl_extents,
+            fog_color,
+            fog_params,
+            // Sun colour*intensity + forward-scatter anisotropy; sun dir + time.
+            fog_light: [
+                l.color[0] * l.intensity,
+                l.color[1] * l.intensity,
+                l.color[2] * l.intensity,
+                0.6,
+            ],
+            fog_sun: [sun.x, sun.y, sun.z, input.time],
+            screen: [ext.width as f32, ext.height as f32, 0.0, 0.0],
+        }
+    }
+
+    /// Build the ray-traced-reflection scene data (instances + lights) for a frame.
+    fn rt_scene(&self, input: &FrameInput) -> (Vec<rt_reflect::RtInstance>, Vec<rt_reflect::RtLight>) {
+        let instances = input
+            .draws
+            .iter()
+            .filter_map(|d| {
+                let m = self.materials.get(d.material.0)?;
+                let p = &m.params;
+                Some(rt_reflect::RtInstance {
+                    mesh: d.mesh.0,
+                    transform: d.transform,
+                    albedo: [p.base_color[0], p.base_color[1], p.base_color[2]],
+                    emission: [
+                        p.emission_color[0] * p.emission_intensity,
+                        p.emission_color[1] * p.emission_intensity,
+                        p.emission_color[2] * p.emission_intensity,
+                    ],
+                })
+            })
+            .collect();
+        let lights = input
+            .lights
+            .iter()
+            .map(|l| {
+                let kind = match l.kind {
+                    LightKind::Directional => 0.0,
+                    LightKind::Point => 1.0,
+                    LightKind::Spot => 2.0,
+                };
+                rt_reflect::RtLight {
+                    position: [l.position.x, l.position.y, l.position.z, kind],
+                    direction: [l.direction.x, l.direction.y, l.direction.z, l.range],
+                    color: [
+                        l.color[0] * l.intensity,
+                        l.color[1] * l.intensity,
+                        l.color[2] * l.intensity,
+                        0.0,
+                    ],
+                    spot: [
+                        (l.spot_inner_deg.to_radians() * 0.5).cos(),
+                        (l.spot_outer_deg.to_radians() * 0.5).cos(),
+                        0.0,
+                        0.0,
+                    ],
+                }
+            })
+            .collect();
+        (instances, lights)
+    }
+
+    fn ensure_vr_overlay(&mut self) -> Result<()> {
+        if self.vr_overlay.is_some() {
+            return Ok(());
+        }
+        let allocator = self
+            .allocator
+            .clone()
+            .context("renderer has no allocator for VR overlay")?;
+        let mut alloc = allocator.lock().unwrap();
+        let ov = vr_overlay::VrOverlay::new(
+            &self.ctx.device,
+            &mut alloc,
+            self.swapchain.format.format,
+            self.swapchain.extent,
+        )?;
+        self.vr_overlay = Some(ov);
+        Ok(())
+    }
+
+    /// Render the editor's egui UI into the VR overlay texture (the left-hand
+    /// panel samples it). Uses the dedicated VR egui renderer so it can't race the
+    /// desktop egui draw. Call after `render` (textures are uploaded there), then
+    /// pass a [`VrOverlayDraw`] to `render_xr_eye` to show it. Synchronous.
+    pub fn render_vr_ui(&mut self, draw: &EguiDraw) -> Result<()> {
+        self.ensure_vr_overlay()?;
+        let (ui_image, ui_view, ui_extent) = {
+            let ov = self.vr_overlay.as_ref().unwrap();
+            (ov.ui_image(), ov.ui_view(), ov.ui_extent())
+        };
+        let device = self.ctx.device.clone();
+        let Some(vr_egui) = self.vr_egui.as_mut() else {
+            return Ok(());
+        };
+        let cb = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0]
+        };
+        let record = (|| -> Result<()> {
+            unsafe {
+                device.begin_command_buffer(
+                    cb,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+            }
+            image_barrier(
+                &device, cb, ui_image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            );
+            let att = vk::RenderingAttachmentInfo::default()
+                .image_view(ui_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
+                });
+            let atts = [att];
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ui_extent })
+                .layer_count(1)
+                .color_attachments(&atts);
+            unsafe {
+                device.cmd_begin_rendering(cb, &info);
+                // Standard (top-left) viewport: egui's own coordinate convention.
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: ui_extent.width as f32,
+                    height: ui_extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                device.cmd_set_viewport(cb, 0, &[viewport]);
+                device.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ui_extent }]);
+            }
+            vr_egui
+                .cmd_draw(cb, ui_extent, draw.pixels_per_point, &draw.primitives)
+                .map_err(|e| anyhow::anyhow!("VR egui draw: {e}"))?;
+            unsafe { device.cmd_end_rendering(cb) };
+            image_barrier(
+                &device, cb, ui_image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
+            unsafe { device.end_command_buffer(cb)? };
+            Ok(())
+        })();
+        let result = record.and_then(|()| unsafe {
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let r = device
+                .queue_submit(self.ctx.queue, &[submit], fence)
+                .and_then(|()| device.wait_for_fences(&[fence], true, u64::MAX));
+            device.destroy_fence(fence, None);
+            r.map_err(Into::into)
+        });
+        unsafe { device.free_command_buffers(self.command_pool, &[cb]) };
+        result
+    }
+
+    /// (Re)create the VR eye render resources (set-0 + camera UBO + depth) for the
+    /// given eye extent. Cheap no-op when already sized.
+    fn ensure_xr_render(&mut self, extent: vk::Extent2D) -> Result<()> {
+        if self.xr_render.as_ref().is_some_and(|x| x.extent == extent) {
+            return Ok(());
+        }
+        let allocator = self
+            .allocator
+            .clone()
+            .context("renderer has no allocator for XR")?;
+        let mut alloc = allocator.lock().unwrap();
+        if let Some(mut old) = self.xr_render.take() {
+            old.destroy(&self.ctx.device, &mut alloc);
+        }
+        let device = &self.ctx.device;
+        // set-0 has 1 UBO (b0), 1 storage buffer (b2), 6 combined samplers (b1,3-7).
+        let pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                    },
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::STORAGE_BUFFER,
+                        descriptor_count: 1,
+                    },
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                        descriptor_count: 6,
+                    },
+                ]),
+                None,
+            )?
+        };
+        let layouts = [self.pipeline_cache.set0_layout];
+        let set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts),
+            )?[0]
+        };
+        let ubo = Buffer::new(
+            device,
+            &mut alloc,
+            size_of::<FrameUbo>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            MemoryLocation::CpuToGpu,
+            "xr eye ubo",
+        )?;
+        let (depth_image, depth_alloc) = create_image(
+            device,
+            &mut alloc,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            extent,
+            "xr eye depth",
+        )?;
+        let depth_view = create_view(device, depth_image, DEPTH_FORMAT, vk::ImageAspectFlags::DEPTH)?;
+        self.xr_render = Some(XrRender {
+            pool,
+            set,
+            ubo,
+            depth_image,
+            depth_view,
+            depth_alloc: Some(depth_alloc),
+            extent,
+        });
+        Ok(())
+    }
+
+    /// Render the scene into one VR eye's XR swapchain image (raw `VkImage`) using
+    /// the per-eye `view`/`proj`. Reuses the last desktop frame's lights/shadows/
+    /// probes (call after `render`); the eye path is inline-tonemapped with
+    /// world-probe GI + env reflection (no SSR / screen-GI / fullscreen post — the
+    /// XR runtime composites the result). Submits + waits synchronously, so the
+    /// image is ready for `xrReleaseSwapchainImage`. Gated by the caller behind an
+    /// active XR session; the desktop path is untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_xr_eye(
+        &mut self,
+        image: u64,
+        color_format: u32,
+        width: u32,
+        height: u32,
+        view: glam::Mat4,
+        proj: glam::Mat4,
+        input: &FrameInput,
+        overlay: Option<VrOverlayDraw>,
+    ) -> Result<()> {
+        let extent = vk::Extent2D {
+            width: width.max(1),
+            height: height.max(1),
+        };
+        let format = vk::Format::from_raw(color_format as i32);
+        let device = self.ctx.device.clone();
+        let queue = self.ctx.queue;
+        self.ensure_xr_render(extent)?;
+
+        // Eye UBO: reuse the desktop frame's lighting, swap the camera, disable the
+        // desktop-only post/SSR/screen-GI paths.
+        let Some(mut ubo) = self.last_frame_ubo else {
+            return Ok(()); // no desktop frame yet this run
+        };
+        let inv_view = view.inverse();
+        ubo.view = view.to_cols_array_2d();
+        ubo.proj = proj.to_cols_array_2d();
+        ubo.view_proj = (proj * view).to_cols_array_2d();
+        ubo.inv_view = inv_view.to_cols_array_2d();
+        ubo.inv_proj = proj.inverse().to_cols_array_2d();
+        ubo.camera_pos = [inv_view.w_axis.x, inv_view.w_axis.y, inv_view.w_axis.z, 1.0];
+        ubo.ssr = [0.0; 4];
+        ubo.debug[2] = 0.0; // world-probe GI (screen-GI gather is desktop-camera-space)
+        ubo.debug[3] = 0.0; // inline tonemap in the surface shader (no post pass)
+        ubo.postfx2[3] = extent.width as f32;
+        ubo.postfx3[3] = extent.height as f32;
+
+        let frame_set = self.frame_sets[self.frame_index];
+        let (xr_set, depth_view, depth_image, ubo_buf) = {
+            let xr = self.xr_render.as_mut().unwrap();
+            xr.ubo.write(0, bytemuck::bytes_of(&ubo));
+            (xr.set, xr.depth_view, xr.depth_image, xr.ubo.handle)
+        };
+        // Bind the eye UBO at 0; share the shadow/probe/lightmap/sgi/depth/env
+        // bindings (1-7) with the current frame set via descriptor copies.
+        let ubo_info = [vk::DescriptorBufferInfo::default()
+            .buffer(ubo_buf)
+            .offset(0)
+            .range(size_of::<FrameUbo>() as u64)];
+        let write0 = vk::WriteDescriptorSet::default()
+            .dst_set(xr_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&ubo_info);
+        let copies: Vec<vk::CopyDescriptorSet> = (1..=7u32)
+            .map(|b| {
+                vk::CopyDescriptorSet::default()
+                    .src_set(frame_set)
+                    .src_binding(b)
+                    .src_array_element(0)
+                    .dst_set(xr_set)
+                    .dst_binding(b)
+                    .dst_array_element(0)
+                    .descriptor_count(1)
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&[write0], &copies) };
+
+        let color_image = {
+            use ash::vk::Handle as _;
+            vk::Image::from_raw(image)
+        };
+        let color_view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(color_image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+                None,
+            )?
+        };
+
+        let order: Vec<usize> = (0..input.draws.len()).collect();
+
+        // Record + submit synchronously (XR has no fence; the runtime reads the
+        // image right after release, so we wait here).
+        let cb = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0]
+        };
+        let record = (|| -> Result<()> {
+            unsafe {
+                device.begin_command_buffer(
+                    cb,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+            }
+            image_barrier(
+                &device, cb, color_image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            );
+            image_barrier(
+                &device, cb, depth_image, vk::ImageAspectFlags::DEPTH,
+                vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            );
+            let color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(color_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: input.clear_color },
+                });
+            let depth_att = vk::RenderingAttachmentInfo::default()
+                .image_view(depth_view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                });
+            let color_atts = [color_att];
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                .layer_count(1)
+                .color_attachments(&color_atts)
+                .depth_attachment(&depth_att);
+            unsafe {
+                device.cmd_begin_rendering(cb, &info);
+                // Negative-height viewport to match the desktop pipelines' winding.
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: extent.height as f32,
+                    width: extent.width as f32,
+                    height: -(extent.height as f32),
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                device.cmd_set_viewport(cb, 0, &[viewport]);
+                device.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }]);
+            }
+            if input.draw_skybox {
+                self.record_skybox(&device, cb, xr_set, false, false)?;
+            }
+            self.record_scene_draws(&device, cb, &order, input, xr_set, false)?;
+            // VR UI overlay: the left-hand panel (sampling the UI texture) + the
+            // right-pointer cursor, drawn on top of the scene (no depth test).
+            if let Some(ov) = overlay {
+                if let Some(panel) = self.vr_overlay.as_ref() {
+                    let vp = proj * view;
+                    let panel_push = vr_overlay::QuadPush {
+                        mvp: (vp * ov.panel_model).to_cols_array_2d(),
+                        params: [0.0; 4],
+                    };
+                    panel.record_quad(&device, cb, &panel_push);
+                    if let Some(cur) = ov.cursor_world {
+                        let cam = inv_view.w_axis.truncate();
+                        let to_cam = (cam - cur).normalize_or(glam::Vec3::Z);
+                        let right = glam::Vec3::Y.cross(to_cam).normalize_or(glam::Vec3::X);
+                        let up = to_cam.cross(right);
+                        let rot = glam::Mat3::from_cols(right, up, to_cam);
+                        let model = glam::Mat4::from_translation(cur)
+                            * glam::Mat4::from_mat3(rot)
+                            * glam::Mat4::from_scale(glam::Vec3::splat(0.012));
+                        let cur_push = vr_overlay::QuadPush {
+                            mvp: (vp * model).to_cols_array_2d(),
+                            params: [1.0, 1.0, 0.85, 0.2],
+                        };
+                        panel.record_quad(&device, cb, &cur_push);
+                    }
+                }
+            }
+            unsafe { device.cmd_end_rendering(cb) };
+            unsafe { device.end_command_buffer(cb)? };
+            Ok(())
+        })();
+
+        let result = record.and_then(|()| unsafe {
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            let r = device
+                .queue_submit(queue, &[submit], fence)
+                .and_then(|()| device.wait_for_fences(&[fence], true, u64::MAX));
+            device.destroy_fence(fence, None);
+            r.map_err(Into::into)
+        });
+        unsafe {
+            device.free_command_buffers(self.command_pool, &[cb]);
+            device.destroy_image_view(color_view, None);
+        }
+        result
+    }
+
     /// Editor RTT: render the viewport 3D (Flux trace + skybox + scene) into the
     /// viewport target's offscreen color/depth at the dock-rect resolution, then
     /// transition the color to SHADER_READ so egui can show it. Uses the editor
@@ -5242,16 +6247,36 @@ impl Renderer {
         order: &[usize],
         input: &FrameInput,
     ) -> Result<()> {
-        let (col_img, col_view, dep_img, dep_view, ext, s_depth_img, s_depth_view, s_probe, s_img, s_view, s_ssr_view, hdr_img, hdr_view, post_set) = {
+        let (col_img, col_view, dep_img, dep_view, ext, s_depth_img, s_depth_view, s_probe, s_img, s_view, s_filtered_img, s_filtered_view, s_sh_buf, s_final_img, s_final_view, s_ssr_view, hdr_img, hdr_view, post_set) = {
             let vt = self.viewport_target.as_ref().unwrap();
             (
                 vt.color, vt.color_view, vt.depth, vt.depth_view, vt.extent,
                 vt.sgi.depth_image, vt.sgi.depth_view, vt.sgi.probe_extent,
-                vt.sgi.gi_image, vt.sgi.gi_view, vt.ssr_color.view,
+                vt.sgi.gi_image, vt.sgi.gi_view, vt.sgi.gi_filtered, vt.sgi.gi_filtered_view,
+                [vt.sgi.sh_buf[0].handle, vt.sgi.sh_buf[1].handle], vt.sgi.gi_final, vt.sgi.gi_final_view,
+                vt.ssr_color.view,
                 vt.hdr_image, vt.hdr_view, vt.post_set,
             )
         };
         let frame_set = self.frame_sets[self.frame_index];
+
+        // Deferred resolve for the viewport: render the reflectance G-buffer
+        // (gbuf=true variants) and resolve SSR + volumetric fog. Runs when either
+        // SSR or fog is on (both need the depth prepass / G-buffer pass).
+        let rt_on = self.flux_settings.reflection_mode == 2
+            && self.rt_reflect.is_some()
+            && self.gi_has_gdf();
+        let ssr_on = self.flux_settings.reflection_mode == 1
+            && self.flux_settings.ssr_enabled
+            && self.gi_has_gdf();
+        let fog_on = self.gi_has_gdf() && input.fog.map_or(false, |f| f.density > 0.0);
+        let vt_gbuf = (rt_on || ssr_on || fog_on) && self.viewport_ssr.is_some();
+        let (vp_gbuf_image, vp_gbuf_view) = self
+            .viewport_ssr
+            .as_ref()
+            .map_or((vk::Image::null(), vk::ImageView::null()), |t| {
+                (t.gbuf_image, t.gbuf_view)
+            });
 
         // 1) Flux trace (editor camera -> the viewport target's sgi), reusing the
         //    main-camera temporal state.
@@ -5264,7 +6289,7 @@ impl Renderer {
             } else {
                 self.sgi_still_frames = self.sgi_still_frames.saturating_add(1);
             }
-            const CF: u32 = 48;
+            const CF: u32 = 120; // keep tracing long enough to fully settle at low alpha
             if camera_moved || self.sgi_still_frames < CF {
                 self.sgi_frame = self.sgi_frame.wrapping_add(1);
                 let hist_valid = self.sgi_history_valid;
@@ -5281,13 +6306,19 @@ impl Renderer {
                 } else if camera_moved {
                     0.5 - 0.4 * s
                 } else {
-                    0.12 - 0.10 * s
+                    // Strong accumulation when still (~25-50 frames): the running
+                    // mean's residual variance is what flickers the plane frame to
+                    // frame. A low alpha averages many independent stratified traces
+                    // so the converged value stops pulsing. (Was 0.12 ≈ 8 frames →
+                    // visible flicker.)
+                    0.04 - 0.02 * s
                 };
                 let seed = self.sgi_frame;
                 let flip = self.screen_gi_flip_y;
                 let t = self.record_flux_trace(
                     device, cb, dp, input, &input.camera, s_depth_img, s_depth_view, s_probe,
-                    s_img[cur], s_view[cur], s_view[cur ^ 1], ext, hist_valid, prev_vp, prev_cam,
+                    s_img[cur], s_view[cur], s_view[cur ^ 1], s_filtered_img, s_filtered_view,
+                    s_sh_buf[cur], s_sh_buf[cur ^ 1], s_final_img, s_final_view, ext, hist_valid, prev_vp, prev_cam,
                     alpha, seed, flip,
                 )?;
                 if let Some(t) = t {
@@ -5298,10 +6329,11 @@ impl Renderer {
                 self.sgi_last_cam = input.camera.position;
                 self.sgi_parity ^= 1;
             }
-            let cur = (self.sgi_parity ^ 1) & 1;
+            let _ = (self.sgi_parity ^ 1) & 1;
+            // Forward samples the INTEGRATED full-res GI (persists across skip frames).
             let info = [vk::DescriptorImageInfo::default()
                 .sampler(self.lightmap_sampler)
-                .image_view(s_view[cur])
+                .image_view(s_final_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(frame_set)
@@ -5351,6 +6383,14 @@ impl Renderer {
                 vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                 vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             );
+            if vt_gbuf {
+                image_barrier(
+                    device, cb, vp_gbuf_image, vk::ImageAspectFlags::COLOR,
+                    vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                );
+            }
             let color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(hdr_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -5358,6 +6398,14 @@ impl Renderer {
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
                     color: vk::ClearColorValue { float32: [0.016, 0.016, 0.024, 1.0] },
+                });
+            let gbuf_att = vk::RenderingAttachmentInfo::default()
+                .image_view(vp_gbuf_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0; 4] },
                 });
             let depth_att = vk::RenderingAttachmentInfo::default()
                 .image_view(dep_view)
@@ -5367,7 +6415,11 @@ impl Renderer {
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
                 });
-            let color_atts = [color_att];
+            let color_atts: Vec<vk::RenderingAttachmentInfo> = if vt_gbuf {
+                vec![color_att, gbuf_att]
+            } else {
+                vec![color_att]
+            };
             let info = vk::RenderingInfo::default()
                 .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext })
                 .layer_count(1)
@@ -5386,30 +6438,90 @@ impl Renderer {
             device.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }]);
         }
         if input.draw_skybox {
-            self.record_skybox(device, cb, frame_set, false)?;
+            self.record_skybox(device, cb, frame_set, false, vt_gbuf)?;
         }
-        self.record_scene_draws(device, cb, order, input, frame_set)?;
+        self.record_scene_draws(device, cb, order, input, frame_set, vt_gbuf)?;
         unsafe { device.cmd_end_rendering(cb) };
-        // SSR colour history for the viewport: copy the HDR scene colour before it
-        // goes shader-read for the post pass.
-        if self.flux_settings.ssr_enabled && self.gi_has_gdf() {
-            if let Some(vt) = self.viewport_target.as_mut() {
-                vt.ssr_color.record_copy(
-                    device,
-                    cb,
-                    hdr_img,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                );
-            }
-        }
-        // HDR -> shader-read; then the post pass (tonemap + bloom) into `color`.
+        // HDR -> shader-read; then the SSR resolve (if active) + post pass into `color`.
         image_barrier(
             device, cb, hdr_img, vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
         );
+        // Reflection resolve into the viewport's resolved HDR target: ray-traced
+        // (mode 2) takes precedence, else the SSR/fog resolve.
+        let vp_post_set = if rt_on {
+            image_barrier(
+                device, cb, vp_gbuf_image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
+            let (instances, lights) = self.rt_scene(input);
+            let cam = &input.camera;
+            let mut refl_center = [0.0; 4];
+            let mut refl_extents = [0.0; 4];
+            if let Some(p) = input.reflection_probe {
+                refl_center = [p.center[0], p.center[1], p.center[2], p.intensity.max(0.0)];
+                refl_extents = [
+                    p.half_extents[0], p.half_extents[1], p.half_extents[2],
+                    if p.box_projection { 1.0 } else { 0.0 },
+                ];
+            }
+            let fs = self.flux_settings;
+            let rt_uniforms = rt_reflect::RtUniforms {
+                inv_proj: cam.proj.inverse().to_cols_array_2d(),
+                inv_view: cam.view.inverse().to_cols_array_2d(),
+                camera_pos: cam.position.extend(0.0).to_array(),
+                refl_center,
+                refl_extents,
+                params: [fs.ssr_roughness_cutoff, fs.ssr_intensity, lights.len() as f32, 0.0],
+                screen: [ext.width as f32, ext.height as f32, 0.0, 0.0],
+            };
+            let env_view = self.reflection_env.view;
+            let target = self.viewport_ssr.take().unwrap();
+            let resolved_image = target.resolved_image();
+            let resolved_view = target.resolved_view();
+            let post_set = target.post_set;
+            let allocator = self.allocator.clone();
+            let frame_index = self.frame_index;
+            let command_pool = self.command_pool;
+            if let (Some(rt), Some(allocator)) = (self.rt_reflect.as_mut(), allocator) {
+                if let Err(e) = rt.record(
+                    &self.ctx, &allocator, command_pool, cb, frame_index, &self.meshes,
+                    &instances, &lights, resolved_image, resolved_view, hdr_view, s_depth_view,
+                    vp_gbuf_view, env_view, &rt_uniforms, ext,
+                ) {
+                    tracing::warn!("viewport RT reflection failed: {e:#}");
+                }
+            }
+            image_barrier(
+                device, cb, resolved_image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
+            self.viewport_ssr = Some(target);
+            post_set
+        } else if vt_gbuf {
+            image_barrier(
+                device, cb, vp_gbuf_image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
+            let uniforms = self.ssr_uniforms(input, ext, ssr_on);
+            let env_view = self.reflection_env.view;
+            let mut target = self.viewport_ssr.take().unwrap();
+            self.ssr_resolve
+                .record(device, cb, &mut target, hdr_view, s_depth_view, env_view, &uniforms);
+            let set = target.post_set;
+            self.viewport_ssr = Some(target);
+            set
+        } else {
+            post_set
+        };
         image_barrier(
             device, cb, col_img, vk::ImageAspectFlags::COLOR,
             vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -5428,7 +6540,7 @@ impl Renderer {
                 .layer_count(1)
                 .color_attachments(&atts);
             device.cmd_begin_rendering(cb, &info);
-            self.post_pass.record_set(device, cb, post_set, ext, &input.postfx);
+            self.post_pass.record_set(device, cb, vp_post_set, ext, &input.postfx);
             device.cmd_end_rendering(cb);
         }
         image_barrier(
@@ -5474,9 +6586,10 @@ impl Drop for Renderer {
             let _ = device.device_wait_idle();
         }
 
-        // egui renderer first: it frees its allocations through the shared
+        // egui renderers first: they free allocations through the shared
         // allocator, which must still be alive.
         drop(self.egui.take());
+        drop(self.vr_egui.take());
 
         let allocator = self.allocator.as_ref().unwrap().clone();
         {
@@ -5525,9 +6638,25 @@ impl Drop for Renderer {
             if let Some(mut vt) = self.viewport_target.take() {
                 vt.destroy(device, &mut alloc);
             }
+            if let Some(mut t) = self.viewport_ssr.take() {
+                t.destroy(device, &mut alloc);
+            }
+            if let Some(mut x) = self.xr_render.take() {
+                x.destroy(device, &mut alloc);
+            }
+            if let Some(mut o) = self.vr_overlay.take() {
+                o.destroy(device, &mut alloc);
+            }
             self.depth.destroy(device, &mut alloc);
             self.sgi.destroy(device, &mut alloc);
             self.ssr_color.destroy(device, &mut alloc);
+            for t in &mut self.ssr_targets {
+                t.destroy(device, &mut alloc);
+            }
+            self.ssr_resolve.destroy(device);
+            if let Some(mut rt) = self.rt_reflect.take() {
+                rt.destroy(&self.ctx, &mut alloc);
+            }
             self.post_pass.destroy(device, &mut alloc);
             self.reflection_env.destroy(device, &mut alloc);
             self.refl_capture_ubo.destroy(device, &mut alloc);

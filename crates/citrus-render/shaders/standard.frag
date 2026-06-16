@@ -55,9 +55,8 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 fog_params;   // x = height falloff, y = height ref, z = start distance
 } frame;
 
-// SSR inputs: full-res scene depth (Flux prepass) + last frame's lit colour.
-layout(set = 0, binding = 5) uniform sampler2D u_scene_depth;
-layout(set = 0, binding = 6) uniform sampler2D u_prev_color;
+// Bindings 5 (scene depth) and 6 (prev colour) feed the deferred SSR resolve
+// pass now, not this shader; they stay in the set-0 layout but go unused here.
 // Reflection probe: prefiltered environment cubemap (mirror at mip 0, rougher
 // toward higher mips). Sampled by reflection direction + roughness.
 layout(set = 0, binding = 7) uniform samplerCube u_env;
@@ -66,14 +65,14 @@ const float ENV_MAX_LOD = 6.0; // matches cube_mip_count(64) - 1
 layout(set = 0, binding = 1) uniform sampler2DArrayShadow u_shadow;
 
 // Baked probe SH-L1: 4 coefficients (RGB in .xyz) per probe.
-struct Probe { vec4 c[4]; };
+struct Probe { vec4 c[5]; }; // c[0..3]=radiance+dist SH, c[4]=dist² SH (Chebyshev)
 layout(set = 0, binding = 2) readonly buffer Probes { Probe probes[]; };
 
 // Baked lightmaps (static-object GI): one array layer per object, sampled by
 // uv1. Each texel is incoming irradiance E; the caller applies albedo/PI.
 layout(set = 0, binding = 3) uniform sampler2DArray u_lightmap;
 
-// Screen-space GI gather (sparse screen probes, Lumen-style). One texel per
+// Screen-space GI gather (sparse screen probes). One texel per
 // SGI_DIV×SGI_DIV screen block; rgb = indirect irradiance, a = probe camera
 // distance (for depth-aware upsampling). Used in place of the coarse world-probe
 // grid when active (frame.debug.z > 0.5). Sampled by screen UV.
@@ -85,35 +84,66 @@ const float SGI_DIV = 4.0;
 // a wide (5×5 probe) edge-aware gather. Each probe is weighted by a spatial
 // Gaussian (distance to the pixel in probe space) AND by how close its stored
 // camera distance is to this fragment's, so it smooths the few-ray noise
-// (Lumen's screen-probe spatial filter) while rejecting probes across a depth
+// (a screen-probe spatial filter) while rejecting probes across a depth
 // edge (no bleed/blockiness). This is the main grain reduction.
-vec3 screen_gi_upsample(vec2 suv, float frag_dist) {
+// `P` is the fragment's VIEW-space position and `Nv` its VIEW-space normal, used
+// to make the depth-edge test PLANE-aware: each neighbour's distance is compared
+// to what it WOULD be if it lay on this fragment's surface plane, so coplanar
+// neighbours on a steep/grazing face (where raw camera distance varies a lot
+// across the surface) are kept instead of rejected. Comparing against a flat
+// camera-distance gave undersampled, noisy/blocky GI on tilted faces (the floor,
+// facing the camera, looked fine; vertical cube faces did not).
+// The screen-GI gather (screen_gi.comp) runs at FULL resolution, so this is a
+// full-res bilateral DENOISE, not a probe-grid upsample: a small à-trous-style
+// kernel that averages neighbouring GI samples on the same surface. The edge
+// test is PLANE-aware (predict each tap's distance on this fragment's plane via
+// its view ray ∩ the plane), so coplanar neighbours on a steep/grazing face are
+// kept — the old version snapped to a coarse ¼-res lattice and looked smooth only
+// on camera-facing surfaces (the floor), leaving tilted faces blocky/noisy.
+vec3 screen_gi_upsample(vec2 suv, vec3 P, vec3 Nv) {
     vec2 screen = vec2(frame.postfx2.w, frame.postfx3.w);
-    vec2 texel = SGI_DIV / max(screen, vec2(1.0)); // probe-texel size in UV
-    vec2 pc = suv / texel - 0.5;                    // probe-grid coords (int = probe)
-    ivec2 c = ivec2(floor(pc + 0.5));              // nearest probe
+    vec2 texel = 1.0 / max(screen, vec2(1.0)); // full-res pixel size in UV
+    float frag_dist = length(P);
+    const int R = 2;          // 5×5 taps
+    const float STEP = 4.0;   // pixels between taps (≈17px-wide denoise)
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
-    const int R = 2;                               // 5×5 probe window
     for (int j = -R; j <= R; ++j) {
         for (int i = -R; i <= R; ++i) {
-            ivec2 g = c + ivec2(i, j);
-            vec2 uv = (vec2(g) + 0.5) * texel;
-            vec4 s = texture(u_screen_gi, clamp(uv, vec2(0.0), vec2(1.0)));
-            vec2 off = vec2(g) - pc;
-            float sw = exp(-dot(off, off) * 0.5);          // spatial Gaussian
-            // RELATIVE depth difference: same-surface neighbours (small relative
-            // delta) are kept so probes blend smoothly; only true depth edges
-            // (large relative delta) are rejected. An absolute threshold wrongly
-            // rejected neighbours on slanted surfaces, giving blocky "big pixels".
-            float dd = abs(s.a - frag_dist) / max(frag_dist, 0.5);
-            float dw = exp(-dd * 6.0);                      // depth-edge reject
+            vec2 off = vec2(i, j);
+            vec2 uv = clamp(suv + off * STEP * texel, vec2(0.0), vec2(1.0));
+            vec4 s = texture(u_screen_gi, uv);
+            float sw = exp(-dot(off, off) * 0.5); // spatial Gaussian
+            // Edge-reject test, kept permissive on CURVED/angled surfaces. Two
+            // measures of how far this tap's stored distance (s.a) is from this
+            // surface, both relative to fragment distance:
+            //   - plane: distance to the fragment's tangent plane along the tap
+            //     ray (handles steep/grazing FLAT faces, where camera distance
+            //     varies a lot across a planar surface), and
+            //   - radial: plain |s.a - frag_dist| (handles CURVED faces, where
+            //     neighbours leave the tangent plane but stay close in depth).
+            // Taking the MIN accepts a tap if EITHER holds, so a sphere keeps its
+            // neighbours (was rejected by the plane test alone -> ~1 effective tap
+            // -> raw ray noise on every angled surface) while a true depth edge,
+            // far in both, is still rejected. Softer falloff (×5) widens the kept
+            // set so high-intensity GI isn't left grainy on curvature.
+            vec2 ndc = uv * 2.0 - 1.0;
+            ndc.y = -ndc.y;
+            vec4 farp = frame.inv_proj * vec4(ndc, 1.0, 1.0);
+            vec3 dir = normalize(farp.xyz / farp.w);
+            float denom = dot(Nv, dir);
+            float pred = abs(denom) > 1e-4 ? length(dir * (dot(Nv, P) / denom)) : frag_dist;
+            float inv_fd = 1.0 / max(frag_dist, 0.5);
+            float dd_plane = abs(s.a - pred) * inv_fd;
+            float dd_radial = abs(s.a - frag_dist) * inv_fd;
+            float dd = min(dd_plane, dd_radial);
+            float dw = exp(-dd * 3.5); // curvature-tolerant edge reject (softened for spheres)
             float w = sw * dw + 1e-6;
             sum += s.rgb * w;
             wsum += w;
         }
     }
-    return wsum > 1e-6 ? sum / wsum : vec3(0.0);
+    return wsum > 1e-6 ? sum / wsum : texture(u_screen_gi, suv).rgb;
 }
 
 // Diffuse irradiance / PI from the probe's SH-L1 radiance coefficients, in
@@ -137,6 +167,14 @@ float dist_at(uint i, vec3 dir) {
          + 0.488603 * (probes[i].c[1].w * dir.y
                      + probes[i].c[2].w * dir.z
                      + probes[i].c[3].w * dir.x);
+}
+// Mean SQUARED distance (second moment), from the dist² SH in c[4]. Pairs with
+// dist_at for the two-moment Chebyshev visibility (matches the gather).
+float dist2_at(uint i, vec3 dir) {
+    return probes[i].c[4].x * 0.282095
+         + 0.488603 * (probes[i].c[4].y * dir.y
+                     + probes[i].c[4].z * dir.z
+                     + probes[i].c[4].w * dir.x);
 }
 
 // Normalized box coords (0..1 across the volume) for a world point.
@@ -183,15 +221,23 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
         float pd = length(to_frag);
         vec3 dir = pd > 1e-5 ? to_frag / pd : n;
         float md = max(dist_at(idx, dir), 0.0);
-        // Visibility: full until the fragment is past the seen distance, then
-        // fade gradually. The stored distance is only SH-L1 (very smooth/blobby),
-        // so a tight one-cell fade with a near-zero floor carves a hard wavy
-        // iso-contour through the bounce (the "edge" behind occluders). Fade over
-        // a few cells and keep a generous floor: the cube still softly darkens the
-        // bounce in its shadow, but as a smooth gradient, not a sharp line. md==0
-        // (no data) disables the test.
+        float md2 = max(dist2_at(idx, dir), 0.0);
+        // Visibility (DDGI two-moment Chebyshev, matching the gather): smooth
+        // occlusion from the distance variance, so it darkens the bounce behind
+        // an occluder as a soft gradient. md==0 → no data; md2==0 → baked sidecar
+        // (single-moment smoothstep fallback). Keeps a small floor so shadowed
+        // faces still gather soft fill instead of crushing to black.
         float band = 3.0 * max(cell.x, max(cell.y, cell.z));
-        float vis = md > 1e-4 ? clamp(1.0 - max(0.0, pd - md) / max(band, 1e-3), 0.25, 1.0) : 1.0;
+        float vis;
+        if (md <= 1e-4 || pd <= md) {
+            vis = 1.0;
+        } else if (md2 > 1e-4) {
+            float variance = max(md2 - md * md, 1e-4);
+            float dd = pd - md;
+            vis = max(variance / (variance + dd * dd), 0.25);
+        } else {
+            vis = clamp(1.0 - (pd - md) / max(band, 1e-3), 0.25, 1.0);
+        }
         // Front-facing weight (probe should be on the surface's lit side). Kept
         // gentle + a generous floor so shadowed/back faces still gather soft fill
         // from surrounding probes instead of crushing to black. Leak prevention
@@ -356,7 +402,21 @@ layout(set = 1, binding = 4) uniform MaterialFx {
     vec4 scroll; // xy base UV scroll, zw emission UV scroll
     vec4 matcap; // xyz matcap layer strengths, w _
     vec4 matcap_blend; // xyz blend modes (0 add / 1 mul / 2 replace), w _
+    vec4 albedo_st;   // xy tiling (scale), zw offset
+    vec4 normal_st;
+    vec4 orm_st;
+    vec4 emission_st;
+    vec4 orm_invert;  // x ao, y roughness, z metallic: 1 = invert sampled value
+    vec4 parallax;    // x = displacement scale (0 = off)
 } fx;
+
+// Split AO / Roughness / Metallic maps. Each multiplies the matching packed-ORM
+// channel; the 1×1 default is white, so an unassigned slot is a no-op.
+layout(set = 1, binding = 13) uniform sampler2D t_ao;
+layout(set = 1, binding = 14) uniform sampler2D t_roughness;
+layout(set = 1, binding = 15) uniform sampler2D t_metallic;
+// Height / displacement map for parallax occlusion mapping (white = flat).
+layout(set = 1, binding = 16) uniform sampler2D t_displacement;
 
 // Extended texture slots (bindings 5-12).
 layout(set = 1, binding = 5) uniform sampler2D t_opacity;
@@ -384,6 +444,11 @@ layout(location = 4) in vec4 v_tangent;
 layout(location = 5) in vec2 v_uv1;
 
 layout(location = 0) out vec4 o_color;
+// Deferred-SSR G-buffer (gbuf pipeline variants only): the specular reflectance
+// weight (Fresnel*ao*spec, the factor multiplying environment radiance) in rgb,
+// surface roughness in alpha. The fullscreen SSR resolve pass reads this to do
+// current-frame screen-space reflections without the forward pass's 1-frame lag.
+layout(location = 1) out vec4 o_gbuf;
 
 const float PI = 3.14159265359;
 
@@ -458,6 +523,29 @@ vec3 f_schlick(float VdotH, vec3 f0) {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
 }
 
+// Karis' analytic split-sum environment BRDF (the "EnvBRDFApprox"): the
+// scale+bias for the prefiltered environment specular, so reflections are
+// roughness- and view-correct and DON'T spike to a harsh mirror at grazing the
+// way a raw Fresnel term does. Returns (scale, bias): spec = f0*scale + bias.
+vec2 env_brdf_approx(float roughness, float NoV) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    return vec2(-1.04, 1.04) * a004 + r.zw;
+}
+
+// Octahedral encode of a unit vector into [0,1]^2 (lossless enough at 16f). The
+// SSR G-buffer stores the view-space shading normal this way so the resolve pass
+// gets the EXACT normal (no depth reconstruction = no bent reflection rays).
+vec2 oct_encode(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 e = n.z >= 0.0
+        ? n.xy
+        : (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return e * 0.5 + 0.5;
+}
+
 // Roughness-aware Fresnel for the ambient/indirect term (rougher surfaces
 // reflect less at grazing angles, so more energy stays in the diffuse).
 vec3 f_schlick_rough(float cosT, vec3 f0, float rough) {
@@ -465,125 +553,38 @@ vec3 f_schlick_rough(float cosT, vec3 f0, float rough) {
     return f0 + (fmax - f0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
 }
 
-// Reconstruct a scene point's view-space position from the depth prepass at a
-// screen UV (`flipY` matches the engine's Y-flipped viewport convention).
-vec3 ssr_view_pos(vec2 uv, bool flipY) {
-    float d = texture(u_scene_depth, uv).r;
-    vec2 ndc = uv * 2.0 - 1.0;
-    if (flipY) ndc.y = -ndc.y;
-    vec4 vp = frame.inv_proj * vec4(ndc, d, 1.0);
-    return vp.xyz / vp.w;
-}
-
-// Project a view-space point to a depth-buffer sampling UV.
-vec2 ssr_project(vec3 p, bool flipY) {
-    vec4 c = frame.proj * vec4(p, 1.0);
-    vec2 uv = (c.xy / c.w) * 0.5 + 0.5;
-    if (flipY) uv.y = 1.0 - uv.y;
-    return uv;
-}
-
-// Screen-space reflections: march the reflected view ray against the scene depth
-// prepass and sample last frame's colour at the hit. Cheap forward-integrated SSR
-// (one frame of lag, LDR source). Returns rgb radiance + a = edge/hit confidence.
-// `P` is the fragment's view-space position, `Nv` its view-space normal.
-// Reconstruct scene view-space Z from a sampled depth at a screen UV.
-float ssr_scene_z(vec2 uv, bool flipY) {
-    float d = texture(u_scene_depth, uv).r;
-    vec2 ndc = uv * 2.0 - 1.0;
-    if (flipY) ndc.y = -ndc.y;
-    vec4 vp = frame.inv_proj * vec4(ndc, d, 1.0);
-    return vp.z / vp.w;
-}
-
-vec4 trace_ssr(vec3 P, vec3 Nv) {
-    vec2 screen = vec2(frame.postfx2.w, frame.postfx3.w);
-    vec3 dir = reflect(normalize(P), Nv); // view-space reflection ray
-    float maxDist = max(frame.ssr.z, 1.0);
-
-    // The scene renders with a Y-flipped (negative-height) viewport, so the
-    // depth-buffer sampling UV is the flipped projection — a CONSTANT, not a
-    // per-pixel guess (the old guess seamed at screen-center).
-    bool flipY = true;
-
-    // Ray endpoint, clipped to stay just in front of the near plane so the
-    // screen-space segment is finite even when the ray points toward the camera.
-    vec3 endP = P + dir * maxDist;
-    if (endP.z > -0.05 && abs(dir.z) > 1e-4) {
-        float tc = (-0.05 - P.z) / dir.z;
-        endP = P + dir * clamp(tc, 0.0, maxDist);
+// Parallax occlusion mapping: march the tangent-space view ray through the
+// height field and return the UV of the first intersection, giving a flat
+// surface apparent depth without extra geometry. `uv` is the (tiled) start
+// coordinate, `vt` the tangent-space view direction (surface->eye), `scale` the
+// max UV shift at full height. Height map convention: white = peak (depth 0).
+vec2 parallax_uv(vec2 uv, vec3 vt, float scale) {
+    const int MAX_L = 32;
+    // More layers at grazing angles (where the parallax shift is largest).
+    float n = mix(float(MAX_L), 8.0, clamp(abs(vt.z), 0.0, 1.0));
+    float layer_d = 1.0 / n;
+    vec2 step_uv = (vt.xy / max(abs(vt.z), 0.1)) * scale / n;
+    vec2 cur = uv;
+    float cur_d = 0.0;
+    float h = 1.0 - texture(t_displacement, cur).r;
+    for (int i = 0; i < MAX_L; ++i) {
+        if (cur_d >= h) break;
+        cur -= step_uv;
+        h = 1.0 - texture(t_displacement, cur).r;
+        cur_d += layer_d;
     }
-
-    vec2 uv0 = ssr_project(P, flipY);
-    vec2 uv1 = ssr_project(endP, flipY);
-
-    // SCREEN-SPACE march at a FIXED pixel stride. The sampling density near the
-    // surface is constant — max distance only caps how far the ray reaches
-    // (t > 1 = endpoint), so changing max distance no longer warps the near
-    // reflection. A continuous stride in UV (not i/N) keeps every pixel sampling
-    // at the same screen cadence, so neighbours don't dither. Depth along the ray
-    // is perspective-correct via linear 1/z interpolation.
-    float invz0 = 1.0 / P.z;
-    float invz1 = 1.0 / endP.z;
-    float segPx = max(length((uv1 - uv0) * screen), 1.0);
-    float strideFrac = 2.0 / segPx; // ~2 px per step, regardless of ray length
-    const int MAX_STEPS = 256;
-
-    float prevT = 0.0;
-    // Track whether the ray is in FRONT of the depth buffer. A hit is a sign
-    // change (front -> behind), not merely "behind": testing "behind" alone makes
-    // the first step self-hit the originating floor and reflect it dark (the dark
-    // band at the contact). The ray starts in front of any reflected geometry.
-    bool wasInFront = true;
-    for (int i = 1; i <= MAX_STEPS; ++i) {
-        float t = float(i) * strideFrac;
-        if (t > 1.0) break; // reached the max-distance endpoint
-        vec2 uv = mix(uv0, uv1, t);
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
-        float rayZ = 1.0 / mix(invz0, invz1, t); // perspective-correct ray depth
-        float rawd = texture(u_scene_depth, uv).r;
-        if (rawd >= 0.9999) { prevT = t; wasInFront = true; continue; } // sky
-        float sceneZ = ssr_scene_z(uv, flipY);
-        float dz = sceneZ - rayZ; // >0: ray went behind the sampled surface
-        // Hit = sign change (in front -> behind). Don't require dz < thickness at
-        // the coarse step: on steep/curved surfaces the per-step depth jump is
-        // large, and gating on it rejected valid crossings as dark rings. Instead
-        // refine to the exact crossing, then validate it landed on a real surface
-        // (small residual) — that rejects silhouette grazes (the speckle) while
-        // keeping steep crossings (no rings).
-        if (wasInFront && dz > 0.0) {
-            float lo = prevT, hi = t;
-            for (int k = 0; k < 8; ++k) {
-                float mt = (lo + hi) * 0.5;
-                vec2 muv = mix(uv0, uv1, mt);
-                float mrz = 1.0 / mix(invz0, invz1, mt);
-                if (ssr_scene_z(muv, flipY) - mrz > 0.0) hi = mt; else lo = mt;
-            }
-            vec2 hitUv = mix(uv0, uv1, hi);
-            float hrz = 1.0 / mix(invz0, invz1, hi);
-            float residual = abs(ssr_scene_z(hitUv, flipY) - hrz);
-            // Confidence = how cleanly the refine landed ON the surface. A SMOOTH
-            // fade (not a hard reject) so silhouette grazes fade into the env
-            // instead of cutting a thin dark line between an object and its
-            // reflection; near-zero residual = a solid hit.
-            float conf = 1.0 - smoothstep(max(0.04 * abs(hrz), 0.04),
-                                          max(0.16 * abs(hrz), 0.16), residual);
-            if (conf > 0.01) {
-                // Fade near the screen edges (off-screen geometry is unavailable;
-                // the reflection probe / env cube fills those — see spec_env).
-                vec2 e = smoothstep(vec2(0.0), vec2(0.1), hitUv)
-                       * (1.0 - smoothstep(vec2(0.9), vec2(1.0), hitUv));
-                return vec4(texture(u_prev_color, hitUv).rgb, e.x * e.y * conf);
-            }
-            // Far-off graze: keep marching (might cross a real surface later).
-        }
-        wasInFront = dz <= 0.0; // in front of (or on) the surface this step
-        prevT = t;
-    }
-    return vec4(0.0);
+    // Soft occlusion: interpolate between the last two steps across the surface.
+    vec2 prev = cur + step_uv;
+    float after = h - cur_d;
+    float before = (1.0 - texture(t_displacement, prev).r) - (cur_d - layer_d);
+    float w = after / (after - before);
+    return mix(cur, prev, clamp(w, 0.0, 1.0));
 }
 
 void main() {
+    // Default the SSR G-buffer to "not a reflector"; the reflection block below
+    // overwrites it for lit surfaces. Keeps early debug returns valid.
+    o_gbuf = vec4(0.0);
     // Lightmap-UV checker preview: visualise per-object texel density. params1.w
     // carries this object's lightmap resolution (texels/side) in preview mode; a
     // fixed 8-texel cell means low-res objects show big squares, high-res small.
@@ -599,8 +600,34 @@ void main() {
         return;
     }
 
-    // Animated UV scroll (Poiyomi-style) from the material FX block.
-    vec2 uv = v_uv + fx.scroll.xy * frame.misc.x;
+    vec3 N = normalize(v_normal);
+    if (!gl_FrontFacing) {
+        N = -N;
+    }
+
+    // Parallax occlusion mapping displaces the mesh UV along the tangent-space
+    // view ray through the height field, so every map below samples the same
+    // apparent surface point. Off (scale 0) leaves the UV untouched. The shift
+    // is computed in albedo-tiled space then mapped back to mesh UV so the
+    // per-map tiling/offset below stays coherent.
+    vec2 v_uv_d = v_uv;
+    if (fx.parallax.x > 0.0) {
+        vec3 Tg = normalize(v_tangent.xyz - N * dot(v_tangent.xyz, N));
+        vec3 Bg = cross(N, Tg) * v_tangent.w;
+        vec3 to_eye = frame.camera_pos.xyz - v_world_pos;
+        vec3 vt = normalize(vec3(dot(to_eye, Tg), dot(to_eye, Bg), dot(to_eye, N)));
+        vec2 a0 = v_uv * fx.albedo_st.xy + fx.albedo_st.zw;
+        vec2 a1 = parallax_uv(a0, vt, fx.parallax.x);
+        v_uv_d = v_uv + (a1 - a0) / max(fx.albedo_st.xy, vec2(1e-4));
+    }
+
+    // Per-texture UV transform (tiling*uv + offset) plus the animated scroll, on
+    // the parallax-displaced mesh UV. Albedo's UV is the shared `uv` used by the
+    // opacity + mask samplers below; normal/orm/emission get their own tiling.
+    vec2 uv = v_uv_d * fx.albedo_st.xy + fx.albedo_st.zw + fx.scroll.xy * frame.misc.x;
+    vec2 uv_normal = v_uv_d * fx.normal_st.xy + fx.normal_st.zw;
+    vec2 uv_orm = v_uv_d * fx.orm_st.xy + fx.orm_st.zw;
+    vec2 uv_emission = v_uv_d * fx.emission_st.xy + fx.emission_st.zw;
 
     vec4 albedo = texture(t_albedo, uv) * pc.base_color * v_color;
     albedo.a *= texture(t_opacity, uv).r; // dedicated opacity map (default white)
@@ -608,24 +635,28 @@ void main() {
         discard;
     }
 
-    vec3 N = normalize(v_normal);
-    if (!gl_FrontFacing) {
-        N = -N;
-    }
     if (FEAT_NORMAL_MAP) {
         vec3 T = normalize(v_tangent.xyz - N * dot(v_tangent.xyz, N));
         vec3 B = cross(N, T) * v_tangent.w;
-        vec3 tn = texture(t_normal, uv).xyz * 2.0 - 1.0;
+        vec3 tn = texture(t_normal, uv_normal).xyz * 2.0 - 1.0;
         tn.xy *= pc.params1.y;
         N = normalize(mat3(T, B, N) * normalize(tn));
     }
 
-    vec3 orm = texture(t_orm, uv).rgb;
-    float ao = mix(1.0, orm.r, pc.params1.z);
+    vec3 orm = texture(t_orm, uv_orm).rgb;
+    // Split AO/Roughness/Metallic maps multiply their packed-ORM channel (white
+    // default = no-op), each with an optional invert (e.g. smoothness->roughness).
+    float ao_s = texture(t_ao, uv_orm).r;
+    float rough_s = texture(t_roughness, uv_orm).r;
+    float metal_s = texture(t_metallic, uv_orm).r;
+    ao_s = mix(ao_s, 1.0 - ao_s, fx.orm_invert.x);
+    rough_s = mix(rough_s, 1.0 - rough_s, fx.orm_invert.y);
+    metal_s = mix(metal_s, 1.0 - metal_s, fx.orm_invert.z);
+    float ao = mix(1.0, orm.r * ao_s, pc.params1.z);
     // Toon rim strength now comes from the FX block (so occlusion stays usable).
     float rim_strength = FEAT_TOON ? fx.toon.x : 0.0;
-    float roughness = clamp(orm.g * pc.params0.y, 0.045, 1.0);
-    float metallic = clamp(orm.b * pc.params0.x, 0.0, 1.0);
+    float roughness = clamp(orm.g * rough_s * pc.params0.y, 0.045, 1.0);
+    float metallic = clamp(orm.b * metal_s * pc.params0.x, 0.0, 1.0);
 
     vec3 V = normalize(frame.camera_pos.xyz - v_world_pos);
     float NdotV = max(dot(N, V), 1e-4);
@@ -716,8 +747,11 @@ void main() {
         // Emissive surfaces are in the depth prepass again, so they sample their
         // OWN GI here (their emission still dominates the look).
         vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
-        float frag_dist = length(v_world_pos - frame.camera_pos.xyz);
-        indirect = screen_gi_upsample(suv, frag_dist);
+        // View-space position + normal so the upsample can reject only true depth
+        // edges, keeping coplanar neighbours on steep/grazing faces (no GI noise).
+        vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;
+        vec3 Nv = normalize(mat3(frame.view) * N);
+        indirect = screen_gi_upsample(suv, Pv, Nv);
     } else {
         // Probe GI where a cascade covers the fragment, fading to flat ambient
         // at the outermost cascade's edge (coverage < 1) and beyond it (0).
@@ -755,29 +789,40 @@ void main() {
         vec3 hit = v_world_pos + R * dist;
         R = hit - frame.refl_center.xyz;
     }
-    float env_scale = probe_intensity > 0.0 ? probe_intensity : 1.0;
+    // No reflection-probe zone → the fallback is the skybox cube, scaled by the
+    // skylight/env intensity (frame.ambient.w). So turning ambient/skylight off
+    // stops metals mirroring the sky and the scene goes black with no lights;
+    // default (intensity 1) is unchanged. A probe zone uses its own intensity.
+    float env_scale = probe_intensity > 0.0 ? probe_intensity : frame.ambient.w;
     // The env cube ALWAYS carries the environment (skybox texture/cube, or the
     // procedural sky when none is set), so this is the reflection's base at any
-    // angle — never the dark diffuse-GI stand-in. SSR refines it on-screen.
+    // angle — never the dark diffuse-GI stand-in. The fullscreen SSR resolve pass
+    // (deferred, current-frame) overlays screen-space reflections on top of this.
     vec3 spec_env = textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * env_scale;
-    if (frame.ssr.x > 0.5 && roughness <= frame.ssr.w) {
-        vec3 Nv = normalize(mat3(frame.view) * N);
-        vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;
-        vec4 ssr = trace_ssr(Pv, Nv);
-        if (ssr.a > 0.0) {
-            // Sharper on smooth surfaces; fade out toward the roughness cutoff.
-            float rough_fade = 1.0 - smoothstep(0.0, frame.ssr.w, roughness);
-            float w = clamp(ssr.a * rough_fade * frame.ssr.y, 0.0, 1.0);
-            spec_env = mix(spec_env, ssr.rgb, w);
-        }
-    }
-    color += F_amb * spec_env * ao * spec_amb;
+    // Reflectance weight that multiplies environment radiance. The resolve pass
+    // re-derives env radiance from this same cube and swaps in the SSR hit:
+    //   final += reflectance * conf * (ssr_radiance - env_radiance)
+    // so SSR exactly replaces the env reflection where it has a confident hit and
+    // leaves the env reflection untouched (this colour, fogged below) elsewhere.
+    // Split-sum environment BRDF instead of a raw Fresnel*spec term: bounded,
+    // roughness-correct specular that doesn't blow out to a harsh mirror band at
+    // grazing angles on rough/dielectric surfaces.
+    vec2 env_ab = env_brdf_approx(roughness, NdotV);
+    vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao;
+    color += reflectance * spec_env;
+    // SSR G-buffer: octahedral view-space normal (rg) + roughness (b) + a scalar
+    // reflectivity (a, the env-reflection weight's luminance). The resolve pass
+    // uses the stored normal directly for an exact reflection ray.
+    vec3 Nv = normalize(mat3(frame.view) * N);
+    float reflectivity = dot(reflectance, vec3(0.2126, 0.7152, 0.0722));
+    o_gbuf = vec4(oct_encode(Nv), roughness, reflectivity);
 
     if (FEAT_EMISSION) {
-        // Emission can scroll on its own UV, pulse over time, and be masked.
-        vec2 euv = v_uv + fx.scroll.zw * frame.misc.x;
+        // Emission uses its own tiling/offset, can scroll, pulse over time, and
+        // be masked (the mask shares the emission UV transform).
+        vec2 euv = uv_emission + fx.scroll.zw * frame.misc.x;
         float pulse = fx.toon.z > 0.0 ? (0.5 + 0.5 * sin(frame.misc.x * fx.toon.z)) : 1.0;
-        float emask = texture(t_emission_mask, uv).r;
+        float emask = texture(t_emission_mask, uv_emission).r;
         color += texture(t_emission, euv).rgb * pc.emission.rgb * pulse * emask;
     }
 
@@ -813,17 +858,9 @@ void main() {
         return;
     }
 
-    // Exponential distance + height fog (atmospheric depth), pre-tonemap so it
-    // sits in linear space. Density 0 = disabled.
-    if (frame.fog_color.w > 0.0) {
-        float view_dist = length(frame.camera_pos.xyz - v_world_pos);
-        float d = max(0.0, view_dist - frame.fog_params.z);
-        // Thin the fog above the height reference (uniform when falloff = 0).
-        float h = max(0.0, v_world_pos.y - frame.fog_params.y);
-        float height_atten = exp(-frame.fog_params.x * h);
-        float fog = 1.0 - exp(-frame.fog_color.w * d * height_atten);
-        color = mix(color, frame.fog_color.rgb, clamp(fog, 0.0, 1.0));
-    }
+    // Fog is now a raymarched volumetric medium in the deferred resolve pass
+    // (ssr_resolve.frag) — a real participating medium that hangs + drifts in the
+    // air, not a per-surface colour tint — so it's no longer applied here.
 
     color = apply_postfx(color, gl_FragCoord.xy);
     float alpha = (ALPHA_MODE == 2u) ? albedo.a : 1.0;

@@ -32,6 +32,9 @@ layout(push_constant) uniform Push {
 
 layout(location = 0) in vec3 v_dir;
 layout(location = 0) out vec4 o_color;
+// Deferred-SSR G-buffer (only consumed by gbuf pipeline variants). The sky is
+// never a reflector, so reflectance is zero -> the resolve pass adds nothing.
+layout(location = 1) out vec4 o_gbuf;
 
 const float PI = 3.14159265359;
 
@@ -89,6 +92,7 @@ void main() {
             color = mix(horizon, ground, clamp(-dir.y * 2.0, 0.0, 1.0));
         }
     }
+    o_gbuf = vec4(0.0);
     // params0.w = HDR output: skip inline tonemap (the fullscreen post pass does it).
     if (pc.params0.w > 0.5) {
         o_color = vec4(color, 1.0);

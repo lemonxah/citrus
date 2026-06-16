@@ -33,6 +33,35 @@ pub struct TrackerTargets {
 /// source (not VR-specific).
 pub type IkTargets = TrackerTargets;
 
+/// One tracker's calibration: the fixed rigid offset from the raw tracker pose to
+/// the avatar bone it drives, captured once while the player holds a known
+/// reference pose (T-pose). A SteamVR/SlimeVR tracker sits at an arbitrary spot on
+/// the limb at an arbitrary orientation; this offset cancels that so the bone
+/// follows the tracker naturally.
+///
+///   offset       = tracker_world⁻¹ · bone_world      (captured at T-pose)
+///   bone_target  = tracker_world   · offset           (every frame after)
+#[derive(Clone, Copy, Debug)]
+pub struct TrackerCalibration {
+    pub offset: glam::Mat4,
+}
+
+impl TrackerCalibration {
+    /// Capture the offset from a tracker's world pose to its bone's world pose in
+    /// the calibration (T-pose) frame.
+    pub fn capture(tracker_world: glam::Mat4, bone_world: glam::Mat4) -> Self {
+        Self {
+            offset: tracker_world.inverse() * bone_world,
+        }
+    }
+
+    /// Apply the calibration to a live tracker pose, yielding the bone's target
+    /// world pose.
+    pub fn apply(&self, tracker_world: glam::Mat4) -> glam::Mat4 {
+        tracker_world * self.offset
+    }
+}
+
 /// Result of a two-bone solve: world-space mid (elbow/knee) and end positions,
 /// plus the rotations to apply to the root and mid joints.
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +181,24 @@ mod tests {
         let s = solve_two_bone(root, mid, end, target, Vec3::new(0.0, -1.0, 1.0));
         // End effector should land very close to the (reachable) target.
         assert!((s.end_pos - target).length() < 1e-2, "end {:?}", s.end_pos);
+    }
+
+    #[test]
+    fn calibration_roundtrips_then_follows_tracker() {
+        use glam::{Mat4, Quat};
+        // T-pose: tracker offset from the bone by some rigid transform.
+        let bone = Mat4::from_rotation_translation(Quat::IDENTITY, Vec3::new(0.5, 1.0, 0.0));
+        let tracker =
+            Mat4::from_rotation_translation(Quat::from_rotation_z(0.3), Vec3::new(0.55, 1.1, 0.02));
+        let cal = TrackerCalibration::capture(tracker, bone);
+        // At the calibration pose, applying recovers the bone exactly.
+        let back = cal.apply(tracker);
+        assert!((back.w_axis.truncate() - bone.w_axis.truncate()).length() < 1e-4);
+        // Move the tracker by a known world translation; the bone target moves with it.
+        let moved = Mat4::from_translation(Vec3::new(0.0, 0.2, 0.3)) * tracker;
+        let target = cal.apply(moved);
+        let expected = bone.w_axis.truncate() + Vec3::new(0.0, 0.2, 0.3);
+        assert!((target.w_axis.truncate() - expected).length() < 1e-4);
     }
 
     #[test]

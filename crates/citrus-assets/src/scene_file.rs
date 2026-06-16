@@ -246,7 +246,7 @@ pub enum GiMode {
     #[default]
     RayQuery,
     /// Software ray-marching of per-mesh signed distance fields (no RT cores,
-    /// runs anywhere). Lumen-style.
+    /// runs anywhere).
     Software,
 }
 
@@ -286,12 +286,15 @@ impl FluxQuality {
     pub const ALL: [FluxQuality; 4] =
         [Self::Performance, Self::Balanced, Self::High, Self::Ultra];
     /// Rays per screen probe per frame (temporal accumulation does the rest).
+    /// One probe serves SCREEN_PROBE_DIV² pixels (16 at DIV=4), so the per-pixel
+    /// cost is amortized — match ~64 rays/probe at the top preset rather
+    /// than the old per-pixel-era counts (which badly undersampled the probes).
     pub fn samples(self) -> u32 {
         match self {
-            Self::Performance => 6,
-            Self::Balanced => 10,
-            Self::High => 16,
-            Self::Ultra => 24,
+            Self::Performance => 16,
+            Self::Balanced => 32,
+            Self::High => 48,
+            Self::Ultra => 64,
         }
     }
 }
@@ -351,6 +354,9 @@ pub struct RealtimeGi {
     pub ssr_max_distance: f32,
     /// SSR roughness cutoff: surfaces rougher than this skip the march.
     pub ssr_roughness_cutoff: f32,
+    /// Reflection model: 0 = environment cube only, 1 = screen-space (SSR),
+    /// 2 = ray-traced (1 bounce; needs GPU ray-query support, falls back to SSR).
+    pub reflection_mode: u8,
     // --- Internal: not shown in the UI. The world-probe DDGI fallback path still
     // uses these; samples/mode are derived from `quality`/Flux on load. ---
     #[doc(hidden)]
@@ -367,7 +373,7 @@ pub struct RealtimeGi {
 
 impl Default for RealtimeGi {
     fn default() -> Self {
-        // Flux is the realtime GI path: soft, gently-settling Lumen look. The
+        // Flux is the realtime GI path: soft, gently-settling realtime-GI look. The
         // internal world-probe fields stay only for the throttled fallback.
         Self {
             enabled: false,
@@ -385,9 +391,10 @@ impl Default for RealtimeGi {
             ssr_intensity: 1.0,
             ssr_max_distance: 40.0,
             ssr_roughness_cutoff: 0.6,
+            reflection_mode: 1,
             mode: GiMode::Software,
             samples: 64,
-            probe_spacing: 2.0,
+            probe_spacing: 1.0,
             temporal_blend: 0.12,
             // 0 = the GDF + emitter feed (what Flux samples) refreshes every
             // frame so moving emitters track without lag.

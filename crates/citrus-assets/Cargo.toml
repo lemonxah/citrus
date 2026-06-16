@@ -11,6 +11,7 @@ bytemuck.workspace = true
 gltf.workspace = true
 ufbx.workspace = true
 image.workspace = true
+half.workspace = true
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true

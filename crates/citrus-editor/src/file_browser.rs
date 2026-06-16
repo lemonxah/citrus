@@ -11,6 +11,14 @@ use egui::{Align2, FontId, RichText, ScrollArea, Sense, Ui};
 
 const TILE: egui::Vec2 = egui::vec2(78.0, 88.0);
 
+/// Max image-thumbnail decodes per frame (the rest stream in over later frames).
+const THUMB_PER_FRAME: u32 = 8;
+/// Max cached thumbnails (each is a live GPU texture); oldest evicted past this.
+const THUMB_CACHE_CAP: usize = 256;
+/// Longest side of a decoded thumbnail, in texels (downscaled for cheap upload).
+/// Sized to stay crisp at the largest tile the size slider allows.
+const THUMB_MAX: u32 = 160;
+
 struct Clipboard {
     path: PathBuf,
     /// True = cut (paste moves), false = copy.
@@ -35,6 +43,20 @@ pub struct FileBrowser {
     /// Ferris (the Rust mascot) tile icon for `.rs` files, decoded + uploaded
     /// once on first use.
     ferris: Option<egui::TextureHandle>,
+    /// Decoded image thumbnails keyed by path. `Some(None)` records a decode
+    /// failure (e.g. unsupported format) so it isn't retried every frame; a
+    /// missing key means "not decoded yet". Built lazily for visible image
+    /// tiles, bounded per frame by `thumb_budget`.
+    thumbs: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// Insertion order for `thumbs`, so the cache can evict oldest-first and
+    /// stay bounded (dropping a handle frees its GPU texture via egui).
+    thumb_order: std::collections::VecDeque<PathBuf>,
+    /// Remaining new-thumbnail decodes allowed this frame, so scrolling into a
+    /// folder full of large images doesn't stall the UI on one frame.
+    thumb_budget: u32,
+    /// Grid tile width in px (height tracks it); driven by the size slider so
+    /// larger tiles show bigger image previews.
+    tile_px: f32,
     /// Per-file LSP problem tally (errors, warnings), refreshed each frame from
     /// the engine. Used to badge files (and aggregate onto folders).
     diags: std::collections::HashMap<PathBuf, (u32, u32)>,
@@ -72,8 +94,44 @@ impl FileBrowser {
             clipboard: None,
             renaming: None,
             ferris: None,
+            thumbs: std::collections::HashMap::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            thumb_budget: 0,
+            tile_px: TILE.x,
             diags: std::collections::HashMap::new(),
         }
+    }
+
+    /// Thumbnail texture for an image file, decoded + downscaled on first use
+    /// and cached. Returns `None` while still un-decoded this frame (budget
+    /// spent) or if the image can't be decoded, so the caller falls back to the
+    /// generic image glyph.
+    fn image_thumb(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        if let Some(slot) = self.thumbs.get(path) {
+            return slot.clone();
+        }
+        if self.thumb_budget == 0 {
+            return None; // not cached: retried next frame
+        }
+        self.thumb_budget -= 1;
+        let tex = decode_thumb(path).map(|img| {
+            ctx.load_texture(
+                format!("citrus-thumb:{}", path.display()),
+                img,
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        self.thumbs.insert(path.to_owned(), tex.clone());
+        self.thumb_order.push_back(path.to_owned());
+        // Bound the cache: dropping the evicted handle frees its GPU texture
+        // (egui emits the free in its next texture delta), so browsing many
+        // image folders can't grow the egui texture set without limit.
+        while self.thumb_order.len() > THUMB_CACHE_CAP {
+            if let Some(old) = self.thumb_order.pop_front() {
+                self.thumbs.remove(&old);
+            }
+        }
+        tex
     }
 
     /// (errors, warns) for a file, or aggregated over a folder's descendants.
@@ -133,6 +191,9 @@ impl FileBrowser {
         let mut response = FileBrowserResponse::default();
         // Refresh the per-frame diagnostics snapshot for the badge helpers.
         self.diags = diags.clone();
+        // Cap new image-thumbnail decodes per frame (the rest decode over the
+        // next frames) so opening an image-heavy folder doesn't hitch.
+        self.thumb_budget = THUMB_PER_FRAME;
 
         // F2 starts an inline rename of the selected file/folder (matches the
         // right-click Rename). Gated on no text field already focused so it
@@ -201,6 +262,14 @@ impl FileBrowser {
                     ui.menu_button("➕ Create", |ui| {
                         self.create_menu(ui, &dir, &mut response);
                     });
+                    // Tile-size slider: larger tiles = bigger image previews.
+                    ui.spacing_mut().slider_width = 90.0;
+                    ui.add(
+                        egui::Slider::new(&mut self.tile_px, TILE.x..=176.0)
+                            .show_value(false),
+                    )
+                    .on_hover_text("Tile size");
+                    ui.label(RichText::new(egui_phosphor::regular::IMAGE).weak());
                 });
             });
             ui.separator();
@@ -389,7 +458,11 @@ impl FileBrowser {
         selected: Option<&Path>,
         response: &mut FileBrowserResponse,
     ) {
-        let (rect, tile) = ui.allocate_exact_size(TILE, Sense::click_and_drag());
+        // Height tracks the slider-driven width; the name row stays a fixed
+        // band at the bottom while the icon/preview area grows.
+        let tile_dim = egui::vec2(self.tile_px, self.tile_px + 10.0);
+        let s = self.tile_px / TILE.x; // icon scale vs. the default tile
+        let (rect, tile) = ui.allocate_exact_size(tile_dim, Sense::click_and_drag());
         if !ui.is_rect_visible(rect) {
             return;
         }
@@ -407,7 +480,9 @@ impl FileBrowser {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
-        let icon_center = egui::pos2(rect.center().x, rect.top() + 26.0);
+        // Centre the icon/preview in the area above the fixed name band.
+        let name_top = rect.bottom() - 32.0;
+        let icon_center = egui::pos2(rect.center().x, (rect.top() + name_top) * 0.5);
         let icon_color = if is_selected {
             ui.visuals().selection.stroke.color
         } else {
@@ -417,7 +492,7 @@ impl FileBrowser {
             // Monochrome Ferris silhouette for .rs files. ~30px tall, keep aspect.
             let tex = self.ferris_texture(ui.ctx());
             let [tw, th] = tex.size();
-            let h = 30.0;
+            let h = 30.0 * s;
             let w = h * tw as f32 / th as f32;
             let img_rect = egui::Rect::from_center_size(icon_center, egui::vec2(w, h));
             ui.painter().image(
@@ -426,8 +501,28 @@ impl FileBrowser {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 icon_color,
             );
+        } else if !is_dir
+            && matches!(icon_kind(path), IconKind::Image)
+            && let Some(tex) = self.image_thumb(ui.ctx(), path)
+        {
+            // Real image preview: fit the decoded thumbnail (true colour, no
+            // selection tint) inside the tile's icon area, keeping aspect.
+            let [tw, th] = tex.size();
+            let max = 48.0 * s;
+            let scale = (max / tw as f32).min(max / th as f32).min(1.0);
+            let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+            let img_rect = egui::Rect::from_center_size(icon_center, size);
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(tex.id(), img_rect, uv, egui::Color32::WHITE);
+            ui.painter().rect_stroke(
+                img_rect,
+                2.0,
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                egui::StrokeKind::Outside,
+            );
         } else {
-            // Phosphor icon glyph for the file/folder type.
+            // Phosphor icon glyph for the file/folder type (also the fallback
+            // for an image whose thumbnail isn't decoded yet / failed).
             let glyph = if is_dir {
                 egui_phosphor::regular::FOLDER
             } else {
@@ -437,7 +532,7 @@ impl FileBrowser {
                 icon_center,
                 Align2::CENTER_CENTER,
                 glyph,
-                FontId::proportional(30.0),
+                FontId::proportional(30.0 * s),
                 icon_color,
             );
         }
@@ -446,7 +541,7 @@ impl FileBrowser {
         let (errs, warns) = self.diag_counts(path, is_dir);
         Self::diag_dot(
             &ui.painter(),
-            egui::pos2(icon_center.x + 15.0, icon_center.y - 13.0),
+            egui::pos2(icon_center.x + 15.0 * s, icon_center.y - 13.0 * s),
             errs,
             warns,
         );
@@ -478,7 +573,7 @@ impl FileBrowser {
                 },
             );
             job.wrap = egui::text::TextWrapping {
-                max_width: TILE.x - 8.0,
+                max_width: self.tile_px - 8.0,
                 max_rows: 1,
                 break_anywhere: true,
                 overflow_character: Some('…'),
@@ -644,7 +739,7 @@ impl FileBrowser {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
-            .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tga"));
+            .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "tga" | "exr"));
         if is_image
             && ui
                 .button("Set as Skybox")
@@ -766,6 +861,40 @@ impl FileBrowser {
     }
 }
 
+/// Decode an image file and downscale it to a thumbnail-sized `ColorImage`.
+/// Returns `None` for an unreadable / unsupported file (caller shows a glyph).
+fn decode_thumb(path: &Path) -> Option<egui::ColorImage> {
+    let img = image::open(path).ok().or_else(|| decode_exr_fallback(path))?;
+    let rgba = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// EXR fallback for layouts the Rust decoder can't read (DWAA/DWAB compression
+/// or single-channel/non-RGB): transcode to a temp lossless ZIP EXR via
+/// `oiiotool` if present, then decode (stays float — no PNG). Mirrors the asset
+/// loader so previews match what the material pipeline can load.
+fn decode_exr_fallback(path: &Path) -> Option<image::DynamicImage> {
+    if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exr")) {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("citrus_thumb_exr_{:016x}.exr", hasher.finish()));
+    let ok = std::process::Command::new("oiiotool")
+        .arg(path)
+        .args(["--ch", "0,0,0", "--compression", "zip", "-o"])
+        .arg(&tmp)
+        .status()
+        .ok()
+        .is_some_and(|s| s.success());
+    let img = if ok { image::open(&tmp).ok() } else { None };
+    let _ = std::fs::remove_file(&tmp);
+    img
+}
+
 /// Visible (non-hidden, non-target) sorted subdirectories.
 fn subdirs_of(dir: &Path) -> Vec<PathBuf> {
     let (dirs, _) = list_dir(dir);
@@ -840,7 +969,7 @@ fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Extensions whose type is conveyed by the icon, so the name hides them.
 const KNOWN_EXTS: &[&str] = &[
     "rs", "gltf", "glb", "fbx", "material", "scene", "citrus", "lightmap", "lightdata", "png",
-    "jpg", "jpeg", "tga", "bmp", "vert", "frag", "glsl", "slang", "spv", "postfx", "toml", "ron",
+    "jpg", "jpeg", "tga", "bmp", "exr", "vert", "frag", "glsl", "slang", "spv", "postfx", "toml", "ron",
     "json", "md",
 ];
 
@@ -870,7 +999,7 @@ fn icon_kind(path: &Path) -> IconKind {
         Some("scene") => IconKind::Scene,
         Some("material") => IconKind::Material,
         Some("gltf" | "glb" | "fbx") => IconKind::Model,
-        Some("png" | "jpg" | "jpeg" | "tga" | "bmp") => IconKind::Image,
+        Some("png" | "jpg" | "jpeg" | "tga" | "bmp" | "exr") => IconKind::Image,
         Some("vert" | "frag" | "glsl" | "slang" | "spv") => IconKind::Shader,
         Some("postfx") => IconKind::PostFx,
         Some("lightmap") => IconKind::Lightmap,

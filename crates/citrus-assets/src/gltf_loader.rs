@@ -392,5 +392,6 @@ fn rgba8_from_gltf(data: &gltf::image::Data, srgb: bool) -> Result<citrus_render
         height: data.height,
         pixels,
         srgb,
+        hdr: false,
     })
 }

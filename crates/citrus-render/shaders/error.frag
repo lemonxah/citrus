@@ -21,8 +21,12 @@ layout(location = 3) in vec4 v_color;
 layout(location = 4) in vec4 v_tangent;
 
 layout(location = 0) out vec4 o_color;
+// Deferred-SSR G-buffer (gbuf pipeline variants only). Error surfaces are not
+// reflectors; depth-only variants mask all colour writes so this is ignored.
+layout(location = 1) out vec4 o_gbuf;
 
 void main() {
+    o_gbuf = vec4(0.0);
     float t = frame.misc.x;
     vec3 wp = v_world_pos * 4.0;
     float r = length(wp.xz) + wp.y * 0.7;

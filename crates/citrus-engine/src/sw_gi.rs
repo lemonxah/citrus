@@ -1,4 +1,4 @@
-//! Software (Lumen-style) GI probe march on the CPU, no RT cores. Mirrors the
+//! Software GI probe march on the CPU, no RT cores. Mirrors the
 //! ray-query `bake_probe.comp` but sphere-marches per-mesh signed distance
 //! fields instead of tracing a hardware BVH, so it runs on any GPU. Produces the
 //! same SH-L1 `ProbeSh` representation the standard shader already samples.
@@ -28,6 +28,13 @@ pub struct SdfInstance {
     pub sdf: Arc<SdfVolume>,
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
+    /// Metalness [0,1]. Diffuse bounce gain is albedo·(1−metallic) — a metal
+    /// absorbs the diffuse GI bounce (energy is specular), so it can't pump light
+    /// into a contact cavity each bounce.
+    pub metallic: f32,
+    /// Roughness [0,1]. Diffuse magnitude is roughness-independent; kept for the
+    /// future specular trace.
+    pub roughness: f32,
     /// Non-moving geometry. The cached Global Distance Field is built from these
     /// only, so a moving dynamic object never forces a costly GDF rebuild.
     pub static_geometry: bool,
@@ -246,7 +253,7 @@ fn direct_light(insts: &[SdfInstance], lights: &[BakeLight], p: Vec3, n: Vec3, e
 
 /// Incoming radiance arriving along `dir`, path-traced through up to `bounces`
 /// diffuse bounces (sky on escape; emission + direct at each hit; cosine-weighted
-/// continuation, throughput attenuated by albedo each bounce, the "lumens drop
+/// continuation, throughput attenuated by albedo each bounce, the "light energy drops
 /// per bounce" scatter). One bounce ≈ the old behavior; more fills cavities.
 #[allow(clippy::too_many_arguments)]
 fn incoming(
@@ -282,7 +289,14 @@ fn incoming(
                     n = -n;
                 }
                 let inst = &insts[who];
-                let albedo = Vec3::from(inst.albedo);
+                // Diffuse bounce albedo = base·(1−metallic). A metal has no diffuse
+                // lobe (its reflectance is specular/F0), so it must NOT re-radiate
+                // the diffuse bounce — otherwise a metal floor pumps light back each
+                // bounce and the contact cavity (form-factor≈1) concentrates toward
+                // E/(1−albedo). This is the per-bounce energy absorption that bounds
+                // the growing contact pool. Roughness leaves diffuse magnitude
+                // unchanged (Lambert); it only matters for the future specular trace.
+                let albedo = Vec3::from(inst.albedo) * (1.0 - inst.metallic.clamp(0.0, 1.0));
                 // Emitters are sampled via NEE below, not added on a random hit,
                 // so a hit on an emissive surface contributes no emission here.
                 // That kills the firefly variance from small bright sources.
@@ -327,6 +341,8 @@ fn probe_sh(
     let (mut sh0, mut sh1, mut sh2, mut sh3) = (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO, Vec3::ZERO);
     // SH-L1 of the directional first-hit distance (scalar), for visibility.
     let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // SH-L1 of the SQUARED distance (second moment) for a two-moment Chebyshev.
+    let (mut q0, mut q1, mut q2, mut q3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for _ in 0..samples {
         let d = uniform_sphere(&mut rng);
         let (r, fd) = incoming(insts, lights, emitters, origin, d, sky, eps, max_dist, bounces, &mut rng);
@@ -339,6 +355,11 @@ fn probe_sh(
         d1 += fd * (0.488603 * d.y);
         d2 += fd * (0.488603 * d.z);
         d3 += fd * (0.488603 * d.x);
+        let fd2 = fd * fd;
+        q0 += fd2 * 0.282095;
+        q1 += fd2 * (0.488603 * d.y);
+        q2 += fd2 * (0.488603 * d.z);
+        q3 += fd2 * (0.488603 * d.x);
     }
     let wgt = (4.0 * PI) / samples as f32;
     let (mut sh0, mut sh1, mut sh2, mut sh3) = (sh0 * wgt, sh1 * wgt, sh2 * wgt, sh3 * wgt);
@@ -367,6 +388,7 @@ fn probe_sh(
     ProbeSh {
         coeffs: [pack(sh0), pack(sh1), pack(sh2), pack(sh3)],
         dist: [d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt],
+        dist2: [q0 * wgt, q1 * wgt, q2 * wgt, q3 * wgt],
     }
 }
 
@@ -552,6 +574,8 @@ mod tests {
             sdf,
             albedo: [0.8, 0.8, 0.8],
             emission: [0.0; 3],
+            metallic: 0.0,
+            roughness: 0.7,
                 static_geometry: true,
         };
         let light = BakeLight {
@@ -632,6 +656,8 @@ mod tests {
             sdf,
             albedo: [0.8; 3],
             emission: [0.0; 3],
+            metallic: 0.0,
+            roughness: 0.7,
                 static_geometry: true,
         };
         let dims = [16, 16, 16];

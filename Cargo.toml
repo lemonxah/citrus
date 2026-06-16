@@ -51,7 +51,8 @@ egui_dock = "0.18"           # 0.19 needs egui 0.34
 # assets
 gltf = { version = "1.4", features = ["KHR_materials_emissive_strength"] }
 ufbx = "0.11"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "exr"] }
+half = "2"
 
 openxr = "0.21"
 libloading = "0.8"

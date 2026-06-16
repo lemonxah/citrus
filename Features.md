@@ -44,6 +44,34 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   - **Matcap blend modes**: each matcap layer combines with the shaded colour via Add / Multiply /
     Replace (`MatcapBlend`), carried in the FX UBO (`fx.matcap_blend`) and applied by `blend_matcap`
     in the shader. Per-layer strength + mask still apply.
+  - **Per-texture UV transform**: Albedo / Normal / ORM / Emission each have independent Tiling
+    (xy scale, default 1) + Offset (default 0), edited inline under each texture row in the
+    inspector. Carried in the FX UBO (`fx.albedo_st`/`normal_st`/`orm_st`/`emission_st`, xy=tiling
+    zw=offset); the shader builds a per-map UV `v_uv*tiling + offset (+ scroll)`. Opacity follows
+    albedo's UV, emission mask follows emission's. Animated UV scroll stacks on top.
+  - **EXR (OpenEXR) images** load as textures + file-browser thumbnails (`image` `exr` feature);
+    recognised as images for thumbnails, the skybox action, and material slot drops. HDR values are
+    currently clamped to LDR on load (full float pipeline is a follow-up). Compressions the Rust
+    decoder lacks (DWAA/DWAB) fall back to transcoding via `oiiotool` (OpenImageIO) to a temp
+    ZIP EXR; if `oiiotool` is absent it logs a hint to re-export with ZIP/PIZ.
+    **EXR now loads natively as HDR float** — decoded to linear RGBA f16 and
+    uploaded as `R16G16B16A16_SFLOAT` (`TextureData.hdr`), no LDR clamp and no PNG
+    round-trip. DWAA/single-channel sources transcode to a temp lossless ZIP EXR
+    (float) via `oiiotool`, never PNG.
+  - **Displacement / parallax occlusion mapping**: a height map slot (15, binding 16) drives
+    per-pixel **POM** in `standard.frag` — the tangent-space view ray marches the height field and
+    every map samples the displaced UV, so flat geometry (e.g. a floor) gains apparent depth with
+    no tessellation. `Displacement Scale` slider (gated to "map assigned"); branch-gated by
+    `fx.parallax.x > 0` so it costs nothing when off. The shift is computed in albedo-tiled space
+    and mapped back to mesh UV so per-map tiling stays coherent. Silhouettes stay flat (POM, not
+    true geometry displacement — that would need tessellation).
+  - **Split AO / Roughness / Metallic maps**: alongside the packed ORM, each PBR channel can take
+    its own texture (slots 12/13/14, bindings 13-15), each with an **Invert** toggle (e.g. a
+    smoothness map used as roughness). Split maps *multiply* their packed-ORM channel — the 1×1
+    white default is a no-op, so a material can use packed ORM, separate maps, or a mix. They share
+    the ORM tiling/offset. Invert is gated to "map assigned" (so it can't zero a channel via
+    `1 - white`). Carried in `fx.orm_invert`; `MaterialTextures`/`MaterialTexturePaths` extended
+    `#[serde(default)]` back-compatibly.
   - **Per-material FX uniform buffer** (set 1, binding 4): the 128-byte push block is full (and
     AMD-capped), so extended params live in a small per-material UBO instead: rim colour/power/
     strength, ramp smoothness, and **animated UV scroll + emission pulse** (Poiyomi-style). The
@@ -238,19 +266,26 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   to the trace.)
   Next: surface/radiance cache for cheap multi-bounce + intrinsic occlusion; masked depth-prepass
   for alpha-test cutout holes; per-camera trace for the in-game camera.
-- [wip] **Screen-space reflections (SSR)**: cheap forward-integrated specular reflections, traced
-  inside `standard.frag`'s ambient-specular block (the old "no reflection probes yet" stand-in).
-  Reuses the full-res Flux depth prepass (set-0 binding 5) + a per-frame copy of last frame's lit
-  colour (binding 6, `ColorHistory`, blitted after the scene pass on both the swapchain and editor-
-  viewport paths). The march is view-space: reflect the view ray about the surface normal, step
-  ~24× against the depth buffer with a thickness test, binary-refine the hit, then sample the
-  colour history; screen-edge fade + roughness-weighted blend mean smooth/metallic pixels get the
-  reflection while rough ones keep the irradiance stand-in. Self-calibrates the viewport Y-flip per
-  fragment. Tunable from **Environment → Flux GI → Reflections (SSR)** (enable, intensity, max
-  distance, roughness cutoff), serialized in `RealtimeGi`. Limits: one frame of lag, reflects LDR
-  colour, on-screen geometry only (off-screen rays miss and fall back), and it rides on the Flux
-  depth prepass so it's active only while realtime GI is on. Off-screen fallback (GDF march) and a
-  prefiltered reflection-probe fallback are the planned follow-ups.
+- [wip] **Screen-space reflections (SSR)** — now **deferred, current-frame** (no 1-frame lag).
+  The forward pass writes a thin G-buffer (a second MRT attachment, `RGBA16F`: specular
+  reflectance.rgb = Fresnel·ao·spec, roughness.a) via opt-in `gbuf` pipeline variants
+  (`PipelineKey::gbuf`), and keeps the env-cube reflection composited in `color` (so it stays
+  correctly fogged and is the SSR-miss fallback). A fullscreen **resolve pass** (`ssr.rs` /
+  `ssr_resolve.frag`, modelled on the post pass) then runs after the forward pass: it reconstructs
+  view position + geometric normal from the Flux depth prepass, re-derives the env radiance the
+  forward pass added (same cube + box-projection), marches the reflected ray against the **current**
+  frame's HDR colour (McGuire screen-space march: fixed ~2px stride, perspective-correct 1/z,
+  sign-change hit + 8-step binary refine + residual confidence fade), and outputs
+  `scene + reflectance·conf·(ssr − env)` into a resolved HDR target the post pass tonemaps. So a
+  confident hit cleanly swaps the env reflection for the live screen reflection and a miss leaves the
+  forward result untouched — killing the old last-frame lag/swim and LDR source. Wired on both the
+  game swapchain path (`self.ssr_targets`, per frame-in-flight) and the editor viewport
+  (`self.viewport_ssr`). Tunable from **Environment → Flux GI → Reflections (SSR)** (enable,
+  intensity, max distance, roughness cutoff), serialized in `RealtimeGi`. Limits: on-screen geometry
+  only (off-screen rays fall back to the env cube), geometric (depth-reconstructed) normals so
+  normal-mapped reflectors lose bump detail in the reflection, and it rides on the Flux depth prepass
+  so it's active only while realtime GI is on. Off-screen GDF fallback, temporal accumulation and a
+  roughness blur are the planned follow-ups.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
   even cube-face packing). The seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.
@@ -299,6 +334,14 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (.citrus), folder, file (unknown); `.rs` keeps a monochrome Ferris silhouette. Known asset
   extensions are hidden (the icon conveys the type) and names clip to one line. Folder clicks
   navigate only, with no Inspector selection.
+- [done] File browser image thumbnails: image tiles (png/jpg/jpeg/tga/bmp) show a real decoded
+  preview in place of the generic image glyph. Decoded + downscaled (`THUMB_MAX`) on demand for
+  visible tiles only, cached as textures, budgeted per frame (`THUMB_PER_FRAME`) so opening an
+  image-heavy folder doesn't hitch; undecodable files fall back to the glyph.
+- [done] File browser tile-size slider (top bar): scales tiles + icons/previews live
+  (`tile_px`), so previews can be enlarged for a closer look.
+- [done] Status bar shows the selected file's full name (with project-relative path on hover),
+  so names the grid tiles clip with `…` are still fully readable.
 - [done] Unified Inspector (object transform/mesh/material slots, `.material` editor,
   component list with Add/Remove)
 - [done] Orbit / pan / scroll-dolly editor camera, F to frame, Escape to deselect
@@ -853,6 +896,29 @@ physics engine (#26) --+                              |
 - [partial] Global illumination in the standard shader: probe SH-L1 sampled per fragment
   (done); baked lightmap sampling for static objects still todo
 - [todo] HDR skybox + IBL
+- [wip] **Full-body IK + VR locomotion** — analytic two-bone + FABRIK solvers
+  (`citrus_core::ik`); `humanoid::HumanoidRig` maps Mixamo/VRM/Unity bones and
+  `pose_from_trackers` drives any humanoid from head/hands/hips/feet targets.
+  Added: **terrain foot IK** (`apply_foot_ik` — hips drop + per-leg two-bone solve
+  onto the ground + foot-to-normal roll, pluggable ground sampler;
+  `LoadedScene::set_foot_ik`/`ground_height`), **T-pose tracker calibration**
+  (`TrackerCalibration` + `humanoid::{calibrate_tpose, targets_from_calibrated}` +
+  `LoadedScene::calibrate_vr_tpose`/`vr_apply_calibration` — capture each tracker's
+  offset to its bone, then drive naturally), and **VR play-space locomotion**
+  (`citrus_core::VrRig`: fly, turn, scale-self, grab-drag the world, pointer ray).
+  All unit-tested.
+- [wip] **Editor VR** (VR-only; desktop editor untouched) — stereo rendering into
+  the HMD (`Renderer::render_xr_eye` per eye + an editor `setup_stereo`/`begin_
+  frame`/`end_frame` loop, eye view composed with the `VrRig`), locomotion (fly /
+  turn / scale-self / grab-drag via controller sticks+grips, `XrSession::input`
+  bound to Oculus Touch), right-hand pointer select+move (`pointer_ray` +
+  `LoadedScene::pick`), and **the whole editor UI on a left-hand panel**: a
+  dedicated `vr_egui` renderer draws the egui UI into a texture (`render_vr_ui`),
+  shown on a quad (`vr_overlay.rs` + `vr_quad` shaders) in each eye with a pointer
+  cursor; the right-controller ray → panel UV → egui pointer events, so every
+  desktop panel/button is usable in VR (a "VR Tools" window adds the VR-only
+  actions). All gated behind an active XR session. Untested without a headset
+  (tuning notes in MORNING-NOTES.md §4).
 - [todo] VR rendering (OpenXR) + VR editing
 - [todo] Slang custom-shader frontend (phase 2)
 - [todo] Networking, content pipeline, VRM avatars (milestones M3-M7)

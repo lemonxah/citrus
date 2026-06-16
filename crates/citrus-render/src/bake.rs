@@ -58,11 +58,12 @@ fn bytes_of<T: Copy>(slice: &[T]) -> &[u8] {
     }
 }
 
-/// A built acceleration structure plus its backing buffer.
-struct Accel {
-    handle: vk::AccelerationStructureKHR,
-    buffer: Buffer,
-    address: u64,
+/// A built acceleration structure plus its backing buffer. Shared with the
+/// runtime ray-traced reflection path (`rt_reflect`).
+pub(crate) struct Accel {
+    pub handle: vk::AccelerationStructureKHR,
+    pub buffer: Buffer,
+    pub address: u64,
 }
 
 /// Run the full bake. Returns one lightmap per instance (same order) and SH
@@ -248,7 +249,7 @@ fn gpu_light(l: &crate::types::BakeLight) -> GpuLight {
 }
 
 /// glam column-major Mat4 → Vulkan row-major 3×4 instance transform.
-fn transform_matrix(m: &Mat4) -> vk::TransformMatrixKHR {
+pub(crate) fn transform_matrix(m: &Mat4) -> vk::TransformMatrixKHR {
     let c = m.to_cols_array();
     vk::TransformMatrixKHR {
         matrix: [
@@ -257,7 +258,7 @@ fn transform_matrix(m: &Mat4) -> vk::TransformMatrixKHR {
     }
 }
 
-fn accel_scratch_alignment(ctx: &GpuContext) -> u64 {
+pub(crate) fn accel_scratch_alignment(ctx: &GpuContext) -> u64 {
     let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
     let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
     unsafe {
@@ -310,7 +311,7 @@ fn scratch_buffer(
     Ok((buf, aligned))
 }
 
-fn build_blas(
+pub(crate) fn build_blas(
     ctx: &GpuContext,
     accel_loader: &khr::acceleration_structure::Device,
     allocator: &Arc<Mutex<Allocator>>,
@@ -406,7 +407,7 @@ fn build_blas(
     })
 }
 
-fn build_tlas(
+pub(crate) fn build_tlas(
     ctx: &GpuContext,
     accel_loader: &khr::acceleration_structure::Device,
     allocator: &Arc<Mutex<Allocator>>,

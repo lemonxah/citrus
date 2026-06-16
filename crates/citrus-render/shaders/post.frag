@@ -37,21 +37,40 @@ void main() {
         color = texture(u_hdr, uv).rgb;
     }
 
-    // Cheap single-pass bloom: blur the over-threshold part in a ring around the
-    // pixel and add it back. A mip-chain bloom is the higher-quality follow-up.
+    // Bloom (UE-style): a soft-knee brightness threshold isolates the bright
+    // part of the linear-HDR scene, which is then spread WIDE and added back.
+    // UE does this with a downsample/upsample mip pyramid for a cheap, very wide
+    // soft glow; we approximate the pyramid in one pass by summing Gaussian rings
+    // at several radii (a true mip-chain is the perf/quality follow-up). The key
+    // fixes vs. the old version: (1) soft-knee threshold (no hard cutoff banding),
+    // (2) a spread of ~25% of the screen (the old 2% was imperceptible).
     if (pc.p4.x > 0.5) {
-        float thr = pc.p4.y;
-        float r = max(pc.p4.w, 0.0) * 0.04;
-        vec3 b = max(texture(u_hdr, uv).rgb - vec3(thr), vec3(0.0));
-        float wsum = 1.0;
-        for (int i = 0; i < 16; ++i) {
-            float a = float(i) / 16.0 * 6.2831853;
-            float rr = (0.5 + 0.5 * float(i & 1)) * r; // two rings
-            vec2 o = vec2(cos(a), sin(a)) * rr;
-            b += max(texture(u_hdr, uv + o).rgb - vec3(thr), vec3(0.0));
-            wsum += 1.0;
+        float thr = max(pc.p4.y, 0.0);
+        float knee = thr * 0.5 + 1e-4;          // soft knee width
+        float maxR = clamp(pc.p4.w, 0.0, 1.0) * 0.25; // spread, fraction of screen
+        vec3 sum = vec3(0.0);
+        float wsum = 0.0;
+        // 3 octaves × 8 directions: rings at 0.4/0.7/1.0 of maxR, Gaussian-weighted
+        // by radius so the inner rings dominate (soft, energy-tapered glow).
+        const int DIRS = 8;
+        for (int oct = 0; oct < 3; ++oct) {
+            float rr = maxR * (0.4 + 0.3 * float(oct));
+            float ow = exp(-float(oct) * 0.6);   // outer octaves contribute less
+            for (int i = 0; i < DIRS; ++i) {
+                float a = (float(i) + 0.5) / float(DIRS) * 6.2831853;
+                vec2 o = vec2(cos(a), sin(a)) * rr;
+                vec3 s = texture(u_hdr, uv + o).rgb;
+                float br = max(s.r, max(s.g, s.b));
+                float soft = clamp(br - thr + knee, 0.0, 2.0 * knee);
+                soft = soft * soft / (4.0 * knee);
+                float contrib = max(soft, br - thr) / max(br, 1e-4);
+                sum += s * contrib * ow;
+                wsum += ow;
+            }
         }
-        color += (b / wsum) * pc.p4.z;
+        if (wsum > 0.0) {
+            color += (sum / wsum) * pc.p4.z;
+        }
     }
 
     // Exposure (EV).

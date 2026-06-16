@@ -17,7 +17,11 @@ use serde::{Deserialize, Serialize};
 mod ik;
 mod input;
 mod models;
-pub use ik::{IkTargets, TrackerTargets, TwoBoneSolution, solve_fabrik, solve_two_bone};
+mod vr;
+pub use ik::{
+    IkTargets, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik, solve_two_bone,
+};
+pub use vr::{Ray, VrRig, pointer_ray, ray_plane};
 pub use input::{
     ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
     MouseAxis, MouseButton, PadAxis, PadButton, RawInput, resolve,

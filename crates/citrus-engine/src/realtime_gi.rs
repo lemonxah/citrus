@@ -51,7 +51,7 @@ pub struct RealtimeGiState {
     gdf_hash: Option<u64>,
     /// Persistent, un-blurred temporal accumulation of per-cascade traces. Each
     /// frame only one cascade is re-traced (round-robin) and blended in here;
-    /// `target` is its spatially-filtered view. Lumen-style: never re-trace the
+    /// `target` is its spatially-filtered view. Cached-GI policy: never re-trace the
     /// whole field at once; amortize across frames and accumulate temporally.
     raw: Vec<citrus_render::ProbeSh>,
     /// Which cascade to trace next (round-robin over the probe volumes).
@@ -130,6 +130,10 @@ impl RealtimeGiState {
             ssr_intensity: gi.ssr_intensity.max(0.0),
             ssr_max_distance: gi.ssr_max_distance.max(0.0),
             ssr_roughness_cutoff: gi.ssr_roughness_cutoff.clamp(0.0, 1.0),
+            reflection_mode: gi.reflection_mode.min(2) as u32,
+            // The existing "Ray Query" GI mode selects the hardware trace backend
+            // (screen_gi_rt); falls back to software when the device lacks it.
+            rt_trace: gi.mode == citrus_assets::GiMode::RayQuery,
         });
         // Hardware (ray-query) mode needs RT cores; software (SDF) runs anywhere.
         if gi.mode == citrus_assets::GiMode::RayQuery && !renderer.supports_baking() {
@@ -266,6 +270,8 @@ impl RealtimeGiState {
                                     .map(|i| citrus_render::GpuGiMaterial {
                                         albedo: i.albedo,
                                         emission: i.emission,
+                                        metallic: i.metallic,
+                                        roughness: i.roughness,
                                     })
                                     .collect();
                                 renderer.gi_set_gdf(
