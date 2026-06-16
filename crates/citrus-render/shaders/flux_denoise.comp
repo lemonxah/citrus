@@ -1,0 +1,132 @@
+#version 450
+// Flux probe-space denoise (an edge-aware probe-space spatial filter).
+// Runs at PROBE resolution (screen/SCREEN_PROBE_DIV), one invocation per probe
+// texel — 16× cheaper than filtering at full screen res, so the expensive wide
+// edge-aware blur lives here and the forward shader only does a cheap bilinear.
+//
+// Input is the temporally-accumulated gather (rgb = irradiance, a = camera
+// distance, stored by screen_gi.comp). The filter is an à-trous wavelet: an
+// edge-stopping cross-bilateral with growing tap spacing, so a handful of taps
+// cover a wide footprint. Edge-stops on DEPTH (the alpha channel — no matrices
+// needed at probe res) and LUMINANCE, so it pools the sparse low-light samples
+// without bleeding across surface or lighting boundaries.
+//
+// VARIANCE-DRIVEN (the key for the user's low-light grain): Monte-Carlo relative
+// variance explodes where the mean is small, so dark regions are the grainiest.
+// `dark` widens the footprint and loosens the luminance edge-stop there, and
+// tightens both where the signal is bright and already converged (keeps contact
+// bounce sharp).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_in;          // gather (rgb=irr, a=dist)
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_out;
+
+layout(push_constant) uniform Push {
+    ivec2 size;   // probe-grid resolution
+    int step;     // base à-trous tap spacing (in probe texels)
+    int _pad;
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
+    vec2 texel = 1.0 / vec2(pc.size);
+    vec2 uv = (vec2(p) + 0.5) * texel;
+
+    vec4 c = texture(u_in, uv);
+    float c_dist = c.a;
+    // Sky / no-GI texels store 0 distance; pass them through untouched so the
+    // filter never drags scene GI onto the background.
+    if (c_dist <= 0.0) { imageStore(u_out, p, c); return; }
+    float c_luma = luma(c.rgb);
+
+    // STABLE luma estimate for the variance-driven width: averaging the centre with
+    // its 4 neighbours removes most of the per-frame noise that would otherwise make
+    // `dark` (and thus the filter width) oscillate frame-to-frame — a positive
+    // feedback that AMPLIFIES flicker. (Driving the width from the raw centre luma
+    // was a flicker source; smoothing the input is why cranking temporal smoothing
+    // hid it.) Cheap at probe res.
+    float lc = c_luma
+        + luma(texture(u_in, clamp(uv + vec2(2.0, 0.0) * texel, vec2(0.0), vec2(1.0))).rgb)
+        + luma(texture(u_in, clamp(uv - vec2(2.0, 0.0) * texel, vec2(0.0), vec2(1.0))).rgb)
+        + luma(texture(u_in, clamp(uv + vec2(0.0, 2.0) * texel, vec2(0.0), vec2(1.0))).rgb)
+        + luma(texture(u_in, clamp(uv - vec2(0.0, 2.0) * texel, vec2(0.0), vec2(1.0))).rgb);
+    lc *= 0.2;
+
+    // Widen + loosen in shadow, tighten in light (0.5 = "bright enough" reference).
+    float dark = clamp(1.0 - lc / 0.5, 0.0, 1.0);
+    float dil = mix(1.0, 3.0, dark) * float(max(pc.step, 1)); // tap spacing
+    float lsigma = mix(0.4, 4.0, dark);                       // luma edge-stop
+    float inv_d = 1.0 / max(c_dist, 0.25);
+
+    // PLANE-AWARE depth edge-stop: on a grazing surface the camera distance ramps
+    // fast across neighbouring probes, so a raw |Δdist| test would reject every tap
+    // (→ no denoise, the leftover grazing-floor grain). Instead estimate the local
+    // screen-space distance GRADIENT (per probe texel) from the axis neighbours and
+    // reject a tap by how far it deviates from the linearly-PREDICTED distance — a
+    // smooth planar ramp predicts perfectly (kept), a true depth edge does not
+    // (rejected). dgrad lanes are 0 where a neighbour is sky/no-GI (falls back to a
+    // flat prediction = the old behaviour).
+    float dl = texture(u_in, clamp(uv - vec2(texel.x, 0.0), vec2(0.0), vec2(1.0))).a;
+    float dr = texture(u_in, clamp(uv + vec2(texel.x, 0.0), vec2(0.0), vec2(1.0))).a;
+    float dd = texture(u_in, clamp(uv - vec2(0.0, texel.y), vec2(0.0), vec2(1.0))).a;
+    float du = texture(u_in, clamp(uv + vec2(0.0, texel.y), vec2(0.0), vec2(1.0))).a;
+    float gx = (dl > 0.0 && dr > 0.0) ? (dr - dl) * 0.5 : 0.0;
+    float gy = (dd > 0.0 && du > 0.0) ? (du - dd) * 0.5 : 0.0;
+
+    vec3 sum = c.rgb;
+    float wsum = 1.0;
+    // Brightest neighbour seen on the same surface — bounds a lone firefly probe
+    // that has no temporal history (disocclusion / freshly revealed), which the
+    // gather's temporal clamp can't catch. Spatial half of the firefly removal.
+    float nbr_max_luma = 0.0;
+    // Two à-trous levels (spacing dil, 2·dil) in one pass. At probe res the whole
+    // buffer is cache-resident, so dilated taps stay cheap (unlike at full res).
+    for (int lvl = 0; lvl < 2; ++lvl) {
+        float s = dil * float(1 << lvl);
+        for (int j = -2; j <= 2; ++j) {
+            for (int i = -2; i <= 2; ++i) {
+                if (i == 0 && j == 0) continue;
+                vec2 off = vec2(i, j);
+                vec2 tuv = clamp(uv + off * s * texel, vec2(0.0), vec2(1.0));
+                vec4 t = texture(u_in, tuv);
+                if (t.a <= 0.0) continue; // skip sky/no-GI taps
+                float sw = exp(-dot(off, off) * 0.5) / float(1 << lvl);
+                // Curvature-tolerant depth edge-stop (mirrors the forward's dual
+                // test): take the MIN deviation of two measures, so a tap is kept if
+                // EITHER holds —
+                //   - plane: deviation from the gradient-predicted ramp → keeps
+                //     grazing FLAT neighbours (their distance ramps linearly), and
+                //   - radial: raw |Δdist| → keeps CURVED neighbours (a sphere's
+                //     distance leaves the linear ramp but stays close), which the
+                //     plane test alone over-rejected, leaving curved-surface grain.
+                // A true depth discontinuity is far in both → still rejected.
+                float pred = c_dist + gx * (off.x * s) + gy * (off.y * s);
+                float dd = min(abs(t.a - pred), abs(t.a - c_dist));
+                float dw = exp(-dd * inv_d * 8.0);
+                // Luminance edge-stop: don't blur across a lighting boundary; opens
+                // up in shadow so grain still pools.
+                float lw = exp(-abs(luma(t.rgb) - c_luma) / lsigma);
+                float w = sw * dw * lw;
+                sum += t.rgb * w;
+                wsum += w;
+                // Track the brightest SAME-SURFACE neighbour (depth-accepted), so a
+                // genuine bright bounce next to us still raises the ceiling.
+                if (dw > 0.4) nbr_max_luma = max(nbr_max_luma, luma(t.rgb));
+            }
+        }
+    }
+    vec3 outc = sum / wsum;
+    // Spatial firefly clamp: if this probe is far brighter than its brightest
+    // same-surface neighbour, it's an isolated outlier (no neighbour supports it) —
+    // pull it down to the neighbourhood ceiling, hue-preserving. The slack (1.6×)
+    // keeps real local highlights; only lone spikes are clipped. Skipped when no
+    // valid neighbour was found (nbr_max_luma == 0).
+    float o_luma = luma(outc);
+    float ceil_luma = nbr_max_luma * 1.6 + 0.02;
+    if (nbr_max_luma > 0.0 && o_luma > ceil_luma) outc *= ceil_luma / max(o_luma, 1e-4);
+    imageStore(u_out, p, vec4(outc, c_dist));
+}
