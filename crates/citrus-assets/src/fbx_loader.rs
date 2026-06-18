@@ -403,8 +403,13 @@ fn convert_part(mesh: &ufbx::Mesh, part_index: usize) -> Result<Option<MeshData>
     if uv_set1.is_none() {
         generate_lightmap_grid(&mut vertices);
     }
-    let indices = (0..vertices.len() as u32).collect();
-    Ok(Some(MeshData { vertices, indices }))
+    let indices: Vec<u32> = (0..vertices.len() as u32).collect();
+    // Real uv_set1 = lightmap UV; else uv1 is a placeholder, but the mesh is still
+    // bakeable if uv0 is a non-overlapping atlas (only tiled/overlapping uv0 needs
+    // a generated set).
+    let has_lightmap_uv =
+        uv_set1.is_some() || crate::lightmap_uv::uv0_is_lightmappable(&vertices, &indices);
+    Ok(Some(MeshData { vertices, indices, has_lightmap_uv }))
 }
 
 /// Pack each triangle into its own cell of a square grid in the [0,1] UV

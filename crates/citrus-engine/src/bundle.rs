@@ -73,6 +73,7 @@ fn entry(name: &str, source: ObjectSource, translation: [f32; 3], scale: [f32; 3
         enabled: true,
         static_geometry: false,
         lightmap_scale: 1.0,
+        layer: 0,
         material: inline_material(),
         extra_materials: Vec::new(),
         parent: None,
@@ -108,6 +109,7 @@ fn starter_scene() -> SceneFile {
         ],
         skybox: None,
         environment: Default::default(),
+        layers: Default::default(),
         editor_camera: None,
         collapsed: Vec::new(),
     }

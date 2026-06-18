@@ -525,6 +525,39 @@ impl Inspect for CameraComponent {
         if self.far <= self.near {
             self.far = self.near + 0.01;
         }
+        // Layer culling mask (Unity-style): which layers this camera renders.
+        // Layer names + the collision matrix are edited in Tools → Layers.
+        ui.collapsing("Culling Mask", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Everything").clicked() {
+                    self.culling_mask = u32::MAX;
+                    changed = true;
+                }
+                if ui.button("Nothing").clicked() {
+                    self.culling_mask = 0;
+                    changed = true;
+                }
+            });
+            // First 8 layers as checkboxes (the common case); higher layers keep
+            // their bit untouched. Names live in the scene, so label generically.
+            egui::Grid::new("camera-culling-mask").show(ui, |ui| {
+                for l in 0u32..8 {
+                    let bit = 1u32 << l;
+                    let mut on = self.culling_mask & bit != 0;
+                    if ui.checkbox(&mut on, format!("Layer {l}")).changed() {
+                        if on {
+                            self.culling_mask |= bit;
+                        } else {
+                            self.culling_mask &= !bit;
+                        }
+                        changed = true;
+                    }
+                    if l % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
         ui.label(
             RichText::new("Post-processing effects arrive with the post pipeline")
                 .small()

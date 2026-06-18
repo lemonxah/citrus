@@ -45,6 +45,13 @@ impl Default for Vertex {
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// True when `uv1` is a real, non-overlapping lightmap UV set — the model's
+    /// own TEXCOORD_1, a primitive's generated atlas, or a generated unwrap.
+    /// False when `uv1` is just a copy of `uv0` (no dedicated lightmap UV), which
+    /// must NOT be baked (overlapping charts → garbage lightmap). Gates the bake
+    /// (offer to generate) and the UV-checker preview. `#[serde(default)]`-style
+    /// default is `false` so older callers stay conservative.
+    pub has_lightmap_uv: bool,
 }
 
 /// Pixel data ready for upload. RGBA8 by default; when `hdr` is set, `pixels`
@@ -418,6 +425,12 @@ pub struct LightInstance {
     pub soft_shadows: bool,
     /// Light-clip-space depth-compare bias.
     pub shadow_bias: f32,
+    /// This light's contribution is BAKED into lightmaps (Baked/Mixed mode + a
+    /// bake exists). It's kept in the realtime pass so **non-lightmapped** objects
+    /// (dynamic objects, anything added after the bake) still receive it; the
+    /// shader skips it for lightmapped objects, which already have it baked in. So
+    /// a baked scene's dynamic objects aren't black. `false` = realtime (all objs).
+    pub baked: bool,
 }
 
 pub struct DrawCmd {
@@ -429,6 +442,10 @@ pub struct DrawCmd {
     /// Mesh AABB center in object space; the outline pass inflates radially
     /// from it so hard-edged meshes stay watertight (no corner gaps).
     pub mesh_center: Vec3,
+    /// Object-space bounding-sphere radius (AABB half-diagonal) around
+    /// `mesh_center`, scaled by the transform to frustum-cull the main camera
+    /// pass. 0 disables culling for this draw (always drawn).
+    pub bound_radius: f32,
     /// Baked-lightmap array layer for this object's static GI, or -1 when the
     /// object has no lightmap (sample probes / flat ambient instead).
     pub lightmap_layer: i32,
@@ -578,6 +595,11 @@ pub struct FrameInput<'a> {
     /// Every light gathered from the scene this frame. When empty, the
     /// standard shader falls back to the single key directional in `light`.
     pub lights: &'a [LightInstance],
+    /// Lights for the reflection-probe cube capture — the FULL set including
+    /// Baked/Mixed lights that `lights` drops once a bake exists. The cube
+    /// renders the scene without lightmaps, so it needs the analytic lights or
+    /// it captures dark. Empty → fall back to `lights`.
+    pub capture_lights: &'a [LightInstance],
     /// When set, the scene is also rendered from this camera into the offscreen
     /// preview target (the editor's Camera tab). `None` skips that pass.
     pub camera_preview: Option<CameraData>,

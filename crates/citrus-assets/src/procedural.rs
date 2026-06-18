@@ -23,7 +23,7 @@ fn mesh_with_lightmap(mut vertices: Vec<Vertex>, indices: Vec<u32>) -> MeshData 
     for v in &mut vertices {
         v.uv1 = v.uv;
     }
-    MeshData { vertices, indices }
+    MeshData { vertices, indices, has_lightmap_uv: true }
 }
 
 /// Capsule: cylinder of height `height` between two hemispheres of `radius`,
@@ -328,7 +328,8 @@ fn cube(size: f32) -> MeshData {
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    MeshData { vertices, indices }
+    // The cube packs its 6 faces into a non-overlapping 3×2 lightmap atlas.
+    MeshData { vertices, indices, has_lightmap_uv: true }
 }
 
 fn uv_sphere(radius: f32, segments: u32, rings: u32) -> MeshData {

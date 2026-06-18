@@ -54,6 +54,9 @@ pub struct FileBrowser {
     /// Remaining new-thumbnail decodes allowed this frame, so scrolling into a
     /// folder full of large images doesn't stall the UI on one frame.
     thumb_budget: u32,
+    /// Source-file mtime each cached `.material` sphere preview was rendered from,
+    /// so editing a material refreshes its tile instead of showing a stale sphere.
+    mat_mtimes: std::collections::HashMap<PathBuf, std::time::SystemTime>,
     /// Grid tile width in px (height tracks it); driven by the size slider so
     /// larger tiles show bigger image previews.
     tile_px: f32,
@@ -108,6 +111,7 @@ impl FileBrowser {
             thumbs: std::collections::HashMap::new(),
             thumb_order: std::collections::VecDeque::new(),
             thumb_budget: 0,
+            mat_mtimes: std::collections::HashMap::new(),
             tile_px: TILE.x,
             diags: std::collections::HashMap::new(),
             multi: HashSet::new(),
@@ -153,6 +157,48 @@ impl FileBrowser {
         while self.thumb_order.len() > THUMB_CACHE_CAP {
             if let Some(old) = self.thumb_order.pop_front() {
                 self.thumbs.remove(&old);
+            }
+        }
+        tex
+    }
+
+    /// Sphere preview for a `.material` file: parse its PBR params and CPU-render
+    /// a lit sphere (base colour + metallic + roughness + emission), cached and
+    /// budgeted exactly like image thumbnails. Re-renders when the file's mtime
+    /// changes so an edit refreshes the tile. Returns `None` until decoded /
+    /// when the file can't be parsed (caller falls back to the sphere glyph).
+    fn material_thumb(&mut self, ctx: &egui::Context, path: &Path) -> Option<egui::TextureHandle> {
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        // Invalidate a stale preview if the material file changed on disk.
+        if let Some(mt) = mtime
+            && self.mat_mtimes.get(path) != Some(&mt)
+            && self.thumbs.contains_key(path)
+        {
+            self.thumbs.remove(path);
+        }
+        if let Some(slot) = self.thumbs.get(path) {
+            return slot.clone();
+        }
+        if self.thumb_budget == 0 {
+            return None;
+        }
+        self.thumb_budget -= 1;
+        let tex = render_material_sphere(path).map(|img| {
+            ctx.load_texture(
+                format!("citrus-mat:{}", path.display()),
+                img,
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        self.thumbs.insert(path.to_owned(), tex.clone());
+        self.thumb_order.push_back(path.to_owned());
+        if let Some(mt) = mtime {
+            self.mat_mtimes.insert(path.to_owned(), mt);
+        }
+        while self.thumb_order.len() > THUMB_CACHE_CAP {
+            if let Some(old) = self.thumb_order.pop_front() {
+                self.thumbs.remove(&old);
+                self.mat_mtimes.remove(&old);
             }
         }
         tex
@@ -533,6 +579,19 @@ impl FileBrowser {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 icon_color,
             );
+        } else if !is_dir
+            && matches!(icon_kind(path), IconKind::Material)
+            && let Some(tex) = self.material_thumb(ui.ctx(), path)
+        {
+            // Sphere preview with the material applied (CPU-shaded from its PBR
+            // params). Fit it into the icon area like an image thumbnail.
+            let [tw, th] = tex.size();
+            let max = 48.0 * s;
+            let scale = (max / tw as f32).min(max / th as f32).min(1.0);
+            let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
+            let img_rect = egui::Rect::from_center_size(icon_center, size);
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(tex.id(), img_rect, uv, egui::Color32::WHITE);
         } else if !is_dir
             && matches!(icon_kind(path), IconKind::Image)
             && let Some(tex) = self.image_thumb(ui.ctx(), path)
@@ -922,17 +981,168 @@ impl FileBrowser {
 /// Decode an image file and downscale it to a thumbnail-sized `ColorImage`.
 /// Returns `None` for an unreadable / unsupported file (caller shows a glyph).
 fn decode_thumb(path: &Path) -> Option<egui::ColorImage> {
+    use image::ColorType;
     let img = image::open(path).ok().or_else(|| decode_exr_fallback(path))?;
-    let mut rgba = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgba8();
-    // EXR/HDR sources frequently decode with no alpha channel (alpha = 0), which
-    // would render the whole thumbnail transparent. Force opaque so the preview
-    // actually shows. (Data maps like normal/roughness preview as their raw
-    // linear values — fine for a thumbnail.)
-    for px in rgba.pixels_mut() {
-        px[3] = 255;
+    let small = img.thumbnail(THUMB_MAX, THUMB_MAX);
+    // HDR sources (EXR / Radiance .hdr) decode to linear float with values that
+    // routinely exceed 1.0. A raw float→u8 clamp (the old path) reads almost
+    // black for a dim environment and blows the sky out to flat white, so the
+    // preview looked broken. Tonemap (ACES) + encode to sRGB the same way the
+    // skybox/standard shaders do, so the thumbnail matches the in-engine look.
+    let hdr = matches!(
+        small.color(),
+        ColorType::Rgb32F | ColorType::Rgba32F
+    ) || path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("exr") || e.eq_ignore_ascii_case("hdr"));
+    let size = [small.width() as usize, small.height() as usize];
+    if hdr {
+        let f = small.to_rgba32f();
+        let mut out = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+        for px in f.pixels() {
+            for c in 0..3 {
+                out.push(linear_to_srgb_u8(aces_tonemap(px[c])));
+            }
+            out.push(255);
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied(size, &out))
+    } else {
+        let mut rgba = small.to_rgba8();
+        // Some LDR sources (e.g. icon TGAs) decode fully transparent; force opaque.
+        for px in rgba.pixels_mut() {
+            px[3] = 255;
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
     }
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// CPU-render a sphere shaded with a `.material` file's PBR parameters, for the
+/// file-browser tile preview. Parses the RON directly (no asset-crate dep) and
+/// shades a unit sphere with a key light + a faux sky environment so base colour,
+/// metalness, roughness and emission are all visible. Background is transparent.
+fn render_material_sphere(path: &Path) -> Option<egui::ColorImage> {
+    use glam::Vec3;
+    let text = std::fs::read_to_string(path).ok()?;
+    let base = parse_floats(&text, "base_color").unwrap_or_default();
+    let albedo = Vec3::new(
+        *base.first().unwrap_or(&0.8),
+        *base.get(1).unwrap_or(&0.8),
+        *base.get(2).unwrap_or(&0.8),
+    );
+    let metallic = parse_floats(&text, "metallic")
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let roughness = parse_floats(&text, "roughness")
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.5)
+        .clamp(0.05, 1.0);
+    let emiss = parse_floats(&text, "emission_color").unwrap_or_default();
+    let emiss_col = Vec3::new(
+        *emiss.first().unwrap_or(&0.0),
+        *emiss.get(1).unwrap_or(&0.0),
+        *emiss.get(2).unwrap_or(&0.0),
+    );
+    let emiss_int = parse_floats(&text, "emission_intensity")
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.0);
+
+    const N: usize = 128;
+    let f0 = Vec3::splat(0.04).lerp(albedo, metallic);
+    let diffuse = albedo * (1.0 - metallic);
+    let light_dir = Vec3::new(-0.4, 0.6, 0.7).normalize();
+    let view = Vec3::Z;
+    // Specular lobe sharpness from roughness (Blinn-Phong fit).
+    let shininess = (2.0 / (roughness * roughness + 1e-3) - 2.0).max(1.0);
+    // Faux sky: a vertical gradient sampled by the reflection ray, so metals show
+    // a recognisable environment and roughness visibly blurs it (via the lobe).
+    let sky = |d: Vec3| -> Vec3 {
+        let t = (d.y * 0.5 + 0.5).clamp(0.0, 1.0);
+        Vec3::new(0.10, 0.12, 0.16).lerp(Vec3::new(0.65, 0.72, 0.85), t)
+    };
+    let mut out = vec![0u8; N * N * 4];
+    for y in 0..N {
+        for x in 0..N {
+            // Pixel → [-1,1], y up. Slight inset so the sphere doesn't touch edges.
+            let px = (x as f32 + 0.5) / N as f32 * 2.0 - 1.0;
+            let py = 1.0 - (y as f32 + 0.5) / N as f32 * 2.0;
+            let r = 1.06; // sphere radius in NDC (slightly < frame)
+            let (sx, sy) = (px * r, py * r);
+            let r2 = sx * sx + sy * sy;
+            let o = (y * N + x) * 4;
+            if r2 > 1.0 {
+                continue; // transparent background
+            }
+            let nz = (1.0 - r2).max(0.0).sqrt();
+            let n = Vec3::new(sx, sy, nz);
+            let n_dot_l = n.dot(light_dir).max(0.0);
+            let n_dot_v = n.dot(view).max(0.0);
+            let half = (light_dir + view).normalize();
+            let n_dot_h = n.dot(half).max(0.0);
+            // Key light: Lambert diffuse + Blinn specular tinted by F0.
+            let spec = n_dot_h.powf(shininess) * (shininess + 8.0) / 8.0;
+            let mut col = diffuse * n_dot_l + f0 * spec * n_dot_l;
+            // Hemisphere ambient fill so the dark side isn't pure black.
+            col += diffuse * (0.18 + 0.12 * (n.y * 0.5 + 0.5));
+            // Environment reflection (stronger for metals / smoother surfaces).
+            let refl = (view * (2.0 * n_dot_v) - n).normalize();
+            let fres = f0 + (Vec3::ONE - f0) * (1.0 - n_dot_v).powf(5.0);
+            col += fres * sky(refl) * (1.0 - roughness * 0.85);
+            // Emission.
+            col += emiss_col * emiss_int;
+            // Soft 1px silhouette coverage for antialiasing.
+            let edge = ((1.0 - r2.sqrt()) * (N as f32 * 0.5)).clamp(0.0, 1.0);
+            out[o] = linear_to_srgb_u8(aces_tonemap(col.x));
+            out[o + 1] = linear_to_srgb_u8(aces_tonemap(col.y));
+            out[o + 2] = linear_to_srgb_u8(aces_tonemap(col.z));
+            out[o + 3] = (edge * 255.0) as u8;
+        }
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied([N, N], &out))
+}
+
+/// Pull the float list out of a RON `field: (a, b, c)` or scalar `field: x` in a
+/// `.material` file. Matches `field:` exactly (so `metallic` won't catch
+/// `metallic_invert`). Returns `None` if the field is absent / unparseable.
+fn parse_floats(text: &str, field: &str) -> Option<Vec<f32>> {
+    let key = format!("{field}:");
+    let start = text.find(&key)? + key.len();
+    let rest = text[start..].trim_start();
+    let span = if let Some(stripped) = rest.strip_prefix('(') {
+        // Tuple: read up to the matching ')'.
+        let end = stripped.find(')')?;
+        &stripped[..end]
+    } else {
+        // Scalar: up to the next comma / newline / close paren.
+        let end = rest
+            .find([',', '\n', ')'])
+            .unwrap_or(rest.len());
+        &rest[..end]
+    };
+    let vals: Vec<f32> = span
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f32>().ok())
+        .collect();
+    (!vals.is_empty()).then_some(vals)
+}
+
+/// Narkowicz ACES filmic tonemap (scalar), matching the engine's HDR rolloff so
+/// EXR/HDR thumbnails preview at the same exposure they render at.
+fn aces_tonemap(x: f32) -> f32 {
+    let x = x.max(0.0);
+    let (a, b, c, d, e) = (2.51, 0.03, 2.43, 0.59, 0.14);
+    ((x * (a * x + b)) / (x * (c * x + d) + e)).clamp(0.0, 1.0)
+}
+
+/// Linear [0,1] → sRGB-encoded u8.
+fn linear_to_srgb_u8(l: f32) -> u8 {
+    let s = if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    (s.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 /// EXR fallback for layouts the Rust decoder can't read (DWAA/DWAB compression

@@ -135,8 +135,12 @@ fn gpu_light(l: &LightInstance) -> GpuLight {
             cos_outer,
         ],
         // spot = [cos_inner, shadow_base_layer (-1 = none), bias, view_count].
-        // The shadow planner patches y/z/w when this light casts shadows.
-        spot: [cos_inner, -1.0, 0.0, 0.0],
+        // The shadow planner patches y/z/w when this light casts shadows. For a
+        // light that does NOT cast shadows (y stays -1) we reuse w as a "baked"
+        // flag (this light's contribution is in lightmaps; the shader skips it for
+        // lightmapped objects). Detected as `spot.y < 0 && spot.w > 0`, so it can
+        // never be confused with a shadow light's view_count (which has y >= 0).
+        spot: [cos_inner, -1.0, 0.0, if l.baked { 1.0 } else { 0.0 }],
     }
 }
 
@@ -584,6 +588,57 @@ pub fn default_render_queue(alpha: AlphaMode) -> i32 {
         AlphaMode::Opaque => RENDER_QUEUE_GEOMETRY,
         AlphaMode::Cutout => RENDER_QUEUE_ALPHA_TEST,
         AlphaMode::Blend => RENDER_QUEUE_TRANSPARENT,
+    }
+}
+
+/// Frustum-cull a draw order against the camera. Returns the subset of `order`
+/// whose world bounding sphere intersects the view frustum, preserving the input
+/// ordering (so the opaque→transparent sort is kept). Draws with `bound_radius`
+/// 0 are always kept. As a safety net, if culling would remove *everything* the
+/// full order is returned unchanged — a bad matrix can never blank the viewport.
+fn frustum_cull(order: &[usize], draws: &[DrawCmd], view_proj: Mat4) -> Vec<usize> {
+    // Gribb-Hartmann plane extraction from view-proj (clip depth 0..1, glam
+    // column-major: `row(i)` is the i-th row, clip = vp * point).
+    let vp = view_proj;
+    let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
+    let raw = [
+        r3 + r0, // left
+        r3 - r0, // right
+        r3 + r1, // bottom
+        r3 - r1, // top
+        r2,      // near (0..1 depth)
+        r3 - r2, // far
+    ];
+    // Normalize so plane.xyz·c + plane.w is a true signed distance.
+    let planes: [glam::Vec4; 6] = std::array::from_fn(|i| {
+        let p = raw[i];
+        let n = p.truncate().length();
+        if n > 1e-6 { p / n } else { p }
+    });
+    let visible = |i: usize| {
+        let d = &draws[i];
+        if d.bound_radius <= 0.0 {
+            return true;
+        }
+        // World sphere: object-space center transformed, radius scaled by the
+        // largest axis (covers non-uniform scale conservatively).
+        let center = d.transform.transform_point3(d.mesh_center);
+        let cols = [d.transform.x_axis, d.transform.y_axis, d.transform.z_axis];
+        let max_scale = cols
+            .iter()
+            .map(|c| c.truncate().length())
+            .fold(0.0f32, f32::max);
+        let r = d.bound_radius * max_scale;
+        // Outside iff fully beyond any one plane.
+        !planes
+            .iter()
+            .any(|p| p.truncate().dot(center) + p.w < -r)
+    };
+    let culled: Vec<usize> = order.iter().copied().filter(|&i| visible(i)).collect();
+    if culled.is_empty() && !order.is_empty() {
+        order.to_vec()
+    } else {
+        culled
     }
 }
 
@@ -2194,6 +2249,13 @@ pub struct Renderer {
     /// 6-face render (plus first-time pipeline compile) never stalls a single
     /// frame. `None` when idle.
     refl_job: Option<ReflCaptureJob>,
+    /// True while rendering the 6 faces of a reflection-probe cube. The cube
+    /// capture uses a positive-height (non-Y-flipped) viewport, which mirrors
+    /// triangle winding relative to the main passes, so the standard CCW/BACK
+    /// pipelines would cull *front* faces and render geometry inside-out (floors
+    /// vanish, spheres show their backs). Forcing no-cull (`double_sided`) during
+    /// capture sidesteps that — the same trick the bake gbuffer pass uses.
+    capturing_refl: bool,
     /// Flip Y in the screen-GI depth→world reconstruction (runtime toggle so the
     /// Y-flipped-viewport convention can be corrected without a rebuild).
     screen_gi_flip_y: bool,
@@ -2926,6 +2988,7 @@ impl Renderer {
             refl_capture_ubo,
             recapture_reflection: None,
             refl_job: None,
+            capturing_refl: false,
             screen_gi_flip_y: true,
             sgi_history_valid: false,
             gi_emitters: Vec::new(),
@@ -4084,7 +4147,8 @@ impl Renderer {
                 .level_count(1)
                 .base_array_layer(i as u32)
                 .layer_count(1);
-            crate::alloc::one_time_submit(&device, pool, queue, |cb| {
+            self.capturing_refl = true;
+            let capture_result = crate::alloc::one_time_submit(&device, pool, queue, |cb| {
                 unsafe {
                     let to_color = vk::ImageMemoryBarrier::default()
                         .image(cube)
@@ -4136,6 +4200,14 @@ impl Renderer {
                         .color_attachments(&atts)
                         .depth_attachment(&depth_att);
                     device.cmd_begin_rendering(cb, &info);
+                    // POSITIVE-height viewport (NOT the main pass's negative-height
+                    // Y-flip). The cube face camera matrices (`faces`, up = -Y for
+                    // +X etc.) + glam perspective_rh, rendered with a positive
+                    // viewport, reproduce the engine's `face_dir` cube convention
+                    // exactly (traced: pixel (fx,fy) on +X → dir [1,-fy,-fx]).
+                    // A NEGATIVE-height viewport flips that Y and the reflection
+                    // comes out upside down. Winding is irrelevant here because the
+                    // capture forces no-cull.
                     let vp = vk::Viewport {
                         x: 0.0,
                         y: 0.0,
@@ -4174,7 +4246,9 @@ impl Renderer {
                         &[to_read],
                     );
                 }
-            })?;
+            });
+            self.capturing_refl = false;
+            capture_result?;
             unsafe { device.destroy_image_view(face_view, None) };
         }
         self.refl_job.as_mut().unwrap().next_face += 1;
@@ -4688,6 +4762,7 @@ impl Renderer {
                 cast_shadows: false,
                 soft_shadows: true,
                 shadow_bias: 0.0,
+                baked: false,
             });
             count = 1;
         }
@@ -4999,8 +5074,22 @@ impl Renderer {
             }
         }
         if self.refl_job.is_some() {
+            // The capture lights the scene with the FULL set (incl. baked lights
+            // that `lights` drops post-bake) so the cube isn't captured dark. Fall
+            // back to the main lights when the engine didn't supply a capture set.
+            let (cap_lights, cap_count) = if input.capture_lights.is_empty() {
+                (lights, count)
+            } else {
+                let mut cl = [GpuLight::default(); MAX_LIGHTS];
+                let mut cc = 0usize;
+                for l in input.capture_lights.iter().take(MAX_LIGHTS) {
+                    cl[cc] = gpu_light(l);
+                    cc += 1;
+                }
+                (cl, cc)
+            };
             if let Err(e) =
-                self.step_refl_capture(lights, count, shadow_vp, cascade_splits, input, &order)
+                self.step_refl_capture(cap_lights, cap_count, shadow_vp, cascade_splits, input, &order)
             {
                 tracing::warn!("reflection capture step failed: {e:#}");
                 self.refl_job = None;
@@ -5204,7 +5293,12 @@ impl Renderer {
                 if input.draw_skybox {
                     self.record_skybox(&device, cb, frame_set, true, true)?;
                 }
-                stats = self.record_scene_draws(&device, cb, &order, input, frame_set, true)?;
+                // Frustum-cull the main camera pass: offscreen draws are skipped
+                // (the shared `order` still feeds shadows / the reflection cube,
+                // which need offscreen casters, so only this pass is culled).
+                let main_order =
+                    frustum_cull(&order, input.draws, input.camera.proj * input.camera.view);
+                stats = self.record_scene_draws(&device, cb, &main_order, input, frame_set, true)?;
             }
 
             // Selection outlines: inverted hull pass over highlighted draws.
@@ -6016,6 +6110,9 @@ impl Renderer {
         let mut stats = RenderStats::default();
         let mut materials_seen: Vec<bool> = vec![false; self.materials.len()];
         let mut bound_pipeline = vk::Pipeline::null();
+        // Cube-face capture mirrors winding (positive-height viewport) → cull
+        // nothing so geometry doesn't render inside-out. See `capturing_refl`.
+        let force_no_cull = self.capturing_refl;
         for &i in order {
             let draw = &input.draws[i];
             let material = &self.materials[draw.material.0];
@@ -6046,6 +6143,9 @@ impl Renderer {
                     key.shader = shader.0 as u32 + 1;
                 }
                 key.gbuf = gbuf;
+                if force_no_cull {
+                    key.double_sided = true;
+                }
                 key
             };
             let pipeline = self.pipeline_cache.get(device, key)?;
@@ -7007,7 +7107,11 @@ impl Renderer {
             if input.draw_skybox {
                 self.record_skybox(&device, cb, xr_set, false, false)?;
             }
-            self.record_scene_draws(&device, cb, &order, input, xr_set, false)?;
+            // Per-eye frustum cull: each eye has its own view/proj, so an object
+            // off the side of one eye's frustum is skipped for that eye — a direct
+            // VR win since the scene is otherwise drawn in full twice.
+            let eye_order = frustum_cull(&order, input.draws, proj * view);
+            self.record_scene_draws(&device, cb, &eye_order, input, xr_set, false)?;
             // VR UI panel + hand lasers, drawn on top of the scene. The panel only
             // shows when the hand menu is up; the lasers always show so you can see
             // what each controller points at (they stop on the surface/object hit).

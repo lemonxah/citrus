@@ -392,23 +392,30 @@ fn probe_sh(
     }
 }
 
-/// Add a directional radiance `r` arriving from `dir` into an SH-L1 accumulator
-/// (the same basis the standard shader reconstructs). FluxVR's building block.
-fn add_sh(s: &mut [Vec3; 4], dir: Vec3, r: Vec3) {
-    s[0] += r * 0.282095;
-    s[1] += r * (0.488603 * dir.y);
-    s[2] += r * (0.488603 * dir.z);
-    s[3] += r * (0.488603 * dir.x);
-}
-
 /// Inject one light's contribution (distance/cone falloff, FULL L1 directionality
 /// — an L0-only term looks flat/translucent) into a probe's SH-L1 accumulator at
 /// world position `p`. The FluxVR per-voxel kernel.
+/// Add a DIRECT light to a probe's SH-L1, but weighted so it reconstructs close to
+/// a clamped `N·L` instead of the soft SH lobe. `add_sh` (used for bounce GI) puts
+/// energy in the L0 *monopole* (omnidirectional) band, which lights a surface from
+/// every side — that's the "FluxVoxel light lights both sides" problem. For a
+/// DIRECT light we want directionality, so trim L0 and boost the L1 directional
+/// band: the ≥0 clamp at eval time then darkens back/grazing faces. (Stopgap until
+/// the per-light directional voxel volume; see scene notes.)
+fn add_sh_direct(s: &mut [Vec3; 4], dir: Vec3, r: Vec3) {
+    const L0: f32 = 0.7; // trim the omnidirectional ambient leak
+    const L1: f32 = 1.8; // sharpen the directional lobe toward N·L
+    s[0] += r * (0.282095 * L0);
+    s[1] += r * (0.488603 * L1 * dir.y);
+    s[2] += r * (0.488603 * L1 * dir.z);
+    s[3] += r * (0.488603 * L1 * dir.x);
+}
+
 pub fn inject_light(s: &mut [Vec3; 4], p: Vec3, l: &BakeLight) {
     let col = Vec3::from(l.color); // already × intensity
     match l.kind {
         LightKind::Directional => {
-            add_sh(s, (-l.direction).normalize_or(Vec3::NEG_Y), col);
+            add_sh_direct(s, (-l.direction).normalize_or(Vec3::NEG_Y), col);
         }
         _ => {
             let to = l.position - p;
@@ -429,7 +436,7 @@ pub fn inject_light(s: &mut [Vec3; 4], p: Vec3, l: &BakeLight) {
                 atten *= sp * sp;
             }
             if atten > 0.0 {
-                add_sh(s, d, col * atten);
+                add_sh_direct(s, d, col * atten);
             }
         }
     }

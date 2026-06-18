@@ -98,6 +98,27 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Selection outline (inverted hull, depth-prepass, always-on-top)
 - [done] Error shader (animated swirl for broken/missing/unknown shaders)
 - [done] VSync toggle (FIFO / MAILBOX / IMMEDIATE)
+- [done] **CPU frustum culling**: each `DrawCmd` carries an object-space bounding-sphere
+  radius (`bound_radius`, from the mesh AABB); the renderer extracts the 6 frustum planes
+  from `proj·view` (Gribb-Hartmann, 0..1 depth) and skips draws whose world sphere is fully
+  outside. Scoped to the **main camera pass** and **per VR eye** (each eye culled against its
+  own view/proj) — the shared draw order still feeds shadows + the reflection cube, which need
+  off-screen geometry. Radius scales by the transform's largest axis (non-uniform scale); a
+  safety net falls back to the full order if culling ever removed everything, so a bad matrix
+  can't blank the viewport.
+- [done] **Reflection-probe cube capture culling fix**: the cube capture renders with a
+  positive-height (non-Y-flipped) viewport, which mirrors winding vs. the main passes, so the
+  standard CCW/BACK pipelines were culling *front* faces (geometry captured inside-out — floors
+  vanished, spheres showed their backs), placing reflections in the wrong spot. The capture now
+  forces no-cull (`double_sided`) for all draws, matching the bake gbuffer pass.
+- [done] **Layer system (Unity-style)**: 32 named layers, a per-object `layer`, a per-camera
+  `culling_mask`, and a symmetric **layer collision matrix** (`LayerSettings` in citrus-core,
+  serialized with the scene). **Physics:** colliders get rapier `InteractionGroups` (membership
+  = layer bit, filter = matrix row) so "layer A ignores B" is honored by the solver.
+  **Rendering:** `LoadedScene::visible_layers` masks draws — the editor viewport's per-layer
+  toggle, or (in a shipped game) the active camera's culling mask. **UI:** Inspector layer
+  dropdown, **Tools → Layers** window (rename layers, edit the collision matrix, toggle
+  viewport visibility), and a Camera "Culling Mask" section. Unit-tested.
 - [done] **Profiler window** (View → Profiler window): a *separate OS window* (own
   surface/swapchain/egui, sharing the GpuContext — `profiler_window.rs`) you can drag to
   another monitor (opens 2× wide), so stats never fill the viewport. Shows **one combined
@@ -393,7 +414,17 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] File browser image thumbnails: image tiles (png/jpg/jpeg/tga/bmp) show a real decoded
   preview in place of the generic image glyph. Decoded + downscaled (`THUMB_MAX`) on demand for
   visible tiles only, cached as textures, budgeted per frame (`THUMB_PER_FRAME`) so opening an
-  image-heavy folder doesn't hitch; undecodable files fall back to the glyph.
+  image-heavy folder doesn't hitch; undecodable files fall back to the glyph. **EXR / `.hdr`
+  thumbnails** are detected as HDR (float color type / extension) and **tonemapped (ACES) +
+  sRGB-encoded** before downscale — previously a raw linear→u8 clamp read black/blown-out, so
+  HDR previews now match the in-engine look.
+- [done] **Material sphere previews**: `.material` tiles render the material **on a lit sphere**
+  (Unity/Unreal content-browser style) instead of a generic glyph. A self-contained CPU shader
+  parses the material's PBR params from the RON (`base_color`, `metallic`, `roughness`,
+  emission) and shades a unit sphere with a key light + Blinn specular + faux-sky reflection
+  (tonemapped + sRGB), so colour/metalness/glossiness/emission are all visible. Cached + frame-
+  budgeted like image thumbnails, and **re-rendered when the material's mtime changes** so an
+  edit refreshes the tile.
 - [done] File browser tile-size slider (top bar): scales tiles + icons/previews live
   (`tile_px`), so previews can be enlarged for a closer look.
 - [done] Status bar shows the selected file's full name (with project-relative path on hover),
@@ -458,8 +489,11 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (game) the engine builds a rapier world: colliders become cuboid/ball shapes (Mesh ->
   AABB cuboid), `RigidBody` objects get that body kind, collider-only objects become fixed
   (static) bodies, steps it under gravity each frame, and writes the simulated transforms
-  back. Foundational slice; still todo: joints, layer-collision matrix, queries
-  (raycast/overlap), trigger events, CCD tuning, parented-body world↔local conversion.
+  back. **Layer-collision matrix** (done): colliders carry rapier `InteractionGroups` from the
+  scene's `LayerSettings` (membership = the object's layer bit, filter = its collision-matrix
+  row), so the Unity-style "which layers collide" matrix is enforced by the solver. Still todo:
+  joints, queries (raycast/overlap), trigger events, CCD tuning, parented-body world↔local
+  conversion.
 
 ---
 

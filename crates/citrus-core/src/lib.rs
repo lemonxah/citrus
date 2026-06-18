@@ -599,6 +599,12 @@ impl ComponentRegistry {
     /// Deserialize a saved component. Unknown names and broken data log a
     /// warning and return None so scene loads survive missing components.
     pub fn load(&self, name: &str, data: &str) -> Option<Box<dyn Component>> {
+        // Backward-compat aliases for renamed components, so older `.scene` files
+        // still load. ("Flux VR Light" was renamed to "FluxVoxel Light".)
+        let name = match name {
+            "Flux VR Light" => "FluxVoxel Light",
+            other => other,
+        };
         let Some(entry) = self.entries.iter().find(|e| e.name == name) else {
             tracing::warn!("unknown component {name:?}; dropping it");
             return None;
@@ -627,6 +633,10 @@ pub struct CameraComponent {
     pub fov_deg: f32,
     pub near: f32,
     pub far: f32,
+    /// Layer culling mask (Unity-style): a bit per layer; this camera only
+    /// renders objects whose layer bit is set. Default = all layers.
+    #[serde(default = "all_layers_mask")]
+    pub culling_mask: u32,
 }
 
 impl Default for CameraComponent {
@@ -636,7 +646,110 @@ impl Default for CameraComponent {
             fov_deg: 60.0,
             near: 0.1,
             far: 100.0,
+            culling_mask: all_layers_mask(),
         }
+    }
+}
+
+/// Default layer mask: every layer visible / collidable.
+pub fn all_layers_mask() -> u32 {
+    u32::MAX
+}
+
+/// Box-projected (parallax-corrected) reflection direction — the **reference
+/// implementation** the `standard.frag` reflection-probe block must match. Given a
+/// surface at `world_pos` reflecting along `refl_dir`, and a probe whose box is
+/// centred at `center` with half-extents `half` (and whose cubemap was captured
+/// from `center`), it intersects the reflection ray with the box and re-vectors
+/// from the capture centre, so a flat surface lines the reflection up with the
+/// captured environment instead of treating the cube as infinitely distant.
+///
+/// Kept here (egui-free, glam-only) so the math is **unit-tested** independently of
+/// the GPU — `cargo test -p citrus-core box_projection` verifies the algorithm, and
+/// any divergence between this and the shader is a bug in one of them.
+pub fn box_project_reflection(world_pos: Vec3, refl_dir: Vec3, center: Vec3, half: Vec3) -> Vec3 {
+    let bmin = center - half;
+    let bmax = center + half;
+    let inv_r = refl_dir.recip();
+    let t1 = (bmax - world_pos) * inv_r;
+    let t2 = (bmin - world_pos) * inv_r;
+    let tmax = t1.max(t2);
+    let dist = tmax.x.min(tmax.y).min(tmax.z);
+    let hit = world_pos + refl_dir * dist;
+    hit - center
+}
+
+/// Number of object layers (Unity-style: a 32-bit mask, one bit per layer).
+pub const NUM_LAYERS: usize = 32;
+
+/// Project-wide layer configuration: layer names + a symmetric layer-collision
+/// matrix (Unity's "Layer Collision Matrix"). Drives both physics (which layers
+/// collide) and rendering (per-camera culling masks). Serialized with the scene.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayerSettings {
+    /// Display name per layer index. Empty string = unnamed (shown as "Layer N").
+    pub names: Vec<String>,
+    /// `collision[i]` is the bitmask of layers that layer `i` collides with.
+    /// Kept symmetric (`collide(a,b) == collide(b,a)`).
+    pub collision: Vec<u32>,
+}
+
+impl Default for LayerSettings {
+    fn default() -> Self {
+        let mut names = vec![String::new(); NUM_LAYERS];
+        names[0] = "Default".to_string();
+        Self {
+            names,
+            collision: vec![u32::MAX; NUM_LAYERS],
+        }
+    }
+}
+
+impl LayerSettings {
+    /// Whether two layers collide (defaults to true for out-of-range indices).
+    pub fn collide(&self, a: u8, b: u8) -> bool {
+        self.collision
+            .get(a as usize)
+            .is_none_or(|m| m & (1u32 << (b as u32 & 31)) != 0)
+    }
+
+    /// Set (symmetrically) whether layers `a` and `b` collide.
+    pub fn set_collide(&mut self, a: u8, b: u8, on: bool) {
+        for (x, y) in [(a, b), (b, a)] {
+            if let Some(m) = self.collision.get_mut(x as usize) {
+                let bit = 1u32 << (y as u32 & 31);
+                if on {
+                    *m |= bit;
+                } else {
+                    *m &= !bit;
+                }
+            }
+        }
+    }
+
+    /// Display name for a layer index ("Layer N" when unnamed).
+    pub fn layer_name(&self, i: u8) -> String {
+        self.names
+            .get(i as usize)
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("Layer {i}"))
+    }
+
+    /// The collision filter mask for objects on `layer` (which layers it hits).
+    pub fn collision_mask(&self, layer: u8) -> u32 {
+        self.collision.get(layer as usize).copied().unwrap_or(u32::MAX)
+    }
+
+    /// Repair a deserialized value that's missing entries (short vecs from an
+    /// older/edited file) so indexing 0..NUM_LAYERS is always safe.
+    pub fn normalized(mut self) -> Self {
+        self.names.resize(NUM_LAYERS, String::new());
+        self.collision.resize(NUM_LAYERS, u32::MAX);
+        if self.names[0].is_empty() {
+            self.names[0] = "Default".to_string();
+        }
+        self
     }
 }
 
@@ -942,7 +1055,7 @@ impl Default for FluxVrLight {
 }
 
 impl TypedComponent for FluxVrLight {
-    const NAME: &'static str = "Flux VR Light";
+    const NAME: &'static str = "FluxVoxel Light";
 }
 
 /// A FluxVR voxel light volume: a box (centred on the object, `size` local
@@ -1598,5 +1711,77 @@ impl TypedComponent for Sync {
                 ctx.request_ownership();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+
+    #[test]
+    fn default_layers_all_collide_and_named() {
+        let s = LayerSettings::default();
+        assert_eq!(s.layer_name(0), "Default");
+        assert_eq!(s.layer_name(5), "Layer 5"); // unnamed fallback
+        assert!(s.collide(0, 0));
+        assert!(s.collide(3, 7));
+        assert_eq!(s.collision_mask(0), u32::MAX);
+    }
+
+    #[test]
+    fn set_collide_is_symmetric() {
+        let mut s = LayerSettings::default();
+        s.set_collide(1, 2, false);
+        assert!(!s.collide(1, 2));
+        assert!(!s.collide(2, 1)); // symmetric
+        assert!(s.collide(1, 3)); // others unaffected
+        s.set_collide(1, 2, true);
+        assert!(s.collide(1, 2));
+        assert!(s.collide(2, 1));
+    }
+
+    #[test]
+    fn box_projection_at_center_is_identity() {
+        // A fragment AT the capture centre: the box-projected vector points the
+        // same way as the reflection ray (just scaled to the box face).
+        let c = Vec3::ZERO;
+        let h = Vec3::splat(5.0);
+        for r in [Vec3::X, Vec3::Y, Vec3::Z, Vec3::new(1.0, 2.0, -3.0).normalize()] {
+            let out = box_project_reflection(Vec3::ZERO, r, c, h).normalize();
+            assert!(
+                out.dot(r) > 0.999,
+                "center reflection should be unchanged: {r:?} -> {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn box_projection_corrects_off_center_parallax() {
+        // A fragment near the +X wall reflecting straight UP should hit the box
+        // ceiling AHEAD of it (still +X-leaning), not straight up — that offset is
+        // exactly the parallax correction a plain infinite cube would miss.
+        let c = Vec3::ZERO;
+        let h = Vec3::splat(5.0);
+        let p = Vec3::new(4.0, 0.0, 0.0);
+        let out = box_project_reflection(p, Vec3::Y, c, h);
+        // Ray exits the top at (4, 5, 0); re-vectored from centre that's (4, 5, 0).
+        assert!((out - Vec3::new(4.0, 5.0, 0.0)).length() < 1e-3, "got {out:?}");
+        assert!(out.x > 0.0, "parallax must keep the +X lean: {out:?}");
+    }
+
+    #[test]
+    fn box_projection_hits_facing_wall() {
+        // Reflecting toward +X from the centre lands on the +X wall.
+        let out = box_project_reflection(Vec3::ZERO, Vec3::X, Vec3::ZERO, Vec3::splat(5.0));
+        assert!((out - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-3, "got {out:?}");
+    }
+
+    #[test]
+    fn normalized_repairs_short_vecs() {
+        let s = LayerSettings { names: vec![], collision: vec![] }.normalized();
+        assert_eq!(s.names.len(), NUM_LAYERS);
+        assert_eq!(s.collision.len(), NUM_LAYERS);
+        assert_eq!(s.names[0], "Default");
+        assert!(s.collide(10, 20)); // filled with full-collision default
     }
 }

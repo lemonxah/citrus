@@ -1124,12 +1124,22 @@ fn denoise_atrous(pixels: &mut Vec<f32>, pos: &[f32], nrm: &[f32], size: u32, it
                         let wp = if inv2h2 > 0.0 { (-d2 * inv2h2).exp() } else { 1.0 };
                         let ndot =
                             (nrm[ni] * n0[0] + nrm[ni + 1] * n0[1] + nrm[ni + 2] * n0[2]).max(0.0);
+                        // Normal edge-stop. The exponent sets how fast the blur
+                        // cuts off as normals diverge. `pow(32)` was far too tight
+                        // (it stopped at ~15-20°), so a low-poly surface with
+                        // smoothly-varying interpolated normals baked with hard
+                        // faceted edges between faces. `pow(8)` blurs across
+                        // moderate curvature (≈30-40°) for a smooth lightmap while
+                        // still cutting hard at real corners (90° → ndot 0). This
+                        // is why the realtime (interpolated-normal) GI looked smooth
+                        // but the baked lightmap showed clear polygon edges.
+                        let wn = ndot.powf(8.0);
                         // Luminance edge-stop (relative, scale-invariant): smooths
                         // similar-brightness noise but preserves lighting edges
                         // (shadow boundaries, falloff) on flat surfaces. Without
                         // this the denoiser washes shadows/gradients away.
                         let wl = (-(lum(ni) - l0).abs() / (0.6 * (l0 + 0.02))).exp();
-                        let w = wk * wp * ndot.powf(32.0) * wl;
+                        let w = wk * wp * wn * wl;
                         sum[0] += src[ni] * w;
                         sum[1] += src[ni + 1] * w;
                         sum[2] += src[ni + 2] * w;

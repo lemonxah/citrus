@@ -667,9 +667,18 @@ void main() {
     // (a directional fallback when the scene has no light objects).
     int light_count = int(frame.misc.y + 0.5);
     vec3 color = vec3(0.0);
+    bool has_lightmap = pc.params1.w >= 0.0;
     for (int i = 0; i < light_count && i < MAX_LIGHTS; ++i) {
         Light light = frame.lights[i];
         int kind = int(light.pos_kind.w + 0.5);
+        // Baked/Mixed light (flagged spot.y<0 & spot.w>0): its energy is already
+        // in the lightmap, so skip it for lightmapped (static) surfaces, but DO
+        // apply it to non-lightmapped objects (dynamic / added-after-bake) so they
+        // aren't black in a baked scene. Realtime lights are never skipped.
+        bool light_baked = light.spot.y < 0.0 && light.spot.w > 0.5;
+        if (light_baked && has_lightmap) {
+            continue;
+        }
 
         // Direction to the light + distance-based attenuation.
         vec3 L;
@@ -808,21 +817,21 @@ void main() {
     // roughness-correct specular that doesn't blow out to a harsh mirror band at
     // grazing angles on rough/dielectric surfaces.
     vec2 env_ab = env_brdf_approx(roughness, NdotV);
-    // Per-material reflection strength (fx.parallax.y, default 1). Scales the env
-    // reflection here AND the gbuffer reflectivity below, so the deferred SSR/RT
-    // resolve tracks it too — letting reflections be mixed/dialled per material.
+    // Reflection strength (fx.parallax.y, default 1) scales the env reflection
+    // here AND the gbuffer reflectivity below so the deferred SSR/RT resolve
+    // tracks it. Reflection *technique* (Probes / SSR / Ray-traced) is a GLOBAL
+    // scene setting (Environment → Reflections), NOT a per-material toggle — UE
+    // does the same (reflection method is a post-process/project setting, not a
+    // material checkbox), so the old per-material SSR/RT gate was removed.
     float refl_strength = fx.parallax.y;
     vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao * refl_strength;
     color += reflectance * spec_env;
     // SSR G-buffer: octahedral view-space normal (rg) + roughness (b) + a scalar
     // reflectivity (a, the env-reflection weight's luminance). The resolve pass
-    // uses the stored normal directly for an exact reflection ray.
+    // uses the stored normal directly for an exact reflection ray. The global
+    // reflection mode decides whether the resolve runs at all.
     vec3 Nv = normalize(mat3(frame.view) * N);
-    // Per-material screen-space/RT toggle (fx.parallax.z, default 1). When 0 the
-    // deferred SSR/RT resolve skips this material (reflectivity 0) but the forward
-    // env-cube reflection above stays — so reflection TECHNIQUE mixes per material.
-    float reflectivity =
-        dot(reflectance, vec3(0.2126, 0.7152, 0.0722)) * fx.parallax.z;
+    float reflectivity = dot(reflectance, vec3(0.2126, 0.7152, 0.0722));
     o_gbuf = vec4(oct_encode(Nv), roughness, reflectivity);
 
     if (FEAT_EMISSION) {

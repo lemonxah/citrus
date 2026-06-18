@@ -153,7 +153,9 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 .map(|t| t.into_f32().collect())
                 .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
             // Second UV set = lightmap UVs; fall back to the primary set when
-            // the model has no TEXCOORD_1.
+            // the model has no TEXCOORD_1. `real_uv1` distinguishes a genuine
+            // non-overlapping lightmap UV from the uv0 fallback (not bakeable).
+            let real_uv1 = reader.read_tex_coords(1).is_some();
             let uvs1: Vec<[f32; 2]> = reader
                 .read_tex_coords(1)
                 .map(|t| t.into_f32().collect())
@@ -198,7 +200,15 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 .map(|i| i.into_u32().collect())
                 .unwrap_or_else(|| (0..vertices.len() as u32).collect());
 
-            scene.meshes.push(MeshData { vertices, indices });
+            // A real TEXCOORD_1 is a lightmap UV; otherwise uv1 falls back to uv0,
+            // which is still bakeable IF uv0 is a non-overlapping atlas (most
+            // models). Only genuinely overlapping/tiled uv0 needs a generated set.
+            // A real TEXCOORD_1 is a lightmap UV; otherwise uv1 falls back to uv0,
+            // which is still bakeable IF uv0 is a non-overlapping atlas (most
+            // models). Only genuinely overlapping/tiled uv0 needs a generated set.
+            let has_lightmap_uv =
+                real_uv1 || crate::lightmap_uv::uv0_is_lightmappable(&vertices, &indices);
+            scene.meshes.push(MeshData { vertices, indices, has_lightmap_uv });
             let material = primitive.material().index().unwrap_or(default_material);
             primitive_map.insert(
                 (mesh.index(), primitive.index()),

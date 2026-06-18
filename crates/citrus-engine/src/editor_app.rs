@@ -156,11 +156,13 @@ pub fn run(config: AppConfig) -> Result<()> {
         net_addr: "127.0.0.1:9000".to_string(),
         show_bindings: false,
         show_network: false,
+        show_layers: false,
         rebinding: None,
         last_cursor: None,
         viewport_rect: egui::Rect::EVERYTHING,
         project_root,
         current_scene_path: None,
+        pending_lm_uv_models: None,
         scene_name_input: "scenes/world.scene".into(),
         show_stats: true,
         show_stats_overlay: false,
@@ -455,6 +457,16 @@ enum EditorAction {
     BakeLighting,
     /// Discard the baked lighting result.
     ClearBake,
+    /// Re-run lightmap-UV generation for every model with a `.lmuv` marker (picks
+    /// up the current unwrapper) by reloading the scene.
+    RegenerateLightmapUvs,
+    /// Generate lightmap UVs for ALL static models that lack a usable one (mark +
+    /// reload), so the whole scene becomes bakeable in one click.
+    GenerateAllLightmapUvs,
+    /// Enable (true) or disable (false) auto-generated lightmap UVs for one model
+    /// — writes/removes its `.lmuv` marker, then reloads. `true` generates UVs for
+    /// the model's meshes that need them; `false` reverts to the model's own uv0.
+    SetLightmapUvGen(String, bool),
     /// Scaffold a new project under `parent/<name>` and switch to it.
     NewProject { parent: PathBuf, name: String },
     /// Open (switch to) an existing project folder.
@@ -814,6 +826,8 @@ struct EngineApp {
     show_bindings: bool,
     /// Network panel open.
     show_network: bool,
+    /// Layers settings (names + collision matrix) window open.
+    show_layers: bool,
     /// Action currently being rebound in the Bindings window (scheme, action,
     /// slot). The next key/mouse press is captured into it.
     rebinding: Option<(usize, String)>,
@@ -822,6 +836,10 @@ struct EngineApp {
     viewport_rect: egui::Rect,
     project_root: PathBuf,
     current_scene_path: Option<PathBuf>,
+    /// Models (project-relative paths) that the in-progress bake found without a
+    /// lightmap UV. `Some` shows a modal asking whether to generate one; cleared
+    /// when the user picks an option.
+    pending_lm_uv_models: Option<Vec<String>>,
     scene_name_input: String,
     show_stats: bool,
     /// Desired state of the separate profiler window (persisted). Reconciled
@@ -1721,9 +1739,13 @@ impl EngineApp {
         tracing::info!("after_scene_loaded: bake {:?}", t1.elapsed());
         let t2 = Instant::now();
 
-        // Reflection env: prefer a disk-baked `.reflprobe`; else capture from the
-        // first reflection-probe zone (the capture itself is deferred to a render).
-        if self.load_reflection_bake() {
+        // Reflection env: a Baked-mode probe loads its `.reflprobe` sidecar; a
+        // Realtime-mode probe (the default) always captures live, so the on-disk
+        // sidecar can never go stale relative to the scene or to engine/capture
+        // fixes. (Previously any existing sidecar was loaded regardless of mode,
+        // so a stale capture masked every later fix until a manual re-bake.)
+        let use_baked = self.scene.has_baked_reflection_probe();
+        if use_baked && self.load_reflection_bake() {
             self.set_load_status("Loading reflection probe…");
         } else if let Some(center) = self
             .scene
@@ -3085,6 +3107,57 @@ impl EngineApp {
                     self.upload_baked_probes();
                     tracing::info!("cleared baked lighting");
                 }
+                EditorAction::RegenerateLightmapUvs => {
+                    // Markers already exist; reloading re-imports each model and
+                    // re-runs the (current) unwrapper.
+                    if self.playing {
+                        self.set_status("Stop play mode to regenerate UVs", false);
+                    } else if self.scene_dirty {
+                        self.set_status("Save the scene first to regenerate UVs", false);
+                    } else if let Some(scene) = self.current_scene_path.clone() {
+                        self.load_scene_runtime(&scene);
+                        self.set_status("Regenerated lightmap UVs", false);
+                    }
+                }
+                EditorAction::GenerateAllLightmapUvs => {
+                    let models = self.scene.models_needing_lightmap_uv();
+                    for m in &models {
+                        if let Err(e) =
+                            citrus_assets::set_lightmap_uv_marker(self.project_root.join(m), true)
+                        {
+                            tracing::error!("writing lightmap-UV marker for {m}: {e:#}");
+                        }
+                    }
+                    if self.playing {
+                        self.set_status("Stop play mode, then reload", false);
+                    } else if self.scene_dirty {
+                        self.set_status("Save the scene first, then reload", false);
+                    } else if let Some(scene) = self.current_scene_path.clone() {
+                        self.load_scene_runtime(&scene);
+                        self.set_status(
+                            format!("Generated lightmap UVs for {} model(s)", models.len()),
+                            false,
+                        );
+                    }
+                }
+                EditorAction::SetLightmapUvGen(path, on) => {
+                    if let Err(e) =
+                        citrus_assets::set_lightmap_uv_marker(self.project_root.join(&path), on)
+                    {
+                        tracing::error!("setting lightmap-UV marker for {path}: {e:#}");
+                    }
+                    if self.playing {
+                        self.set_status("Stop play mode, then reload", false);
+                    } else if self.scene_dirty {
+                        self.set_status("Save the scene first, then reload", false);
+                    } else if let Some(scene) = self.current_scene_path.clone() {
+                        self.load_scene_runtime(&scene);
+                        self.set_status(
+                            if on { "Generated lightmap UVs" } else { "Reverted to model UVs" },
+                            false,
+                        );
+                    }
+                }
                 EditorAction::NewProject { parent, name } => {
                     self.set_status(format!("creating project {name}…"), true);
                     match bundle::scaffold_project(&parent, &name) {
@@ -3366,6 +3439,10 @@ impl EngineApp {
                     }
                     if ui.button("Network…").clicked() {
                         self.show_network = true;
+                        ui.close();
+                    }
+                    if ui.button("Layers…").clicked() {
+                        self.show_layers = true;
                         ui.close();
                     }
                     ui.separator();
@@ -3778,6 +3855,18 @@ impl EngineApp {
     /// Start a chunked lighting bake (one unit/frame; see `step_bake`). No-op if
     /// one is already running or the GPU can't ray trace.
     fn start_bake(&mut self) {
+        // Before baking, check for static models that have no lightmap UV (uv1 is
+        // a uv0 fallback → would bake garbage, so the bake skips them). If any,
+        // ask the user whether to generate a non-overlapping unwrap first.
+        let needs = self.scene.models_needing_lightmap_uv();
+        if !needs.is_empty() {
+            self.pending_lm_uv_models = Some(needs);
+            return; // the modal (lightmap_uv_window) drives what happens next
+        }
+        self.do_bake();
+    }
+
+    fn do_bake(&mut self) {
         use crate::tasks::{BakePhase, NotifyLevel, TaskKind, TaskProgress};
         if self.bake_job.is_some() {
             self.tasks.notify("Bake already running", NotifyLevel::Info);
@@ -4392,6 +4481,188 @@ impl EngineApp {
     /// runtime (play-mode) scene switches and Stop-restore. Does not run start
     /// Input Bindings window (2C): pick the active control scheme, view/clear
     /// each action's bindings, and rebind by capturing the next key/mouse press.
+    /// Layers settings (Unity-style): edit the 32 layer names, the symmetric
+    /// collision matrix (which layers collide in physics), and toggle per-layer
+    /// viewport visibility (the editor's render culling). Stored in the scene.
+    fn layers_window(&mut self, ctx: &egui::Context) {
+        use citrus_core::NUM_LAYERS;
+        let mut open = self.show_layers;
+        egui::Window::new("Layers")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Layer names, the physics collision matrix, and viewport visibility. \
+                         Assign an object's layer in the Inspector. Saved with the scene.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.separator();
+                // Highest layer index actually in use (+a couple spare rows), so
+                // the matrix stays compact instead of always showing all 32.
+                let max_used = self
+                    .scene
+                    .objects
+                    .iter()
+                    .map(|o| o.layer as usize)
+                    .max()
+                    .unwrap_or(0);
+                let shown = (max_used + 2).clamp(4, NUM_LAYERS);
+
+                egui::ScrollArea::both().max_height(440.0).show(ui, |ui| {
+                    ui.heading("Names & visibility");
+                    egui::Grid::new("layer-names").striped(true).show(ui, |ui| {
+                        ui.label("#");
+                        ui.label("Name");
+                        ui.label("Visible");
+                        ui.end_row();
+                        for l in 0..shown {
+                            ui.label(format!("{l}"));
+                            let name = self
+                                .scene
+                                .layers
+                                .names
+                                .get_mut(l)
+                                .map(|s| s as &mut String);
+                            if let Some(name) = name {
+                                // Layer 0 ("Default") keeps its name fixed.
+                                ui.add_enabled(l != 0, egui::TextEdit::singleline(name));
+                            } else {
+                                ui.label("-");
+                            }
+                            let bit = 1u32 << (l as u32 & 31);
+                            let mut vis = self.scene.visible_layers & bit != 0;
+                            if ui.checkbox(&mut vis, "").changed() {
+                                if vis {
+                                    self.scene.visible_layers |= bit;
+                                } else {
+                                    self.scene.visible_layers &= !bit;
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("Collision matrix");
+                    ui.label(
+                        egui::RichText::new("Checked = the two layers collide (physics).")
+                            .weak()
+                            .small(),
+                    );
+                    egui::Grid::new("layer-matrix").striped(true).show(ui, |ui| {
+                        // Header row: blank corner + column labels.
+                        ui.label("");
+                        for c in 0..shown {
+                            ui.label(egui::RichText::new(format!("{c}")).small());
+                        }
+                        ui.end_row();
+                        for r in 0..shown {
+                            ui.label(
+                                egui::RichText::new(self.scene.layers.layer_name(r as u8)).small(),
+                            );
+                            for c in 0..shown {
+                                // Lower triangle only (symmetric); blank the rest.
+                                if c > r {
+                                    ui.label("");
+                                    continue;
+                                }
+                                let mut on = self.scene.layers.collide(r as u8, c as u8);
+                                if ui.checkbox(&mut on, "").changed() {
+                                    self.scene.layers.set_collide(r as u8, c as u8, on);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+
+                ui.separator();
+                if ui.button("Reset to defaults").clicked() {
+                    self.scene.layers = citrus_core::LayerSettings::default();
+                    self.scene.visible_layers = citrus_core::all_layers_mask();
+                }
+            });
+        self.show_layers = open;
+    }
+
+    /// Modal shown when a bake found static models without a lightmap UV. Offers
+    /// to generate a non-overlapping unwrap (persisted via a `.lmuv` marker, then
+    /// reproduced on reload), bake without them, or cancel.
+    fn lightmap_uv_window(&mut self, ctx: &egui::Context) {
+        let Some(models) = self.pending_lm_uv_models.clone() else {
+            return;
+        };
+        let mut choice: Option<u8> = None;
+        egui::Window::new("Generate Lightmap UVs?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(
+                    "These models have no lightmap UV (second UV set). Baking their \
+                     overlapping texture UVs would produce a garbage lightmap, so the \
+                     bake skips them:",
+                );
+                for m in &models {
+                    ui.label(format!("  • {m}"));
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Generate a non-overlapping lightmap UV for them? It's saved as a \
+                         .lmuv marker next to the model and regenerated on load, so it \
+                         persists. (Re-imports the scene.)",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Generate UVs & Reload").clicked() {
+                        choice = Some(0);
+                    }
+                    if ui.button("Bake Without Them").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(2);
+                    }
+                });
+            });
+        match choice {
+            Some(0) => {
+                self.pending_lm_uv_models = None;
+                for m in &models {
+                    if let Err(e) =
+                        citrus_assets::set_lightmap_uv_marker(self.project_root.join(m), true)
+                    {
+                        tracing::error!("writing lightmap-UV marker for {m}: {e:#}");
+                    }
+                }
+                if self.playing {
+                    self.set_status("Stop play mode, then bake again", false);
+                } else if self.scene_dirty {
+                    self.set_status("Save the scene first, then bake again", false);
+                } else if let Some(scene) = self.current_scene_path.clone() {
+                    self.load_scene_runtime(&scene);
+                    self.set_status("Generated lightmap UVs — click Bake again", false);
+                } else {
+                    self.set_status("Save the scene first, then bake again", false);
+                }
+            }
+            Some(1) => {
+                self.pending_lm_uv_models = None;
+                self.do_bake();
+            }
+            Some(2) => self.pending_lm_uv_models = None,
+            _ => {}
+        }
+    }
+
     /// Saves to `project.citrus` on every change.
     fn bindings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_bindings;
@@ -6162,6 +6433,8 @@ impl EngineApp {
             self.project_windows(ctx);
             self.bindings_window(ctx);
             self.network_window(ctx);
+            self.layers_window(ctx);
+            self.lightmap_uv_window(ctx);
             self.busy_overlay(ctx);
             self.bake_modal(ctx);
             self.status_bar(ctx);
@@ -6196,6 +6469,11 @@ impl EngineApp {
             // (now Flux-traced) preview render.
             self.camera_tab_visible = false;
             self.viewport_visible = false;
+            // Models whose lightmap UVs were auto-generated (.lmuv marker), for the
+            // FluxBaker "Generated Lightmap UVs" list. Computed before the mutable
+            // scene borrow below.
+            let generated_uv_models =
+                self.scene.models_with_generated_lightmap_uv(&self.project_root);
             let mut tabs = EditorTabs {
                 camera_visible: &mut self.camera_tab_visible,
                 viewport_visible: &mut self.viewport_visible,
@@ -6238,6 +6516,7 @@ impl EngineApp {
                 handle_drag: &mut self.handle_drag,
                 can_bake,
                 lightmap_preview: &mut self.lightmap_preview,
+                generated_uv_models: &generated_uv_models,
                 selected_material_slot: &mut self.selected_material_slot,
             };
             DockArea::new(&mut dock_state)
@@ -6398,9 +6677,13 @@ impl EngineApp {
                 cast_shadows: true,
                 soft_shadows: true,
                 shadow_bias: 0.003,
+                baked: false,
             });
         }
         lights.extend(self.scene.gather_lights());
+        // Full light set (incl. baked) for the reflection-probe cube capture, so
+        // a baked scene's reflections aren't captured in the dark.
+        let capture_lights = self.scene.gather_lights_all();
         let world_light = LightData {
             direction: Vec3::from(env.sun_direction).normalize_or(Vec3::NEG_Y),
             color: env.sun_color,
@@ -6492,6 +6775,7 @@ impl EngineApp {
             },
             light: world_light,
             lights: &lights,
+            capture_lights: &capture_lights,
             camera_preview,
             draw_skybox: env.skybox_enabled,
             shadow_pcf_texel,
@@ -6716,6 +7000,9 @@ struct EditorTabs<'a> {
     can_bake: bool,
     /// Baker tab: lightmap-UV checker preview toggle.
     lightmap_preview: &'a mut bool,
+    /// Baker tab: model paths whose lightmap UVs were auto-generated (a `.lmuv`
+    /// marker exists), so they can be regenerated/reverted. Computed per frame.
+    generated_uv_models: &'a [String],
     /// Inspector: selected material slot of the current object (multi-material).
     selected_material_slot: &'a mut usize,
 }
@@ -7468,6 +7755,64 @@ impl EditorTabs<'_> {
                 });
 
                 ui.separator();
+                ui.label(RichText::new("Lightmap UVs").strong());
+                let needing = self.scene.models_needing_lightmap_uv();
+                if !needing.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} model(s) have no usable lightmap UV (the bake skips them):",
+                            needing.len()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    for m in &needing {
+                        ui.label(RichText::new(format!("  • {m}")).small());
+                    }
+                    if ui
+                        .button("⚙ Generate lightmap UVs for these")
+                        .on_hover_text(
+                            "Auto-unwrap a non-overlapping lightmap UV for each model that needs \
+                             one (saved as a .lmuv marker; reloads the scene).",
+                        )
+                        .clicked()
+                    {
+                        self.actions.push(EditorAction::GenerateAllLightmapUvs);
+                    }
+                }
+                if !self.generated_uv_models.is_empty() {
+                    ui.label(RichText::new("Generated (auto-unwrapped):").small().strong());
+                    for m in self.generated_uv_models {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("• {m}")).small());
+                            if ui
+                                .small_button("Revert")
+                                .on_hover_text("Remove the generated UVs; use the model's own uv0.")
+                                .clicked()
+                            {
+                                self.actions
+                                    .push(EditorAction::SetLightmapUvGen(m.clone(), false));
+                            }
+                        });
+                    }
+                    if ui
+                        .button("↻ Regenerate all")
+                        .on_hover_text(
+                            "Re-run the unwrapper on every generated model (picks up unwrapper \
+                             improvements). Reloads the scene.",
+                        )
+                        .clicked()
+                    {
+                        self.actions.push(EditorAction::RegenerateLightmapUvs);
+                    }
+                }
+                if needing.is_empty() && self.generated_uv_models.is_empty() {
+                    ui.label(
+                        RichText::new("All models have usable lightmap UVs.").small().weak(),
+                    );
+                }
+
+                ui.separator();
                 ui.label(RichText::new("Status").strong());
                 match summary {
                     Some((lm, probes, max)) => {
@@ -7717,105 +8062,6 @@ impl EditorTabs<'_> {
                                             });
                                     });
                                 });
-                            egui::CollapsingHeader::new("Reflections")
-                                .id_salt("citrus-flux-ssr")
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Model");
-                                        let label = match gi.reflection_mode {
-                                            0 => "Environment only",
-                                            2 => "Ray-traced (1 bounce)",
-                                            _ => "Screen-space (SSR)",
-                                        };
-                                        egui::ComboBox::from_id_salt("citrus-refl-model")
-                                            .selected_text(label)
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(&mut gi.reflection_mode, 0, "Environment only");
-                                                ui.selectable_value(&mut gi.reflection_mode, 1, "Screen-space (SSR)");
-                                                ui.selectable_value(&mut gi.reflection_mode, 2, "Ray-traced (1 bounce)");
-                                            });
-                                    });
-                                    if gi.reflection_mode == 2 {
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Ray-traced traces real geometry (no SSR artifacts). \
-                                                 Needs a GPU with ray query; falls back to SSR if \
-                                                 unavailable. Rides on Flux (the depth prepass).",
-                                            )
-                                            .small()
-                                            .weak(),
-                                        );
-                                    }
-                                    // SSR-specific knobs (shared intensity/roughness also tune RT).
-                                    gi.ssr_enabled = gi.reflection_mode == 1;
-                                    ui.add_enabled_ui(gi.reflection_mode != 0, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Intensity");
-                                            ui.add(egui::Slider::new(&mut gi.ssr_intensity, 0.0..=2.0))
-                                                .on_hover_text("Reflection strength multiplier.");
-                                        });
-                                        ui.horizontal(|ui| {
-                                            ui.label("Max distance");
-                                            ui.add(
-                                                egui::Slider::new(&mut gi.ssr_max_distance, 1.0..=200.0)
-                                                    .suffix(" m"),
-                                            )
-                                            .on_hover_text("Max view-space ray distance.");
-                                        });
-                                        ui.horizontal(|ui| {
-                                            ui.label("Roughness cutoff");
-                                            ui.add(egui::Slider::new(
-                                                &mut gi.ssr_roughness_cutoff,
-                                                0.0..=1.0,
-                                            ))
-                                            .on_hover_text(
-                                                "Surfaces rougher than this skip SSR (the cheap \
-                                                 ambient-specular env carries them instead).",
-                                            );
-                                        });
-                                    });
-                                    // Reflection probes: box-projected cubemap
-                                    // captures (independent of the SSR/RT model
-                                    // above — they mix). Captured once on load;
-                                    // refresh after moving scene geometry.
-                                    ui.separator();
-                                    ui.label(
-                                        RichText::new("Reflection Probes")
-                                            .small()
-                                            .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(
-                                            "Add a Reflection Probe component to an object for a \
-                                             box-projected cubemap. Recapture after editing the scene.",
-                                        )
-                                        .small()
-                                        .weak(),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .button("Recapture")
-                                            .on_hover_text(
-                                                "Re-render the active probe's cubemap from the \
-                                                 current scene (this session only).",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.actions.push(EditorAction::RecaptureReflections);
-                                        }
-                                        if ui
-                                            .button("Bake to disk")
-                                            .on_hover_text(
-                                                "Recapture, then persist the cube as a \
-                                                 .reflprobe sidecar — loaded on scene open \
-                                                 (baked reflection probe).",
-                                            )
-                                            .clicked()
-                                        {
-                                            self.actions.push(EditorAction::BakeReflections);
-                                        }
-                                    });
-                                });
                         });
                     });
                     if baked {
@@ -7825,6 +8071,106 @@ impl EditorTabs<'_> {
                                 .weak(),
                         );
                     }
+
+                    // Reflections: a dedicated Environment section (NOT under GI),
+                    // matching Unreal where reflection method is a global scene
+                    // setting, not a per-material toggle. Type = how specular
+                    // reflections are produced for the whole scene.
+                    ui.separator();
+                    egui::CollapsingHeader::new("Reflections")
+                        .id_salt("citrus-env-reflections")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            let gi = &mut env.realtime_gi;
+                            ui.horizontal(|ui| {
+                                ui.label("Type");
+                                let label = match gi.reflection_mode {
+                                    1 => "Screen-space (SSR)",
+                                    2 => "Ray-traced",
+                                    _ => "Reflection Probes",
+                                };
+                                egui::ComboBox::from_id_salt("citrus-refl-type")
+                                    .selected_text(label)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut gi.reflection_mode, 0, "Reflection Probes")
+                                            .on_hover_text(
+                                                "Box-projected cubemap probes, with the env / \
+                                                 skylight cube as the fallback. Cheapest, works \
+                                                 everywhere.",
+                                            );
+                                        ui.selectable_value(&mut gi.reflection_mode, 1, "Screen-space (SSR)")
+                                            .on_hover_text(
+                                                "Screen-space reflections layered over the probe / \
+                                                 env base; off-screen rays fall back to the probes.",
+                                            );
+                                        ui.selectable_value(&mut gi.reflection_mode, 2, "Ray-traced")
+                                            .on_hover_text(
+                                                "Traces real geometry (needs a ray-query GPU; \
+                                                 falls back to SSR if unavailable).",
+                                            );
+                                    });
+                            });
+                            // Intensity / distance / roughness tune SSR + Ray-traced.
+                            gi.ssr_enabled = gi.reflection_mode == 1;
+                            ui.add_enabled_ui(gi.reflection_mode != 0, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Intensity");
+                                    ui.add(egui::Slider::new(&mut gi.ssr_intensity, 0.0..=2.0))
+                                        .on_hover_text("Reflection strength multiplier.");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Max distance");
+                                    ui.add(
+                                        egui::Slider::new(&mut gi.ssr_max_distance, 1.0..=200.0)
+                                            .suffix(" m"),
+                                    )
+                                    .on_hover_text("Max view-space ray distance.");
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Roughness cutoff");
+                                    ui.add(egui::Slider::new(&mut gi.ssr_roughness_cutoff, 0.0..=1.0))
+                                        .on_hover_text(
+                                            "Surfaces rougher than this skip SSR (the probe / env \
+                                             cube carries them instead).",
+                                        );
+                                });
+                            });
+                            ui.separator();
+                            ui.label(RichText::new("Reflection Probes").small().strong());
+                            ui.label(
+                                RichText::new(
+                                    "Add a Reflection Probe component to an object for a \
+                                     box-projected cubemap. The highest-priority probe covering a \
+                                     surface is used (higher Importance wins, then smaller box), \
+                                     fading to the skybox at the box edge. Recapture after editing \
+                                     the scene.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button("Recapture")
+                                    .on_hover_text(
+                                        "Re-render the active probe's cubemap from the current \
+                                         scene (this session only).",
+                                    )
+                                    .clicked()
+                                {
+                                    self.actions.push(EditorAction::RecaptureReflections);
+                                }
+                                if ui
+                                    .button("Bake to disk")
+                                    .on_hover_text(
+                                        "Recapture, then persist the cube as a .reflprobe sidecar \
+                                         (loaded on scene open as a baked reflection probe).",
+                                    )
+                                    .clicked()
+                                {
+                                    self.actions.push(EditorAction::BakeReflections);
+                                }
+                            });
+                        });
 
                     ui.separator();
                     ui.label(RichText::new("Shadows").strong());
@@ -9107,6 +9453,63 @@ impl EditorTabs<'_> {
                     } else {
                         None
                     };
+                }
+                // Layer dropdown (Unity-style): drives the camera culling mask
+                // (rendering) and the layer-collision matrix (physics). Edit the
+                // names + matrix in Tools → Layers.
+                let layer_names: Vec<String> = (0..citrus_core::NUM_LAYERS as u8)
+                    .map(|l| self.scene.layers.layer_name(l))
+                    .collect();
+                let obj = &mut self.scene.objects[index];
+                let mut layer = obj.layer;
+                ui.horizontal(|ui| {
+                    ui.label("Layer");
+                    egui::ComboBox::from_id_salt("object-layer")
+                        .selected_text(
+                            layer_names
+                                .get(layer as usize)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (l, name) in layer_names.iter().enumerate() {
+                                ui.selectable_value(&mut layer, l as u8, name);
+                            }
+                        });
+                });
+                if layer != obj.layer {
+                    obj.layer = layer;
+                }
+                // Lightmap UVs (model objects): auto-generate toggle (off by
+                // default) + regenerate. Generated UVs persist as a `.lmuv` marker.
+                let model_path = match &self.scene.objects[index].source {
+                    citrus_assets::ObjectSource::Model { path, .. } => Some(path.clone()),
+                    _ => None,
+                };
+                if let Some(mpath) = model_path {
+                    let has_marker = self.generated_uv_models.iter().any(|m| m == &mpath);
+                    ui.horizontal(|ui| {
+                        let mut on = has_marker;
+                        if ui
+                            .checkbox(&mut on, "Auto-gen lightmap UVs")
+                            .on_hover_text(
+                                "When this model has no usable lightmap UV (no 2nd UV set AND an \
+                                 overlapping uv0), auto-unwrap a non-overlapping one for baking. \
+                                 Off (default) = use the model's own UVs. Reloads the scene.",
+                            )
+                            .changed()
+                        {
+                            self.actions.push(EditorAction::SetLightmapUvGen(mpath.clone(), on));
+                        }
+                        if has_marker
+                            && ui
+                                .small_button("Regenerate")
+                                .on_hover_text("Re-run the unwrapper (picks up improvements).")
+                                .clicked()
+                        {
+                            self.actions.push(EditorAction::RegenerateLightmapUvs);
+                        }
+                    });
                 }
             }
             _ => {

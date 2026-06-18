@@ -46,6 +46,9 @@ pub struct SceneObject {
     pub static_geometry: bool,
     /// Per-object lightmap-resolution multiplier ("Scale In Lightmap").
     pub lightmap_scale: f32,
+    /// Layer index (0..32, Unity-style). Drives the camera culling mask
+    /// (rendering) and the layer-collision matrix (physics). 0 = "Default".
+    pub layer: u8,
     /// Parent object index; transform is local to it.
     pub parent: Option<usize>,
     pub translation: Vec3,
@@ -103,6 +106,15 @@ pub struct MaterialEntry {
     /// Derived/runtime only — deliberately NOT on `MaterialModel`, so it stays
     /// out of edit/dirty detection (PartialEq) and undo snapshots.
     pub emission_map_mean: [f32; 3],
+    /// Mean diffuse albedo + metalness the LIGHTMAP BAKE uses, computed at
+    /// apply_material from the albedo + ORM textures (× the scalar factors). The
+    /// bake gbuffer is flat (no per-texel texture sampling), so a textured object
+    /// must not bake with just its scalar `base_color`/`metallic` — a glTF PBR
+    /// material with an MR map keeps `metallic = 1.0` as a *multiplier*, which
+    /// would make the whole surface read fully-metallic (zero diffuse → black
+    /// lightmap). These hold the texture-mean-corrected values instead.
+    pub bake_albedo: [f32; 3],
+    pub bake_metallic: f32,
     /// Set when this material came from (or was saved to) a `.material` file.
     pub file: Option<PathBuf>,
     /// True for imported-model materials whose textures came embedded in the
@@ -164,6 +176,11 @@ pub struct LoadedScene {
     mesh_handles: Vec<MeshHandle>,
     mesh_infos: Vec<MeshInfo>,
     mesh_bounds: Vec<(Vec3, Vec3)>,
+    /// Parallel to `mesh_bounds`: whether each mesh has a real non-overlapping
+    /// lightmap UV (its own UV1 / a generated unwrap), so it's safe to bake. A
+    /// mesh whose uv1 is just a uv0 copy is `false` and excluded from the bake +
+    /// the UV-checker preview until a lightmap UV is generated for it.
+    mesh_has_lightmap_uv: Vec<bool>,
     /// CPU positions + indices kept per mesh for software-GI SDF generation.
     mesh_geometry: Vec<(Vec<Vec3>, Vec<u32>)>,
     /// Lazily-built signed distance field per mesh (software GI). `None` until
@@ -189,6 +206,12 @@ pub struct LoadedScene {
     pub skybox: Option<String>,
     /// World lighting / environment (ambient + sun + skybox toggle).
     pub environment: citrus_assets::WorldEnvironment,
+    /// Layer names + collision matrix (Unity-style). Round-trips with the scene.
+    pub layers: citrus_core::LayerSettings,
+    /// Render-time layer visibility mask. In the editor this is the viewport's
+    /// layer toggle (default all-on); in a running game it's set from the active
+    /// camera's `culling_mask`. A draw is skipped when its layer bit is clear.
+    pub visible_layers: u32,
     /// Baked lighting result (None until a bake runs). Re-uploaded to the
     /// renderer for runtime sampling.
     pub baked: Option<BakedData>,
@@ -257,6 +280,7 @@ impl LoadedScene {
             mesh_handles: Vec::new(),
             mesh_infos: Vec::new(),
             mesh_bounds: Vec::new(),
+            mesh_has_lightmap_uv: Vec::new(),
             primitive_meshes: HashMap::new(),
             default_material: None,
             model_mesh_base: HashMap::new(),
@@ -266,6 +290,8 @@ impl LoadedScene {
             emission_mask_mean_cache: HashMap::new(),
             skybox: None,
             environment: citrus_assets::WorldEnvironment::default(),
+            layers: citrus_core::LayerSettings::default(),
+            visible_layers: citrus_core::all_layers_mask(),
             baked: None,
             active_camera_override: None,
         }
@@ -541,6 +567,8 @@ impl LoadedScene {
             model,
             handle,
             emission_map_mean: [1.0; 3],
+            bake_albedo: [1.0; 3],
+            bake_metallic: 0.0,
             file: None,
             embedded_textures: false,
             base_textures: TexSlots::default(),
@@ -577,6 +605,7 @@ impl LoadedScene {
             max = max.max(Vec3::from(v.position));
         }
         self.mesh_bounds.push((min, max));
+        self.mesh_has_lightmap_uv.push(data.has_lightmap_uv);
         let index = self.mesh_handles.len() - 1;
         self.primitive_meshes.insert(shape, index);
         Ok(index)
@@ -607,6 +636,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             parent: None,
             translation: position,
             rotation: Quat::IDENTITY,
@@ -673,6 +703,7 @@ impl LoadedScene {
                 max = max.max(Vec3::from(v.position));
             }
             self.mesh_bounds.push((min, max));
+            self.mesh_has_lightmap_uv.push(mesh.has_lightmap_uv);
         }
 
         let material_base = self.materials.len();
@@ -707,6 +738,8 @@ impl LoadedScene {
                 model,
                 handle,
                 emission_map_mean: [1.0; 3],
+                bake_albedo: [1.0; 3],
+                bake_metallic: 0.0,
                 file: None,
                 embedded_textures: material.albedo.is_some()
                     || material.normal.is_some()
@@ -734,6 +767,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             parent: None,
             translation: Vec3::ZERO,
             rotation: Quat::IDENTITY,
@@ -776,6 +810,7 @@ impl LoadedScene {
                 enabled: true,
                 static_geometry: false,
                 lightmap_scale: 1.0,
+                layer: 0,
                 parent: Some(root_index),
                 translation,
                 rotation,
@@ -832,6 +867,7 @@ impl LoadedScene {
                 max = max.max(Vec3::from(v.position));
             }
             self.mesh_bounds.push((min, max));
+            self.mesh_has_lightmap_uv.push(mesh.has_lightmap_uv);
         }
 
         let material_base = self.materials.len();
@@ -864,6 +900,8 @@ impl LoadedScene {
                 model,
                 handle,
                 emission_map_mean: [1.0; 3],
+                bake_albedo: [1.0; 3],
+                bake_metallic: 0.0,
                 file: None,
                 embedded_textures: material.albedo.is_some()
                     || material.normal.is_some()
@@ -888,6 +926,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             parent: None,
             translation: Vec3::ZERO,
             rotation: Quat::IDENTITY,
@@ -928,6 +967,7 @@ impl LoadedScene {
                 enabled: true,
                 static_geometry: false,
                 lightmap_scale: 1.0,
+                layer: 0,
                 parent: Some(root_index),
                 translation,
                 rotation,
@@ -982,6 +1022,8 @@ impl LoadedScene {
                     model,
                     handle,
                     emission_map_mean: [1.0; 3],
+                    bake_albedo: [1.0; 3],
+                    bake_metallic: 0.0,
                     file: Some(path.to_owned()),
                     embedded_textures: false,
                     base_textures: TexSlots::default(),
@@ -1095,6 +1137,8 @@ impl LoadedScene {
             model,
             handle,
             emission_map_mean: [1.0; 3],
+            bake_albedo: [1.0; 3],
+            bake_metallic: 0.0,
             file: Some(path.to_owned()),
             embedded_textures: false,
             base_textures: TexSlots::default(),
@@ -1191,6 +1235,36 @@ impl LoadedScene {
         mean
     }
 
+    /// Mean LINEAR RGB of an albedo map (sRGB texture → linear), for the bake.
+    /// `None` (no map) → `[1,1,1]` so only the scalar base_color applies. Cached
+    /// in the emission map-mean cache map (keyed by abs path; albedo and emission
+    /// files never collide).
+    fn albedo_map_mean(&mut self, project_root: &Path, rel: Option<&PathBuf>) -> [f32; 3] {
+        let Some(rel) = rel else { return [1.0; 3] };
+        let abs = project_root.join(rel);
+        if let Some(m) = self.emission_mean_cache.get(&abs) {
+            return *m;
+        }
+        let mean = match citrus_assets::load_texture_file(&abs, true) {
+            Ok(data) => texture_mean_linear(&data),
+            Err(_) => [1.0; 3],
+        };
+        self.emission_mean_cache.insert(abs, mean);
+        mean
+    }
+
+    /// Mean metalness from an ORM map's `.b` channel (linear data), for the bake.
+    /// `None` (no map) → `1.0` so only the scalar metallic applies. Not cached
+    /// (apply_material is infrequent; the mask cache stores a different channel).
+    fn orm_metallic_mean(&self, project_root: &Path, rel: Option<&PathBuf>) -> f32 {
+        let Some(rel) = rel else { return 1.0 };
+        let abs = project_root.join(rel);
+        match citrus_assets::load_texture_file(&abs, false) {
+            Ok(data) => texture_mean_linear(&data)[2], // .b = metalness (ORM)
+            Err(_) => 1.0,
+        }
+    }
+
     pub fn apply_material(
         &mut self,
         renderer: &mut Renderer,
@@ -1229,6 +1303,24 @@ impl LoadedScene {
             map_mean[2] * mask_mean,
         ];
         self.materials[index].emission_map_mean = emission_mean;
+
+        // Bake albedo/metalness from the texture means × scalars (the lightmap
+        // bake gbuffer is flat, so it can't sample per-texel — see MaterialEntry).
+        // glTF PBR keeps metallic=1.0 as a *multiplier* on the MR map, so without
+        // this a textured helmet would bake fully metallic (zero diffuse → black).
+        let albedo_path = self.materials[index].model.textures.albedo.clone();
+        let orm_path = self.materials[index].model.textures.orm.clone();
+        let albedo_mean = self.albedo_map_mean(project_root, albedo_path.as_ref());
+        let orm_metallic_mean = self.orm_metallic_mean(project_root, orm_path.as_ref());
+        let bc = self.materials[index].model.base_color;
+        let bake_albedo = [
+            albedo_mean[0] * bc[0],
+            albedo_mean[1] * bc[1],
+            albedo_mean[2] * bc[2],
+        ];
+        let bake_metallic = (orm_metallic_mean * self.materials[index].model.metallic).clamp(0.0, 1.0);
+        self.materials[index].bake_albedo = bake_albedo;
+        self.materials[index].bake_metallic = bake_metallic;
 
         let entry = &self.materials[index];
         let m = &entry.model;
@@ -1496,6 +1588,21 @@ impl LoadedScene {
         self.camera_view_proj_for(self.main_camera()?, aspect)
     }
 
+    /// Layer culling mask of the main camera (Unity-style); all layers when the
+    /// scene has no camera. Drives render culling in the shipped game runtime.
+    pub fn main_camera_culling_mask(&self) -> u32 {
+        use citrus_core::CameraComponent;
+        self.main_camera()
+            .and_then(|i| {
+                self.objects[i]
+                    .components
+                    .iter()
+                    .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+            })
+            .map(|c| c.culling_mask)
+            .unwrap_or(citrus_core::all_layers_mask())
+    }
+
     /// View/proj/position for the camera on object `i` (None if it has no
     /// CameraComponent). Used for the selected-camera viewport preview.
     pub fn camera_view_proj_for(&self, i: usize, aspect: f32) -> Option<(Mat4, Mat4, Vec3)> {
@@ -1705,13 +1812,29 @@ impl LoadedScene {
     /// are included for now (the bake path isn't built yet), so scenes don't
     /// go dark.
     pub fn gather_lights(&self) -> Vec<citrus_render::LightInstance> {
-        use citrus_core::{LightComponent, LightKind, LightMode};
         // Once a bake exists, Baked + Mixed lights are represented by it
         // (lightmaps/probes), so drop them from the realtime loop to avoid
-        // double-counting. Realtime lights are always kept. With NO bake we keep
-        // everything so an un-baked scene is never dark (baking stays opt-in).
-        // `baked.is_some()` (not probe-based) so a lightmap-only bake counts too.
-        let drop_baked = self.baked.is_some();
+        // double-counting. Realtime lights are always kept.
+        self.gather_lights_impl(self.baked.is_some(), true)
+    }
+
+    /// All scene lights, **including Baked/Mixed even when a bake exists** — for
+    /// the reflection-probe cube capture, which renders the scene fresh (no
+    /// lightmaps) and so must light it with the analytic lights or the captured
+    /// cube comes out dark (a baked scene's main lights would otherwise vanish
+    /// from the reflection). No double-counting risk: the cube is a separate
+    /// render, not composited with the lightmapped main pass.
+    pub fn gather_lights_all(&self) -> Vec<citrus_render::LightInstance> {
+        self.gather_lights_impl(false, false)
+    }
+
+    /// `flux_voxel_skip`: when true (forward pass), drop Realtime/Mixed lights in
+    /// the FluxVoxel backend since they're volume-lit. The reflection capture
+    /// passes false — the cube is a separate forward render with no voxel volume,
+    /// so it MUST direct-light the scene or every non-sky reflection comes out
+    /// black (only the skybox + self-emissive survive).
+    fn gather_lights_impl(&self, drop_baked: bool, flux_voxel_skip: bool) -> Vec<citrus_render::LightInstance> {
+        use citrus_core::{LightComponent, LightKind, LightMode};
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -1724,9 +1847,23 @@ impl LoadedScene {
             else {
                 continue;
             };
-            if drop_baked && light.mode != LightMode::Realtime {
+            // In the FluxVoxel backend, Realtime/Mixed lights are volume-lit
+            // (injected into the voxel probes, with occlusion). The forward pass
+            // must NOT also direct-light them — that's the cheap, no-shadow-map
+            // path and avoids double-counting. Baked lights stay (their lightmap).
+            if flux_voxel_skip
+                && self.environment.realtime_gi.mode == citrus_assets::GiMode::FluxVoxel
+                && light.mode != LightMode::Baked
+            {
                 continue;
             }
+            // Once a bake exists, Baked/Mixed lights are folded into the lightmaps.
+            // Rather than DROP them (which left dynamic / non-lightmapped objects
+            // pitch black in a baked scene), keep them flagged `baked`: the shader
+            // applies them ONLY to objects with no lightmap, so static lightmapped
+            // surfaces don't double-count while dynamic objects still get lit. They
+            // don't cast realtime shadows (kept out of the shadow atlas).
+            let is_baked = drop_baked && light.mode != LightMode::Realtime;
             let world = self.world_transform(i);
             let (_, rotation, position) = world.to_scale_rotation_translation();
             // Forward (-Z) is the light's travel direction.
@@ -1745,9 +1882,10 @@ impl LoadedScene {
                 range: light.range,
                 spot_inner_deg: light.spot_angle * (1.0 - light.spot_blend),
                 spot_outer_deg: light.spot_angle,
-                cast_shadows: light.shadow_type.casts(),
+                cast_shadows: light.shadow_type.casts() && !is_baked,
                 soft_shadows: light.shadow_type.soft(),
                 shadow_bias: light.shadow_bias,
+                baked: is_baked,
             });
         }
         lights
@@ -1848,6 +1986,12 @@ impl LoadedScene {
                 continue;
             }
             let Some(render) = obj.render else { continue };
+            // Skip meshes with no real lightmap UV (uv1 == uv0 fallback): baking
+            // their overlapping charts yields garbage. The editor offers to
+            // generate UVs for these before a bake (see `meshes_needing_lightmap_uv`).
+            if !self.mesh_has_lightmap_uv.get(render.mesh).copied().unwrap_or(false) {
+                continue;
+            }
             let world = self.world_transform(i);
             let (min, max) = self.mesh_bounds[render.mesh];
             let scale = world.to_scale_rotation_translation().0.abs();
@@ -1877,9 +2021,13 @@ impl LoadedScene {
                 mesh: self.mesh_handles[render.mesh],
                 transform: world,
                 lightmap_size,
-                albedo: [model.base_color[0], model.base_color[1], model.base_color[2]],
+                // Texture-mean-corrected albedo + metalness (see MaterialEntry):
+                // a textured object bakes with its real average colour/metalness,
+                // not just the scalar base_color/metallic, so an MR-mapped surface
+                // (metallic scalar = 1.0 multiplier) isn't treated as fully metal.
+                albedo: entry.bake_albedo,
                 emission,
-                metallic: model.metallic,
+                metallic: entry.bake_metallic,
                 roughness: model.roughness,
             });
             instance_objects.push(i);
@@ -2071,7 +2219,55 @@ impl LoadedScene {
     /// lights up static objects sharing the volume. Only components participate,
     /// so the author chooses what feeds FluxVR.
     pub fn fluxvr_lights(&self) -> Vec<(citrus_render::BakeLight, bool)> {
+        use citrus_core::{LightComponent, LightKind, LightMode};
         let mut out = Vec::new();
+        // Unified: every Realtime/Mixed normal light is also a FluxVoxel light, so
+        // a single light works across all GI backends. In the FluxVoxel backend
+        // these are volume-lit (the forward pass skips them — see gather_lights),
+        // which is why it's the cheap path. Baked-only lights stay out (they're in
+        // the lightmaps). Marked dynamic so movable lights track per frame.
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(l) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
+            else {
+                continue;
+            };
+            if l.mode == LightMode::Baked {
+                continue;
+            }
+            let world = self.world_transform(i);
+            let pos = world.w_axis.truncate();
+            let dir = world.to_scale_rotation_translation().1 * Vec3::NEG_Z;
+            let kind = match l.kind {
+                LightKind::Directional => citrus_render::LightKind::Directional,
+                LightKind::Point => citrus_render::LightKind::Point,
+                LightKind::Spot => citrus_render::LightKind::Spot,
+            };
+            out.push((
+                citrus_render::BakeLight {
+                    kind,
+                    position: pos,
+                    direction: dir,
+                    color: [
+                        l.color[0] * l.intensity,
+                        l.color[1] * l.intensity,
+                        l.color[2] * l.intensity,
+                    ],
+                    range: l.range.max(0.1),
+                    spot_inner_deg: l.spot_angle * (1.0 - l.spot_blend),
+                    spot_outer_deg: l.spot_angle,
+                    radius: 0.0,
+                },
+                false,
+            ));
+        }
+        // The legacy `FluxVrLight` component is still honoured (a dedicated
+        // volume-only light), so old scenes keep working.
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
                 continue;
@@ -2094,6 +2290,47 @@ impl LoadedScene {
                     f.color[2] * f.intensity,
                 ],
                 range: f.range.max(0.1),
+                spot_inner_deg: 0.0,
+                spot_outer_deg: 0.0,
+                radius: 0.0,
+            };
+            out.push((light, self.objects[i].static_geometry));
+        }
+        // Emissive objects act as additive FluxVoxel lights: their emission
+        // (colour × intensity × emission-map mean) becomes a movable point light
+        // with distance falloff, so the voxel GI is lit FROM them like any other
+        // FluxVoxel light (instead of not at all). Brighter emission reaches
+        // further. Dynamic (non-static) emitters track their movement per frame.
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            let Some(render) = self.objects[i].render else {
+                continue;
+            };
+            let entry = &self.materials[render.material];
+            let m = &entry.model;
+            if !m.emission_enabled {
+                continue;
+            }
+            let mean = entry.emission_map_mean;
+            let flux = [
+                m.emission_color[0] * m.emission_intensity * mean[0],
+                m.emission_color[1] * m.emission_intensity * mean[1],
+                m.emission_color[2] * m.emission_intensity * mean[2],
+            ];
+            let lum = 0.2126 * flux[0] + 0.7152 * flux[1] + 0.0722 * flux[2];
+            if lum <= 1e-3 {
+                continue;
+            }
+            let pos = self.world_transform(i).w_axis.truncate();
+            let range = (lum.sqrt() * 4.0).clamp(0.5, 40.0);
+            let light = citrus_render::BakeLight {
+                kind: citrus_render::LightKind::Point,
+                position: pos,
+                direction: Vec3::NEG_Y,
+                color: flux,
+                range,
                 spot_inner_deg: 0.0,
                 spot_outer_deg: 0.0,
                 radius: 0.0,
@@ -2660,6 +2897,67 @@ impl LoadedScene {
         }
     }
 
+    /// Distinct model paths (project-relative) used by active objects that have a
+    /// **generated** lightmap UV — i.e. a `.lmuv` marker exists next to the model,
+    /// so its meshes were auto-unwrapped on load. The FluxBaker tab lists these so
+    /// they can be regenerated (re-run with the current unwrapper) or reverted.
+    pub fn models_with_generated_lightmap_uv(&self, project_root: &Path) -> Vec<String> {
+        use citrus_assets::ObjectSource;
+        let mut out: Vec<String> = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            if let ObjectSource::Model { path, .. } = &self.objects[i].source
+                && !out.contains(path)
+                && citrus_assets::lightmap_uv_marker_path(project_root.join(path)).exists()
+            {
+                out.push(path.clone());
+            }
+        }
+        out
+    }
+
+    /// Distinct model file paths (project-relative) of **static** objects whose
+    /// mesh has NO real lightmap UV — i.e. models the bake would skip until a
+    /// lightmap unwrap is generated. The editor uses this to offer "generate
+    /// lightmap UVs" before a bake. Empty when every static object is bakeable.
+    pub fn models_needing_lightmap_uv(&self) -> Vec<String> {
+        use citrus_assets::ObjectSource;
+        let mut out: Vec<String> = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) || !self.objects[i].static_geometry {
+                continue;
+            }
+            let Some(r) = self.objects[i].render else { continue };
+            if self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false) {
+                continue;
+            }
+            if let ObjectSource::Model { path, .. } = &self.objects[i].source
+                && !out.contains(path)
+            {
+                out.push(path.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether the scene has any active reflection probe set to **Baked** mode
+    /// (loads its `.reflprobe` sidecar). `false` when there's no probe or every
+    /// probe is Realtime (always re-captured live, so engine/capture fixes take
+    /// effect without a manual re-bake of a stale sidecar).
+    pub fn has_baked_reflection_probe(&self) -> bool {
+        use citrus_core::{ReflectionProbe, ReflectionProbeMode};
+        self.objects.iter().enumerate().any(|(i, o)| {
+            self.is_active(i)
+                && o.components.iter().any(|c| {
+                    c.as_any()
+                        .downcast_ref::<ReflectionProbe>()
+                        .is_some_and(|p| p.mode == ReflectionProbeMode::Baked)
+                })
+        })
+    }
+
     /// The reflection-probe zone covering `camera_pos` (or the nearest), as a
     /// world-space box for box-projected reflections. `None` when the scene has
     /// no `ReflectionProbe` — the env cube is then sampled as distant/infinite.
@@ -2668,7 +2966,12 @@ impl LoadedScene {
         camera_pos: Vec3,
     ) -> Option<citrus_render::ReflectionProbeBox> {
         use citrus_core::ReflectionProbe;
-        let mut best: Option<(f32, citrus_render::ReflectionProbeBox)> = None;
+        // Unreal-style priority: among probes whose box CONTAINS the point, the
+        // highest Importance wins, tie-broken by the smallest box (a small specific
+        // probe overrides a large surrounding one). When no probe contains the
+        // point, the nearest box is used. Rank key (higher = better):
+        // (contains, importance, -box_volume, -outside_distance).
+        let mut best: Option<((bool, i32, f32, f32), citrus_render::ReflectionProbeBox)> = None;
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
                 continue;
@@ -2682,7 +2985,11 @@ impl LoadedScene {
             };
             let center = self.world_transform(i).w_axis.truncate();
             let half = Vec3::from(probe.size) * 0.5 * self.objects[i].scale;
-            let outside = ((camera_pos - center).abs() - half).max(Vec3::ZERO).length();
+            let d = (camera_pos - center).abs() - half;
+            let outside = d.max(Vec3::ZERO).length();
+            let contains = d.max_element() <= 0.0;
+            let volume = (half.x * half.y * half.z).max(1e-4);
+            let key = (contains, probe.importance, -volume, -outside);
             let candidate = citrus_render::ReflectionProbeBox {
                 center: center.to_array(),
                 half_extents: half.to_array(),
@@ -2690,8 +2997,18 @@ impl LoadedScene {
                 box_projection: probe.box_projection,
                 resolution: probe.resolution,
             };
-            if best.as_ref().is_none_or(|(d, _)| outside < *d) {
-                best = Some((outside, candidate));
+            let better = match &best {
+                None => true,
+                Some((bk, _)) => {
+                    // Lexicographic compare; f32 lanes via partial_cmp.
+                    (key.0, key.1).cmp(&(bk.0, bk.1)) == std::cmp::Ordering::Greater
+                        || ((key.0, key.1) == (bk.0, bk.1)
+                            && (key.2, key.3).partial_cmp(&(bk.2, bk.3))
+                                == Some(std::cmp::Ordering::Greater))
+                }
+            };
+            if better {
+                best = Some((key, candidate));
             }
         }
         best.map(|(_, p)| p)
@@ -2871,15 +3188,26 @@ impl LoadedScene {
             if !self.is_active(i) {
                 continue;
             }
+            // Layer culling: skip objects whose layer bit is clear in the active
+            // visibility mask (editor viewport toggle / game camera culling mask).
+            if self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) == 0 {
+                continue;
+            }
             let lightmap_layer = self
                 .baked
                 .as_ref()
                 .and_then(|b| b.object_lightmap.get(&i))
                 .map(|&l| l as i32)
                 .unwrap_or(-1);
-            // For the UV-checker preview: the would-be lightmap resolution for
-            // static objects (0 otherwise).
-            let lightmap_size = if self.objects[i].static_geometry {
+            // For the UV-checker preview: the would-be lightmap resolution, shown
+            // ONLY for objects that are BOTH static AND have a real non-overlapping
+            // lightmap UV (their own UV1 / a generated unwrap). An object reusing
+            // its uv0 isn't bakeable, so it must not show the checker. 0 = no
+            // checker.
+            let has_lm_uv = self.objects[i]
+                .render
+                .is_some_and(|r| self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false));
+            let lightmap_size = if self.objects[i].static_geometry && has_lm_uv {
                 self.lightmap_size_for_world(i, world[i])
             } else {
                 0
@@ -2888,12 +3216,14 @@ impl LoadedScene {
             let highlight = if selected.contains(&i) { highlight } else { 0.0 };
             // One draw per material slot (slot 0 + extras), all at this transform.
             for render in self.objects[i].render_slots().collect::<Vec<_>>() {
+                let (mn, mx) = self.mesh_aabb(render.mesh);
                 self.draws.push(DrawCmd {
                     mesh: self.mesh_handles[render.mesh],
                     material: self.materials[render.material].handle,
                     transform,
                     highlight,
                     mesh_center: self.mesh_center_local(render.mesh),
+                    bound_radius: ((mx - mn) * 0.5).length(),
                     lightmap_layer,
                     lightmap_size,
                 });
@@ -3006,6 +3336,7 @@ impl LoadedScene {
                 enabled: src.enabled,
                 static_geometry: src.static_geometry,
                 lightmap_scale: src.lightmap_scale,
+                layer: src.layer,
                 parent,
                 translation: src.translation,
                 rotation: src.rotation,
@@ -3138,6 +3469,7 @@ impl LoadedScene {
                     enabled: object.enabled,
                     static_geometry: object.static_geometry,
                     lightmap_scale: object.lightmap_scale,
+                    layer: object.layer,
                     material,
                     extra_materials,
                     parent: object.parent,
@@ -3159,6 +3491,7 @@ impl LoadedScene {
             entries,
             skybox: self.skybox.clone(),
             environment: self.environment.clone(),
+            layers: self.layers.clone(),
             editor_camera: None,
             collapsed: Vec::new(),
         }
@@ -3276,6 +3609,7 @@ impl LoadedScene {
         let mut scene = Self::empty();
         scene.skybox = file.skybox.clone();
         scene.environment = file.environment.clone();
+        scene.layers = file.layers.clone().normalized();
 
         // Material textures decoded + uploaded on the loader thread: install the
         // GPU handles and seed the file cache keyed by (abs path, srgb), so the
@@ -3421,6 +3755,7 @@ impl LoadedScene {
                 enabled: entry.enabled,
                 static_geometry: entry.static_geometry,
                 lightmap_scale: entry.lightmap_scale,
+                layer: entry.layer,
                 parent: None, // applied below once all objects exist
                 translation: Vec3::from(entry.translation),
                 rotation: Quat::from_array(entry.rotation),

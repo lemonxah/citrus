@@ -337,6 +337,9 @@ impl GameApp {
             .set_ik_targets(self.xr_session.as_ref().map(|_| self.vr_targets));
         self.scene.update_skinning(&mut renderer, dt);
 
+        // Shipped game: the main camera's layer culling mask drives which layers
+        // render (editor uses the viewport's own visibility toggle instead).
+        self.scene.visible_layers = self.scene.main_camera_culling_mask();
         self.scene.sync_draws(None, 0.0);
 
         let (width, height) = self
@@ -391,9 +394,12 @@ impl GameApp {
                 cast_shadows: true,
                 soft_shadows: true,
                 shadow_bias: 0.003,
+                baked: false,
             });
         }
         lights.extend(self.scene.gather_lights());
+        // Full light set (incl. baked) for the reflection cube capture.
+        let capture_lights = self.scene.gather_lights_all();
         let world_light = LightData {
             direction: Vec3::from(env.sun_direction).normalize_or(Vec3::NEG_Y),
             color: env.sun_color,
@@ -423,6 +429,7 @@ impl GameApp {
             },
             light: world_light,
             lights: &lights,
+            capture_lights: &capture_lights,
             camera_preview: None,
             draw_skybox: env.skybox_enabled,
             shadow_pcf_texel,

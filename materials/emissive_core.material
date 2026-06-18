@@ -4,7 +4,7 @@
     params: (
         base_color: (0.013778448, 1.0, 0.0, 1.0),
         emission_color: (0.0, 1.0, 0.15488672),
-        emission_intensity: 20.0,
+        emission_intensity: 5.0,
         emission_map_mean: (1.0, 1.0, 1.0),
         metallic: 0.0,
         roughness: 0.9,
@@ -34,6 +34,8 @@
         roughness_invert: false,
         metallic_invert: false,
         displacement_scale: 0.0,
+        reflection_intensity: 1.0,
+        screen_reflections: true,
     ),
     features: (
         toon: false,

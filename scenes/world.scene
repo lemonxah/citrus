@@ -7,8 +7,9 @@
                 mesh: 0,
             ),
             enabled: true,
-            static_geometry: false,
+            static_geometry: true,
             lightmap_scale: 1.0,
+            layer: 0,
             material: File("materials/emissive_core.material"),
             parent: Some(3),
             components: [
@@ -16,13 +17,9 @@
                     kind: "Orbit",
                     data: "(degrees_per_second:-40.0,radius:0.8,target:(Some(\"833c3f8a-e8d4-4746-91f7-390a9d31c7e0\")))",
                 ),
-                (
-                    kind: "Flux VR Light",
-                    data: "(color:(0.0,0.7005968,1.0),intensity:7.2,range:2.0)",
-                ),
             ],
-            translation: (-3.2939348, -0.28074718, -0.44701362),
-            rotation: (-0.0, -0.0, -0.0, 1.0),
+            translation: (-4.3014536, 0.29122543, 0.7312765),
+            rotation: (0.0, 0.0, 0.0, 1.0),
             scale: (0.2, 0.2, 0.2),
         ),
         (
@@ -34,6 +31,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: File("materials/emissive_core_copy.material"),
             parent: Some(3),
             components: [
@@ -41,13 +39,9 @@
                     kind: "Orbit",
                     data: "(degrees_per_second:40.0,radius:1.1,target:(Some(\"833c3f8a-e8d4-4746-91f7-390a9d31c7e0\")))",
                 ),
-                (
-                    kind: "Flux VR Light",
-                    data: "(color:(1.0,0.0,0.63392067),intensity:5.0,range:2.0)",
-                ),
             ],
-            translation: (-3.4807787, -0.28074718, -1.9335172),
-            rotation: (-0.0, -0.0, -0.0, 1.0),
+            translation: (-3.4807787, -0.28074718, -0.0076533556),
+            rotation: (0.0, 0.0, 0.0, 1.0),
             scale: (0.2, 0.2, 0.2),
         ),
         (
@@ -57,6 +51,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -107,7 +102,7 @@
             components: [
                 (
                     kind: "Camera",
-                    data: "(id:1,fov_deg:60.0,near:0.1,far:100.0)",
+                    data: "(id:1,fov_deg:60.0,near:0.1,far:100.0,culling_mask:4294967295)",
                 ),
                 (
                     kind: "Volume (Post FX)",
@@ -125,6 +120,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -183,6 +179,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -249,6 +246,7 @@
             enabled: true,
             static_geometry: true,
             lightmap_scale: 1.0,
+            layer: 0,
             material: File("materials/floor.material"),
             parent: Some(3),
             translation: (-2.7956839, -1.3914907, -1.0729098),
@@ -262,6 +260,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -322,7 +321,8 @@
             ),
             enabled: true,
             static_geometry: true,
-            lightmap_scale: 1.0,
+            lightmap_scale: 10.0,
+            layer: 0,
             material: File("extracted/damagedhelmet/materials/material_mr.material"),
             parent: Some(6),
             translation: (0.0, 0.0, 0.0),
@@ -336,6 +336,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -396,7 +397,8 @@
             ),
             enabled: true,
             static_geometry: true,
-            lightmap_scale: 1.0,
+            lightmap_scale: 2.0,
+            layer: 0,
             material: File("materials/material_0.material"),
             parent: Some(8),
             translation: (0.0, 0.7498503, -1.2632253),
@@ -410,6 +412,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -460,11 +463,11 @@
             components: [
                 (
                     kind: "Reflection Probe",
-                    data: "(size:(9.90384,4.4803624,9.897496),resolution:128,mode:Realtime,intensity:1.0,box_projection:true,blend_distance:1.0,importance:0)",
+                    data: "(size:(9.90384,4.608464,9.897496),resolution:128,mode:Realtime,intensity:1.0,box_projection:true,blend_distance:1.0,importance:0)",
                 ),
             ],
-            translation: (-0.030971527, 2.2598186, 0.0762589),
-            rotation: (0.0, 0.0, 0.0, 1.0),
+            translation: (-0.030971527, 2.1957679, 0.0762589),
+            rotation: (-0.0, -0.0, -0.0, 1.0),
             scale: (1.0, 1.0, 1.0),
         ),
         (
@@ -474,6 +477,7 @@
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            layer: 0,
             material: Inline(
                 params: (
                     base_color: (1.0, 1.0, 1.0, 1.0),
@@ -524,11 +528,11 @@
             components: [
                 (
                     kind: "Flux Volume",
-                    data: "(size:(9.942849,4.6319666,9.959586),density:0.75)",
+                    data: "(size:(9.942849,4.7398367,10.018697),density:4.0)",
                 ),
             ],
-            translation: (-0.06942409, 2.3399513, -0.080231965),
-            rotation: (0.0, 0.0, 0.0, 1.0),
+            translation: (-0.06942409, 2.2860162, -0.050676644),
+            rotation: (-0.0, -0.0, -0.0, 1.0),
             scale: (1.0, 1.0, 1.0),
         ),
     ],
@@ -547,7 +551,7 @@
         bake: (
             texel_density: 100.0,
             bounces: 8,
-            samples: 6110,
+            samples: 12100,
             max_lightmap: 2048,
         ),
         realtime_gi: (
@@ -609,9 +613,79 @@
         fog_start_distance: 0.0,
         skybox_faces: None,
     ),
+    layers: (
+        names: [
+            "Default",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ],
+        collision: [
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+            4294967295,
+        ],
+    ),
     editor_camera: Some((
-        position: (1.2764876, 1.0157852, 3.75284),
-        yaw: 10.642692,
-        pitch: -0.014600486,
+        position: (-6.5662513, 5.704271, 6.684908),
+        yaw: -0.89902997,
+        pitch: -0.5446411,
     )),
 )

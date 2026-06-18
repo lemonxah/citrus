@@ -123,6 +123,10 @@ pub struct SceneEntry {
     /// texels.
     #[serde(default = "default_lightmap_scale")]
     pub lightmap_scale: f32,
+    /// Object layer index (0..32, Unity-style): camera culling mask (rendering)
+    /// + layer-collision matrix (physics). 0 = "Default".
+    #[serde(default)]
+    pub layer: u8,
     pub material: MaterialRef,
     /// Materials for additional slots beyond the first (parallel to
     /// `ObjectSource::Model::extra_meshes`). Empty for single-material objects.
@@ -268,6 +272,40 @@ impl GiMode {
         }
     }
     pub const ALL: [GiMode; 3] = [Self::FluxRT, Self::Flux, Self::FluxVoxel];
+
+    // --- Per-backend capability flags ---
+    // Each backend declares which settings it actually consumes, so the
+    // Environment UI can render only the relevant controls (modular settings)
+    // and the engine can skip work a backend ignores.
+
+    /// Path-traced bounce count (FluxRT / Flux). FluxVoxel injects direct-only.
+    pub fn uses_bounces(self) -> bool {
+        matches!(self, Self::FluxRT | Self::Flux)
+    }
+    /// Rays-per-probe quality preset (the ray-marching/ray-query backends).
+    pub fn uses_quality(self) -> bool {
+        matches!(self, Self::FluxRT | Self::Flux)
+    }
+    /// Per-probe sample count + firefly clamp (the sampling backends).
+    pub fn uses_samples(self) -> bool {
+        matches!(self, Self::FluxRT | Self::Flux)
+    }
+    /// Signed-distance-field resolution (software march only).
+    pub fn uses_gdf(self) -> bool {
+        matches!(self, Self::Flux)
+    }
+    /// March distance (the software march; RT uses the BVH, Voxel uses volumes).
+    pub fn uses_march_distance(self) -> bool {
+        matches!(self, Self::Flux)
+    }
+    /// Voxel-grid density (the FluxVoxel analytic volume only).
+    pub fn uses_voxel_density(self) -> bool {
+        matches!(self, Self::FluxVoxel)
+    }
+    /// DDGI-style per-probe visibility (currently the FluxVoxel voxel-light path).
+    pub fn uses_ddgi_occlusion(self) -> bool {
+        matches!(self, Self::FluxVoxel)
+    }
 }
 
 /// Flux quality preset. Drives per-frame samples-per-probe and the march step
@@ -492,6 +530,10 @@ pub struct SceneFile {
     /// Scene environment / world lighting.
     #[serde(default)]
     pub environment: WorldEnvironment,
+    /// Layer names + collision matrix (Unity-style). Drives physics collision
+    /// filtering and per-camera render culling masks.
+    #[serde(default)]
+    pub layers: citrus_core::LayerSettings,
     /// Last editor (fly-cam) viewpoint, restored on open so the scene reopens
     /// framed the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]

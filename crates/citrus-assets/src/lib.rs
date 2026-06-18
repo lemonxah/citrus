@@ -8,6 +8,7 @@ mod asset_meta;
 mod bake_file;
 mod fbx_loader;
 mod gltf_loader;
+mod lightmap_uv;
 mod material_file;
 mod post_file;
 mod procedural;
@@ -23,6 +24,7 @@ pub use asset_meta::{
 };
 pub use fbx_loader::{load_fbx, load_fbx_with};
 pub use gltf_loader::load_gltf;
+pub use lightmap_uv::generate_lightmap_uv;
 pub use skeleton::{
     AnimChannel, AnimationClip, ChannelPath, Joint, Skeleton, skin_direction, skin_position,
 };
@@ -53,9 +55,9 @@ pub use shader_file::{
     ShaderSource, compile_shader, load_shader_file, parse_shader_source,
 };
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use citrus_render::{MaterialFeatures, MaterialParams, MeshData, TextureData};
 use glam::Mat4;
 
@@ -121,10 +123,45 @@ pub fn is_model_file(path: &Path) -> bool {
     )
 }
 
+/// Sidecar marker that records "generate lightmap UVs for this model's meshes".
+/// Its presence (content unused) means each mesh lacking a real UV1 gets a
+/// deterministic generated unwrap on load — so the generated UVs persist across
+/// sessions without storing the whole rebuilt mesh.
+pub fn lightmap_uv_marker_path(model: impl AsRef<Path>) -> PathBuf {
+    model.as_ref().with_extension("lmuv")
+}
+
+/// Create (or remove) the lightmap-UV marker for a model. Called by the editor
+/// when the user opts to generate lightmap UVs at bake time.
+pub fn set_lightmap_uv_marker(model: impl AsRef<Path>, on: bool) -> Result<()> {
+    let p = lightmap_uv_marker_path(&model);
+    if on {
+        std::fs::write(&p, b"citrus-lightmap-uv\n")
+            .with_context(|| format!("writing lightmap-UV marker {}", p.display()))?;
+    } else if p.exists() {
+        std::fs::remove_file(&p)
+            .with_context(|| format!("removing lightmap-UV marker {}", p.display()))?;
+    }
+    Ok(())
+}
+
+/// Apply the lightmap-UV marker after loading: replace every mesh that has no
+/// real UV1 with a generated non-overlapping unwrap. No-op without the marker.
+fn apply_lightmap_uv_marker(path: &Path, scene: &mut Scene) {
+    if !lightmap_uv_marker_path(path).exists() {
+        return;
+    }
+    for mesh in &mut scene.meshes {
+        if !mesh.has_lightmap_uv {
+            *mesh = generate_lightmap_uv(mesh);
+        }
+    }
+}
+
 /// Import any supported model format, dispatching on extension.
 pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
     let path = path.as_ref();
-    match path
+    let mut scene = match path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_lowercase)
@@ -133,7 +170,9 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
         Some("gltf" | "glb") => load_gltf(path),
         Some("fbx") => load_fbx(path),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
-    }
+    }?;
+    apply_lightmap_uv_marker(path, &mut scene);
+    Ok(scene)
 }
 
 /// Load a model applying its `.meta` sidecar import settings if the sidecar
@@ -144,7 +183,7 @@ pub fn load_model_with_meta(path: impl AsRef<Path>) -> Result<Scene> {
     let model = load_asset_meta(path)?
         .and_then(|m| m.importer.as_model().cloned())
         .unwrap_or_default();
-    match path
+    let mut scene = match path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_lowercase)
@@ -153,5 +192,7 @@ pub fn load_model_with_meta(path: impl AsRef<Path>) -> Result<Scene> {
         Some("gltf" | "glb") => load_gltf(path),
         Some("fbx") => load_fbx_with(path, &model),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
-    }
+    }?;
+    apply_lightmap_uv_marker(path, &mut scene);
+    Ok(scene)
 }

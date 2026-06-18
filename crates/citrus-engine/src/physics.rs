@@ -74,10 +74,21 @@ impl PhysicsWorld {
             let handle = bodies.insert(builder.build());
 
             let (rest, fric) = rb.map(|r| (r.restitution, r.friction)).unwrap_or((0.0, 0.5));
+            // Layer-collision matrix (Unity-style): membership = this object's
+            // layer bit, filter = the layers it's allowed to collide with. Two
+            // colliders interact only if each is in the other's filter, so a
+            // symmetric matrix gives "layer A ignores layer B" both ways.
+            let layer = scene.objects[i].layer;
+            let groups = InteractionGroups::new(
+                Group::from_bits_truncate(1u32 << (layer as u32 & 31)),
+                Group::from_bits_truncate(scene.layers.collision_mask(layer)),
+                InteractionTestMode::And,
+            );
             let collider = shape
                 .translation(offset)
                 .restitution(rest)
                 .friction(fric)
+                .collision_groups(groups)
                 .build();
             colliders.insert_with_parent(collider, handle, &mut bodies);
 

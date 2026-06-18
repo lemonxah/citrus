@@ -223,17 +223,10 @@ pub fn material_editor_ui(
             property_row(ui, "Reflection", changed, |ui| {
                 ui.add(Slider::new(&mut m.reflection_intensity, 0.0..=2.0))
                     .on_hover_text(
-                        "Per-material reflection strength. Scales the environment / \
-                         reflection-probe cube AND screen-space/RT reflections for this \
-                         material (mix & match per material). 1 = default, 0 = matte.",
-                    )
-            });
-            property_row(ui, "Screen/RT Reflections", changed, |ui| {
-                ui.checkbox(&mut m.screen_reflections, "")
-                    .on_hover_text(
-                        "Reflection technique mix: ON = screen-space / ray-traced \
-                         reflections on top of the environment cube; OFF = environment / \
-                         reflection-probe cube only (cheaper, no SSR/RT for this material).",
+                        "Per-material reflection strength (1 = default, 0 = matte). \
+                         The reflection TECHNIQUE (Reflection Probes / SSR / Ray-traced) \
+                         is a global scene setting — Environment → Reflections — not a \
+                         per-material toggle (matching Unreal).",
                     )
             });
             *changed |= texture_row(

@@ -102,8 +102,17 @@ impl InputManager {
         let Some(gilrs) = self.gilrs.as_mut() else {
             return;
         };
-        // Pump the event queue so cached gamepad state is current.
-        while gilrs.next_event().is_some() {}
+        // Pump the event queue so cached gamepad state is current, noting any
+        // disconnect: a removed pad leaves gilrs's force-feedback thread holding
+        // the now-deleted `/dev/input/eventN` fd, which then spams ENODEV every
+        // ~50ms forever. Recreating the Gilrs context below drops that thread +
+        // its stale fd (and re-enumerates the pads still plugged in).
+        let mut disconnected = false;
+        while let Some(ev) = gilrs.next_event() {
+            if matches!(ev.event, gilrs::EventType::Disconnected) {
+                disconnected = true;
+            }
+        }
         self.raw.pad_down.clear();
         self.raw.pad_axes.clear();
         // Merge all connected pads (local co-op shares one snapshot for now).
@@ -118,6 +127,13 @@ impl InputManager {
                 if v != 0.0 {
                     *self.raw.pad_axes.entry(pa).or_insert(0.0) += v;
                 }
+            }
+        }
+        if disconnected {
+            // Drop the old context (joins its FF thread, closes the dead fd) and
+            // rebuild. Keep the old one if rebuild fails so input still works.
+            if let Ok(g) = gilrs::Gilrs::new() {
+                self.gilrs = Some(g);
             }
         }
     }
