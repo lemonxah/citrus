@@ -4,7 +4,7 @@
     params: (
         base_color: (0.8806248, 0.0, 1.0, 1.0),
         emission_color: (1.0, 0.0, 0.8383813),
-        emission_intensity: 5.0,
+        emission_intensity: 1.0,
         emission_map_mean: (1.0, 1.0, 1.0),
         metallic: 0.0,
         roughness: 0.9,

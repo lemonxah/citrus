@@ -552,7 +552,7 @@ impl ComponentRegistry {
         registry.register::<CameraComponent>();
         registry.register::<LightComponent>();
         registry.register::<LightProbeVolume>();
-        registry.register::<FluxVrLight>();
+        registry.register::<FluxVoxelLight>();
         registry.register::<FluxVolume>();
         registry.register::<ReflectionProbe>();
         registry.register::<AudioSource>();
@@ -563,6 +563,7 @@ impl ComponentRegistry {
         registry.register::<MeshCollider>();
         registry.register::<Spin>();
         registry.register::<Bob>();
+        registry.register::<LodComponent>();
         registry.register::<RigidBody>();
         registry.register::<Pawn>();
         registry.register::<SpawnPoint>();
@@ -599,12 +600,6 @@ impl ComponentRegistry {
     /// Deserialize a saved component. Unknown names and broken data log a
     /// warning and return None so scene loads survive missing components.
     pub fn load(&self, name: &str, data: &str) -> Option<Box<dyn Component>> {
-        // Backward-compat aliases for renamed components, so older `.scene` files
-        // still load. ("Flux VR Light" was renamed to "FluxVoxel Light".)
-        let name = match name {
-            "Flux VR Light" => "FluxVoxel Light",
-            other => other,
-        };
         let Some(entry) = self.entries.iter().find(|e| e.name == name) else {
             tracing::warn!("unknown component {name:?}; dropping it");
             return None;
@@ -725,6 +720,14 @@ impl LayerSettings {
                 }
             }
         }
+    }
+
+    /// How many layers the editor UIs show. All 32 (`NUM_LAYERS`), CONSISTENTLY
+    /// across the object layer dropdown, the camera culling mask, and the collision
+    /// matrix — Unity-style (every layer is always addressable). A single source of
+    /// truth so the three can never disagree (they previously showed 32 / 8 / 4).
+    pub fn shown_count(&self) -> usize {
+        NUM_LAYERS
     }
 
     /// Display name for a layer index ("Layer N" when unnamed).
@@ -963,6 +966,52 @@ impl TypedComponent for Bob {
     }
 }
 
+/// Level-of-detail group (Unity `LODGroup`-style): swap the object's mesh for a
+/// cheaper one as it gets farther from the camera, and optionally cull past the
+/// last level. Authored PER-OBJECT in the Inspector (this is a component, not a
+/// tool). The renderer reads the selected level via `select_lod`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LodComponent {
+    /// LOD levels, ascending by `max_distance`. Level 0 = highest detail (nearest).
+    pub levels: Vec<LodLevel>,
+    /// Beyond this camera distance the object is culled entirely (0 = never).
+    pub cull_distance: f32,
+}
+
+/// One LOD level: used while camera distance <= `max_distance`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LodLevel {
+    pub max_distance: f32,
+    /// Project-relative model path for this level (empty = keep the base mesh).
+    pub model: String,
+}
+
+impl Default for LodComponent {
+    fn default() -> Self {
+        Self {
+            levels: vec![
+                LodLevel { max_distance: 15.0, model: String::new() },
+                LodLevel { max_distance: 50.0, model: String::new() },
+            ],
+            cull_distance: 0.0,
+        }
+    }
+}
+
+impl LodComponent {
+    /// Pick the LOD index for a camera distance, or `None` if culled.
+    pub fn select_lod(&self, distance: f32) -> Option<usize> {
+        if self.cull_distance > 0.0 && distance > self.cull_distance {
+            return None;
+        }
+        self.levels.iter().position(|l| distance <= l.max_distance)
+    }
+}
+
+impl TypedComponent for LodComponent {
+    const NAME: &'static str = "LOD Group";
+}
+
 /// A box volume seeded with a regular grid of irradiance light probes.
 #[derive(Serialize, Deserialize)]
 pub struct LightProbeVolume {
@@ -1029,22 +1078,22 @@ impl TypedComponent for LightProbeVolume {
     const NAME: &'static str = "Light Probe Volume";
 }
 
-/// Marks an object as a FluxVR light source. With the FluxVR GI backend active,
-/// the object casts `color × intensity` into the FluxVR voxel light volume with
+/// Marks an object as a FluxVoxel light source. With the FluxVoxel GI backend active,
+/// the object casts `color × intensity` into the FluxVoxel voxel light volume with
 /// smooth distance falloff out to `range`, from the object's (possibly moving)
 /// world position. Put it on a light or an emissive prop, static OR dynamic — a
-/// dynamic FluxVR light mixes into the same voxel grid live, so it lights up
+/// dynamic FluxVoxel light mixes into the same voxel grid live, so it lights up
 /// static objects sharing the volume. Only objects bearing this component feed
-/// FluxVR, so you choose exactly which lights/props participate.
+/// FluxVoxel, so you choose exactly which lights/props participate.
 #[derive(Serialize, Deserialize)]
-pub struct FluxVrLight {
+pub struct FluxVoxelLight {
     pub color: [f32; 3],
     pub intensity: f32,
     /// World-space distance at which the contribution reaches zero.
     pub range: f32,
 }
 
-impl Default for FluxVrLight {
+impl Default for FluxVoxelLight {
     fn default() -> Self {
         Self {
             color: [1.0, 1.0, 1.0],
@@ -1054,13 +1103,13 @@ impl Default for FluxVrLight {
     }
 }
 
-impl TypedComponent for FluxVrLight {
+impl TypedComponent for FluxVoxelLight {
     const NAME: &'static str = "FluxVoxel Light";
 }
 
-/// A FluxVR voxel light volume: a box (centred on the object, `size` local
+/// A FluxVoxel voxel light volume: a box (centred on the object, `size` local
 /// meters) filled with a regular grid of SH-L1 light probes at `density` probes
-/// per meter. FluxVR injects every Flux VR Light into these voxels (static ones
+/// per meter. FluxVoxel injects every FluxVoxel Light into these voxels (static ones
 /// baked once, dynamic ones mixed live) and the standard shader reads them to
 /// light static + dynamic meshes inside the box. Place one (or several) over the
 /// play space; configurable size + density trade quality for memory/cost.

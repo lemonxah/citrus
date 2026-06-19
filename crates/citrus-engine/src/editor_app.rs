@@ -134,6 +134,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         shaders: ShaderLibrary::default(),
         shader_files: Vec::new(),
         last_shader_scan: None,
+        engine_shader_mtime: None,
         last_asset_check: None,
         dirty_materials: HashSet::new(),
         last_material_edit: None,
@@ -157,6 +158,8 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_bindings: false,
         show_network: false,
         show_layers: false,
+        show_mixer: false,
+        mixer: crate::audio_mixer::AudioMixer::new(),
         rebinding: None,
         last_cursor: None,
         viewport_rect: egui::Rect::EVERYTHING,
@@ -297,13 +300,13 @@ enum PendingJob {
 enum BakeRunPhase {
     /// Main lightmaps + probes.
     Main,
-    /// FluxVR voxel volumes (appended to the probe set).
-    FluxVr,
+    /// FluxVoxel voxel volumes (appended to the probe set).
+    FluxVoxel,
 }
 
 /// Drives a chunked lighting bake across frames (one unit per frame). Holds the
 /// GPU `BakeJob` plus the metadata needed to assemble `BakedData` when it
-/// completes, and carries the partial result from the main pass into the FluxVR
+/// completes, and carries the partial result from the main pass into the FluxVoxel
 /// pass. See the bake phase of the background-task plan.
 struct BakeRunner {
     job: citrus_render::BakeJob,
@@ -315,7 +318,7 @@ struct BakeRunner {
     /// Main pass: object→lightmap-layer map and probe volumes for assembly.
     object_lightmap: std::collections::HashMap<usize, usize>,
     probe_volumes: Vec<scene::ProbeVolumeMeta>,
-    /// Partial bake carried from the main pass into the FluxVR pass.
+    /// Partial bake carried from the main pass into the FluxVoxel pass.
     baked: Option<scene::BakedData>,
 }
 
@@ -777,6 +780,9 @@ struct EngineApp {
     shader_files: Vec<String>,
     /// Last shader-file scan / hot-reload poll.
     last_shader_scan: Option<Instant>,
+    /// Last-seen mtime of the engine's standard.frag, for dev-time hot-reload
+    /// when it is edited on disk outside the editor.
+    engine_shader_mtime: Option<std::time::SystemTime>,
     /// Wall-clock of the last asset-change check (on window-focus regain), so
     /// externally-edited assets (e.g. a re-exported FBX) reimport automatically.
     last_asset_check: Option<std::time::SystemTime>,
@@ -828,6 +834,10 @@ struct EngineApp {
     show_network: bool,
     /// Layers settings (names + collision matrix) window open.
     show_layers: bool,
+    /// Audio mixer window open.
+    show_mixer: bool,
+    /// Audio bus mixer (volumes/mutes per bus). Drives playback gains.
+    mixer: crate::audio_mixer::AudioMixer,
     /// Action currently being rebound in the Bindings window (scheme, action,
     /// slot). The next key/mouse press is captured into it.
     rebinding: Option<(usize, String)>,
@@ -1589,13 +1599,14 @@ impl EngineApp {
                         let slots: Vec<std::sync::Mutex<Option<Result<_, String>>>> =
                             (0..refs.len()).map(|_| std::sync::Mutex::new(None)).collect();
                         let next = std::sync::atomic::AtomicUsize::new(0);
-                        let threads = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4)
-                            .min(refs.len());
+                        // Reserve cores for the UI/OS so a big import doesn't pin the
+                        // whole machine while the editor is interactive.
+                        let threads = crate::sw_gi::bake_worker_count().min(refs.len());
                         std::thread::scope(|s| {
                             for _ in 0..threads {
-                                s.spawn(|| loop {
+                                s.spawn(|| {
+                                    crate::sw_gi::lower_compute_priority();
+                                    loop {
                                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if i >= refs.len() {
                                         break;
@@ -1615,6 +1626,7 @@ impl EngineApp {
                                         );
                                     }
                                     *slots[i].lock().unwrap() = Some(r);
+                                    }
                                 });
                             }
                         });
@@ -3377,6 +3389,24 @@ impl EngineApp {
                         self.actions.push(EditorAction::Spawn(ObjectSource::Empty));
                         ui.close();
                     }
+                    // Create a reusable .prefab from the selected object subtree
+                    // (CHECKLIST T0 #7). Saved next to the scene; instantiate later
+                    // via `Prefab::load(..).instantiate(pos)`.
+                    if let Selection::Object(i) = self.selection {
+                        if ui.button("Create Prefab from Selection").clicked() {
+                            if let Some(prefab) =
+                                self.scene.prefab_from_object(i, &self.project_root, &self.shaders)
+                            {
+                                let name = self.scene.objects[i].name.replace(' ', "_");
+                                let path = self.project_root.join(format!("{name}.prefab"));
+                                match prefab.save(&path) {
+                                    Ok(_) => self.set_load_status(&format!("Saved prefab {}", path.display())),
+                                    Err(e) => self.set_load_status(&format!("Prefab save failed: {e}")),
+                                }
+                            }
+                            ui.close();
+                        }
+                    }
                     if ui.button("Create Camera").clicked() {
                         self.actions.push(EditorAction::Spawn(ObjectSource::Camera));
                         ui.close();
@@ -3443,6 +3473,10 @@ impl EngineApp {
                     }
                     if ui.button("Layers…").clicked() {
                         self.show_layers = true;
+                        ui.close();
+                    }
+                    if ui.button("Audio Mixer…").clicked() {
+                        self.show_mixer = true;
                         ui.close();
                     }
                     ui.separator();
@@ -3822,14 +3856,14 @@ impl EngineApp {
         };
         match &self.scene.baked {
             Some(b) => {
-                // FluxVR voxel volumes are owned by `realtime_gi::update_fluxvr`
+                // FluxVoxel voxel volumes are owned by `realtime_gi::update_flux_voxel`
                 // (it seeds its static base from the baked SH, then adds dynamic
                 // lights live), so skip them here — only plain DDGI volumes are
                 // uploaded as static baked probes.
                 let vols: Vec<_> = b
                     .probe_volumes
                     .iter()
-                    .filter(|v| !v.fluxvr)
+                    .filter(|v| !v.flux_voxel)
                     .map(|v| {
                         (
                             v.world_to_local,
@@ -3906,11 +3940,11 @@ impl EngineApp {
                 return;
             }
         };
-        // FluxVR volume count for the progress display (peek; recomputed when the
+        // FluxVoxel volume count for the progress display (peek; recomputed when the
         // main pass completes).
-        let fluxvr_volumes = self
+        let flux_voxel_volumes = self
             .scene
-            .gather_fluxvr_bake()
+            .gather_flux_voxel_bake()
             .map(|f| f.probe_volumes.len() as u32)
             .unwrap_or(0);
         let (task_id, cancel, progress) = self.tasks.register_stepped(
@@ -3922,7 +3956,7 @@ impl EngineApp {
                 lightmap_done: 0,
                 lightmap_total: gather.instances.len() as u32,
                 probe_volumes: gather.probe_volumes.len() as u32,
-                fluxvr_volumes,
+                flux_voxel_volumes,
                 phase: BakePhase::Lightmaps,
             },
         );
@@ -3951,7 +3985,7 @@ impl EngineApp {
     }
 
     /// Advance the active bake by one unit per frame; handles cancel, progress,
-    /// phase transition (main → FluxVR), and finalization.
+    /// phase transition (main → FluxVoxel), and finalization.
     fn step_bake(&mut self) {
         use crate::tasks::{BakePhase, NotifyLevel, TaskProgress};
         if self.bake_job.is_none() {
@@ -4043,7 +4077,7 @@ impl EngineApp {
                 if let Ok(mut p) = runner.progress.lock() {
                     if let TaskProgress::Bake { phase, .. } = &mut *p {
                         *phase = match runner.phase {
-                            BakeRunPhase::FluxVr => BakePhase::FluxVr,
+                            BakeRunPhase::FluxVoxel => BakePhase::FluxVoxel,
                             BakeRunPhase::Main => BakePhase::Probes,
                         };
                     }
@@ -4053,8 +4087,8 @@ impl EngineApp {
         }
     }
 
-    /// A bake pass finished: collect its output, advance main → FluxVR, or
-    /// finalize when the FluxVR pass is done.
+    /// A bake pass finished: collect its output, advance main → FluxVoxel, or
+    /// finalize when the FluxVoxel pass is done.
     fn bake_phase_complete(&mut self) {
         use crate::tasks::{BakePhase, TaskProgress};
         let mut runner = match self.bake_job.take() {
@@ -4073,8 +4107,8 @@ impl EngineApp {
                     probe_volumes: std::mem::take(&mut runner.probe_volumes),
                     probe_sh: output.probes,
                 };
-                // Kick the FluxVR voxel pass if any FluxVolumes exist; else done.
-                if let Some(fg) = self.scene.gather_fluxvr_bake() {
+                // Kick the FluxVoxel voxel pass if any FluxVolumes exist; else done.
+                if let Some(fg) = self.scene.gather_flux_voxel_bake() {
                     let fin = citrus_render::BakeInput {
                         instances: &fg.instances,
                         lights: &fg.lights,
@@ -4088,7 +4122,7 @@ impl EngineApp {
                         Some(Ok(job)) => {
                             if let Ok(mut p) = runner.progress.lock() {
                                 if let TaskProgress::Bake { phase, .. } = &mut *p {
-                                    *phase = BakePhase::FluxVr;
+                                    *phase = BakePhase::FluxVoxel;
                                 }
                             }
                             self.bake_job = Some(BakeRunner {
@@ -4096,7 +4130,7 @@ impl EngineApp {
                                 task_id: runner.task_id,
                                 cancel: runner.cancel,
                                 progress: runner.progress,
-                                phase: BakeRunPhase::FluxVr,
+                                phase: BakeRunPhase::FluxVoxel,
                                 settings: runner.settings,
                                 object_lightmap: std::collections::HashMap::new(),
                                 probe_volumes: fg.probe_volumes,
@@ -4105,13 +4139,13 @@ impl EngineApp {
                             return;
                         }
                         _ => {
-                            tracing::warn!("FluxVR bake begin failed; finalizing main bake only");
+                            tracing::warn!("FluxVoxel bake begin failed; finalizing main bake only");
                         }
                     }
                 }
                 self.finalize_bake(baked, runner.task_id);
             }
-            BakeRunPhase::FluxVr => {
+            BakeRunPhase::FluxVoxel => {
                 let mut baked = runner.baked.take().unwrap_or_else(|| scene::BakedData {
                     object_lightmap: std::collections::HashMap::new(),
                     lightmaps: Vec::new(),
@@ -4129,12 +4163,12 @@ impl EngineApp {
         }
     }
 
-    /// Install a finished bake: store on the scene, reseed FluxVR, upload, save,
+    /// Install a finished bake: store on the scene, reseed FluxVoxel, upload, save,
     /// clear the task, and flush any imports deferred during the bake.
     fn finalize_bake(&mut self, baked: scene::BakedData, task_id: crate::tasks::TaskId) {
         let n = baked.lightmaps.len();
         self.scene.baked = Some(baked);
-        self.rt_gi.invalidate_fluxvr();
+        self.rt_gi.invalidate_flux_voxel();
         self.upload_baked_probes();
         self.save_bake();
         self.tasks.complete_stepped(task_id);
@@ -4308,7 +4342,7 @@ impl EngineApp {
                     size: v.size,
                     counts: [v.counts[0] as u32, v.counts[1] as u32, v.counts[2] as u32],
                     sh_base: v.sh_base as u32,
-                    fluxvr: v.fluxvr,
+                    flux_voxel: v.flux_voxel,
                 })
                 .collect(),
             probes: baked
@@ -4503,6 +4537,9 @@ impl EngineApp {
                 ui.separator();
                 // Highest layer index actually in use (+a couple spare rows), so
                 // the matrix stays compact instead of always showing all 32.
+                // Consistent with the object layer dropdown + camera culling mask.
+                // The matrix can name beyond `shown` to reveal more layers (naming a
+                // higher layer raises shown_count everywhere).
                 let max_used = self
                     .scene
                     .objects
@@ -4510,7 +4547,7 @@ impl EngineApp {
                     .map(|o| o.layer as usize)
                     .max()
                     .unwrap_or(0);
-                let shown = (max_used + 2).clamp(4, NUM_LAYERS);
+                let shown = self.scene.layers.shown_count().max(max_used + 1);
 
                 egui::ScrollArea::both().max_height(440.0).show(ui, |ui| {
                     ui.heading("Names & visibility");
@@ -4519,7 +4556,10 @@ impl EngineApp {
                         ui.label("Name");
                         ui.label("Visible");
                         ui.end_row();
-                        for l in 0..shown {
+                        // The NAMES list shows ALL layers (scrollable) so you can name
+                        // any of the 32; naming a higher one raises `shown_count`, which
+                        // reveals it in the matrix + camera mask + object dropdown.
+                        for l in 0..NUM_LAYERS {
                             ui.label(format!("{l}"));
                             let name = self
                                 .scene
@@ -4578,6 +4618,9 @@ impl EngineApp {
                             ui.end_row();
                         }
                     });
+                    // Breathing room so the horizontal scrollbar (the 32-wide matrix
+                    // needs one) sits below the grid instead of over its last row.
+                    ui.add_space(18.0);
                 });
 
                 ui.separator();
@@ -4587,6 +4630,58 @@ impl EngineApp {
                 }
             });
         self.show_layers = open;
+
+        // Audio mixer window: a fader + mute per bus. `effective_gain(bus)` drives
+        // playback volume (the audio backend multiplies each source by it).
+        let mut mixer_open = self.show_mixer;
+        egui::Window::new("Audio Mixer")
+            .open(&mut mixer_open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                use citrus_editor::egui_phosphor::regular as ph;
+                ui.label(
+                    egui::RichText::new("Buses · linear gain, chained to Master")
+                        .small()
+                        .weak(),
+                );
+                // Grid so the mute icon / name / fader / gain columns line up.
+                egui::Grid::new("audio-mixer-grid")
+                    .num_columns(4)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        for name in self.mixer.bus_names() {
+                            // Mute toggle as a phosphor speaker icon (no checkbox box).
+                            let muted = self.mixer.is_muted(&name);
+                            let icon = if muted { ph::SPEAKER_NONE } else { ph::SPEAKER_HIGH };
+                            if ui
+                                .add(egui::Button::new(icon).frame(false))
+                                .on_hover_text(if muted { "Unmute" } else { "Mute" })
+                                .clicked()
+                            {
+                                self.mixer.set_muted(&name, !muted);
+                            }
+                            ui.label(egui::RichText::new(&name).monospace());
+                            let mut v = self.mixer.volume(&name);
+                            ui.spacing_mut().slider_width = 130.0;
+                            if ui
+                                .add(egui::Slider::new(&mut v, 0.0..=1.0).fixed_decimals(2))
+                                .changed()
+                            {
+                                self.mixer.set_volume(&name, v);
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {:.2}",
+                                    ph::ARROW_RIGHT,
+                                    self.mixer.effective_gain(&name)
+                                ))
+                                .weak(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.show_mixer = mixer_open;
     }
 
     /// Modal shown when a bake found static models without a lightmap UV. Offers
@@ -5250,7 +5345,7 @@ impl EngineApp {
                 let p = match phase {
                     crate::tasks::BakePhase::Lightmaps => "Tracing lightmaps",
                     crate::tasks::BakePhase::Probes => "Tracing probes",
-                    crate::tasks::BakePhase::FluxVr => "Tracing FluxVoxel",
+                    crate::tasks::BakePhase::FluxVoxel => "Tracing FluxVoxel",
                 };
                 let total = (*lightmap_total).max(1);
                 (
@@ -5602,6 +5697,27 @@ impl EngineApp {
                 self.set_status(format!("Reloaded {} shader(s)", changed.len()), false);
             }
         }
+
+        // Engine built-in shaders (e.g. standard.frag) are baked into the binary
+        // at build time, so watch their source on disk and recompile + hot-swap
+        // the pipeline when they change outside the editor.
+        let frag = std::path::Path::new(citrus_render::ENGINE_SHADER_DIR).join("standard.frag");
+        let mtime = std::fs::metadata(&frag).and_then(|m| m.modified()).ok();
+        if mtime != self.engine_shader_mtime {
+            let first = self.engine_shader_mtime.is_none();
+            self.engine_shader_mtime = mtime;
+            if !first {
+                // Drop the renderer borrow before set_status (which needs &mut self).
+                if let Some(result) = self.renderer.as_mut().map(|r| r.reload_standard_shaders()) {
+                    match result {
+                        Ok(()) => {
+                            self.set_status("Reloaded engine shader (standard.frag)", false)
+                        }
+                        Err(e) => self.set_status(format!("standard.frag reload failed: {e}"), true),
+                    }
+                }
+            }
+        }
     }
 
     /// Reflected shader info for the selection's material, resolved before
@@ -5694,8 +5810,7 @@ impl EngineApp {
         anchor: usize,
         before: &ObjectState,
         after: &ObjectState,
-        gesture_active: bool,
-    ) {
+    ) -> Vec<UndoEntry> {
         let dt = after.translation - before.translation;
         let dr = after.rotation * before.rotation.inverse();
         let inv = |v: f32| if v.abs() > 1e-6 { v } else { 1.0 };
@@ -5727,6 +5842,7 @@ impl EngineApp {
         let xform_changed = dt != glam::Vec3::ZERO
             || ds != glam::Vec3::ONE
             || before.rotation != after.rotation;
+        let mut entries = Vec::new();
         for j in targets {
             // Snapshot before mutating so the propagated edit is itself undoable
             // (otherwise undo would revert only the anchor, leaving the others).
@@ -5752,16 +5868,17 @@ impl EngineApp {
             }
             let t_after = object_state(&self.scene.objects[j]);
             if t_after != t_before {
-                self.undo_stack.record(
-                    UndoEntry::Object {
-                        index: j,
-                        before: t_before,
-                        after: t_after,
-                    },
-                    gesture_active,
-                );
+                // Returned to the caller to bundle into ONE Group entry with the
+                // anchor, so the whole multi-move is a single undo step (and one
+                // coalescing unit across the drag, not N interleaved entries).
+                entries.push(UndoEntry::Object {
+                    index: j,
+                    before: t_before,
+                    after: t_after,
+                });
             }
         }
+        entries
     }
 
     fn record_edits(&mut self, pre: EditSnapshot, gesture_active: bool) {
@@ -5779,20 +5896,28 @@ impl EngineApp {
                 let now = object_state(o);
                 if now != state {
                     self.scene_dirty = true;
+                    let anchor = UndoEntry::Object {
+                        index,
+                        before: state.clone(),
+                        after: now.clone(),
+                    };
                     // Multi-select: mirror the anchor's edit to the other selected
                     // objects (transforms as a delta so they move/rotate/scale
-                    // together; shared components set to the anchor's new value).
+                    // together; shared components set to the anchor's new value), and
+                    // bundle anchor + others into ONE atomic Group so a multi-move is
+                    // a single undo step that coalesces cleanly across the drag.
                     if self.multi_objects.len() > 1 && self.multi_objects.contains(&index) {
-                        self.propagate_multi_edit(index, &state, &now, gesture_active);
+                        let mut group = vec![anchor];
+                        group.extend(self.propagate_multi_edit(index, &state, &now));
+                        let entry = if group.len() > 1 {
+                            UndoEntry::Group(group)
+                        } else {
+                            group.pop().unwrap()
+                        };
+                        self.undo_stack.record(entry, gesture_active);
+                    } else {
+                        self.undo_stack.record(anchor, gesture_active);
                     }
-                    self.undo_stack.record(
-                        UndoEntry::Object {
-                            index,
-                            before: state,
-                            after: now,
-                        },
-                        gesture_active,
-                    );
                 }
                 if let (Some(material), Some(model)) = (material, model)
                     && material < self.scene.materials.len()
@@ -6036,7 +6161,25 @@ impl EngineApp {
             return;
         };
         self.suppress_undo_record = true;
+        self.apply_entry(entry, undo);
+    }
+
+    /// Apply a single history entry (recursing into `Group`). `apply_history` owns
+    /// the pop + `suppress_undo_record`; this just mutates the scene.
+    fn apply_entry(&mut self, entry: UndoEntry, undo: bool) {
         match entry {
+            UndoEntry::Group(entries) => {
+                // Undo reverts in reverse application order; redo replays forward.
+                if undo {
+                    for e in entries.into_iter().rev() {
+                        self.apply_entry(e, undo);
+                    }
+                } else {
+                    for e in entries {
+                        self.apply_entry(e, undo);
+                    }
+                }
+            }
             UndoEntry::Object {
                 index,
                 before,
@@ -6651,7 +6794,15 @@ impl EngineApp {
         // Highlight every multi-selected object (anchor + extras) in the viewport.
         let selected = self.selected_object_indices();
         let draws_t = Instant::now();
+        // Apply the MAIN CAMERA's culling mask on top of the viewport's layer toggle,
+        // so deselecting a layer in a camera's Culling Mask hides it in the editor too
+        // (previously the editor only used the Layers-window toggle, so the per-camera
+        // mask did nothing until you ran the game). Restored right after the draw
+        // build so the Layers window still edits the toggle, not the intersection.
+        let view_toggle = self.scene.visible_layers;
+        self.scene.visible_layers = view_toggle & self.scene.main_camera_culling_mask();
         self.scene.sync_draws_multi(&selected, 1.0);
+        self.scene.visible_layers = view_toggle;
         FrameTimings::ema(
             &mut self.frame_timings.draws,
             draws_t.elapsed().as_secs_f32() * 1000.0,
@@ -6791,6 +6942,9 @@ impl EngineApp {
             postfx,
             reflection_probe: self.scene.active_reflection_probe(self.camera.position),
             fog: self.scene.fog_params(),
+            voxel_specular: self.scene.environment.realtime_gi.mode
+                == citrus_assets::GiMode::FluxVoxel
+                && self.scene.environment.realtime_gi.voxel_specular,
             egui: Some(citrus_render::EguiDraw {
                 pixels_per_point: output.pixels_per_point,
                 primitives,
@@ -7735,7 +7889,7 @@ impl EditorTabs<'_> {
                     egui::ComboBox::from_id_salt("citrus-bake-max")
                         .selected_text(format!("{}", bake.max_lightmap))
                         .show_ui(ui, |ui| {
-                            for s in [128u32, 256, 512, 1024, 2048] {
+                            for s in [128u32, 256, 512, 1024, 2048, 4096] {
                                 ui.selectable_value(&mut bake.max_lightmap, s, format!("{s}"));
                             }
                         });
@@ -7960,33 +8114,22 @@ impl EditorTabs<'_> {
                     ui.separator();
                     ui.label(RichText::new("Flux GI (realtime)").strong());
                     let gi = &mut env.realtime_gi;
-                    ui.add_enabled_ui(!baked, |ui| {
+                    // Settings stay EDITABLE even with a baked lightmap loaded: the
+                    // FluxVoxel backend runs alongside a bake (the baked voxels are its
+                    // static base), and for the other backends the values you set here
+                    // take effect the moment the bake is cleared. (Previously the whole
+                    // section was disabled when baked, so you couldn't tweak anything.)
+                    ui.add_enabled_ui(true, |ui| {
                         ui.checkbox(&mut gi.enabled, "Enabled").on_hover_text(
                             "Flux: realtime global illumination. Screen-space probes \
                              march the scene distance field every frame for live indirect bounce \
                              — no bake, runs anywhere (no RT cores needed).",
                         );
                         ui.add_enabled_ui(gi.enabled, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Intensity");
-                                ui.add(egui::Slider::new(&mut gi.intensity, 0.0..=4.0))
-                                    .on_hover_text("Indirect bounce strength multiplier.");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Quality");
-                                egui::ComboBox::from_id_salt("citrus-flux-quality")
-                                    .selected_text(gi.quality.label())
-                                    .show_ui(ui, |ui| {
-                                        for q in citrus_assets::FluxQuality::ALL {
-                                            ui.selectable_value(&mut gi.quality, q, q.label());
-                                        }
-                                    });
-                            })
-                            .response
-                            .on_hover_text(
-                                "Rays per screen probe each frame. Temporal accumulation smooths \
-                                 the rest, so even Performance stays clean once settled.",
-                            );
+                            // Backend first: it decides which settings below apply.
+                            // Each control is gated by `gi.mode.uses_*()` so the panel
+                            // only shows what the chosen backend actually consumes
+                            // (modular settings — FluxVoxel hides bounces/quality/etc).
                             ui.horizontal(|ui| {
                                 ui.label("Backend");
                                 egui::ComboBox::from_id_salt("citrus-flux-mode")
@@ -7999,16 +8142,43 @@ impl EditorTabs<'_> {
                             })
                             .response
                             .on_hover_text(
-                                "Trace backend (NOT auto): Software marches the SDF (runs \
-                                 anywhere); Hardware (RT cores) ray-queries the scene BVH for \
-                                 exact geometry — needs a ray-query GPU, falls back to Software \
-                                 if unsupported.",
+                                "Trace backend (NOT auto): Flux marches the SDF (runs anywhere); \
+                                 FluxRT ray-queries the scene BVH for exact geometry (needs a \
+                                 ray-query GPU, falls back to Flux); FluxVoxel injects lights into \
+                                 an analytic voxel volume — cheapest, no ray tracing, for VR / \
+                                 low-end. Settings below adapt to the backend.",
                             );
+                            let mode = gi.mode;
                             ui.horizontal(|ui| {
-                                ui.label("Bounces");
-                                ui.add(egui::Slider::new(&mut gi.bounces, 1..=4))
-                                    .on_hover_text("Indirect bounces per ray (more = softer fill).");
+                                ui.label("Intensity");
+                                ui.add(egui::Slider::new(&mut gi.intensity, 0.0..=4.0))
+                                    .on_hover_text("Indirect bounce strength multiplier.");
                             });
+                            if mode.uses_quality() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Quality");
+                                    egui::ComboBox::from_id_salt("citrus-flux-quality")
+                                        .selected_text(gi.quality.label())
+                                        .show_ui(ui, |ui| {
+                                            for q in citrus_assets::FluxQuality::ALL {
+                                                ui.selectable_value(&mut gi.quality, q, q.label());
+                                            }
+                                        });
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Rays per screen probe each frame. Temporal accumulation \
+                                     smooths the rest, so even Performance stays clean once settled.",
+                                );
+                            }
+                            if mode.uses_bounces() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Bounces");
+                                    ui.add(egui::Slider::new(&mut gi.bounces, 1..=4)).on_hover_text(
+                                        "Indirect bounces per ray (more = softer fill).",
+                                    );
+                                });
+                            }
                             ui.horizontal(|ui| {
                                 ui.label("Smoothing");
                                 ui.add(egui::Slider::new(&mut gi.smoothing, 0.0..=1.0))
@@ -8017,36 +8187,132 @@ impl EditorTabs<'_> {
                                          lower = sharper/more responsive but noisier while moving.",
                                     );
                             });
-                            egui::CollapsingHeader::new("Advanced")
-                                .id_salt("citrus-flux-advanced")
-                                .show(ui, |ui| {
+                            // FluxVoxel-only controls: density of the auto scene grid +
+                            // the expensive toggles (DDGI occlusion). All ON by default.
+                            if mode.uses_voxel_density() {
+                                ui.horizontal(|ui| {
+                                    ui.label("Voxel density");
+                                    ui.add(
+                                        egui::Slider::new(&mut gi.voxel_density, 0.25..=4.0)
+                                            .suffix(" /m"),
+                                    )
+                                    .on_hover_text(
+                                        "Probes per world meter for the auto scene-covering grid \
+                                         (used when there are no FluxVolumes). Higher = finer GI, \
+                                         more cost. Per-FluxVolume density is set on each volume.",
+                                    );
+                                });
+                                ui.checkbox(&mut gi.voxel_auto_grid, "Auto scene grid")
+                                    .on_hover_text(
+                                        "Build a grid covering the scene when no FluxVolumes are \
+                                         placed, so everything gets voxel GI. Mutually exclusive \
+                                         with placed FluxVolumes: placing any volume turns this off \
+                                         and the author then controls coverage.",
+                                    );
+                                if gi.voxel_auto_grid {
                                     ui.horizontal(|ui| {
-                                        ui.label("GDF resolution");
-                                        egui::ComboBox::from_id_salt("citrus-flux-gdfres")
-                                            .selected_text(format!("{}³", gi.gdf_resolution))
+                                        ui.label("Grid mode");
+                                        egui::ComboBox::from_id_salt("citrus-voxel-gridmode")
+                                            .selected_text(gi.voxel_grid_mode.label())
                                             .show_ui(ui, |ui| {
-                                                for r in [64u32, 128, 256] {
+                                                for m in citrus_assets::VoxelGridMode::ALL {
                                                     ui.selectable_value(
-                                                        &mut gi.gdf_resolution,
-                                                        r,
-                                                        format!("{r}³"),
+                                                        &mut gi.voxel_grid_mode,
+                                                        m,
+                                                        m.label(),
                                                     );
                                                 }
                                             });
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("March distance");
-                                        ui.add(
-                                            egui::Slider::new(&mut gi.march_distance, 0.0..=500.0)
+                                    })
+                                    .response
+                                    .on_hover_text(
+                                        "Auto-grid layout:\n\
+                                         • Whole scene: one box over everything (cost scales with level size).\n\
+                                         • Camera clipmap: fixed cube following the camera — constant cost, best for big levels.\n\
+                                         • Occupancy culled: tight bounds around geometry.\n\
+                                         • Per object: tight grids hugging object clusters, gaps left uncovered.",
+                                    );
+                                    if gi.voxel_grid_mode
+                                        == citrus_assets::VoxelGridMode::CameraClipmap
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Clipmap extent");
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut gi.voxel_clipmap_extent,
+                                                    4.0..=64.0,
+                                                )
                                                 .suffix(" m"),
-                                        )
-                                        .on_hover_text("Max trace distance (0 = auto from scene size).");
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Firefly clamp");
-                                        ui.add(egui::Slider::new(&mut gi.firefly_clamp, 0.5..=16.0))
-                                            .on_hover_text("Caps bright bounce outliers (lower = calmer).");
-                                    });
+                                            )
+                                            .on_hover_text(
+                                                "Half-size of the camera-following cube; the grid is \
+                                                 2× this on a side, centred on the camera.",
+                                            );
+                                        });
+                                    }
+                                }
+                                ui.checkbox(&mut gi.voxel_ddgi_occlusion, "DDGI occlusion")
+                                    .on_hover_text(
+                                        "Block voxel lights with geometry (cheap DDGI-style shadows \
+                                         from a coarse scene occupancy grid). Turn off on low-end / \
+                                         VR to save the per-probe marches.",
+                                    );
+                                ui.checkbox(&mut gi.voxel_propagation, "Light propagation")
+                                    .on_hover_text(
+                                        "LPV-style diffuse bounce: spread injected light through \
+                                         the voxel grid so it fills shadowed pockets (≥1 bounce). \
+                                         Off = direct-only (cheapest).",
+                                    );
+                                ui.checkbox(&mut gi.voxel_specular, "Specular GI")
+                                    .on_hover_text(
+                                        "Metallic / rough surfaces sample the voxel volume in the \
+                                         reflection direction (VXGI-style glossy) so they pick up \
+                                         emissive + voxel-light bounce, not just the reflection cube.",
+                                    );
+                            }
+                            egui::CollapsingHeader::new("Advanced")
+                                .id_salt("citrus-flux-advanced")
+                                .show(ui, |ui| {
+                                    if mode.uses_gdf() {
+                                        ui.horizontal(|ui| {
+                                            ui.label("GDF resolution");
+                                            egui::ComboBox::from_id_salt("citrus-flux-gdfres")
+                                                .selected_text(format!("{}³", gi.gdf_resolution))
+                                                .show_ui(ui, |ui| {
+                                                    for r in [64u32, 128, 256] {
+                                                        ui.selectable_value(
+                                                            &mut gi.gdf_resolution,
+                                                            r,
+                                                            format!("{r}³"),
+                                                        );
+                                                    }
+                                                });
+                                        });
+                                    }
+                                    if mode.uses_march_distance() {
+                                        ui.horizontal(|ui| {
+                                            ui.label("March distance");
+                                            ui.add(
+                                                egui::Slider::new(&mut gi.march_distance, 0.0..=500.0)
+                                                    .suffix(" m"),
+                                            )
+                                            .on_hover_text(
+                                                "Max trace distance (0 = auto from scene size).",
+                                            );
+                                        });
+                                    }
+                                    if mode.uses_samples() {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Firefly clamp");
+                                            ui.add(egui::Slider::new(
+                                                &mut gi.firefly_clamp,
+                                                0.5..=16.0,
+                                            ))
+                                            .on_hover_text(
+                                                "Caps bright bounce outliers (lower = calmer).",
+                                            );
+                                        });
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.label("Probe fallback");
                                         egui::ComboBox::from_id_salt("citrus-flux-fallback")
@@ -8065,11 +8331,14 @@ impl EditorTabs<'_> {
                         });
                     });
                     if baked {
-                        ui.label(
-                            RichText::new("Off while a bake is loaded (Clear it to use Flux GI).")
-                                .small()
-                                .weak(),
-                        );
+                        let note = if gi.mode == citrus_assets::GiMode::FluxVoxel {
+                            "FluxVoxel runs alongside the bake (baked voxels are its static base) \
+                             — these settings are live."
+                        } else {
+                            "A bake is loaded, so Flux/FluxRT realtime GI is paused; these settings \
+                             apply when you Clear the bake. (FluxVoxel runs with a bake.)"
+                        };
+                        ui.label(RichText::new(note).small().weak());
                     }
 
                     // Reflections: a dedicated Environment section (NOT under GI),
@@ -8847,7 +9116,18 @@ impl EditorTabs<'_> {
                         .downcast_ref::<citrus_core::AudioSource>()
                         .is_some()
                 });
-                if !is_light && !is_camera && !is_probe && !is_refl_probe && !is_audio {
+                let is_flux_volume = object.components.iter().any(|c| {
+                    c.as_any()
+                        .downcast_ref::<citrus_core::FluxVolume>()
+                        .is_some()
+                });
+                if !is_light
+                    && !is_camera
+                    && !is_probe
+                    && !is_refl_probe
+                    && !is_audio
+                    && !is_flux_volume
+                {
                     continue;
                 }
                 let pos = self.scene.world_transform(i).w_axis.truncate();
@@ -8864,10 +9144,11 @@ impl EditorTabs<'_> {
                     continue;
                 }
                 let selected = matches!(*self.selection, Selection::Object(s) if s == i);
-                // Icon priority: light, probe volume, reflection probe, audio, camera.
+                // Icon priority: light, probe volume (incl. FluxVolume), reflection
+                // probe, audio, camera.
                 let setting = if is_light {
                     self.widget_filter.lights
-                } else if is_probe {
+                } else if is_probe || is_flux_volume {
                     self.widget_filter.probes
                 } else if is_refl_probe {
                     self.widget_filter.reflection_probes
@@ -8883,7 +9164,7 @@ impl EditorTabs<'_> {
                 }
                 if is_light {
                     draw_light_icon(painter, screen, selected, setting.size);
-                } else if is_probe {
+                } else if is_probe || is_flux_volume {
                     draw_probe_icon(painter, screen, selected, setting.size);
                 } else if is_refl_probe {
                     draw_reflection_probe_icon(painter, screen, selected, setting.size);
@@ -9237,6 +9518,7 @@ impl EditorTabs<'_> {
                         1 => ph::COMPASS,         // world normals
                         2 => ph::CUBE_TRANSPARENT, // indirect GI
                         3 => ph::PAINT_BRUSH,     // unlit
+                        4 | 5 => ph::SPHERE,      // reflection debug
                         _ => ph::LIGHTBULB,       // lit
                     };
                     let mode = &mut *self.gi_debug;
@@ -9248,6 +9530,16 @@ impl EditorTabs<'_> {
                             ui.selectable_value(mode, 3, format!("{} Unlit", ph::PAINT_BRUSH));
                             ui.selectable_value(mode, 2, format!("{} Indirect GI", ph::CUBE_TRANSPARENT));
                             ui.selectable_value(mode, 1, format!("{} World Normals", ph::COMPASS));
+                            ui.separator();
+                            ui.label(egui::RichText::new("Reflection debug").small().weak());
+                            ui.selectable_value(mode, 4, format!("{} Reflection cube (mirror)", ph::SPHERE))
+                                .on_hover_text(
+                                    "Every surface becomes a perfect mirror of the reflection \
+                                     cube (sharp, no roughness/BRDF) — reveals the captured \
+                                     cube's orientation directly.",
+                                );
+                            ui.selectable_value(mode, 5, format!("{} Reflection vector", ph::ARROWS_OUT))
+                                .on_hover_text("Reflection direction R as RGB (+X red, +Y green, +Z blue).");
                         });
                     // Gizmos dropdown (icon only): per-kind billboard filter. Stays
                     // open across clicks so several kinds toggle at once.
@@ -9455,22 +9747,20 @@ impl EditorTabs<'_> {
                     };
                 }
                 // Layer dropdown (Unity-style): drives the camera culling mask
-                // (rendering) and the layer-collision matrix (physics). Edit the
-                // names + matrix in Tools → Layers.
-                let layer_names: Vec<String> = (0..citrus_core::NUM_LAYERS as u8)
+                // (rendering) and the layer-collision matrix (physics). Shows the
+                // SAME layer set as the camera mask + Layers window (`shown_count`).
+                // Edit the names + matrix in Tools → Layers.
+                let shown = self.scene.layers.shown_count();
+                let layer_names: Vec<String> = (0..shown as u8)
                     .map(|l| self.scene.layers.layer_name(l))
                     .collect();
+                let selected_text = self.scene.layers.layer_name(self.scene.objects[index].layer);
                 let obj = &mut self.scene.objects[index];
                 let mut layer = obj.layer;
                 ui.horizontal(|ui| {
                     ui.label("Layer");
                     egui::ComboBox::from_id_salt("object-layer")
-                        .selected_text(
-                            layer_names
-                                .get(layer as usize)
-                                .cloned()
-                                .unwrap_or_default(),
-                        )
+                        .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             for (l, name) in layer_names.iter().enumerate() {
                                 ui.selectable_value(&mut layer, l as u8, name);
@@ -9660,6 +9950,9 @@ impl EditorTabs<'_> {
                         .iter()
                         .map(|o| (o.id, o.name.clone()))
                         .collect();
+                    // Layer names for the camera culling-mask picker (cloned before
+                    // the mutable scene borrow below).
+                    let layer_names: Vec<String> = self.scene.layers.names.clone();
                     // Imported (embedded) materials have no backing file; they're
                     // read-only until extracted, so don't hand them to the editor.
                     let embedded = material_index
@@ -9684,6 +9977,7 @@ impl EditorTabs<'_> {
                             registry: self.registry,
                             editor_components: self.editor_components,
                             objects: &objects,
+                            layer_names: &layer_names,
                         },
                         &shader_refs,
                     );

@@ -8,7 +8,7 @@ layout(constant_id = 1) const bool FEAT_NORMAL_MAP = false;
 layout(constant_id = 2) const bool FEAT_EMISSION = false;
 layout(constant_id = 3) const uint ALPHA_MODE = 0u; // 0 opaque, 1 cutout, 2 blend
 
-const int MAX_LIGHTS = 16;
+const int MAX_LIGHTS = 128;
 
 struct Light {
     vec4 pos_kind;   // xyz world position, w = kind (0 dir, 1 point, 2 spot)
@@ -60,7 +60,13 @@ layout(set = 0, binding = 0) uniform FrameData {
 // Reflection probe: prefiltered environment cubemap (mirror at mip 0, rougher
 // toward higher mips). Sampled by reflection direction + roughness.
 layout(set = 0, binding = 7) uniform samplerCube u_env;
-const float ENV_MAX_LOD = 6.0; // matches cube_mip_count(64) - 1
+// Max roughness mip = (mip count - 1) of the CURRENTLY bound cube, queried at
+// runtime so it's correct whether u_env is the 64px skybox cube (7 mips) or a
+// higher-res captured reflection-probe cube (e.g. 256px = 9 mips). A hardcoded
+// constant under-blurred probe reflections (sampled mip 6 of 9 -> too sharp on
+// rough surfaces, the "defined blob on a rough floor" artifact). See
+// REFLECTION_PROBES_MATH.md 6.5.
+#define ENV_MAX_LOD (float(textureQueryLevels(u_env) - 1))
 
 layout(set = 0, binding = 1) uniform sampler2DArrayShadow u_shadow;
 
@@ -159,6 +165,16 @@ vec3 sh_eval(uint i, vec3 n) {
                      + probes[i].c[3].rgb * n.x);
 }
 
+// RADIANCE (not irradiance) from the probe SH-L1 in direction `dir`: the raw L1
+// band reconstruction (no cosine-lobe factor), used for the FluxVoxel specular-
+// from-volume term. Very low-frequency, so only a rough-glossy approximation.
+vec3 sh_radiance(uint i, vec3 dir) {
+    return probes[i].c[0].rgb * 0.282095
+         + 0.488603 * (probes[i].c[1].rgb * dir.y
+                     + probes[i].c[2].rgb * dir.z
+                     + probes[i].c[3].rgb * dir.x);
+}
+
 // Expected distance to geometry from probe `i` in world direction `dir`,
 // reconstructed from the SH-L1 stored in the coeffs' .w lanes (raw band factors,
 // no cosine convolution). Zero (the bake path) means "no visibility data".
@@ -200,11 +216,13 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
     vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
     ivec3 g0 = ivec3(floor(g));
     vec3 f = g - vec3(g0);
-    // Smoothstep (Hermite) the interpolation factor so the trilinear blend is
-    // C1-continuous across cell boundaries. Plain linear trilinear has a kink in
-    // its gradient at every boundary, which reads as visible facets/"squares" on
-    // a smooth gradient; this removes that without needing a finer grid.
-    f = f * f * (3.0 - 2.0 * f);
+    // Smootherstep (quintic) the interpolation factor so the trilinear blend is
+    // C2-continuous across cell boundaries. Plain linear trilinear kinks the
+    // gradient at every boundary, and even smoothstep (cubic, C1) leaves a jump in
+    // the SECOND derivative there — which the eye still reads as faint grid lines
+    // (Mach banding) between voxels. The quintic is C2, so the cell edges blend
+    // away entirely without needing a finer grid.
+    f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
 
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
@@ -234,9 +252,11 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
         } else if (md2 > 1e-4) {
             float variance = max(md2 - md * md, 1e-4);
             float dd = pd - md;
-            vis = max(variance / (variance + dd * dd), 0.25);
+            // Higher floor (0.5) = gentler occlusion, so any residual per-probe
+            // moment variation reads as a soft contact-shadow, not hard grid dots.
+            vis = max(variance / (variance + dd * dd), 0.5);
         } else {
-            vis = clamp(1.0 - (pd - md) / max(band, 1e-3), 0.25, 1.0);
+            vis = clamp(1.0 - (pd - md) / max(band, 1e-3), 0.5, 1.0);
         }
         // Front-facing weight (probe should be on the surface's lit side). Kept
         // gentle + a generous floor so shadowed/back faces still gather soft fill
@@ -290,6 +310,75 @@ float sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
     }
     irradiance = vec3(0.0);
     return 0.0;
+}
+
+// FluxVoxel specular-from-volume (VXGI-style glossy approximation): trilinearly
+// sample the probe volume's RADIANCE in the reflection direction `dir`, so a
+// metallic/rough surface receives the emissive + voxel-light bounce held in the
+// volume — not just the reflection cube. Coarse (SH-L1 is very low frequency), so
+// it's only used for rough-glossy surfaces. Returns false when `world_pos` is
+// outside every volume. No cascade cross-fade / visibility — a glossy fill term.
+bool volume_radiance(vec3 world_pos, vec3 dir, out vec3 rad) {
+    int vcount = int(frame.misc.w + 0.5);
+    for (int vi = 0; vi < vcount && vi < MAX_PROBE_VOLUMES; ++vi) {
+        ProbeVolume v = frame.probe_volumes[vi];
+        vec3 t = volume_coords(v, world_pos);
+        if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) {
+            continue;
+        }
+        ivec3 cnt = ivec3(v.counts.xyz + 0.5);
+        vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
+        ivec3 g0 = ivec3(floor(g));
+        vec3 f = g - vec3(g0);
+        f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0); // smootherstep (C2): blend voxel edges
+        vec3 sum = vec3(0.0);
+        float wsum = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            ivec3 off = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+            ivec3 gc = clamp(g0 + off, ivec3(0), cnt - 1);
+            vec3 tw = mix(vec3(1.0) - f, f, vec3(off));
+            float w = tw.x * tw.y * tw.z;
+            uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
+            sum += w * max(sh_radiance(idx, dir), vec3(0.0));
+            wsum += w;
+        }
+        rad = wsum > 1e-5 ? sum / wsum : vec3(0.0);
+        return true;
+    }
+    return false;
+}
+
+// Smooth probe irradiance in normal `n` — pure trilinear `sh_eval`, NO Chebyshev /
+// front-facing weighting. Used to add realtime voxel GI on top of a LIGHTMAP: the
+// bake already carries the static occlusion, so the per-probe Chebyshev variation
+// (which draws the grid as fixed dots on bright baked surfaces) isn't wanted here.
+vec3 sample_irradiance_smooth(vec3 world_pos, vec3 n) {
+    int vcount = int(frame.misc.w + 0.5);
+    for (int vi = 0; vi < vcount && vi < MAX_PROBE_VOLUMES; ++vi) {
+        ProbeVolume v = frame.probe_volumes[vi];
+        vec3 t = volume_coords(v, world_pos);
+        if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) {
+            continue;
+        }
+        ivec3 cnt = ivec3(v.counts.xyz + 0.5);
+        vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
+        ivec3 g0 = ivec3(floor(g));
+        vec3 f = g - vec3(g0);
+        f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0); // smootherstep (C2): blend voxel edges
+        vec3 sum = vec3(0.0);
+        float wsum = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            ivec3 off = ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+            ivec3 gc = clamp(g0 + off, ivec3(0), cnt - 1);
+            vec3 tw = mix(vec3(1.0) - f, f, vec3(off));
+            float w = tw.x * tw.y * tw.z;
+            uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
+            sum += w * sh_eval(idx, n);
+            wsum += w;
+        }
+        return wsum > 1e-5 ? max(sum / wsum, vec3(0.0)) : vec3(0.0);
+    }
+    return vec3(0.0);
 }
 
 // Returns 1.0 fully lit, 0.0 fully shadowed. `light.spot` packs
@@ -751,6 +840,14 @@ void main() {
     if (pc.params1.w >= 0.0) {
         int layer = int(pc.params1.w + 0.5);
         indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
+        // MIXED LIGHTING: a lightmapped (static-baked) surface ALSO receives the
+        // realtime FluxVoxel probe GI, added on top of the baked bounce. The bake
+        // can't contain dynamic/movable emitters, so without this an emissive orb
+        // lights ONLY metals (via reflections) and never the baked floor/couch.
+        // Use the SMOOTH (non-occluded) probe sample — the lightmap already carries
+        // the static occlusion, and the DDGI Chebyshev's per-probe variation showed
+        // as fixed dots on the bright baked surface. Returns 0 with no realtime GI.
+        indirect += sample_irradiance_smooth(v_world_pos, N);
     } else if (frame.debug.z > 0.5) {
         // Screen-space GI: depth-aware upsample of the sparse screen probes.
         // Emissive surfaces are in the depth prepass again, so they sample their
@@ -764,9 +861,16 @@ void main() {
     } else {
         // Probe GI where a cascade covers the fragment, fading to flat ambient
         // at the outermost cascade's edge (coverage < 1) and beyond it (0).
-        vec3 probe_irr;
-        float cov = sample_probes(v_world_pos, N, probe_irr);
-        indirect = mix(frame.ambient.rgb, probe_irr, cov);
+        // Use the SAME smooth, full-strength voxel sample as the lightmap path (no
+        // per-probe Chebyshev dots/dimming) so a non-baked floor lights up just like
+        // a baked one. `sample_probes` is still called for its coverage value (the
+        // cascade fade-to-ambient at the volume edge); FluxVoxel's analytic radiance
+        // has no occlusion to lose, and the SDF/RT march already bakes occlusion into
+        // the probe values, so dropping the Chebyshev here only removes interpolation
+        // leak-guarding — a fair trade for the smooth, even result.
+        vec3 occ_irr;
+        float cov = sample_probes(v_world_pos, N, occ_irr);
+        indirect = mix(frame.ambient.rgb, sample_irradiance_smooth(v_world_pos, N), cov);
     }
     // Energy-conserving ambient: split indirect into diffuse (non-reflected) and
     // a cheap specular share so metals/smooth surfaces pick up environment colour
@@ -790,13 +894,23 @@ void main() {
     if (probe_intensity > 0.0 && frame.refl_extents.w > 0.5) {
         vec3 bmin = frame.refl_center.xyz - frame.refl_extents.xyz;
         vec3 bmax = frame.refl_center.xyz + frame.refl_extents.xyz;
-        vec3 invR = 1.0 / R;
-        vec3 t1 = (bmax - v_world_pos) * invR;
-        vec3 t2 = (bmin - v_world_pos) * invR;
-        vec3 tmax = max(t1, t2);
-        float dist = min(min(tmax.x, tmax.y), tmax.z);
-        vec3 hit = v_world_pos + R * dist;
-        R = hit - frame.refl_center.xyz;
+        // Only box-project surfaces INSIDE the probe box. The box is a proxy for the
+        // room geometry as seen from the capture point; for a surface OUTSIDE it (a
+        // floor extending past the probe, say) the ray-box intersection lands on the
+        // wrong face and the reflection is mis-placed — so fall back to the infinite-
+        // cube direction (raw R) there instead of producing a garbage parallax hit.
+        // (REFLECTION_PROBES_MATH.md 6.4: wrong box coverage = offset reflections.)
+        bool inside = all(greaterThanEqual(v_world_pos, bmin))
+                   && all(lessThanEqual(v_world_pos, bmax));
+        if (inside) {
+            vec3 invR = 1.0 / R;
+            vec3 t1 = (bmax - v_world_pos) * invR;
+            vec3 t2 = (bmin - v_world_pos) * invR;
+            vec3 tmax = max(t1, t2);
+            float dist = min(min(tmax.x, tmax.y), tmax.z);
+            vec3 hit = v_world_pos + R * dist;
+            R = hit - frame.refl_center.xyz;
+        }
     }
     // No reflection-probe zone → the fallback is the skybox cube, scaled by the
     // skylight/env intensity (frame.ambient.w). So turning ambient/skylight off
@@ -826,6 +940,24 @@ void main() {
     float refl_strength = fx.parallax.y;
     vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao * refl_strength;
     color += reflectance * spec_env;
+    // FluxVoxel specular-from-volume (frame.fog_params.w = voxel_specular flag):
+    // sample the volume in the reflection direction so SMOOTH METALS pick up the
+    // local emissive/voxel bounce the (coarse) reflection cube misses. This term is
+    // VIEW-DEPENDENT (R = reflect(-V, N)), so it must NOT drive a rough/dielectric
+    // floor — there the emissive arrives as VIEW-INDEPENDENT diffuse GI (above), so
+    // the floor glow looks the same from every angle instead of riding the camera.
+    // Gate by metallic·(1-roughness): ~0 for dielectric OR rough, only smooth metals
+    // get it. (Earlier `reflectance·vrad·roughness` lit rough floors at grazing
+    // Fresnel → the "GI only on the camera side" artifact.)
+    if (frame.fog_params.w > 0.5) {
+        float spec_w = metallic * (1.0 - roughness);
+        if (spec_w > 0.001) {
+            vec3 vrad;
+            if (volume_radiance(v_world_pos, R, vrad)) {
+                color += f0 * vrad * spec_w;
+            }
+        }
+    }
     // SSR G-buffer: octahedral view-space normal (rg) + roughness (b) + a scalar
     // reflectivity (a, the env-reflection weight's luminance). The resolve pass
     // uses the stored normal directly for an exact reflection ray. The global
@@ -865,7 +997,9 @@ void main() {
     }
 
     // Viewport render modes (frame.debug.y): 1 = world normals, 2 = indirect/GI
-    // term only, 3 = unlit (raw albedo, no lighting/post).
+    // term only, 3 = unlit (raw albedo, no lighting/post), 4 = reflection cube
+    // (every surface a perfect mirror of u_env at R — reveals the captured cube's
+    // orientation directly, no BRDF/roughness), 5 = reflection direction R as RGB.
     int gi_dbg = int(frame.debug.y + 0.5);
     if (gi_dbg == 1) {
         o_color = vec4(N * 0.5 + 0.5, 1.0);
@@ -875,6 +1009,14 @@ void main() {
         return;
     } else if (gi_dbg == 3) {
         o_color = vec4(albedo.rgb, 1.0);
+        return;
+    } else if (gi_dbg == 4) {
+        // Perfect-mirror sample of the reflection cube (sharp mip 0), no shading.
+        o_color = vec4(textureLod(u_env, R, 0.0).rgb * env_scale, 1.0);
+        return;
+    } else if (gi_dbg == 5) {
+        // Reflection direction visualized: +X red, +Y green, +Z blue.
+        o_color = vec4(normalize(R) * 0.5 + 0.5, 1.0);
         return;
     }
 

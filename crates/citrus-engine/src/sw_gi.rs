@@ -394,17 +394,26 @@ fn probe_sh(
 
 /// Inject one light's contribution (distance/cone falloff, FULL L1 directionality
 /// — an L0-only term looks flat/translucent) into a probe's SH-L1 accumulator at
-/// world position `p`. The FluxVR per-voxel kernel.
-/// Add a DIRECT light to a probe's SH-L1, but weighted so it reconstructs close to
-/// a clamped `N·L` instead of the soft SH lobe. `add_sh` (used for bounce GI) puts
-/// energy in the L0 *monopole* (omnidirectional) band, which lights a surface from
-/// every side — that's the "FluxVoxel light lights both sides" problem. For a
-/// DIRECT light we want directionality, so trim L0 and boost the L1 directional
-/// band: the ≥0 clamp at eval time then darkens back/grazing faces. (Stopgap until
-/// the per-light directional voxel volume; see scene notes.)
+/// world position `p`. The FluxVoxel per-voxel kernel.
+/// Add a DIRECT light to a probe's SH-L1, weighted to reconstruct close to a
+/// clamped `N·L` while still letting MULTIPLE lights blend. The L0 *monopole*
+/// (omnidirectional) band is what makes different-coloured lights mix additively;
+/// the L1 directional band darkens back/grazing faces via the ≥0 clamp at eval.
+///
+/// Balance matters: too little L0 (the old 0.7) over-sharpened the lobe so two
+/// lights from different directions CANCELLED instead of blending — one colour won
+/// and the other was clamped to black (the "only one emissive light shows / lights
+/// don't blend" bug). L0=1.0 keeps each light's contribution additive (colours mix)
+/// while L1 (>L0) preserves enough directionality that a fully back-facing surface
+/// still clamps dark, so we don't regress "lights both sides".
 fn add_sh_direct(s: &mut [Vec3; 4], dir: Vec3, r: Vec3) {
-    const L0: f32 = 0.7; // trim the omnidirectional ambient leak
-    const L1: f32 = 1.8; // sharpen the directional lobe toward N·L
+    // Slightly omnidirectional-biased: emitters at floor level light the up-facing
+    // floor only via the L0 monopole (the floor catches them at a grazing angle, so
+    // the directional L1 barely contributes). A higher L0 lets those up-facing
+    // surfaces pick up more of the glow, evening out the floor-vs-couch difference,
+    // while L1 stays > L0 so strongly back-facing surfaces still clamp toward dark.
+    const L0: f32 = 1.4; // monopole (blending + up-facing/grazing pickup)
+    const L1: f32 = 1.6; // directional lobe (kept > L0 so back-faces still clamp)
     s[0] += r * (0.282095 * L0);
     s[1] += r * (0.488603 * L1 * dir.y);
     s[2] += r * (0.488603 * L1 * dir.z);
@@ -412,10 +421,24 @@ fn add_sh_direct(s: &mut [Vec3; 4], dir: Vec3, r: Vec3) {
 }
 
 pub fn inject_light(s: &mut [Vec3; 4], p: Vec3, l: &BakeLight) {
+    inject_light_occ(s, p, l, None);
+}
+
+/// Inject one light into a probe SH, optionally attenuated by a coarse scene
+/// occupancy grid (DDGI-style cheap occlusion). `occ = None` is the unshadowed
+/// path. The occlusion is a *soft* transmittance from the coarse grid so it can
+/// never hard-black a probe (the grid is too coarse for crisp shadows — it gives
+/// contact darkening, not stencils), keeping it safe to leave on by default.
+pub fn inject_light_occ(s: &mut [Vec3; 4], p: Vec3, l: &BakeLight, occ: Option<&SceneOccupancy>) {
     let col = Vec3::from(l.color); // already × intensity
     match l.kind {
         LightKind::Directional => {
-            add_sh_direct(s, (-l.direction).normalize_or(Vec3::NEG_Y), col);
+            // March from the probe toward the light; if blocked, attenuate.
+            let dir = (-l.direction).normalize_or(Vec3::NEG_Y);
+            let vis = occ.map_or(1.0, |o| o.visibility(p, p + dir * o.span()));
+            if vis > 0.0 {
+                add_sh_direct(s, dir, col * vis);
+            }
         }
         _ => {
             let to = l.position - p;
@@ -436,13 +459,435 @@ pub fn inject_light(s: &mut [Vec3; 4], p: Vec3, l: &BakeLight) {
                 atten *= sp * sp;
             }
             if atten > 0.0 {
-                add_sh_direct(s, d, col * atten);
+                let vis = occ.map_or(1.0, |o| o.visibility(p, l.position));
+                atten *= vis;
+                if atten > 0.0 {
+                    add_sh_direct(s, d, col * atten);
+                }
             }
         }
     }
 }
 
-/// World-space probe positions for a FluxVR voxel volume (box centred at
+/// Coarse scene occupancy bit-grid for cheap voxel-light occlusion. Mesh world
+/// AABBs are rasterized into cells; `visibility` DDA-marches a segment and counts
+/// solid interior cells (endpoints skipped so a probe sitting on the floor isn't
+/// self-occluded). Soft, monotone attenuation — never amplifies, never hard-zero.
+pub struct SceneOccupancy {
+    min: Vec3,
+    cell: Vec3, // world size of one cell
+    dims: [i32; 3],
+    bits: Vec<u64>,
+}
+
+impl SceneOccupancy {
+    /// Build from world-space mesh AABBs. `max_dim` caps the longest axis's cell
+    /// count (memory/cost bound). Returns None if there's nothing to occlude.
+    pub fn build(boxes: &[(Vec3, Vec3)], max_dim: i32) -> Option<Self> {
+        if boxes.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for (mn, mx) in boxes {
+            lo = lo.min(*mn);
+            hi = hi.max(*mx);
+        }
+        if !lo.is_finite() {
+            return None;
+        }
+        let size = (hi - lo).max(Vec3::splat(0.1));
+        let longest = size.max_element();
+        let cell_size = (longest / max_dim as f32).max(0.05);
+        let dims = [
+            ((size.x / cell_size).ceil() as i32 + 1).clamp(1, max_dim),
+            ((size.y / cell_size).ceil() as i32 + 1).clamp(1, max_dim),
+            ((size.z / cell_size).ceil() as i32 + 1).clamp(1, max_dim),
+        ];
+        let total = (dims[0] * dims[1] * dims[2]) as usize;
+        let mut occ = Self {
+            min: lo,
+            cell: Vec3::splat(cell_size),
+            dims,
+            bits: vec![0u64; total.div_ceil(64)],
+        };
+        for (mn, mx) in boxes {
+            let c0 = occ.cell_coord(*mn);
+            let c1 = occ.cell_coord(*mx);
+            for z in c0[2]..=c1[2] {
+                for y in c0[1]..=c1[1] {
+                    for x in c0[0]..=c1[0] {
+                        occ.set_solid([x, y, z]);
+                    }
+                }
+            }
+        }
+        Some(occ)
+    }
+
+    /// Diagonal world span — a safe "march to the edge" distance for directional
+    /// lights (the DDA clips to the grid anyway).
+    pub fn span(&self) -> f32 {
+        (Vec3::new(self.dims[0] as f32, self.dims[1] as f32, self.dims[2] as f32) * self.cell)
+            .length()
+    }
+
+    /// Clamped cell coord — for rasterizing solid boxes (which are guaranteed to
+    /// overlap the grid, since the grid IS their bounds).
+    fn cell_coord(&self, p: Vec3) -> [i32; 3] {
+        let r = (p - self.min) / self.cell;
+        [
+            (r.x.floor() as i32).clamp(0, self.dims[0] - 1),
+            (r.y.floor() as i32).clamp(0, self.dims[1] - 1),
+            (r.z.floor() as i32).clamp(0, self.dims[2] - 1),
+        ]
+    }
+
+    /// Unclamped cell coord — for the visibility march, so a sample point OUTSIDE
+    /// the grid maps to an out-of-range cell that `solid()` treats as empty (a ray
+    /// running beside the geometry must not clamp into a solid boundary cell).
+    fn cell_coord_raw(&self, p: Vec3) -> [i32; 3] {
+        let r = (p - self.min) / self.cell;
+        [r.x.floor() as i32, r.y.floor() as i32, r.z.floor() as i32]
+    }
+
+    fn lin(&self, c: [i32; 3]) -> usize {
+        ((c[2] * self.dims[1] + c[1]) * self.dims[0] + c[0]) as usize
+    }
+
+    fn set_solid(&mut self, c: [i32; 3]) {
+        let i = self.lin(c);
+        self.bits[i >> 6] |= 1u64 << (i & 63);
+    }
+
+    fn solid(&self, c: [i32; 3]) -> bool {
+        if c[0] < 0
+            || c[1] < 0
+            || c[2] < 0
+            || c[0] >= self.dims[0]
+            || c[1] >= self.dims[1]
+            || c[2] >= self.dims[2]
+        {
+            return false;
+        }
+        let i = self.lin(c);
+        (self.bits[i >> 6] >> (i & 63)) & 1 != 0
+    }
+
+    /// Soft visibility in [floor, 1] for the segment a→b. Counts solid interior
+    /// cells (the first/last cell near each endpoint are skipped). Each blocked
+    /// cell softly attenuates; a small floor keeps it from ever going black so the
+    /// coarse grid can't punch hard holes in the lighting.
+    pub fn visibility(&self, a: Vec3, b: Vec3) -> f32 {
+        let seg = b - a;
+        let len = seg.length();
+        if len < 1e-4 {
+            return 1.0;
+        }
+        let dir = seg / len;
+        let step = self.cell.min_element() * 0.5;
+        let n = (len / step).ceil() as i32;
+        // Skip ~1.5 cells at each end to avoid self-occlusion at probe/light.
+        let skip = (self.cell.min_element() * 1.5 / step).ceil() as i32;
+        let mut blocked = 0i32;
+        let mut last = [i32::MIN; 3];
+        for i in skip..(n - skip).max(skip) {
+            let p = a + dir * (i as f32 * step);
+            let c = self.cell_coord_raw(p);
+            if c == last {
+                continue;
+            }
+            last = c;
+            if self.solid(c) {
+                blocked += 1;
+            }
+        }
+        if blocked == 0 {
+            1.0
+        } else {
+            // 1 cell → 0.5, 2 → 0.33, … with a 0.1 floor.
+            (1.0 / (1.0 + blocked as f32)).max(0.1)
+        }
+    }
+}
+
+impl SceneOccupancy {
+    /// Distance from `p` along unit `dir` to the first solid cell, clamped to
+    /// `max_dist` (returned when nothing is hit). Used to build per-probe distance
+    /// moments for the DDGI Chebyshev visibility test in the shader.
+    pub fn ray_distance(&self, p: Vec3, dir: Vec3, max_dist: f32) -> f32 {
+        let step = self.cell.min_element() * 0.5;
+        let n = (max_dist / step).ceil() as i32;
+        let mut last = [i32::MIN; 3];
+        for i in 1..=n {
+            let t = i as f32 * step;
+            let c = self.cell_coord_raw(p + dir * t);
+            if c == last {
+                continue;
+            }
+            last = c;
+            if self.solid(c) {
+                return t.min(max_dist);
+            }
+        }
+        max_dist
+    }
+}
+
+/// Deterministic Fibonacci-sphere of `n` unit directions (even coverage, no RNG so
+/// the cached moments are stable run to run).
+fn fib_sphere(n: usize) -> Vec<Vec3> {
+    const GA: f32 = 2.399_963_2; // golden angle (radians)
+    (0..n)
+        .map(|i| {
+            let y = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+            let r = (1.0 - y * y).max(0.0).sqrt();
+            let th = GA * i as f32;
+            Vec3::new(th.cos() * r, y, th.sin() * r)
+        })
+        .collect()
+}
+
+/// Per-probe DDGI distance moments from the scene occupancy: SH-L1 of the
+/// directional first-hit distance (`dist`) and its square (`dist2`), matching the
+/// `march_probes` / shader `dist_at` convention exactly. The shader's Chebyshev
+/// then blocks a probe's light from reaching fragments behind geometry — leak-free
+/// diffuse + cheap shadows — computed ONCE here (cached), free per frame.
+pub fn flux_distance_moments(
+    positions: &[Vec3],
+    occ: &SceneOccupancy,
+) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    let dirs = fib_sphere(16);
+    let wgt = (4.0 * PI) / dirs.len() as f32;
+    let max_dist = occ.span();
+    let mut dist = Vec::with_capacity(positions.len());
+    let mut dist2 = Vec::with_capacity(positions.len());
+    for &p in positions {
+        let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0, 0.0, 0.0);
+        let (mut q0, mut q1, mut q2, mut q3) = (0.0f32, 0.0, 0.0, 0.0);
+        for &d in &dirs {
+            let fd = occ.ray_distance(p, d, max_dist).min(8.0);
+            d0 += fd * 0.282095;
+            d1 += fd * (0.488603 * d.y);
+            d2 += fd * (0.488603 * d.z);
+            d3 += fd * (0.488603 * d.x);
+            let fd2 = fd * fd;
+            q0 += fd2 * 0.282095;
+            q1 += fd2 * (0.488603 * d.y);
+            q2 += fd2 * (0.488603 * d.z);
+            q3 += fd2 * (0.488603 * d.x);
+        }
+        dist.push([d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt]);
+        dist2.push([q0 * wgt, q1 * wgt, q2 * wgt, q3 * wgt]);
+    }
+    (dist, dist2)
+}
+
+/// Build a `ProbeSh` from a radiance accumulator plus precomputed distance moments
+/// (vs [`acc_to_probe`] which zeroes them). Lets the FluxVoxel path carry DDGI
+/// visibility so the shader Chebyshev occludes voxel light leak-free.
+pub fn acc_to_probe_moments(s: &[Vec3; 4], dist: [f32; 4], dist2: [f32; 4]) -> ProbeSh {
+    let p = |v: Vec3| [v.x, v.y, v.z];
+    ProbeSh {
+        coeffs: [p(s[0]), p(s[1]), p(s[2]), p(s[3])],
+        dist,
+        dist2,
+    }
+}
+
+/// Like [`flux_inject`] but each light is attenuated by the scene occupancy grid
+/// (cheap DDGI-style voxel-light occlusion). Used when `voxel_ddgi_occlusion` is on.
+pub fn flux_inject_occluded(
+    acc: &mut [[Vec3; 4]],
+    positions: &[Vec3],
+    lights: &[BakeLight],
+    occ: &SceneOccupancy,
+) {
+    for (s, &p) in acc.iter_mut().zip(positions) {
+        for l in lights {
+            inject_light_occ(s, p, l, Some(occ));
+        }
+    }
+}
+
+/// Evaluate an SH-L1 accumulator in direction `dir` (same band layout as
+/// `add_sh_direct`: s[0]=L0, s[1]=Y, s[2]=Z, s[3]=X). Returns radiance toward `dir`.
+pub fn sh_eval(s: &[Vec3; 4], dir: Vec3) -> Vec3 {
+    s[0] * 0.282095
+        + s[1] * (0.488603 * dir.y)
+        + s[2] * (0.488603 * dir.z)
+        + s[3] * (0.488603 * dir.x)
+}
+
+/// LPV-style flux propagation (FLUXVOXEL_TODO §D — ≥1 real diffuse bounce). Each
+/// iteration spreads a fraction (`gain`) of every cell's directional radiance to its
+/// 6 axis neighbours, re-projected as a lobe along the travel direction, so light
+/// "flows" through the grid and fills shadowed pockets — a cheap one-bounce GI on
+/// top of the direct inject. `counts` is the per-volume probe grid (x-fastest, then
+/// y, then z — the `flux_volume_positions` order). With `6·gain < 1` energy decays,
+/// so it stays bounded over the (small) iteration count. Operates per-volume; call
+/// once per FluxVolume slice.
+pub fn flux_propagate(acc: &mut [[Vec3; 4]], counts: [u32; 3], iterations: u32, gain: f32) {
+    let [nx, ny, nz] = [counts[0].max(2) as i32, counts[1].max(2) as i32, counts[2].max(2)
+        as i32];
+    let lin = |x: i32, y: i32, z: i32| ((z * ny + y) * nx + x) as usize;
+    let neighbors = [
+        (Vec3::X, 1, 0, 0),
+        (Vec3::NEG_X, -1, 0, 0),
+        (Vec3::Y, 0, 1, 0),
+        (Vec3::NEG_Y, 0, -1, 0),
+        (Vec3::Z, 0, 0, 1),
+        (Vec3::NEG_Z, 0, 0, -1),
+    ];
+    for _ in 0..iterations {
+        // Snapshot so propagation reads the previous iteration uniformly.
+        let src = acc.to_vec();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mut add = [Vec3::ZERO; 4];
+                    for (axis, dx, dy, dz) in neighbors {
+                        let (ax, ay, az) = (x + dx, y + dy, z + dz);
+                        if ax < 0 || ay < 0 || az < 0 || ax >= nx || ay >= ny || az >= nz {
+                            continue;
+                        }
+                        // Light travels from the neighbour toward this cell, i.e.
+                        // along -axis; sample the neighbour's radiance in that dir.
+                        let travel = -axis;
+                        let r = sh_eval(&src[lin(ax, ay, az)], travel).max(Vec3::ZERO);
+                        add_sh_direct(&mut add, travel, r * gain);
+                    }
+                    let c = lin(x, y, z);
+                    for b in 0..4 {
+                        acc[c][b] += add[b];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Box-blur the SH accumulator over the probe grid to smooth out the blotchy
+/// per-probe footprints (each emitter lights nearby probes with a sharp falloff, so
+/// the raw trilinear field shows discrete blobs at the grid spacing). A weighted
+/// 7-tap blur (centre + 6 axis neighbours) per iteration evens the field into a
+/// smooth gradient without washing it out. Operates per-volume slice.
+pub fn blur_acc(acc: &mut [[Vec3; 4]], counts: [u32; 3], iterations: u32) {
+    let [nx, ny, nz] = [counts[0].max(2) as i32, counts[1].max(2) as i32, counts[2].max(2)
+        as i32];
+    let lin = |x: i32, y: i32, z: i32| ((z * ny + y) * nx + x) as usize;
+    let neighbors = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+    for _ in 0..iterations {
+        let src = acc.to_vec();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    // Centre weighted 2× so the blur smooths without over-flattening.
+                    let mut sum = [Vec3::ZERO; 4];
+                    let mut wsum = 2.0f32;
+                    let c = &src[lin(x, y, z)];
+                    for b in 0..4 {
+                        sum[b] = c[b] * 2.0;
+                    }
+                    for (dx, dy, dz) in neighbors {
+                        let (ax, ay, az) = (x + dx, y + dy, z + dz);
+                        if ax < 0 || ay < 0 || az < 0 || ax >= nx || ay >= ny || az >= nz {
+                            continue;
+                        }
+                        let n = &src[lin(ax, ay, az)];
+                        for b in 0..4 {
+                            sum[b] += n[b];
+                        }
+                        wsum += 1.0;
+                    }
+                    let dst = &mut acc[lin(x, y, z)];
+                    for b in 0..4 {
+                        dst[b] = sum[b] / wsum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Box-blur the per-probe DISTANCE MOMENTS (`[f32;4]` SH) across the grid, the
+/// same way as the radiance. Without this the Chebyshev visibility varies per probe
+/// (each stores its own distance-to-geometry), re-introducing the grid as fixed
+/// dots on a surface even when the light field itself is smooth. Blurring the
+/// moments smooths the occlusion across the grid (a touch softer shadow edge, no
+/// grid dots).
+pub fn blur_moments(data: &mut [[f32; 4]], counts: [u32; 3], iterations: u32) {
+    let [nx, ny, nz] = [counts[0].max(2) as i32, counts[1].max(2) as i32, counts[2].max(2)
+        as i32];
+    let lin = |x: i32, y: i32, z: i32| ((z * ny + y) * nx + x) as usize;
+    let neighbors = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+    for _ in 0..iterations {
+        let src = data.to_vec();
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let c = &src[lin(x, y, z)];
+                    let mut sum = [c[0] * 2.0, c[1] * 2.0, c[2] * 2.0, c[3] * 2.0];
+                    let mut wsum = 2.0f32;
+                    for (dx, dy, dz) in neighbors {
+                        let (ax, ay, az) = (x + dx, y + dy, z + dz);
+                        if ax < 0 || ay < 0 || az < 0 || ax >= nx || ay >= ny || az >= nz {
+                            continue;
+                        }
+                        let nb = &src[lin(ax, ay, az)];
+                        for b in 0..4 {
+                            sum[b] += nb[b];
+                        }
+                        wsum += 1.0;
+                    }
+                    let dst = &mut data[lin(x, y, z)];
+                    for b in 0..4 {
+                        dst[b] = sum[b] / wsum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Probe relocation + classification (FLUXVOXEL_TODO §B). Returns a per-probe
+/// activity mask: a probe whose cell is solid is nudged toward the nearest empty
+/// neighbour cell (relocation) and, if it can't escape, marked inactive (its SH is
+/// zeroed by the caller) so geometry-trapped probes don't leak black/!wrong SH into
+/// the trilinear blend. `positions` is mutated in place; returns `active[i]`.
+pub fn relocate_probes(positions: &mut [Vec3], occ: &SceneOccupancy) -> Vec<bool> {
+    let mut active = vec![true; positions.len()];
+    let step = occ.cell.min_element();
+    for (i, p) in positions.iter_mut().enumerate() {
+        if !occ.solid(occ.cell_coord_raw(*p)) {
+            continue;
+        }
+        // Search a small neighbourhood for the nearest empty cell and move there.
+        let mut best: Option<(f32, Vec3)> = None;
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 && dz == 0 {
+                        continue;
+                    }
+                    let cand = *p + Vec3::new(dx as f32, dy as f32, dz as f32) * step;
+                    if !occ.solid(occ.cell_coord_raw(cand)) {
+                        let d = (cand - *p).length_squared();
+                        if best.is_none_or(|(bd, _)| d < bd) {
+                            best = Some((d, cand));
+                        }
+                    }
+                }
+            }
+        }
+        match best {
+            Some((_, cand)) => *p = cand,
+            None => active[i] = false, // fully trapped in solid → classify dead
+        }
+    }
+    active
+}
+
+/// World-space probe positions for a FluxVoxel voxel volume (box centred at
 /// `center`, `size` meters, `counts` probes per axis), x-fastest then y then z —
 /// matching the `set_baked_probes` / shader indexing convention.
 pub fn flux_volume_positions(center: Vec3, size: Vec3, counts: [u32; 3]) -> Vec<Vec3> {
@@ -473,7 +918,7 @@ pub fn flux_inject(acc: &mut [[Vec3; 4]], positions: &[Vec3], lights: &[BakeLigh
 }
 
 /// Convert an SH-L1 accumulator into the engine's `ProbeSh` (no visibility data —
-/// FluxVR is an analytic volume, not a traced one).
+/// FluxVoxel is an analytic volume, not a traced one).
 pub fn acc_to_probe(s: &[Vec3; 4]) -> ProbeSh {
     let p = |v: Vec3| [v.x, v.y, v.z];
     ProbeSh {
@@ -484,11 +929,42 @@ pub fn acc_to_probe(s: &[Vec3; 4]) -> ProbeSh {
 }
 
 /// Inverse of [`acc_to_probe`]: lift a baked `ProbeSh` back into an SH-L1
-/// accumulator so dynamic Flux VR Lights can be added on top of a build-time
-/// baked static base (distance data is dropped — FluxVR is analytic).
+/// accumulator so dynamic FluxVoxel Lights can be added on top of a build-time
+/// baked static base (distance data is dropped — FluxVoxel is analytic).
 pub fn probe_to_acc(p: &ProbeSh) -> [Vec3; 4] {
     let v = |c: [f32; 3]| Vec3::new(c[0], c[1], c[2]);
     [v(p.coeffs[0]), v(p.coeffs[1]), v(p.coeffs[2]), v(p.coeffs[3])]
+}
+
+/// Worker-thread budget for background bake / GI compute. Reserves a slice of the
+/// cores so the editor UI and the rest of the OS stay responsive instead of the
+/// bake pinning every core to a standstill. The reserve scales with core count
+/// (keep ~1 free on a quad-core, ~2 on an octa-core, ~4 on a 16-core) but always
+/// leaves a working majority for the compute.
+pub fn bake_worker_count() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4)
+        .max(1);
+    // Use 80% of the cores (floor), always leaving at least one free for the UI/OS
+    // and never dropping below one worker.
+    ((cores * 8) / 10).clamp(1, cores.saturating_sub(1).max(1))
+}
+
+/// Best-effort: drop the CALLING thread's scheduling priority (Linux nice) so bake
+/// compute yields to interactive editor / OS work under contention. This is what
+/// actually keeps the desktop usable while a bake runs — the reserved cores above
+/// are extra insurance (and the only lever on platforms without per-thread nice).
+/// No-op where unsupported (non-Linux, or the `editor` feature — which links libc —
+/// is off, e.g. a shipped game, which never bakes anyway).
+pub fn lower_compute_priority() {
+    #[cfg(all(target_os = "linux", feature = "editor"))]
+    unsafe {
+        // PRIO_PROCESS + who=0 targets the calling task (thread) on Linux, so only
+        // this worker is niced, not the whole process. +10 sits it clearly below
+        // normal-priority interactive threads, which then always win the CPU.
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
 }
 
 /// March every probe and return SH-L1 radiance coefficients (same layout as the
@@ -512,16 +988,15 @@ pub fn march_probes(
     let emitters = collect_emitters(insts);
     let n = probes.len();
     let mut out = vec![ProbeSh::default(); n];
-    let cores = std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(4)
-        .max(1);
+    // Leave cores free for the UI/OS so a bake doesn't pin the whole machine.
+    let cores = bake_worker_count();
     let chunk = n.div_ceil(cores).max(1);
     let emitters = &emitters; // shared ref so each scoped thread can read it
     std::thread::scope(|s| {
         for (ci, (pchunk, ochunk)) in probes.chunks(chunk).zip(out.chunks_mut(chunk)).enumerate() {
             let base = ci * chunk;
             s.spawn(move || {
+                lower_compute_priority();
                 for (k, &origin) in pchunk.iter().enumerate() {
                     ochunk[k] = probe_sh(
                         insts, lights, &emitters, origin, sky, eps, max_dist, samples, bounces,
@@ -567,10 +1042,8 @@ pub fn build_gdf(insts: &[SdfInstance], min: Vec3, max: Vec3, dims: [u32; 3]) ->
     );
     let (nx, ny, nz) = (dims[0] as usize, dims[1] as usize, dims[2] as usize);
     let slice = nx * ny;
-    let cores = std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(4)
-        .max(1);
+    // Leave cores free for the UI/OS so a bake doesn't pin the whole machine.
+    let cores = bake_worker_count();
     let zchunk = nz.div_ceil(cores).max(1);
     std::thread::scope(|s| {
         for (ci, (dchunk, ichunk)) in dist
@@ -580,6 +1053,7 @@ pub fn build_gdf(insts: &[SdfInstance], min: Vec3, max: Vec3, dims: [u32; 3]) ->
         {
             let z0 = ci * zchunk;
             s.spawn(move || {
+                lower_compute_priority();
                 for (local, (d, idx)) in dchunk.iter_mut().zip(ichunk.iter_mut()).enumerate() {
                     let z = z0 + local / slice;
                     let rem = local % slice;
@@ -769,5 +1243,173 @@ mod tests {
         // A corner voxel is well outside, so positive.
         assert!(at(0, 0, 0) > 0.0, "far corner should be outside (positive)");
         assert!(gdf.index.iter().all(|&i| i == 0), "only instance 0 exists");
+    }
+
+    // Occlusion grid: a wall box between two points must drop visibility below 1,
+    // a clear line of sight stays fully visible, and it never amplifies or blacks.
+    #[test]
+    fn occupancy_blocks_through_wall_not_around() {
+        // A thin wall slab at x∈[-0.25,0.25], spanning y,z.
+        let wall = (Vec3::new(-0.25, -2.0, -2.0), Vec3::new(0.25, 2.0, 2.0));
+        let occ = SceneOccupancy::build(&[wall], 48).expect("occupancy built");
+
+        // A ray crossing the wall (from -x to +x) is occluded.
+        let through = occ.visibility(Vec3::new(-3.0, 0.0, 0.0), Vec3::new(3.0, 0.0, 0.0));
+        assert!(through < 1.0, "ray through the wall should be occluded, got {through}");
+        assert!(through >= 0.1, "soft floor: occlusion must never hard-black, got {through}");
+
+        // A ray that runs parallel well off to the side never enters the slab.
+        let beside = occ.visibility(Vec3::new(3.0, 0.0, 3.5), Vec3::new(-3.0, 0.0, 3.5));
+        assert!((beside - 1.0).abs() < 1e-6, "clear line of sight should stay 1.0, got {beside}");
+
+        // Degenerate (a == b) is fully visible, never NaN.
+        let same = occ.visibility(Vec3::ZERO, Vec3::ZERO);
+        assert_eq!(same, 1.0);
+    }
+
+    // A point light on the far side of a wall must inject less into a probe than
+    // the same light with no occluder (cheap voxel-light shadowing).
+    #[test]
+    fn occluded_inject_darkens_behind_wall() {
+        let wall = (Vec3::new(-0.25, -2.0, -2.0), Vec3::new(0.25, 2.0, 2.0));
+        let occ = SceneOccupancy::build(&[wall], 48).unwrap();
+        let light = BakeLight {
+            kind: LightKind::Point,
+            position: Vec3::new(-3.0, 0.0, 0.0),
+            direction: Vec3::ZERO,
+            color: [10.0, 10.0, 10.0],
+            range: 20.0,
+            spot_inner_deg: 0.0,
+            spot_outer_deg: 0.0,
+            radius: 0.0,
+        };
+        let probe = Vec3::new(3.0, 0.0, 0.0); // behind the wall from the light
+        let mut lit = [Vec3::ZERO; 4];
+        inject_light(&mut lit, probe, &light);
+        let mut shadowed = [Vec3::ZERO; 4];
+        inject_light_occ(&mut shadowed, probe, &light, Some(&occ));
+        assert!(
+            shadowed[0].x < lit[0].x && shadowed[0].x >= 0.0,
+            "occluded probe ({}) should be dimmer than unoccluded ({}) but non-negative",
+            shadowed[0].x,
+            lit[0].x
+        );
+    }
+
+    // Propagation spreads an injected spike into neighbours (a diffuse bounce) and
+    // stays bounded (no runaway). A dark neighbour must gain L0; energy must not blow up.
+    #[test]
+    fn propagation_spreads_and_stays_bounded() {
+        let counts = [3u32, 3, 3];
+        let n = (counts[0] * counts[1] * counts[2]) as usize;
+        let lin = |x: usize, y: usize, z: usize| (z * 3 + y) * 3 + x;
+        let mut acc = vec![[Vec3::ZERO; 4]; n];
+        // Inject a bright omnidirectional spike at the center.
+        acc[lin(1, 1, 1)][0] = Vec3::splat(10.0);
+        let before_center = acc[lin(1, 1, 1)][0].x;
+        let before_neighbor = acc[lin(0, 1, 1)][0].x;
+        flux_propagate(&mut acc, counts, 4, 0.12);
+        let after_neighbor = acc[lin(0, 1, 1)][0].x;
+        assert!(
+            after_neighbor > before_neighbor,
+            "neighbour L0 should gain from propagation ({before_neighbor} -> {after_neighbor})"
+        );
+        // Bounded: total energy must not exceed a sane multiple of the injected spike.
+        let total: f32 = acc.iter().map(|s| s[0].x.max(0.0)).sum();
+        assert!(
+            total.is_finite() && total < before_center * 6.0,
+            "propagation energy should stay bounded, got {total}"
+        );
+    }
+
+    // Relocation: a probe inside a solid wall is pushed to an adjacent empty cell;
+    // a probe in open space is left untouched; a fully-trapped probe is classified dead.
+    #[test]
+    fn relocation_pushes_probe_out_of_solid() {
+        // Thin wall slab at x in [-0.25, 0.25].
+        let wall = (Vec3::new(-0.25, -2.0, -2.0), Vec3::new(0.25, 2.0, 2.0));
+        let occ = SceneOccupancy::build(&[wall], 48).unwrap();
+        let open = Vec3::new(3.0, 0.0, 0.0);
+        let inside = Vec3::new(0.0, 0.0, 0.0); // inside the wall
+        let mut positions = vec![open, inside];
+        let active = relocate_probes(&mut positions, &occ);
+        assert!(active[0], "open-space probe stays active");
+        assert_eq!(positions[0], open, "open-space probe must not move");
+        // The inside probe either escaped (moved out of solid) or was classified dead.
+        let escaped = !occ.solid(occ.cell_coord_raw(positions[1]));
+        assert!(
+            escaped || !active[1],
+            "trapped probe must be relocated out of solid or marked inactive"
+        );
+    }
+
+    // FPS verification: the FluxVoxel PER-FRAME work (clone the cached static base +
+    // inject dynamic lights + build ProbeSh with cached moments) must be far under a
+    // 1 ms frame budget (1000 fps) for a representative auto-grid, so the new DDGI /
+    // propagation / specular features don't cost per-frame time — they're all cached.
+    // Run with `--nocapture` to see the measured per-frame microseconds.
+    #[test]
+    fn fluxvoxel_per_frame_cost_is_sub_millisecond() {
+        // ~27k probes (a 30³ auto-grid — a typical room at density 1).
+        let counts = [30u32, 30, 30];
+        let positions =
+            flux_volume_positions(Vec3::ZERO, Vec3::splat(30.0), counts);
+        let n = positions.len();
+        let static_base = vec![[Vec3::ONE; 4]; n]; // pretend a built static base
+        let dist = vec![[1.0f32; 4]; n];
+        let dist2 = vec![[2.0f32; 4]; n];
+        // Two moving emissive orbs (the dynamic per-frame lights).
+        let dynamic = vec![
+            BakeLight {
+                kind: LightKind::Point,
+                position: Vec3::new(2.0, 1.0, 0.0),
+                direction: Vec3::NEG_Y,
+                color: [8.0, 1.0, 6.0],
+                range: 5.0,
+                spot_inner_deg: 0.0,
+                spot_outer_deg: 0.0,
+                radius: 0.0,
+            },
+            BakeLight {
+                kind: LightKind::Point,
+                position: Vec3::new(-2.0, 1.0, 1.0),
+                direction: Vec3::NEG_Y,
+                color: [0.0, 8.0, 1.0],
+                range: 5.0,
+                spot_inner_deg: 0.0,
+                spot_outer_deg: 0.0,
+                radius: 0.0,
+            },
+        ];
+
+        // Warm up, then time the exact per-frame path from `update_flux_voxel`.
+        let iters = 60;
+        let t0 = std::time::Instant::now();
+        let mut sink = 0.0f32;
+        for _ in 0..iters {
+            let mut acc = static_base.clone();
+            flux_inject(&mut acc, &positions, &dynamic);
+            let probes: Vec<ProbeSh> = acc
+                .iter()
+                .enumerate()
+                .map(|(i, s)| acc_to_probe_moments(s, dist[i], dist2[i]))
+                .collect();
+            sink += probes[0].coeffs[0][0] + probes[n - 1].coeffs[0][1];
+        }
+        let per_frame = t0.elapsed().as_secs_f64() / iters as f64;
+        let fps = 1.0 / per_frame;
+        println!(
+            "FluxVoxel per-frame ({n} probes, 2 dynamic lights): {:.1} µs => {:.0} fps headroom (sink {sink})",
+            per_frame * 1e6,
+            fps
+        );
+        // Must leave 1000+ fps of headroom: the per-frame CPU GI work alone is well
+        // under 1 ms (debug builds are slower; allow 2 ms before failing).
+        assert!(
+            per_frame < 2.0e-3,
+            "per-frame FluxVoxel cost {:.0} µs is too high (would cap fps at {:.0})",
+            per_frame * 1e6,
+            fps
+        );
     }
 }

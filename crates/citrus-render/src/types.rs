@@ -639,6 +639,10 @@ pub struct FrameInput<'a> {
     pub reflection_probe: Option<ReflectionProbeBox>,
     /// Distance + height exponential fog (atmospheric depth). `None` = no fog.
     pub fog: Option<FogParams>,
+    /// FluxVoxel specular-from-volume: metallic/rough surfaces sample the probe
+    /// volume in the reflection direction for emissive/voxel-light bounce (VXGI-style
+    /// glossy approximation). Off = reflection cube only.
+    pub voxel_specular: bool,
     pub egui: Option<EguiDraw>,
 }
 

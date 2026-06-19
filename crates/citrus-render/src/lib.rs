@@ -86,6 +86,10 @@ use pipeline::{PipelineCache, PipelineKey};
 use swapchain::Swapchain;
 use texture::GpuTexture;
 
+/// Source directory of the engine's built-in shaders, baked in at compile time.
+/// Used for dev-time hot-reload so edits to e.g. standard.frag take effect live.
+pub const ENGINE_SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
+
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 /// Deferred-SSR G-buffer attachment: reflectance.rgb (Fresnel*ao*spec weight)
 /// in the colour lanes, surface roughness in alpha. RGBA16F so the resolve pass
@@ -97,7 +101,10 @@ const TEXTURE_BINDINGS: [u32; 16] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 
 
 /// Maximum scene lights evaluated per frame by the standard shader. Matches
 /// `MAX_LIGHTS` in standard.frag; the array lives in the frame UBO.
-const MAX_LIGHTS: usize = 16;
+// Forward-pass light cap. Lives in the frame UBO, so it's bounded by the 16 KB
+// guaranteed uniform-buffer size: 128 GpuLights = 8 KB, leaving headroom. Truly
+// unbounded would need a storage buffer (like the screen-GI path already uses).
+const MAX_LIGHTS: usize = 128;
 
 /// One light in std140 layout (four vec4s). Mirrors `Light` in standard.frag.
 #[repr(C)]
@@ -243,6 +250,9 @@ struct PushData {
 }
 
 const _: () = assert!(size_of::<PushData>() == pipeline::PUSH_CONSTANT_SIZE as usize);
+// The frame UBO must fit the Vulkan-guaranteed 16 KB uniform-buffer range (it's
+// the floor across all GPUs). Mainly guards MAX_LIGHTS / future field growth.
+const _: () = assert!(size_of::<FrameUbo>() <= 16384);
 
 /// Push constants for the shadow depth pass: the light's view-projection and
 /// the object's model matrix (same 128-byte block, different interpretation).
@@ -909,6 +919,20 @@ struct ReflectionEnv {
 }
 
 const ENV_CUBE_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+/// Per-face `(look_direction, up)` for the reflection-cube capture, ordered
+/// +X,-X,+Y,-Y,+Z,-Z. Each face is rendered with `look_at_rh(center, center+dir,
+/// up)` + `perspective_rh(90°)` into a POSITIVE-height (non-Y-flipped) viewport.
+/// These up-vectors are chosen so that round-trip equals the `face_dir` sampling
+/// convention exactly — see `cube_capture_matches_sampling` test, which proves it.
+const CUBE_CAPTURE_FACES: [(glam::Vec3, glam::Vec3); 6] = [
+    (glam::Vec3::X, glam::Vec3::NEG_Y),
+    (glam::Vec3::NEG_X, glam::Vec3::NEG_Y),
+    (glam::Vec3::Y, glam::Vec3::Z),
+    (glam::Vec3::NEG_Y, glam::Vec3::NEG_Z),
+    (glam::Vec3::Z, glam::Vec3::NEG_Y),
+    (glam::Vec3::NEG_Z, glam::Vec3::NEG_Y),
+];
 
 impl ReflectionEnv {
     /// Direction for cube `face` at face-plane coords (`fx`,`fy`) in [-1,1].
@@ -4091,7 +4115,7 @@ impl Renderer {
         input: &FrameInput,
         order: &[usize],
     ) -> Result<()> {
-        use glam::{Mat4, Vec3};
+        use glam::Mat4;
         let Some(job) = self.refl_job.as_ref() else {
             return Ok(());
         };
@@ -4111,15 +4135,9 @@ impl Renderer {
             return self.finish_refl_capture();
         }
 
-        // Face look directions (+X,-X,+Y,-Y,+Z,-Z) matching the cube sampling.
-        let faces = [
-            (Vec3::X, Vec3::NEG_Y),
-            (Vec3::NEG_X, Vec3::NEG_Y),
-            (Vec3::Y, Vec3::Z),
-            (Vec3::NEG_Y, Vec3::NEG_Z),
-            (Vec3::Z, Vec3::NEG_Y),
-            (Vec3::NEG_Z, Vec3::NEG_Y),
-        ];
+        // Face look directions (+X,-X,+Y,-Y,+Z,-Z) matching the cube sampling
+        // (shared with the round-trip test that proves the orientation).
+        let faces = CUBE_CAPTURE_FACES;
         let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 2000.0);
         let capture_set = self.refl_capture_set;
 
@@ -4135,6 +4153,7 @@ impl Renderer {
                 &cam, input, lights, count, shadow_vp, cascade_splits,
                 &self.probe_volumes, [size as f32, size as f32],
             );
+            ubo.debug[1] = 0.0; // never render a debug view-mode into the cube
             ubo.debug[2] = 0.0; // no screen-GI in the cube capture
             ubo.debug[3] = 0.0; // inline tonemap -> LDR cube
             ubo.ssr = [0.0; 4];
@@ -4465,11 +4484,47 @@ impl Renderer {
     }
 
     /// Register a runtime-compiled custom fragment shader (SPIR-V bytes).
+    /// Last main-view camera world position (from the most recent desktop frame),
+    /// or None before the first frame. Used by the FluxVoxel camera-clipmap grid to
+    /// follow the viewer. One frame stale — fine for a grid snapped to the spacing.
+    pub fn last_view_pos(&self) -> Option<glam::Vec3> {
+        self.last_frame_ubo.map(|u| {
+            glam::Vec3::new(u.camera_pos[0], u.camera_pos[1], u.camera_pos[2])
+        })
+    }
+
     pub fn register_shader(&mut self, spirv: &[u8]) -> Result<ShaderId> {
         Ok(ShaderId(
             self.pipeline_cache
                 .register_custom(&self.ctx.device, spirv)?,
         ))
+    }
+
+    /// Recompile and hot-swap the engine's standard fragment shader from its
+    /// source on disk (dev convenience). Compiles with `glslc`; on any compile
+    /// error the existing pipeline is kept and the error is returned so the
+    /// caller can surface it without crashing the editor.
+    pub fn reload_standard_shaders(&mut self) -> Result<()> {
+        let frag_path = std::path::Path::new(ENGINE_SHADER_DIR).join("standard.frag");
+        let output = std::process::Command::new("glslc")
+            .arg("-o")
+            .arg("-")
+            .arg(&frag_path)
+            .output()
+            .with_context(|| format!("running glslc on {}", frag_path.display()))?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "glslc failed for {}:\n{}",
+                frag_path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        unsafe {
+            self.ctx.device.device_wait_idle()?;
+        }
+        self.pipeline_cache
+            .reload_standard_frag(&self.ctx.device, &output.stdout)?;
+        Ok(())
     }
 
     /// Switch a material between the standard shader (None) and a custom one.
@@ -4826,6 +4881,9 @@ impl Renderer {
             ubo.fog_color = [f.color[0], f.color[1], f.color[2], f.density.max(0.0)];
             ubo.fog_params = [f.height_falloff.max(0.0), f.height_ref, f.start_distance.max(0.0), 0.0];
         }
+        // fog_params.w doubles as the FluxVoxel specular-from-volume flag (set
+        // unconditionally so it's independent of whether fog is enabled).
+        ubo.fog_params[3] = if input.voxel_specular { 1.0 } else { 0.0 };
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
         // Keep this frame's lights/shadows/probes so the VR eyes can reuse them
         // (only the camera matrices differ per eye).
@@ -7677,5 +7735,78 @@ pub(crate) fn image_barrier(
     let dependency = vk::DependencyInfo::default().image_memory_barriers(&barriers);
     unsafe {
         device.cmd_pipeline_barrier2(cb, &dependency);
+    }
+}
+
+#[cfg(test)]
+mod refl_capture_tests {
+    use super::{ReflectionEnv, CUBE_CAPTURE_FACES};
+    use glam::{Mat4, Vec3, Vec4};
+
+    // Simulate EXACTLY what the GPU does to capture one cube-face texel: render the
+    // scene through `look_at_rh(center, center+dir, up)` + `perspective_rh(90deg)`
+    // into a POSITIVE-height (non-Y-flipped) viewport, then read the texel at
+    // face-plane coords (fx, fy). With a positive viewport the framebuffer row maps
+    // straight to NDC y (ndc_y = fy) and the column to NDC x (ndc_x = fx), so the
+    // world direction seen at that texel is the unprojection of NDC (fx, fy).
+    fn capture_ray(face: usize, fx: f32, fy: f32) -> Vec3 {
+        let (dir, up) = CUBE_CAPTURE_FACES[face];
+        let center = Vec3::ZERO; // direction is translation-invariant
+        let view = Mat4::look_at_rh(center, center + dir, up);
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.05, 2000.0);
+        let inv = (proj * view).inverse();
+        let unproject = |d: f32| {
+            let p = inv * Vec4::new(fx, fy, d, 1.0);
+            p.truncate() / p.w
+        };
+        // Vulkan clip-space depth is [0,1]: near plane d=0, far plane d=1.
+        (unproject(1.0) - unproject(0.0)).normalize()
+    }
+
+    // THE invariant: the captured cube must equal the sampling convention, or every
+    // reflection is mis-oriented. For all 6 faces and a spread of face-plane points,
+    // the world direction the capture RENDERS at (fx,fy) must equal the direction
+    // the sampler READS at (fx,fy) (`ReflectionEnv::face_dir`). If any face/axis is
+    // flipped, this fails and names it.
+    #[test]
+    fn cube_capture_matches_sampling() {
+        let samples = [
+            (0.0f32, 0.0f32),
+            (0.5, 0.0),
+            (-0.5, 0.0),
+            (0.0, 0.5),
+            (0.0, -0.5),
+            (0.6, -0.3),
+            (-0.4, 0.7),
+        ];
+        for face in 0..6 {
+            for &(fx, fy) in &samples {
+                let got = capture_ray(face, fx, fy);
+                let want = ReflectionEnv::face_dir(face, fx, fy);
+                let want = Vec3::from_array(want);
+                let err = (got - want).length();
+                assert!(
+                    err < 1e-4,
+                    "face {face} at ({fx},{fy}): capture renders {got:?} but sampler reads \
+                     {want:?} (err {err}) — cube is mis-oriented on this face/axis",
+                );
+            }
+        }
+    }
+
+    // Center-of-a-mirror-sphere sanity (REFLECTION_PROBES_MATH.md 2.3): a surface
+    // whose normal faces the camera must reflect the direction BEHIND the camera
+    // (R == V), not in front. Guards against a flipped incident-vector sign.
+    #[test]
+    fn mirror_center_reflects_behind_camera() {
+        // Camera looks down -Z at a surface facing it (N = +Z toward camera).
+        let n = Vec3::Z;
+        let v = Vec3::Z; // surface->camera, camera is on +Z side
+        // GLSL reflect(-V, N) = 2*(N·V)*N - V
+        let r = 2.0 * n.dot(v) * n - v;
+        assert!(
+            (r - v).length() < 1e-6,
+            "center of a mirror facing the camera must reflect behind it (R==V), got {r:?}",
+        );
     }
 }

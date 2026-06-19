@@ -35,7 +35,9 @@ layout(set = 0, binding = 4) uniform SsrData {
     vec4 screen;       // x width, y height, z _, w _
 } u;
 
-const float ENV_MAX_LOD = 6.0; // matches cube_mip_count(64) - 1 / standard.frag
+// Max roughness mip of the CURRENTLY bound cube, queried at runtime (correct for
+// the 64px skybox cube or a higher-res captured probe cube). Matches standard.frag.
+#define ENV_MAX_LOD (float(textureQueryLevels(u_env) - 1))
 
 // The scene renders with a Y-flipped (negative-height) viewport, so a sampling
 // UV maps to NDC with a flipped Y. This constant matches the forward pass.
@@ -258,11 +260,17 @@ void main() {
             if (probe_intensity > 0.0 && u.refl_extents.w > 0.5) {
                 vec3 bmin = u.refl_center.xyz - u.refl_extents.xyz;
                 vec3 bmax = u.refl_center.xyz + u.refl_extents.xyz;
-                vec3 invR = 1.0 / Rw;
-                vec3 t1 = (bmax - worldPos) * invR;
-                vec3 t2 = (bmin - worldPos) * invR;
-                vec3 tmax = max(t1, t2);
-                Rw = (worldPos + Rw * min(min(tmax.x, tmax.y), tmax.z)) - u.refl_center.xyz;
+                // Only box-project surfaces inside the probe box (matches
+                // standard.frag; outside, the box proxy mis-places the reflection).
+                bool inside = all(greaterThanEqual(worldPos, bmin))
+                           && all(lessThanEqual(worldPos, bmax));
+                if (inside) {
+                    vec3 invR = 1.0 / Rw;
+                    vec3 t1 = (bmax - worldPos) * invR;
+                    vec3 t2 = (bmin - worldPos) * invR;
+                    vec3 tmax = max(t1, t2);
+                    Rw = (worldPos + Rw * min(min(tmax.x, tmax.y), tmax.z)) - u.refl_center.xyz;
+                }
             }
             float env_scale = probe_intensity > 0.0 ? probe_intensity : 1.0;
             vec3 env = textureLod(u_env, Rw, roughness * ENV_MAX_LOD).rgb * env_scale;

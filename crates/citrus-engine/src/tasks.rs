@@ -30,7 +30,7 @@ pub enum TaskKind {
 pub enum BakePhase {
     Lightmaps,
     Probes,
-    FluxVr,
+    FluxVoxel,
 }
 
 /// Live progress a worker (or the bake stepper) updates and the UI reads.
@@ -45,7 +45,7 @@ pub enum TaskProgress {
         lightmap_done: u32,
         lightmap_total: u32,
         probe_volumes: u32,
-        fluxvr_volumes: u32,
+        flux_voxel_volumes: u32,
         phase: BakePhase,
     },
 }
@@ -73,17 +73,17 @@ impl TaskProgress {
                 lightmap_done,
                 lightmap_total,
                 probe_volumes,
-                fluxvr_volumes,
+                flux_voxel_volumes,
                 phase,
             } => {
                 let p = match phase {
                     BakePhase::Lightmaps => "lightmaps",
                     BakePhase::Probes => "probes",
-                    BakePhase::FluxVr => "FluxVoxel",
+                    BakePhase::FluxVoxel => "FluxVoxel",
                 };
                 format!(
                     "{p}: lightmap {lightmap_done}/{lightmap_total} · {lights} lights · \
-                     {bounces} bounces · {probe_volumes} probe vols · {fluxvr_volumes} FluxVoxel"
+                     {bounces} bounces · {probe_volumes} probe vols · {flux_voxel_volumes} FluxVoxel"
                 )
             }
         }

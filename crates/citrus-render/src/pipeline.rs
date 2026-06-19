@@ -642,6 +642,31 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
+    /// Hot-reload the standard fragment shader from fresh SPIR-V (dev convenience).
+    /// Swaps in the new module and drops every cached pipeline so each variant
+    /// rebuilds lazily against the new shader on its next use. The caller MUST have
+    /// waited for the device to idle first (no in-flight use of the old pipelines).
+    pub fn reload_standard_frag(&mut self, device: &ash::Device, frag_spirv: &[u8]) -> Result<()> {
+        let frag_code = ash::util::read_spv(&mut Cursor::new(frag_spirv))
+            .context("reading recompiled standard.frag SPIR-V")?;
+        let new_frag = unsafe {
+            device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&frag_code),
+                None,
+            )?
+        };
+        unsafe {
+            // Drop all cached pipelines (they reference the old frag module). Only
+            // the frag changed; each variant rebuilds lazily with its own modules.
+            for (_, pipeline) in self.pipelines.drain() {
+                device.destroy_pipeline(pipeline, None);
+            }
+            device.destroy_shader_module(self.frag, None);
+        }
+        self.frag = new_frag;
+        Ok(())
+    }
+
     pub fn destroy(&mut self, device: &ash::Device) {
         unsafe {
             for (_, pipeline) in self.pipelines.drain() {

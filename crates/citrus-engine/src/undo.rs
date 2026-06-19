@@ -55,6 +55,10 @@ pub enum UndoEntry {
         before: Box<MaterialModel>,
         after: Box<MaterialModel>,
     },
+    /// One atomic multi-object edit (a multi-select gesture): all sub-entries are
+    /// undone/redone together as a single history step, and coalesce as a unit so a
+    /// continuous multi-object drag is ONE entry, not hundreds of interleaved ones.
+    Group(Vec<UndoEntry>),
 }
 
 impl UndoEntry {
@@ -65,6 +69,11 @@ impl UndoEntry {
             (UndoEntry::Material { index: a, .. }, UndoEntry::Material { index: b, .. }) => a == b,
             (UndoEntry::FileMaterial { path: a, .. }, UndoEntry::FileMaterial { path: b, .. }) => {
                 a == b
+            }
+            // Same gesture if the groups cover the same targets in the same order
+            // (record_edits builds them stably: anchor first, then the others).
+            (UndoEntry::Group(a), UndoEntry::Group(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.same_target(y))
             }
             _ => false,
         }
@@ -81,6 +90,13 @@ impl UndoEntry {
             }
             (UndoEntry::FileMaterial { after, .. }, UndoEntry::FileMaterial { after: new, .. }) => {
                 *after = new;
+            }
+            // Absorb sub-entry by sub-entry (same structure, guaranteed by
+            // `same_target`): each keeps its own `before`, takes the newest `after`.
+            (UndoEntry::Group(a), UndoEntry::Group(new)) => {
+                for (x, y) in a.iter_mut().zip(new) {
+                    x.absorb(y);
+                }
             }
             _ => {}
         }

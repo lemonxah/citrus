@@ -30,6 +30,43 @@ const GBUFFER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_gbuff
 const LIGHTMAP_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_lightmap.comp.spv"));
 const PROBE_COMP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bake_probe.comp.spv"));
 
+/// Rows-per-band (in workgroups; local_size_y = 8, so ×8 texel rows) for the tiled
+/// lightmap dispatch. Each band is a separate GPU submission so the OS GPU
+/// scheduler can interleave the desktop compositor between bands instead of one
+/// giant dispatch hogging the GPU until the whole lightmap finishes.
+const LIGHTMAP_BAND_GROUPS: u32 = 8;
+
+/// Workgroups-per-chunk for the tiled probe dispatch (local_size_x = 64, so ×64
+/// probes per chunk). Same idea as the lightmap bands — keep each submission short.
+const PROBE_CHUNK_GROUPS: u32 = 16;
+
+/// Fraction of each heavy GPU bake submission's duration to then idle the GPU, so
+/// the desktop compositor gets a real share instead of the bake keeping the GPU
+/// ~100% busy back-to-back (which still froze the whole machine even with tiling).
+/// 1.0 ≈ a 50% GPU duty cycle: the bake runs ~2× slower but the system stays
+/// usable. Lower it for faster bakes, raise it if the desktop still stutters.
+const BAKE_GPU_IDLE_FRAC: f32 = 1.0;
+
+/// Submit a one-time command buffer, wait for it, then sleep for a fraction of how
+/// long it took — deliberately idling the GPU between heavy bake dispatches so the
+/// rest of the system (compositor, other apps) gets GPU time. Tiling alone only
+/// creates scheduler boundaries; this guarantees the GPU is actually free part of
+/// the time, which is what keeps the machine responsive during a bake.
+fn throttled_submit(
+    device: &ash::Device,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    f: impl FnOnce(vk::CommandBuffer),
+) -> Result<()> {
+    let t = std::time::Instant::now();
+    alloc::one_time_submit(device, command_pool, queue, f)?;
+    let idle = t.elapsed().mul_f32(BAKE_GPU_IDLE_FRAC);
+    if idle > std::time::Duration::ZERO {
+        std::thread::sleep(idle);
+    }
+    Ok(())
+}
+
 const GBUF_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 
 /// Mirrors the `Instance` struct in the bake shaders (scalar layout, 48 B).
@@ -984,6 +1021,11 @@ impl LightmapPipeline {
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
+                        // DISPATCH_BASE lets the bake tile the lightmap into row
+                        // bands via cmd_dispatch_base (one submit per band) so a
+                        // single huge dispatch can't monopolize the GPU and freeze
+                        // the whole desktop while baking.
+                        .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
                         .stage(
                             vk::PipelineShaderStageCreateInfo::default()
                                 .stage(stage)
@@ -1461,24 +1503,41 @@ fn bake_one_lightmap(
             vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE,
         );
 
-        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, lightmap.pipeline);
-        device.cmd_bind_descriptor_sets(
-            cb,
-            vk::PipelineBindPoint::COMPUTE,
-            lightmap.layout,
-            0,
-            &[set],
-            &[],
-        );
-        device.cmd_push_constants(
-            cb,
-            lightmap.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytes_of(std::slice::from_ref(&push)),
-        );
-        device.cmd_dispatch(cb, groups, groups, 1);
+    })?;
 
+    // Path-trace the lightmap in horizontal row bands, each its own GPU
+    // submission, so the OS GPU scheduler can interleave the desktop compositor
+    // between bands instead of one giant dispatch monopolizing the GPU (which
+    // froze the whole system) until the lightmap finished. DISPATCH_BASE offsets
+    // gl_WorkGroupID so gl_GlobalInvocationID.y already carries the band origin —
+    // no shader / push-constant change needed. Bands write disjoint rows, so no
+    // inter-band barrier is required; the copy submit below synchronizes them.
+    let mut y0 = 0u32;
+    while y0 < groups {
+        let bg = LIGHTMAP_BAND_GROUPS.min(groups - y0);
+        throttled_submit(device, command_pool, ctx.queue, |cb| unsafe {
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, lightmap.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                lightmap.layout,
+                0,
+                &[set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cb,
+                lightmap.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes_of(std::slice::from_ref(&push)),
+            );
+            device.cmd_dispatch_base(cb, 0, y0, 0, groups, bg, 1);
+        })?;
+        y0 += bg;
+    }
+
+    alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
         // out image → TRANSFER_SRC, copy to readback buffer
         image_barrier(
             device, cb, out_img.image,
@@ -1662,6 +1721,9 @@ fn bake_probes(
             .create_compute_pipelines(
                 vk::PipelineCache::null(),
                 &[vk::ComputePipelineCreateInfo::default()
+                    // Tiled probe dispatch (cmd_dispatch_base) so a huge probe bake
+                    // (e.g. a dense FluxVoxel auto-grid) doesn't monopolize the GPU.
+                    .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
                     .stage(
                         vk::PipelineShaderStageCreateInfo::default()
                             .stage(stage)
@@ -1714,25 +1776,33 @@ fn bake_probes(
         sky_color: [input.sky_color[0], input.sky_color[1], input.sky_color[2], 0.0],
     };
     let groups = (count as u32).div_ceil(64);
-    alloc::one_time_submit(device, command_pool, ctx.queue, |cb| unsafe {
-        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
-        device.cmd_bind_descriptor_sets(
-            cb,
-            vk::PipelineBindPoint::COMPUTE,
-            layout,
-            0,
-            &[set],
-            &[],
-        );
-        device.cmd_push_constants(
-            cb,
-            layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytes_of(std::slice::from_ref(&push_data)),
-        );
-        device.cmd_dispatch(cb, groups, 1, 1);
-    })?;
+    // Tile the probe path-trace into chunks, each its own throttled submission, so
+    // a large probe set (a dense FluxVoxel auto-grid can be tens of thousands of
+    // probes) can't hog the GPU in one dispatch and freeze the machine.
+    let mut g0 = 0u32;
+    while g0 < groups {
+        let cg = PROBE_CHUNK_GROUPS.min(groups - g0);
+        throttled_submit(device, command_pool, ctx.queue, |cb| unsafe {
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cb,
+                layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytes_of(std::slice::from_ref(&push_data)),
+            );
+            device.cmd_dispatch_base(cb, g0, 0, 0, cg, 1, 1);
+        })?;
+        g0 += cg;
+    }
 
     let bytes = out_ssbo.read();
     let raw: &[f32] = bytemuck::cast_slice(&bytes[..(count * 4 * 4 * 4).min(bytes.len())]);

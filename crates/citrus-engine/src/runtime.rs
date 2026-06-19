@@ -443,6 +443,9 @@ impl GameApp {
             postfx,
             reflection_probe: self.scene.active_reflection_probe(cam_pos),
             fog: self.scene.fog_params(),
+            voxel_specular: self.scene.environment.realtime_gi.mode
+                == citrus_assets::GiMode::FluxVoxel
+                && self.scene.environment.realtime_gi.voxel_specular,
             egui: None,
         };
         if let Err(e) = renderer.render(&frame) {

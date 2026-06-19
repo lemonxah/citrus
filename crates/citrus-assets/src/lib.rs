@@ -47,7 +47,7 @@ pub use project_file::{
 pub use scene_file::{
     ComponentData, EditorCamera, FluxQuality, GiMode, MaterialRef, ObjectSource, PrimitiveShape,
     ProbeFallback, RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile,
-    WorldEnvironment, load_scene_file, save_scene_file,
+    VoxelGridMode, WorldEnvironment, load_scene_file, save_scene_file,
 };
 pub use tex_cache::load_texture_bc;
 pub use shader_file::{

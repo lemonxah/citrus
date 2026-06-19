@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 use citrus_core::{
     AudioListener, AudioRolloff, AudioSource, Bob, BodyKind, BoxCollider, CameraComponent,
-    Component, ComponentRegistry, ControlMode, FluxVolume, FluxVrLight, LightComponent, LightKind,
-    LightMode, LightProbeVolume, MeshCollider, ObjectId, ObjectRef, Pawn, ReflectionProbe,
-    RigidBody, ShadowType,
+    Component, ComponentRegistry, ControlMode, FluxVolume, FluxVoxelLight, LightComponent, LightKind,
+    LightMode, LightProbeVolume, LodComponent, LodLevel, MeshCollider, ObjectId, ObjectRef, Pawn,
+    ReflectionProbe, RigidBody, ShadowType,
     Spin,
     SpawnPoint, SphereCollider, Sync, TypedComponent, VolumeComponent,
     COLLISION_LAYERS,
@@ -36,6 +36,10 @@ pub const DRAG_FILE_KEY: &str = "citrus-drag-file";
 pub struct InspectCtx<'a> {
     /// (id, display name) of every object in the scene.
     pub objects: &'a [(ObjectId, String)],
+    /// Per-layer display names (len = NUM_LAYERS). Lets layer pickers (camera
+    /// culling mask) show the SAME layer set + names as the Layers window and the
+    /// object's layer dropdown, instead of a hardcoded count.
+    pub layer_names: &'a [String],
 }
 
 impl InspectCtx<'_> {
@@ -259,7 +263,7 @@ impl EditorComponents {
         e.register::<LightComponent>();
         e.register::<LightProbeVolume>();
         e.register::<ReflectionProbe>();
-        e.register::<FluxVrLight>();
+        e.register::<FluxVoxelLight>();
         e.register::<FluxVolume>();
         e.register::<AudioSource>();
         e.register::<AudioListener>();
@@ -268,6 +272,7 @@ impl EditorComponents {
         e.register::<MeshCollider>();
         e.register::<Spin>();
         e.register::<Bob>();
+        e.register::<LodComponent>();
         e.register::<RigidBody>();
         e.register::<VolumeComponent>();
         e.register::<Pawn>();
@@ -340,9 +345,10 @@ pub fn components_ui(
     registry: &ComponentRegistry,
     editor: &EditorComponents,
     objects: &[(ObjectId, String)],
+    layer_names: &[String],
 ) -> ComponentsResponse {
     let mut response = ComponentsResponse::default();
-    let inspect_ctx = InspectCtx { objects };
+    let inspect_ctx = InspectCtx { objects, layer_names };
     // Plugin components (cdylibs) statically link their own copy of egui, so a
     // selectable label drawn from a plugin's egui panics (mismatched TypeId for
     // egui's selection state). Disable selection for the whole inspector list.
@@ -508,7 +514,7 @@ fn collider_common_ui(ui: &mut Ui, is_trigger: &mut bool, layer: &mut u32, chang
 // ----------------------------------------------------------- builtin inspect
 
 impl Inspect for CameraComponent {
-    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
         let mut changed = false;
         property_row(ui, "Camera ID", &mut changed, |ui| {
             ui.add_enabled(false, DragValue::new(&mut self.id))
@@ -538,13 +544,24 @@ impl Inspect for CameraComponent {
                     changed = true;
                 }
             });
-            // First 8 layers as checkboxes (the common case); higher layers keep
-            // their bit untouched. Names live in the scene, so label generically.
+            // Show ALL layers (same as the object dropdown + collision matrix), with
+            // their real names. Scrollable so 32 rows don't blow out the inspector.
+            let shown = ctx.layer_names.len().max(8) as u32;
+            egui::ScrollArea::vertical()
+                .id_salt("cam-cull-scroll")
+                .max_height(220.0)
+                .show(ui, |ui| {
             egui::Grid::new("camera-culling-mask").show(ui, |ui| {
-                for l in 0u32..8 {
+                for l in 0u32..shown {
                     let bit = 1u32 << l;
                     let mut on = self.culling_mask & bit != 0;
-                    if ui.checkbox(&mut on, format!("Layer {l}")).changed() {
+                    let name = ctx
+                        .layer_names
+                        .get(l as usize)
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| format!("Layer {l}"));
+                    if ui.checkbox(&mut on, name).changed() {
                         if on {
                             self.culling_mask |= bit;
                         } else {
@@ -556,6 +573,7 @@ impl Inspect for CameraComponent {
                         ui.end_row();
                     }
                 }
+            });
             });
         });
         ui.label(
@@ -695,6 +713,54 @@ impl Inspect for VolumeComponent {
     }
 }
 impl Gizmo for VolumeComponent {}
+
+impl Inspect for LodComponent {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        ui.label(
+            egui::RichText::new("Swap to a cheaper mesh as the object recedes. Level 0 = nearest.")
+                .small()
+                .weak(),
+        );
+        let mut remove: Option<usize> = None;
+        for (i, level) in self.levels.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("LOD {i}"));
+                ui.label("≤");
+                changed |= ui
+                    .add(DragValue::new(&mut level.max_distance).speed(0.5).range(0.1..=10000.0).suffix(" m"))
+                    .changed();
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut level.model).hint_text("model path (blank = base mesh)"))
+                    .changed();
+                if ui.small_button("✕").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.levels.remove(i);
+            changed = true;
+        }
+        ui.horizontal(|ui| {
+            if ui.button("+ Add level").clicked() {
+                let d = self.levels.last().map(|l| l.max_distance * 2.0).unwrap_or(15.0);
+                self.levels.push(LodLevel { max_distance: d, model: String::new() });
+                changed = true;
+            }
+        });
+        property_row(ui, "Cull distance", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.cull_distance).speed(0.5).range(0.0..=10000.0).suffix(" m"))
+                .on_hover_text("Beyond this the object is culled entirely (0 = never)")
+        });
+        // Keep levels sorted ascending so selection is correct.
+        if changed {
+            self.levels.sort_by(|a, b| a.max_distance.partial_cmp(&b.max_distance).unwrap());
+        }
+        changed
+    }
+}
+impl Gizmo for LodComponent {}
 
 impl Inspect for Spin {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
@@ -905,7 +971,7 @@ impl Gizmo for ReflectionProbe {
     }
 }
 
-impl Inspect for FluxVrLight {
+impl Inspect for FluxVoxelLight {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
@@ -921,7 +987,7 @@ impl Inspect for FluxVrLight {
         changed
     }
 }
-impl Gizmo for FluxVrLight {}
+impl Gizmo for FluxVoxelLight {}
 
 impl Inspect for FluxVolume {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {

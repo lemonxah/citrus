@@ -89,6 +89,9 @@ impl PhysicsWorld {
                 .restitution(rest)
                 .friction(fric)
                 .collision_groups(groups)
+                // Stash the object index so raycast / overlap queries can report
+                // which scene object was hit (CHECKLIST T0 #12 physics queries).
+                .user_data(i as u128)
                 .build();
             colliders.insert_with_parent(collider, handle, &mut bodies);
 
@@ -153,6 +156,83 @@ impl PhysicsWorld {
             scene.objects[i].rotation = Quat::from_xyzw(r.x, r.y, r.z, r.w);
         }
     }
+
+    /// Raycast: the nearest collider hit along `dir` within `max_dist`, reported as
+    /// the scene object index + hit point/normal/distance. Gameplay uses this for
+    /// shooting, ground checks, interaction, line-of-sight, etc. (CHECKLIST T0 #12).
+    pub fn raycast(&self, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<RayHit> {
+        let dir = dir.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return None;
+        }
+        let ray = Ray::new(
+            Vector::new(origin.x, origin.y, origin.z),
+            Vector::new(dir.x, dir.y, dir.z),
+        );
+        let qp = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            QueryFilter::default(),
+        );
+        let (handle, hit) = qp.cast_ray_and_get_normal(&ray, max_dist, true)?;
+        let obj = self.colliders.get(handle).map(|c| c.user_data as usize)?;
+        let point = origin + dir * hit.time_of_impact;
+        let n = hit.normal;
+        Some(RayHit {
+            object: obj,
+            distance: hit.time_of_impact,
+            point,
+            normal: Vec3::new(n.x, n.y, n.z),
+        })
+    }
+
+    /// Overlap test: every scene object whose collider's bounding sphere intersects
+    /// a sphere at `center` (explosion radius, trigger volume, AoE). A bounding-
+    /// sphere approximation — cheap and dependency-light; exact shape overlap is a
+    /// later refinement.
+    pub fn overlap_sphere(&self, center: Vec3, radius: f32) -> Vec<usize> {
+        let mut hits = Vec::new();
+        for (_, col) in self.colliders.iter() {
+            let t = col.translation();
+            let p = Vec3::new(t.x, t.y, t.z);
+            let br = col.shape().compute_local_bounding_sphere().radius;
+            if (p - center).length() <= radius + br {
+                hits.push(col.user_data as usize);
+            }
+        }
+        hits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::LoadedScene;
+
+    #[test]
+    fn queries_on_empty_world_are_safe() {
+        let scene = LoadedScene::empty();
+        let pw = PhysicsWorld::build(&scene);
+        // No colliders -> a ray hits nothing and a sphere overlaps nothing.
+        assert!(pw.raycast(Vec3::ZERO, Vec3::NEG_Y, 100.0).is_none());
+        assert!(pw.overlap_sphere(Vec3::ZERO, 5.0).is_empty());
+        // A zero direction ray is rejected, not a panic.
+        assert!(pw.raycast(Vec3::ZERO, Vec3::ZERO, 100.0).is_none());
+    }
+}
+
+/// A raycast hit against the physics world.
+#[derive(Clone, Copy, Debug)]
+pub struct RayHit {
+    /// Scene object index of the collider hit.
+    pub object: usize,
+    /// Distance from the ray origin to the hit.
+    pub distance: f32,
+    /// World-space hit point.
+    pub point: Vec3,
+    /// World-space surface normal at the hit.
+    pub normal: Vec3,
 }
 
 /// Build a rapier collider shape (+ its object-space offset) for the first

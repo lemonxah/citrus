@@ -363,6 +363,83 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   Reflections** button (capture + write the `.reflprobe` sidecar, loaded on scene open) and a
   **Recapture** (session-only); both disabled until the scene has a probe. Same actions still live
   in the Environment panel.
+- [done] **Reflection capture lighting fix (FluxVoxel)**: `gather_lights_impl` grew a
+  `flux_voxel_skip` arg so the "drop Realtime/Mixed lights in FluxVoxel mode" filter applies
+  ONLY to the forward pass, **not** to the reflection-probe capture (`gather_lights_all`). The
+  cube is a separate forward render with no voxel volume, so it must direct-light the scene —
+  previously in FluxVoxel mode it lost every light and reflections of geometry came out black
+  (only the skybox + self-emissive survived). This was the actual cause of the "black scene in
+  reflections" reports.
+- [done] **Reflection-probe math reference + debug views**: `REFLECTION_PROBES_MATH.md` documents
+  the full cubemap/parallax/split-sum math (Vulkan face table, `R=reflect(-V,N)`, Lagarde box
+  projection, Karis split-sum, Vulkan capture-orientation pitfalls, a bug→symptom checklist) with
+  primary sources, and cross-references each piece to our code. Verified the whole pipeline matches
+  the reference (face_dir = Vulkan spec, capture position = box center = correct Lagarde,
+  `box_projection` default true, env_brdf_approx = Karis). Added two viewport **render modes**:
+  **4 = Reflection cube (mirror)** (every surface a perfect mirror of `u_env`, reveals cube
+  orientation) and **5 = Reflection vector** (R as RGB), per the reference's recommended debug
+  visualizations — use them to empirically confirm orientation instead of guessing.
+- [done] **Reflection-probe fixes from the math doc** (2026-06-18): (1) **Orientation proven**
+  by an executable round-trip test (`refl_capture_tests::cube_capture_matches_sampling`) that
+  simulates the GPU capture (look_at_rh + perspective_rh + positive viewport) for all 6 faces ×
+  7 sample points and asserts it equals the `face_dir` sampler convention — capture faces
+  extracted to `CUBE_CAPTURE_FACES` as the single source of truth. (2) **Roughness mip fix**
+  (§6.5): `ENV_MAX_LOD` was hardcoded to the 64px skybox cube's mip count, so 256px captured
+  probe cubes under-blurred (rough reflections too sharp — a defined blob on a rough floor); now
+  `textureQueryLevels(u_env)`-driven in `standard.frag` + `ssr_resolve.frag`, correct for any
+  cube size. (3) **Box-projection coverage guard** (§6.4): parallax only applies to surfaces
+  INSIDE the probe box; a surface outside it (floor extending past the probe) falls back to the
+  infinite-cube direction instead of a mis-placed parallax hit.
+- [done] **FluxVoxel modular settings + coverage** (FLUXVOXEL_TODO §A): `GiMode::uses_{bounces,
+  quality,samples,gdf,march_distance,voxel_density,ddgi_occlusion}()` declare per-backend
+  capabilities; the Environment → Flux GI panel renders only the controls the chosen backend
+  uses (FluxVoxel hides bounces/quality/GDF/march, shows **Voxel density**, **Auto scene grid**,
+  **DDGI occlusion** instead). `RealtimeGi.voxel_density` (probes/m) drives the auto scene-covering
+  grid built when no FluxVolumes are placed; `voxel_auto_grid` gates it.
+- [done] **FluxVoxel DDGI-style occlusion** (FLUXVOXEL_TODO §B, toggleable): voxel lights are
+  softly blocked by geometry via a coarse scene **occupancy bit-grid** (`sw_gi::SceneOccupancy`,
+  mesh-AABB rasterized; `inject_light_occ` DDA-marches light→probe, soft transmittance with a
+  floor so the coarse grid never hard-blacks). Toggle **`voxel_ddgi_occlusion`** (Environment →
+  "DDGI occlusion", default **on**; off saves the per-probe marches on low-end/VR). Unit-tested
+  (`occupancy_blocks_through_wall_not_around`, `occluded_inject_darkens_behind_wall`). NOTE: this
+  is the occupancy-DDA approximation, not yet true per-probe distance moments + Chebyshev — that's
+  the documented quality follow-up. Needs visual verification.
+- [done] **FluxVoxel propagation, specular, relocation, emissive fidelity** (FLUXVOXEL_TODO
+  B-F): (1) **LPV propagation** (`sw_gi::flux_propagate`) spreads injected radiance through the
+  grid for a >=1 diffuse bounce, per-frame per-volume, toggle `voxel_propagation`. (2) **Specular
+  from the volume** (`standard.frag::volume_radiance` + `sh_radiance`) - metallic/rough surfaces
+  sample the probe volume in the reflection dir for emissive/voxel-light bounce (weighted by
+  roughness so mirrors keep the cube), toggle `voxel_specular` via `FrameInput`->`fog_params.w`.
+  (3) **Probe relocation + classification** (`sw_gi::relocate_probes` + `fluxvr_active` mask) -
+  nudge probes out of solid, zero fully-trapped ones. (4) **Multi-point emissive** + **principled
+  range** in `scene.flux_voxel_lights` - elongated emitters scatter K points along their long axis
+  (energy split), range from a luminance cutoff. All toggleable, default on; CPU pieces
+  unit-tested (`propagation_spreads_and_stays_bounded`, `relocation_pushes_probe_out_of_solid`).
+  Shader paths need visual verification.
+- [done] **FluxVoxel per-frame stall fix** (perf): the per-frame probe upload was going through
+  `Renderer::set_baked_probes`, which does a `device_wait_idle` + buffer realloc + descriptor
+  rewrite on every call — a full GPU stall each frame the emitters moved (cost scaling with probe
+  count, so only the grid density appeared to affect FPS). It now uses the in-place
+  `update_probe_sh` (no stall/realloc) on the per-frame path, falling back to `set_baked_probes`
+  only on a rebuild or probe-count change — the same cheap path Flux/FluxRT already used. Removes
+  the FluxVoxel-was-slower-than-FluxRT paradox.
+- [done] **FluxVoxel auto-grid modes + mutual exclusion** (`VoxelGridMode`): the auto grid is now
+  **mutually exclusive** with author-placed FluxVolumes (placing any volume turns it off, so the
+  global density slider stops perturbing — and dropping the bake of — the placed region). Four
+  selectable layouts (Environment → Grid mode, shown when Auto scene grid is on): **Whole scene**
+  (one padded box, current behaviour), **Camera clipmap** (a fixed `2·extent` cube that follows
+  the camera, snapped to the probe spacing → constant probe count regardless of level size; the
+  camera comes from `Renderer::last_view_pos`), **Occupancy culled** (tight bounds around
+  geometry), **Per object** (tight grids clustered onto object AABBs, capped at `MAX_AUTO_VOLUMES`
+  = the shader's 4-volume limit via `cluster_aabbs`, unit-tested). `voxel_clipmap_extent` controls
+  the clipmap half-size. NOTE: Occupancy currently only tightens the bounds; dropping individual
+  empty probes needs sparse shader indexing (follow-up).
+- [done] **Full `fluxvr` → `flux_voxel` / `FluxVoxel` rename** (no backwards compat): all
+  lowercase `fluxvr_*` identifiers → `flux_voxel_*`; the `FluxVrLight` component type →
+  `FluxVoxelLight`; comments/labels `Flux VR`/`FluxVR` → `FluxVoxel`. Removed the legacy
+  GiMode serde aliases (`Hardware`/`RayQuery`/`Software`/`FluxVR`) and the `ComponentRegistry::load`
+  "Flux VR Light" → "FluxVoxel Light" migration map — old scene/bake files are no longer
+  supported by design.
 - [todo] Lower-distortion primitive lightmap unwrap (octahedral sphere instead of lat-long;
   even cube-face packing). The seam-stitch hides the seams but the lat-long sphere still
   wastes texels at the poles.
@@ -371,6 +448,55 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   lightmap-UV checkerboard whose cell size tracks each object's would-be texel density
   (big squares = low resolution, stretched = UV distortion; grey = non-static), live from
   the current bake settings, no re-bake needed.
+- [done] **Bake / startup CPU niceness** (responsive editor + live splash): the CPU path tracer
+  (`sw_gi::march_probes`), GDF build (`build_gdf`), and the parallel texture import/decode (runs
+  on the scene-load worker during startup) no longer fan out to *every* core at normal priority
+  (which pinned the whole machine to a standstill and starved the splash animation).
+  `sw_gi::bake_worker_count` caps workers at **80% of cores** (always ≥1 core free for the UI/OS),
+  and `lower_compute_priority` drops each worker thread's Linux nice to +10 so interactive threads
+  always win the CPU under contention. The nice path is cfg-gated to Linux + the `editor` feature
+  (which links libc); a shipped game compiles it out and never bakes.
+- [done] **GPU bake tiling** (no more whole-desktop freeze while baking): the lightmap path-trace
+  was one `cmd_dispatch(groups, groups)` per object — a single multi-second GPU job that
+  monopolized the GPU so the OS compositor couldn't run, freezing the entire desktop (a long
+  dispatch can't be preempted mid-flight on consumer GPUs). It now dispatches in horizontal row
+  bands (`LIGHTMAP_BAND_GROUPS` = 8 workgroups = 64 rows), each its own submission via
+  `cmd_dispatch_base` (pipeline created with `DISPATCH_BASE`; `gl_GlobalInvocationID.y` carries the
+  band origin, so no shader/push change). The probe bake is tiled the same way
+  (`PROBE_CHUNK_GROUPS`) since a dense FluxVoxel auto-grid can be tens of thousands of probes.
+  Output is identical (tiles cover the same grid). Because tiling alone still kept the GPU ~100%
+  busy back-to-back (the machine still stalled), each heavy submission also goes through
+  `throttled_submit`, which idles the GPU for `BAKE_GPU_IDLE_FRAC` (= 1.0 → ~50% duty cycle) of
+  the time the submission took — genuinely freeing the GPU for the compositor. Lower the const for
+  faster bakes, raise it if the desktop still stutters.
+
+- [done] **Realtime/Mixed lights in FluxVoxel** (correct, no double-count): Realtime/Mixed
+  `LightComponent` lights now direct-light the forward pass in FluxVoxel mode (they used to be
+  dropped, assuming the voxel grid covered them — which broke once the auto-grid became mutually
+  exclusive with placed volumes), and are **no longer injected into the voxel grid** (the grid
+  carries only emissive + dedicated `FluxVoxelLight` volume lights). Previously a Mixed light was
+  triple-counted — lightmap + forward + grid — which read as "too much light". Mixed semantics are
+  unchanged and correct: with no bake it's a full realtime light; with a lightmap its static
+  contribution is baked and it direct-lights only the non-static (non-lightmapped) objects (the
+  `gather_lights` baked flag + the shader's `light_baked && has_lightmap` skip).
+- [done] **Forward light cap 16 → 128** (`MAX_LIGHTS`): lights beyond 16 silently didn't render.
+  Raised to 128 (frame-UBO bound; a `const _` assert keeps `FrameUbo` ≤ 16 KB). Truly unbounded
+  would need a lights storage buffer (the screen-GI path already uses one). Only `standard.frag`
+  uses this UBO array, so the change is self-contained.
+- [done] **Duplicate naming `name(N)`**: duplicating an object now yields `file`, `file(1)`,
+  `file(2)`… (smallest free N, stripping any existing `(N)` first) instead of the stacking
+  `Copy Copy Copy` (`scene::strip_dup_suffix` / `next_duplicate_name`, unit-tested).
+
+- [done] **Texture tiling fix** (albedo + normal/ORM/emission): `apply_material` (the live
+  material-update path) copied every param from the model except the per-map UV tiling/offset, so
+  editing or reapplying a material silently reset `albedo_tiling`/etc. to 1×/0 — tiling "didn't
+  work". Now copied through to `MaterialParams` → `MaterialFx.albedo_st`. The sampler was already
+  REPEAT and the shader already applied `uv * st.xy + st.zw`.
+- [done] **Sharper lightmap defaults**: bake defaults raised so lightmaps aren't pixelated/blocky
+  out of the box — texel density 16 → 40 /m, Max Lightmap 512 → 2048, samples 256 → 512; the Max
+  Lightmap dropdown gains a 4096 option. (Existing scenes keep their saved settings — raise them in
+  the Baker tab.) Caveat: the lightmap texture array still pads every layer to the largest size, so
+  high res × many static objects is VRAM-heavy until the per-object atlas lands.
 
 ### Post-processing
 - [partial] **Unity Volume-style post-processing**: a `.postfx` profile asset (RON: tonemap
@@ -476,6 +602,9 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   2D); editor Open/New/Save Scene already covers authoring
 - [done] Custom GLSL shaders v1 (runtime glslc, pragma-declared properties reflected into
   Inspector, hot reload)
+- [done] Engine built-in shader hot-reload: `standard.frag` (baked into the binary) is
+  watched on disk; edits outside the editor recompile via glslc and hot-swap the pipeline
+  (cached variants rebuilt lazily), with status-bar success/compile-error feedback
 
 ### Audio
 - [done] AudioSource (clip, play-on-start, loop, volume, pitch) + Spatial toggle (min/max
@@ -1015,3 +1144,68 @@ physics engine (#26) --+                              |
 - [todo] Slang custom-shader frontend (phase 2)
 - [todo] Networking, content pipeline, VRM avatars (milestones M3-M7)
 - [todo] Occlusion culling, mipmaps, MSAA/TAA, multi-select gizmo, JFA outline
+
+## Gameplay / engine subsystems (ENGINE_FEATURE_CHECKLIST, 2026-06-19)
+
+Foundations added to close the T0/T1 gap list. Each is a tested module under
+`crates/citrus-engine/src/`; authoring/inspect UI is in **Tools → Systems** (and
+**Tools → Audio Mixer**) unless noted. See `ENGINE_FEATURE_CHECKLIST.md` for the
+per-feature "what's done / what's left" table.
+
+- [done] **Prefabs** (`prefab.rs`, T0 #7) — `.prefab` RON subtree; `instantiate` clears ids
+  (fresh on insert) + applies per-instance transform overrides. Editor: **Object → Create
+  Prefab from Selection** (`scene.prefab_from_object` extracts the subtree, re-indexes parents).
+- [done] **Physics queries** (`physics.rs`, T0 #12) — `raycast` (returns object index + point +
+  normal + distance) and `overlap_sphere`; colliders carry the object index in `user_data`.
+- [wip] **Runtime UI** (`ui_canvas.rs`, T0 #13) — retained `UiNode` tree + anchor layout solver
+  (stretch / corner-pin / center, nested, button hit-test). Live **preview** in the Systems
+  panel. GPU draw of solved rects + a text atlas is the remaining render layer.
+- [done] **Audio mixer** (`audio_mixer.rs`, T0 #14) — bus graph (master/music/sfx/voice/ui),
+  per-bus volume + mute, `effective_gain` chains up the tree, cycle guard. **Tools → Audio Mixer.**
+- [wip] **Animation state machine** (`anim_graph.rs`, T1 #21) — states, param/trigger
+  transitions, cross-fade blend, 1D blend trees, `current_pose` clip weights. Feeding weights
+  into skinning + a graph editor remain.
+- [done] **Navmesh + pathfinding** (`navmesh.rs`, T1 #24) — walkability grid, A* (8-connected,
+  no corner-cutting), line-of-sight string-pull to natural waypoints. Scene-bake + agent
+  component remain.
+- [wip] **Particles** (`particles.rs`, T1 #25) — CPU emitter sim (rate/lifetime/cone/gravity/
+  drag, recycle cap). GPU instanced-billboard draw + an emitter component remain.
+- [wip] **Shader graph** (`shader_graph.rs`, T1 #26) — node graph (const/uv/texture/mul/add/mix)
+  → **GLSL codegen** with topo-sort + cycle/ref validation; live output in the Systems panel.
+  A visual node editor is the remaining UI.
+- [done] **LOD** (`lod.rs`, T1 #29) — distance-banded LOD select + hysteresis (no popping) + cull
+  distance. Mesh-swap wiring + component inspector remain.
+- [done] **Events / messaging** (`events.rs`, T1 #30) — double-buffered typed event bus
+  (`emit`/`signal`/`read`/`swap`), Bevy-style one-frame visibility.
+- [done] **Save/load game state** (`savegame.rs`, T1 #31) — typed `SaveValue` KV store, atomic
+  `.save` RON write, typed getters.
+- [done] **Localization** (`localization.rs`, T1 #32) — `.loc` string tables, `tr()` with
+  default→key fallback, runtime language switch.
+- [done] **World streaming** (`streaming.rs`, T1 #33) — cell residency with load/unload
+  hysteresis band. Async loader wiring remains.
+- [done] **Asset streaming handles** (`asset_handle.rs`, T1 #34) — typed ref-counted `Handle<T>`,
+  dedupe-by-path, per-frame load budget, GC of unused slots. Real-decoder wiring remains.
+- [done] **FPS verification** — `sw_gi.rs::fluxvoxel_per_frame_cost_is_sub_millisecond` measures
+  the per-frame FluxVoxel CPU GI cost at ~156 µs for 27k probes + 2 moving lights (~6400 fps
+  headroom), and zero when idle (dynamic-hash skip).
+
+## Editor fixes + UI placement (2026-06-19)
+
+- [done] **Mesh-precise object picking** (`scene.rs::pick`) — was ray-vs-AABB, which selected a
+  big object (couch) when a small one (orb) sat inside its loose bounding box. Now AABB is the
+  broad-phase reject and the actual hit is **ray-vs-triangle** (`ray_mesh` / `ray_triangle`
+  Möller–Trumbore) against `mesh_geometry`, so you select the surface you click.
+- [done] **Consistent layer UIs** — object layer dropdown, camera culling mask, and collision
+  matrix all use `LayerSettings::shown_count()` (highest named + 2, clamped [8,32]) instead of
+  32 / 8 / 4. The Layers-window names list shows all 32 (naming a higher layer reveals it
+  everywhere). Camera mask now shows real layer names via `InspectCtx.layer_names`.
+- [done] **LOD is now a component** — `LodComponent` (citrus-core) with an Inspector editor
+  (Add Component → "LOD Group": per-level distance + model path, cull distance). Replaces the
+  incorrect Tools-menu placement. See `FEATURE_UI_GUIDE.md` for where every feature's UI belongs.
+- [done] **Removed the "Tools → Systems" dump** — it wrongly mixed components, settings, and
+  runtime-only APIs. Features now live in their correct homes (components / settings / asset-
+  editor windows / runtime-only).
+- [done] **Emissive GI on all (non-metal) objects** — the floor glow had been a view-DEPENDENT
+  specular term (now gated to smooth metals). The diffuse emissive bounce is injected ~8× into
+  the voxel volume (`EMISSIVE_GI_GAIN`) with an 8 m reach, so floor/couch/props get a visible
+  VIEW-INDEPENDENT colored pool (chrome/mirror specular deferred per request).

@@ -230,10 +230,10 @@ pub struct ProbeVolumeMeta {
     pub counts: [usize; 3],
     /// First probe index (into `BakedData.probe_sh`) for this volume.
     pub sh_base: usize,
-    /// True for FluxVR voxel volumes (baked from Flux VR Lights). At runtime
-    /// these are owned by `realtime_gi::update_fluxvr` (it seeds its static base
+    /// True for FluxVoxel voxel volumes (baked from FluxVoxel Lights). At runtime
+    /// these are owned by `realtime_gi::update_flux_voxel` (it seeds its static base
     /// from them, then adds dynamic lights), NOT uploaded as plain DDGI probes.
-    pub fluxvr: bool,
+    pub flux_voxel: bool,
 }
 
 /// Baked lighting, kept on the scene and pushed to the renderer for runtime.
@@ -1350,6 +1350,17 @@ impl LoadedScene {
         params.ramp_smoothness = m.ramp_smoothness;
         params.emission_scroll = m.emission_scroll;
         params.emission_pulse = m.emission_pulse;
+        // Per-texture UV tiling + offset. These were missing here, so editing (or
+        // reapplying) a material reset its tiling to the default 1×/0 — "tiling not
+        // working". apply_material is the live update path, so it MUST copy them.
+        params.albedo_tiling = m.albedo_tiling;
+        params.albedo_offset = m.albedo_offset;
+        params.normal_tiling = m.normal_tiling;
+        params.normal_offset = m.normal_offset;
+        params.orm_tiling = m.orm_tiling;
+        params.orm_offset = m.orm_offset;
+        params.emission_tiling = m.emission_tiling;
+        params.emission_offset = m.emission_offset;
         params.matcap_strength = m.matcap_strength;
         params.matcap_blend = [
             m.matcap_blend[0].to_f32(),
@@ -1814,8 +1825,12 @@ impl LoadedScene {
     pub fn gather_lights(&self) -> Vec<citrus_render::LightInstance> {
         // Once a bake exists, Baked + Mixed lights are represented by it
         // (lightmaps/probes), so drop them from the realtime loop to avoid
-        // double-counting. Realtime lights are always kept.
-        self.gather_lights_impl(self.baked.is_some(), true)
+        // double-counting. Realtime lights are always kept — including in the
+        // FluxVoxel backend, where they now direct-light the forward pass
+        // (previously dropped on the assumption the voxel grid covered them, which
+        // broke once the auto-grid became mutually exclusive with placed volumes),
+        // so realtime lights work everywhere a voxel volume may not cover.
+        self.gather_lights_impl(self.baked.is_some())
     }
 
     /// All scene lights, **including Baked/Mixed even when a bake exists** — for
@@ -1825,15 +1840,13 @@ impl LoadedScene {
     /// from the reflection). No double-counting risk: the cube is a separate
     /// render, not composited with the lightmapped main pass.
     pub fn gather_lights_all(&self) -> Vec<citrus_render::LightInstance> {
-        self.gather_lights_impl(false, false)
+        self.gather_lights_impl(false)
     }
 
-    /// `flux_voxel_skip`: when true (forward pass), drop Realtime/Mixed lights in
-    /// the FluxVoxel backend since they're volume-lit. The reflection capture
-    /// passes false — the cube is a separate forward render with no voxel volume,
-    /// so it MUST direct-light the scene or every non-sky reflection comes out
-    /// black (only the skybox + self-emissive survive).
-    fn gather_lights_impl(&self, drop_baked: bool, flux_voxel_skip: bool) -> Vec<citrus_render::LightInstance> {
+    /// `drop_baked`: when a bake exists, flag Baked/Mixed lights so the shader
+    /// applies them only to non-lightmapped objects (no double-count). Realtime
+    /// lights are always kept and direct-light every backend, FluxVoxel included.
+    fn gather_lights_impl(&self, drop_baked: bool) -> Vec<citrus_render::LightInstance> {
         use citrus_core::{LightComponent, LightKind, LightMode};
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
@@ -1847,16 +1860,6 @@ impl LoadedScene {
             else {
                 continue;
             };
-            // In the FluxVoxel backend, Realtime/Mixed lights are volume-lit
-            // (injected into the voxel probes, with occlusion). The forward pass
-            // must NOT also direct-light them — that's the cheap, no-shadow-map
-            // path and avoids double-counting. Baked lights stay (their lightmap).
-            if flux_voxel_skip
-                && self.environment.realtime_gi.mode == citrus_assets::GiMode::FluxVoxel
-                && light.mode != LightMode::Baked
-            {
-                continue;
-            }
             // Once a bake exists, Baked/Mixed lights are folded into the lightmaps.
             // Rather than DROP them (which left dynamic / non-lightmapped objects
             // pitch black in a baked scene), keep them flagged `baked`: the shader
@@ -1922,7 +1925,7 @@ impl LoadedScene {
                     size: v.size,
                     counts: [v.counts[0] as usize, v.counts[1] as usize, v.counts[2] as usize],
                     sh_base: v.sh_base as usize,
-                    fluxvr: v.fluxvr,
+                    flux_voxel: v.flux_voxel,
                 })
                 .collect();
             baked.probe_sh = ld
@@ -2101,7 +2104,7 @@ impl LoadedScene {
                 size: vol.size,
                 counts: vol.counts(),
                 sh_base,
-                fluxvr: false,
+                flux_voxel: false,
             });
         }
 
@@ -2162,22 +2165,22 @@ impl LoadedScene {
         }
     }
 
-    /// Build-time FluxVR bake input: the FluxVolume grids are the probe points,
-    /// the STATIC Flux VR Lights are the light sources, and the scene's static
+    /// Build-time FluxVoxel bake input: the FluxVolume grids are the probe points,
+    /// the STATIC FluxVoxel Lights are the light sources, and the scene's static
     /// geometry is the occluder/bouncer set (so the voxels carry real multi-bounce
     /// GI, not analytic direct-only). Reuses [`gather_bake`] for the geometry +
-    /// sky, then swaps in FluxVR probes + lights. Returns `None` when there are no
-    /// FluxVolumes or no static Flux VR Lights (nothing to bake). The returned
-    /// `probe_volumes` are flagged `fluxvr = true` so the runtime knows to feed
-    /// them to `update_fluxvr` (static base + live dynamic add) instead of
+    /// sky, then swaps in FluxVoxel probes + lights. Returns `None` when there are no
+    /// FluxVolumes or no static FluxVoxel Lights (nothing to bake). The returned
+    /// `probe_volumes` are flagged `flux_voxel = true` so the runtime knows to feed
+    /// them to `update_flux_voxel` (static base + live dynamic add) instead of
     /// uploading them as plain DDGI probes.
-    pub fn gather_fluxvr_bake(&self) -> Option<BakeGather> {
-        let volumes = self.fluxvr_volumes();
+    pub fn gather_flux_voxel_bake(&self) -> Option<BakeGather> {
+        let volumes = self.flux_voxel_volumes();
         if volumes.is_empty() {
             return None;
         }
         let static_lights: Vec<citrus_render::BakeLight> = self
-            .fluxvr_lights()
+            .flux_voxel_lights()
             .into_iter()
             .filter(|(_, s)| *s)
             .map(|(l, _)| l)
@@ -2197,7 +2200,7 @@ impl LoadedScene {
                 size: size.to_array(),
                 counts: [counts[0] as usize, counts[1] as usize, counts[2] as usize],
                 sh_base,
-                fluxvr: true,
+                flux_voxel: true,
             });
         }
         Some(BakeGather {
@@ -2212,62 +2215,22 @@ impl LoadedScene {
     }
 
     /// Gather inputs for the realtime-GI preview: every active mesh object as a
-    /// FluxVR light sources: every active object bearing a `FluxVrLight`
+    /// FluxVoxel light sources: every active object bearing a `FluxVoxelLight`
     /// component, as a point-light contribution at its CURRENT world position,
     /// tagged with whether the object is static. Static ones are baked into the
-    /// volume once; dynamic ones (`false`) mix in live so a moving FluxVR light
+    /// volume once; dynamic ones (`false`) mix in live so a moving FluxVoxel light
     /// lights up static objects sharing the volume. Only components participate,
-    /// so the author chooses what feeds FluxVR.
-    pub fn fluxvr_lights(&self) -> Vec<(citrus_render::BakeLight, bool)> {
-        use citrus_core::{LightComponent, LightKind, LightMode};
+    /// so the author chooses what feeds FluxVoxel.
+    pub fn flux_voxel_lights(&self) -> Vec<(citrus_render::BakeLight, bool)> {
         let mut out = Vec::new();
-        // Unified: every Realtime/Mixed normal light is also a FluxVoxel light, so
-        // a single light works across all GI backends. In the FluxVoxel backend
-        // these are volume-lit (the forward pass skips them — see gather_lights),
-        // which is why it's the cheap path. Baked-only lights stay out (they're in
-        // the lightmaps). Marked dynamic so movable lights track per frame.
-        for i in 0..self.objects.len() {
-            if !self.is_active(i) {
-                continue;
-            }
-            let Some(l) = self.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<LightComponent>())
-            else {
-                continue;
-            };
-            if l.mode == LightMode::Baked {
-                continue;
-            }
-            let world = self.world_transform(i);
-            let pos = world.w_axis.truncate();
-            let dir = world.to_scale_rotation_translation().1 * Vec3::NEG_Z;
-            let kind = match l.kind {
-                LightKind::Directional => citrus_render::LightKind::Directional,
-                LightKind::Point => citrus_render::LightKind::Point,
-                LightKind::Spot => citrus_render::LightKind::Spot,
-            };
-            out.push((
-                citrus_render::BakeLight {
-                    kind,
-                    position: pos,
-                    direction: dir,
-                    color: [
-                        l.color[0] * l.intensity,
-                        l.color[1] * l.intensity,
-                        l.color[2] * l.intensity,
-                    ],
-                    range: l.range.max(0.1),
-                    spot_inner_deg: l.spot_angle * (1.0 - l.spot_blend),
-                    spot_outer_deg: l.spot_angle,
-                    radius: 0.0,
-                },
-                false,
-            ));
-        }
-        // The legacy `FluxVrLight` component is still honoured (a dedicated
-        // volume-only light), so old scenes keep working.
+        // Realtime/Mixed normal LightComponents are NOT injected into the grid:
+        // they direct-light the forward pass instead (Mixed is baked into the
+        // lightmap for static objects and applied realtime only to dynamic ones —
+        // see gather_lights). Injecting them here as well triple-counted their
+        // energy (lightmap + forward + grid) — the "too much light" on Mixed.
+        // The grid carries only dedicated FluxVoxelLight volume lights + emissive.
+        //
+        // A `FluxVoxelLight` component is a dedicated volume-only light.
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
                 continue;
@@ -2275,7 +2238,7 @@ impl LoadedScene {
             let Some(f) = self.objects[i]
                 .components
                 .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_core::FluxVrLight>())
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::FluxVoxelLight>())
             else {
                 continue;
             };
@@ -2314,39 +2277,87 @@ impl LoadedScene {
                 continue;
             }
             let mean = entry.emission_map_mean;
-            let flux = [
-                m.emission_color[0] * m.emission_intensity * mean[0],
-                m.emission_color[1] * m.emission_intensity * mean[1],
-                m.emission_color[2] * m.emission_intensity * mean[2],
+            // Gain on the emissive→voxel injection. The bounce a surface receives is
+            // `albedo · irradiance / π`, so off a dark floor it's physically very dim
+            // — invisible without help. An emissive object reads as a glowing LAMP,
+            // so we inject it as a brighter area source into the volume to give a
+            // clearly-visible VIEW-INDEPENDENT diffuse pool (the look the user wants).
+            // Tunable; raise if emitters should throw more light, lower for subtler.
+            const EMISSIVE_GI_GAIN: f32 = 8.0;
+            let total_flux = [
+                m.emission_color[0] * m.emission_intensity * mean[0] * EMISSIVE_GI_GAIN,
+                m.emission_color[1] * m.emission_intensity * mean[1] * EMISSIVE_GI_GAIN,
+                m.emission_color[2] * m.emission_intensity * mean[2] * EMISSIVE_GI_GAIN,
             ];
-            let lum = 0.2126 * flux[0] + 0.7152 * flux[1] + 0.0722 * flux[2];
+            let lum = 0.2126 * total_flux[0] + 0.7152 * total_flux[1] + 0.0722 * total_flux[2];
             if lum <= 1e-3 {
                 continue;
             }
-            let pos = self.world_transform(i).w_axis.truncate();
-            let range = (lum.sqrt() * 4.0).clamp(0.5, 40.0);
-            let light = citrus_render::BakeLight {
-                kind: citrus_render::LightKind::Point,
-                position: pos,
-                direction: Vec3::NEG_Y,
-                color: flux,
-                range,
-                spot_inner_deg: 0.0,
-                spot_outer_deg: 0.0,
-                radius: 0.0,
+            // Multi-point emissive sampling (FLUXVOXEL_TODO §E): a compact orb is one
+            // point at its centre, but an elongated emitter (light strip, screen,
+            // visor) scatters K points along its longest axis so it lights its
+            // surroundings over its whole extent, not just the object centre. Energy
+            // is split across the points so the total emitted flux is preserved.
+            let world = self.world_transform(i);
+            let (lmin, lmax) = self.mesh_bounds[render.mesh];
+            let lcenter = (lmin + lmax) * 0.5;
+            let extent = (lmax - lmin).abs();
+            let long_axis = if extent.x >= extent.y && extent.x >= extent.z {
+                0
+            } else if extent.y >= extent.z {
+                1
+            } else {
+                2
             };
-            out.push((light, self.objects[i].static_geometry));
+            let long = extent[long_axis];
+            let thin = extent.min_element().max(1e-3);
+            let k = if long > 1e-3 {
+                ((long / thin).round() as usize).clamp(1, 8)
+            } else {
+                1
+            };
+            let inv_k = 1.0 / k as f32;
+            let flux = [
+                total_flux[0] * inv_k,
+                total_flux[1] * inv_k,
+                total_flux[2] * inv_k,
+            ];
+            // Range = pool radius (the falloff hits 0 here). Keep it MODEST: a bright
+            // orb should glow a few metres, not flood the whole floor. Computed from
+            // the TRUE emission (gain divided back out) so the GI brightness gain
+            // above doesn't also inflate the reach.
+            let plum = (lum / EMISSIVE_GI_GAIN) * inv_k;
+            // Reach: enough to glow onto nearby surfaces (floor, couch, props), not
+            // just the object itself — but capped so it doesn't flood the whole room.
+            let range = (plum.sqrt() * 2.0).clamp(1.0, 8.0);
+            for j in 0..k {
+                let t = if k == 1 { 0.5 } else { j as f32 / (k - 1) as f32 };
+                let mut lp = lcenter;
+                lp[long_axis] = lmin[long_axis] + extent[long_axis] * t;
+                let pos = world.transform_point3(lp);
+                let light = citrus_render::BakeLight {
+                    kind: citrus_render::LightKind::Point,
+                    position: pos,
+                    direction: Vec3::NEG_Y,
+                    color: flux,
+                    range,
+                    spot_inner_deg: 0.0,
+                    spot_outer_deg: 0.0,
+                    radius: 0.0,
+                };
+                out.push((light, self.objects[i].static_geometry));
+            }
         }
         out
     }
 
-    /// The build-time baked FluxVR static base, if a bake exists with FluxVR
+    /// The build-time baked FluxVoxel static base, if a bake exists with FluxVoxel
     /// volumes. Returns the flattened SH accumulators, world positions, and the
     /// `set_baked_probes` meta tuples — exactly the three parallel arrays
-    /// `realtime_gi::update_fluxvr` keeps, so it can seed its static base from
+    /// `realtime_gi::update_flux_voxel` keeps, so it can seed its static base from
     /// disk-baked voxels instead of recomputing them analytically each load.
     #[allow(clippy::type_complexity)]
-    pub fn fluxvr_baked(
+    pub fn flux_voxel_baked(
         &self,
     ) -> Option<(
         Vec<[glam::Vec3; 4]>,
@@ -2354,14 +2365,14 @@ impl LoadedScene {
         Vec<(Mat4, [f32; 3], [u32; 3], u32)>,
     )> {
         let baked = self.baked.as_ref()?;
-        if !baked.probe_volumes.iter().any(|v| v.fluxvr) {
+        if !baked.probe_volumes.iter().any(|v| v.flux_voxel) {
             return None;
         }
         let mut acc = Vec::new();
         let mut positions = Vec::new();
         let mut meta = Vec::new();
         let mut base = 0u32;
-        for v in baked.probe_volumes.iter().filter(|v| v.fluxvr) {
+        for v in baked.probe_volumes.iter().filter(|v| v.flux_voxel) {
             // The bake stored world_to_local as translate(-center); recover center.
             let center = -v.world_to_local.w_axis.truncate();
             let size = Vec3::from(v.size);
@@ -2379,10 +2390,65 @@ impl LoadedScene {
         Some((acc, positions, meta))
     }
 
-    /// FluxVR voxel volumes: each author-placed `FluxVolume` component as
+    /// FluxVoxel voxel volumes: each author-placed `FluxVolume` component as
     /// `(world center, box size, probe counts)`. Falls back to a single volume
-    /// covering the whole scene (so FluxVR works without an explicit volume).
-    pub fn fluxvr_volumes(&self) -> Vec<(Vec3, Vec3, [u32; 3])> {
+    /// covering the whole scene (so FluxVoxel works without an explicit volume).
+    /// Coarse scene occupancy grid (world-space mesh AABBs) for FluxVoxel
+    /// voxel-light occlusion. None when there's no geometry to occlude.
+    pub fn flux_occupancy(&self) -> Option<crate::sw_gi::SceneOccupancy> {
+        let mut boxes: Vec<(Vec3, Vec3)> = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) || self.objects[i].render.is_none() {
+                continue;
+            }
+            // Emitters are NOT occluders: an emissive object's own mesh must not be
+            // in the occupancy grid, or its light self-occludes (the ray from the orb
+            // centre to nearby probes starts inside the orb's own solid cells and
+            // reads as fully blocked). This is exactly why a STATIC emissive orb
+            // (occluded inject) went dark while a dynamic one (non-occluded) lit fine.
+            let emissive = self.objects[i].render_slots().any(|r| {
+                self.materials
+                    .get(r.material)
+                    .is_some_and(|e| e.model.emission_enabled)
+            });
+            if emissive {
+                continue;
+            }
+            let world = self.world_transform(i);
+            for render in self.objects[i].render_slots() {
+                let (min, max) = self.mesh_bounds[render.mesh];
+                let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                for cx in [min.x, max.x] {
+                    for cy in [min.y, max.y] {
+                        for cz in [min.z, max.z] {
+                            let p = world.transform_point3(Vec3::new(cx, cy, cz));
+                            lo = lo.min(p);
+                            hi = hi.max(p);
+                        }
+                    }
+                }
+                if lo.is_finite() {
+                    boxes.push((lo, hi));
+                }
+            }
+        }
+        crate::sw_gi::SceneOccupancy::build(&boxes, 48)
+    }
+
+    pub fn flux_voxel_volumes(&self) -> Vec<(Vec3, Vec3, [u32; 3])> {
+        self.flux_voxel_volumes_view(None)
+    }
+
+    /// FluxVoxel volumes with the camera position available (for the
+    /// `CameraClipmap` auto-grid mode). `view_pos = None` (the bake / gizmo path)
+    /// makes the clipmap fall back to the scene-centred whole-scene grid.
+    ///
+    /// Author-placed FluxVolumes and the auto grid are MUTUALLY EXCLUSIVE: placing
+    /// any FluxVolume turns the auto grid off entirely, so the author controls
+    /// coverage exactly and the global density slider stops perturbing the placed
+    /// region (changing density used to re-grid + drop the placed volume's bake).
+    pub fn flux_voxel_volumes_view(&self, view_pos: Option<Vec3>) -> Vec<(Vec3, Vec3, [u32; 3])> {
+        use citrus_assets::VoxelGridMode;
         let mut out = Vec::new();
         for i in 0..self.objects.len() {
             if !self.is_active(i) {
@@ -2398,11 +2464,91 @@ impl LoadedScene {
             let center = self.world_transform(i).w_axis.truncate();
             out.push((center, Vec3::from(v.size), v.counts()));
         }
-        if out.is_empty() {
-            // No author-placed volume → cover the whole scene at a default density.
+        // Mutual exclusion + master toggle: auto grid only when zero placed volumes.
+        if !out.is_empty() || !self.environment.realtime_gi.voxel_auto_grid {
+            return out;
+        }
+
+        let gi = &self.environment.realtime_gi;
+        // density = probes per meter → spacing = 1/density.
+        let density = gi.voxel_density.clamp(0.05, 8.0);
+        let spacing = (1.0 / density).max(0.25);
+        // Cap per axis so a huge scene can't explode the probe count (the per-frame
+        // inject is O(probes); 48³ ≈ 110k is the upper bound for 1k+ fps headroom).
+        let counts_for = |size: Vec3| {
+            [
+                ((size.x / spacing).round() as u32 + 1).clamp(2, 48),
+                ((size.y / spacing).round() as u32 + 1).clamp(2, 48),
+                ((size.z / spacing).round() as u32 + 1).clamp(2, 48),
+            ]
+        };
+
+        match gi.voxel_grid_mode {
+            // A fixed cube that follows the camera, snapped to the probe spacing so
+            // it scrolls in whole-probe steps (the grid stays world-aligned → no
+            // per-frame re-bake jitter). Constant probe count regardless of level
+            // size: space you never visit is never computed. Falls back to the
+            // scene centre when there's no camera (bake / gizmo path).
+            VoxelGridMode::CameraClipmap => {
+                let extent = gi.voxel_clipmap_extent.clamp(2.0, 256.0);
+                let center = view_pos
+                    .map(|p| (p / spacing).round() * spacing)
+                    .or_else(|| self.flux_voxel_static_bounds().map(|(lo, hi)| (lo + hi) * 0.5))
+                    .unwrap_or(Vec3::ZERO);
+                let size = Vec3::splat(extent * 2.0);
+                vec![(center, size, counts_for(size))]
+            }
+            // Tight grids hugging clusters of static geometry; the gaps between
+            // clusters stay uncovered. Clustered down to the shader's volume cap.
+            VoxelGridMode::PerObject => {
+                let mut clusters = self.flux_voxel_object_aabbs();
+                cluster_aabbs(&mut clusters, MAX_AUTO_VOLUMES);
+                clusters
+                    .into_iter()
+                    .map(|(lo, hi)| {
+                        let (lo, hi) = (lo - spacing, hi + spacing);
+                        let center = (lo + hi) * 0.5;
+                        let size = (hi - lo).max(Vec3::splat(0.5));
+                        (center, size, counts_for(size))
+                    })
+                    .collect()
+            }
+            // A single box over the static-geometry bounds. WholeScene pads by a
+            // fade margin so GI melts into ambient at the edge; Occupancy uses tight
+            // bounds and (in update_flux_voxel) drops probes far from geometry so open
+            // air costs nothing to inject.
+            mode @ (VoxelGridMode::WholeScene | VoxelGridMode::Occupancy) => {
+                let Some((lo, hi)) = self.flux_voxel_static_bounds() else {
+                    return Vec::new();
+                };
+                let pad = if mode == VoxelGridMode::WholeScene {
+                    ((hi - lo).length() * 0.1).max(1.0)
+                } else {
+                    spacing
+                };
+                let (lo, hi) = (lo - pad, hi + pad);
+                // Snap to a 1 m grid so sub-metre jitter never re-bakes the base.
+                let q = 1.0f32;
+                let lo = (lo / q).floor() * q;
+                let hi = (hi / q).ceil() * q;
+                let center = (lo + hi) * 0.5;
+                let size = (hi - lo).max(Vec3::splat(0.5));
+                vec![(center, size, counts_for(size))]
+            }
+        }
+    }
+
+    /// World-space AABB over STATIC render geometry (the stable basis for the auto
+    /// grid — a moving object mustn't reshape it). Falls back to ALL geometry when
+    /// the scene has no static objects. None when there's no geometry at all.
+    fn flux_voxel_static_bounds(&self) -> Option<(Vec3, Vec3)> {
+        let bounds = |want_static: bool| {
             let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
             for i in 0..self.objects.len() {
                 if !self.is_active(i) || self.objects[i].render.is_none() {
+                    continue;
+                }
+                if want_static && !self.objects[i].static_geometry {
                     continue;
                 }
                 let world = self.world_transform(i);
@@ -2419,18 +2565,39 @@ impl LoadedScene {
                     }
                 }
             }
+            (lo, hi)
+        };
+        let s = bounds(true);
+        let (lo, hi) = if s.0.is_finite() { s } else { bounds(false) };
+        lo.is_finite().then_some((lo, hi))
+    }
+
+    /// Per-object world-space AABBs over static render geometry (Per-object grid).
+    fn flux_voxel_object_aabbs(&self) -> Vec<(Vec3, Vec3)> {
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) || self.objects[i].render.is_none() {
+                continue;
+            }
+            if !self.objects[i].static_geometry {
+                continue;
+            }
+            let world = self.world_transform(i);
+            let (mut lo, mut hi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            for render in self.objects[i].render_slots() {
+                let (min, max) = self.mesh_bounds[render.mesh];
+                for cx in [min.x, max.x] {
+                    for cy in [min.y, max.y] {
+                        for cz in [min.z, max.z] {
+                            let p = world.transform_point3(Vec3::new(cx, cy, cz));
+                            lo = lo.min(p);
+                            hi = hi.max(p);
+                        }
+                    }
+                }
+            }
             if lo.is_finite() {
-                let pad = ((hi - lo).length() * 0.1).max(1.0);
-                let (lo, hi) = (lo - pad, hi + pad);
-                let center = (lo + hi) * 0.5;
-                let size = (hi - lo).max(Vec3::splat(0.5));
-                let spacing = self.environment.realtime_gi.probe_spacing.max(0.5);
-                let counts = [
-                    ((size.x / spacing).round() as u32 + 1).clamp(2, 48),
-                    ((size.y / spacing).round() as u32 + 1).clamp(2, 48),
-                    ((size.z / spacing).round() as u32 + 1).clamp(2, 48),
-                ];
-                out.push((center, size, counts));
+                out.push((lo, hi));
             }
         }
         out
@@ -2653,7 +2820,7 @@ impl LoadedScene {
                 size: cs.to_array(),
                 counts,
                 sh_base,
-                fluxvr: false,
+                flux_voxel: false,
             });
         }
 
@@ -3285,6 +3452,19 @@ impl LoadedScene {
     /// re-parents the copies among themselves; the duplicated root becomes a
     /// sibling of the original. Returns the new root index. Not undoable (like
     /// object deletion).
+    /// Name for a duplicate: `base(N)` with the smallest free N >= 1, where `base`
+    /// is `src_name` with any trailing `(N)` stripped. So `file` -> `file(1)`,
+    /// duplicating `file(1)` -> `file(2)`, etc. — never the stacking `Copy Copy`.
+    fn next_duplicate_name(&self, src_name: &str) -> String {
+        let base = strip_dup_suffix(src_name);
+        let existing: std::collections::HashSet<&str> =
+            self.objects.iter().map(|o| o.name.as_str()).collect();
+        (1..)
+            .map(|n| format!("{base}({n})"))
+            .find(|c| !existing.contains(c.as_str()))
+            .unwrap()
+    }
+
     pub fn duplicate_object(
         &mut self,
         index: usize,
@@ -3326,7 +3506,7 @@ impl LoadedScene {
             let mut obj = SceneObject {
                 id: ObjectId::new(),
                 name: if old == index {
-                    format!("{} Copy", src.name)
+                    self.next_duplicate_name(&src.name)
                 } else {
                     src.name.clone()
                 },
@@ -3393,11 +3573,25 @@ impl LoadedScene {
             let inv = world.inverse();
             let local_origin = inv.transform_point3(origin);
             let local_dir = inv.transform_vector3(dir);
-            // Test every slot's mesh AABB so a click on any sub-mesh selects the
-            // whole object.
+            // Test every slot's mesh so a click on any sub-mesh selects the whole
+            // object. AABB is the broad-phase reject; the PRECISE hit is ray-vs-
+            // triangle against the mesh geometry. (AABB-only picking selected a big
+            // object like a couch when a small object — an orb — sat INSIDE its loose
+            // bounding box, because the couch's AABB front face is nearer than the
+            // orb even though the couch's actual geometry is behind it.)
             for render in object.render_slots() {
                 let (min, max) = self.mesh_bounds[render.mesh];
-                if let Some(t_local) = ray_aabb(local_origin, local_dir, min, max) {
+                if ray_aabb(local_origin, local_dir, min, max).is_none() {
+                    continue; // misses the box entirely -> skip the triangle test
+                }
+                let t_local = match self.mesh_geometry.get(render.mesh) {
+                    Some((pos, idx)) if !idx.is_empty() => {
+                        ray_mesh(local_origin, local_dir, pos, idx)
+                    }
+                    // No CPU geometry (e.g. a primitive without it) -> AABB fallback.
+                    _ => ray_aabb(local_origin, local_dir, min, max),
+                };
+                if let Some(t_local) = t_local {
                     let hit_world = world.transform_point3(local_origin + local_dir * t_local);
                     let t_world = (hit_world - origin).length();
                     if best.is_none_or(|(_, t)| t_world < t) {
@@ -3495,6 +3689,51 @@ impl LoadedScene {
             editor_camera: None,
             collapsed: Vec::new(),
         }
+    }
+
+    /// Extract object `root` and all its descendants as a self-contained
+    /// [`Prefab`](crate::prefab::Prefab): entries are re-indexed so parent
+    /// references are local to the prefab and the root becomes parentless. Drives
+    /// the editor's "Create Prefab from Selection" action (CHECKLIST T0 #7).
+    pub fn prefab_from_object(
+        &self,
+        root: usize,
+        project_root: &Path,
+        shaders: &ShaderLibrary,
+    ) -> Option<crate::prefab::Prefab> {
+        if root >= self.objects.len() {
+            return None;
+        }
+        let file = self.to_scene_file(project_root, shaders);
+        // Collect root + descendants (parents always precede children in `objects`,
+        // but walk defensively in case they don't).
+        let mut keep = vec![root];
+        let mut i = 0;
+        while i < keep.len() {
+            let p = keep[i];
+            for (idx, e) in file.entries.iter().enumerate() {
+                if e.parent == Some(p) && !keep.contains(&idx) {
+                    keep.push(idx);
+                }
+            }
+            i += 1;
+        }
+        // Old index -> new local index.
+        let remap: std::collections::HashMap<usize, usize> =
+            keep.iter().enumerate().map(|(new, &old)| (old, new)).collect();
+        let entries = keep
+            .iter()
+            .map(|&old| {
+                let mut e = file.entries[old].clone();
+                e.parent = if old == root {
+                    None
+                } else {
+                    e.parent.and_then(|p| remap.get(&p).copied())
+                };
+                e
+            })
+            .collect();
+        Some(crate::prefab::Prefab::new(entries))
     }
 
     /// Resolve one serialized `MaterialRef` to a material index. `File` loads
@@ -4045,6 +4284,50 @@ fn tracker_poses_from_targets(t: &citrus_core::TrackerTargets) -> crate::humanoi
     }
 }
 
+/// Strip a trailing `(N)` (N = digits) from a duplicate name so re-duplicating
+/// `file(2)` yields `file(3)`, not `file(2)(1)`. Returns the base, trimmed.
+fn strip_dup_suffix(name: &str) -> &str {
+    if let Some(open) = name.rfind('(') {
+        if name.ends_with(')') {
+            let inner = &name[open + 1..name.len() - 1];
+            if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
+                return name[..open].trim_end();
+            }
+        }
+    }
+    name
+}
+
+/// Shader's per-fragment probe-volume cap (`MAX_PROBE_VOLUMES` in standard.frag).
+/// The Per-object auto grid clusters down to this many tight volumes.
+const MAX_AUTO_VOLUMES: usize = 4;
+
+/// Greedily merge AABBs (by smallest merged volume) until at most `max` remain, so
+/// the Per-object grid stays within the shader's volume cap. O(n³) but n = object
+/// count, small.
+fn cluster_aabbs(boxes: &mut Vec<(Vec3, Vec3)>, max: usize) {
+    while boxes.len() > max {
+        let (mut bi, mut bj, mut best) = (0usize, 1usize, f32::INFINITY);
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                let lo = boxes[i].0.min(boxes[j].0);
+                let hi = boxes[i].1.max(boxes[j].1);
+                let d = (hi - lo).max(Vec3::ZERO);
+                let vol = d.x * d.y * d.z;
+                if vol < best {
+                    best = vol;
+                    bi = i;
+                    bj = j;
+                }
+            }
+        }
+        let lo = boxes[bi].0.min(boxes[bj].0);
+        let hi = boxes[bi].1.max(boxes[bj].1);
+        boxes.swap_remove(bj); // bj > bi, so this doesn't disturb index bi
+        boxes[bi] = (lo, hi);
+    }
+}
+
 fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let inv_dir = dir.recip();
     let t1 = (min - origin) * inv_dir;
@@ -4052,4 +4335,102 @@ fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let t_min = t1.min(t2).max_element();
     let t_max = t1.max(t2).min_element();
     (t_max >= t_min.max(0.0)).then_some(t_min.max(0.0))
+}
+
+/// Nearest ray-vs-triangle hit distance across an indexed mesh (positions are
+/// object-local; the caller transforms the ray into the same space). Used to pick
+/// the actual SURFACE, not the loose AABB.
+fn ray_mesh(origin: Vec3, dir: Vec3, pos: &[Vec3], idx: &[u32]) -> Option<f32> {
+    let mut best = f32::INFINITY;
+    for tri in idx.chunks_exact(3) {
+        let (Some(&a), Some(&b), Some(&c)) = (
+            pos.get(tri[0] as usize),
+            pos.get(tri[1] as usize),
+            pos.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        if let Some(t) = ray_triangle(origin, dir, a, b, c) {
+            if t < best {
+                best = t;
+            }
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
+/// Möller–Trumbore ray-triangle intersection (two-sided). Returns the forward
+/// distance `t` along `dir`, or None.
+fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let e1 = b - a;
+    let e2 = c - a;
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-7 {
+        return None; // ray parallel to the triangle
+    }
+    let inv_det = 1.0 / det;
+    let tv = origin - a;
+    let u = tv.dot(p) * inv_det;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = tv.cross(e1);
+    let v = dir.dot(q) * inv_det;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = e2.dot(q) * inv_det;
+    (t > 1e-5).then_some(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_aabbs_merges_down_to_cap() {
+        // Six well-separated unit boxes; merging to a cap of 4 must leave exactly 4
+        // (and the two nearest get merged first, so the count drops by exactly 2).
+        let mut boxes: Vec<(Vec3, Vec3)> = (0..6)
+            .map(|i| {
+                let c = Vec3::new(i as f32 * 10.0, 0.0, 0.0);
+                (c - Vec3::splat(0.5), c + Vec3::splat(0.5))
+            })
+            .collect();
+        cluster_aabbs(&mut boxes, 4);
+        assert_eq!(boxes.len(), 4);
+        // Every original box must still be covered by some cluster (merging only
+        // grows AABBs, never drops geometry).
+        for i in 0..6 {
+            let c = Vec3::new(i as f32 * 10.0, 0.0, 0.0);
+            assert!(
+                boxes.iter().any(|(lo, hi)| c.cmpge(*lo).all() && c.cmple(*hi).all()),
+                "object {i} center fell outside every cluster"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_dup_suffix_handles_numbered_and_plain() {
+        assert_eq!(strip_dup_suffix("file"), "file");
+        assert_eq!(strip_dup_suffix("file(1)"), "file");
+        assert_eq!(strip_dup_suffix("file(42)"), "file");
+        assert_eq!(strip_dup_suffix("l1(2)"), "l1");
+        // Non-numeric parens are part of the name, not a dup suffix.
+        assert_eq!(strip_dup_suffix("file(abc)"), "file(abc)");
+        assert_eq!(strip_dup_suffix("file()"), "file()");
+        // A space before the suffix is trimmed.
+        assert_eq!(strip_dup_suffix("file (3)"), "file");
+    }
+
+    #[test]
+    fn cluster_aabbs_noop_under_cap() {
+        let mut boxes = vec![
+            (Vec3::ZERO, Vec3::ONE),
+            (Vec3::splat(5.0), Vec3::splat(6.0)),
+        ];
+        cluster_aabbs(&mut boxes, 4);
+        assert_eq!(boxes.len(), 2);
+    }
 }

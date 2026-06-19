@@ -247,19 +247,14 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum GiMode {
     /// FluxRT: hardware ray-query (RT cores) against the scene BVH. Most accurate.
-    /// (Legacy scenes named this `Hardware`/`RayQuery`.)
     #[default]
-    #[serde(alias = "Hardware", alias = "RayQuery")]
     FluxRT,
     /// Flux: software ray-marching of per-mesh signed distance fields (no RT
-    /// cores, runs anywhere). (Legacy scenes named this `Software`.)
-    #[serde(alias = "Software")]
+    /// cores, runs anywhere).
     Flux,
     /// FluxVoxel: analytic voxel light volume (no ray tracing). Injects lights +
     /// emissive into an SH-L1 probe grid every frame — cheapest backend, built
     /// for VR. Static + dynamic meshes read it; dynamic lights mix in live.
-    /// (Older scenes named this `FluxVR`.)
-    #[serde(alias = "FluxVR")]
     FluxVoxel,
 }
 
@@ -304,6 +299,14 @@ impl GiMode {
     }
     /// DDGI-style per-probe visibility (currently the FluxVoxel voxel-light path).
     pub fn uses_ddgi_occlusion(self) -> bool {
+        matches!(self, Self::FluxVoxel)
+    }
+    /// LPV-style propagation bounce (FluxVoxel only — RT/SDF bounce via their march).
+    pub fn uses_propagation(self) -> bool {
+        matches!(self, Self::FluxVoxel)
+    }
+    /// VXGI-style specular-from-volume (FluxVoxel only — RT/SDF reflect via cube/BVH).
+    pub fn uses_voxel_specular(self) -> bool {
         matches!(self, Self::FluxVoxel)
     }
 }
@@ -369,6 +372,44 @@ impl ProbeFallback {
     pub const ALL: [ProbeFallback; 2] = [Self::Off, Self::Throttled];
 }
 
+/// How the auto FluxVoxel grid is laid out when there are no author-placed
+/// FluxVolumes. Trades coverage of empty space against probe count (= per-frame
+/// cost). Only consulted by the FluxVoxel backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum VoxelGridMode {
+    /// One grid spanning the whole static-scene AABB. Simplest, but the probe
+    /// count scales with level size — empty space you never visit is computed too.
+    #[default]
+    WholeScene,
+    /// A fixed-size grid centred on the camera (snapped to the probe spacing so it
+    /// scrolls in discrete steps). Constant probe count regardless of level size:
+    /// space you never go to is never computed. Best for large levels.
+    CameraClipmap,
+    /// Whole-scene bounds, but probes far from any geometry are dropped (left dark)
+    /// so open air between surfaces costs nothing to inject/propagate.
+    Occupancy,
+    /// Tight grids hugging clusters of objects; the gaps between clusters aren't
+    /// covered. Sparse by construction. Capped at a few clusters (shader volume cap).
+    PerObject,
+}
+
+impl VoxelGridMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WholeScene => "Whole scene",
+            Self::CameraClipmap => "Camera clipmap",
+            Self::Occupancy => "Occupancy culled",
+            Self::PerObject => "Per object",
+        }
+    }
+    pub const ALL: [VoxelGridMode; 4] = [
+        Self::WholeScene,
+        Self::CameraClipmap,
+        Self::Occupancy,
+        Self::PerObject,
+    ];
+}
+
 /// Realtime global-illumination (probe) settings. Drives the live probe re-trace
 /// that lets realtime lights cast soft indirect bounce without a bake.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -405,6 +446,34 @@ pub struct RealtimeGi {
     /// Reflection model: 0 = environment cube only, 1 = screen-space (SSR),
     /// 2 = ray-traced (1 bounce; needs GPU ray-query support, falls back to SSR).
     pub reflection_mode: u8,
+    // --- FluxVoxel backend ---
+    /// Probes per world meter for the auto scene-covering FluxVoxel grid (used
+    /// when there are 0 author-placed FluxVolumes). Higher = finer GI, more cost.
+    pub voxel_density: f32,
+    /// Auto-build a scene-covering FluxVoxel grid when no FluxVolumes exist, so
+    /// the whole scene gets voxel GI (not just inside author-placed volumes).
+    /// Author-placed FluxVolumes and the auto grid are mutually exclusive: placing
+    /// any FluxVolume turns the auto grid off (the author then controls coverage).
+    pub voxel_auto_grid: bool,
+    /// Layout strategy for the auto grid (see `VoxelGridMode`). Lets large levels
+    /// keep a constant probe count (camera clipmap) or skip empty space.
+    pub voxel_grid_mode: VoxelGridMode,
+    /// Half-extent (metres) of the camera-clipmap auto grid: the grid is a cube of
+    /// side `2 * extent` centred on the camera. Larger = more GI range, more cost.
+    pub voxel_clipmap_extent: f32,
+    /// DDGI-style occlusion for FluxVoxel voxel lights: per-probe directional
+    /// distance moments + a Chebyshev visibility test so voxel lights are blocked
+    /// by geometry (cheap shadows). Toggle off on low-end/VR to save the moment
+    /// write + test. Expensive-ish; ON by default.
+    pub voxel_ddgi_occlusion: bool,
+    /// FluxVoxel light propagation (LPV-style ≥1 diffuse bounce): spread injected
+    /// radiance through the probe grid so light fills shadowed pockets. Toggle off
+    /// on low-end/VR for direct-only (cheapest). ON by default.
+    pub voxel_propagation: bool,
+    /// FluxVoxel specular GI: metallic/rough surfaces sample the probe volume in the
+    /// reflection direction (VXGI-style glossy approx) so they pick up emissive +
+    /// voxel-light bounce, not just the reflection cube. ON by default.
+    pub voxel_specular: bool,
     // --- Internal: not shown in the UI. The world-probe DDGI fallback path still
     // uses these; samples/mode are derived from `quality`/Flux on load. ---
     #[doc(hidden)]
@@ -440,6 +509,13 @@ impl Default for RealtimeGi {
             ssr_max_distance: 40.0,
             ssr_roughness_cutoff: 0.6,
             reflection_mode: 1,
+            voxel_density: 1.0,
+            voxel_auto_grid: true,
+            voxel_grid_mode: VoxelGridMode::WholeScene,
+            voxel_clipmap_extent: 16.0,
+            voxel_ddgi_occlusion: true,
+            voxel_propagation: true,
+            voxel_specular: true,
             mode: GiMode::Flux,
             samples: 64,
             probe_spacing: 1.0,
@@ -470,13 +546,18 @@ pub struct BakeSettings {
 impl Default for BakeSettings {
     fn default() -> Self {
         Self {
-            texel_density: 16.0,
+            // Detailed by default so lightmaps aren't pixelated/blocky: 40 texels/m
+            // with a 2048 per-object cap (was 16/m capped at 512, which clamped any
+            // sizeable surface to visible texel squares). Bakes take longer, but the
+            // result is sharp. Crank texel_density (slider to 1024) + Max Lightmap
+            // (up to 4096) for even finer detail.
+            texel_density: 40.0,
             // High-quality multi-bounce by default (the FluxBaker slider goes to 8):
             // 6 bounces + plenty of paths per texel so the indirect settles to a
             // clean, good-looking lightmap rather than a noisy 1–2-bounce preview.
             bounces: 6,
-            samples: 256,
-            max_lightmap: 512,
+            samples: 512,
+            max_lightmap: 2048,
         }
     }
 }
@@ -573,7 +654,7 @@ mod rgi_compat_tests {
         // The struct form with the `mode` enum field. This is what broke the
         // untagged shim (RON enum can't replay through serde's Content buffer).
         let with_mode: WorldEnvironment =
-            ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:(enabled:true,mode:Software,bounces:2,samples:64,intensity:1.0,probe_spacing:2.0,temporal_blend:0.12,update_interval:0.2))")
+            ron::from_str("(ambient:(0.1,0.1,0.1),ambient_intensity:1.0,sun_enabled:true,sun_color:(1.0,1.0,1.0),sun_intensity:3.0,sun_direction:(0.0,-1.0,0.0),skybox_enabled:true,realtime_gi:(enabled:true,mode:Flux,bounces:2,samples:64,intensity:1.0,probe_spacing:2.0,temporal_blend:0.12,update_interval:0.2))")
                 .expect("struct form with mode enum must parse");
         assert_eq!(with_mode.realtime_gi.mode, GiMode::Flux);
     }

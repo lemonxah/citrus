@@ -35,6 +35,8 @@ rodio.workspace = true
 glam.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+ron.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # Editor-only (optional; enabled by the `editor` feature).

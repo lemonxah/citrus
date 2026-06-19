@@ -21,9 +21,9 @@ const SETTLE_UPDATES: u32 = 96;
 /// Probe-grid layout (`world_to_local`, size, counts, sh_base) for an upload.
 type VolUpload = (glam::Mat4, [f32; 3], [u32; 3], u32);
 
-/// Hash of the FluxVR static inputs (volumes + static-light positions/colors/
+/// Hash of the FluxVoxel static inputs (volumes + static-light positions/colors/
 /// ranges) so the baked base is recomputed only when they actually change.
-fn fluxvr_static_hash(
+fn flux_voxel_static_hash(
     volumes: &[(glam::Vec3, glam::Vec3, [u32; 3])],
     lights: &[citrus_render::BakeLight],
 ) -> u64 {
@@ -111,18 +111,28 @@ pub struct RealtimeGiState {
     /// Volume layout, counts, and cascade index for an in-flight async GPU march
     /// (collected via `gi_march_poll` next frame, so it never blocks the frame).
     gpu_pending: Option<(Vec<VolUpload>, [usize; 3], usize)>,
-    /// FluxVR BAKED static base: SH-L1 accumulator per probe (all volumes
-    /// concatenated), rebuilt only when volumes / static Flux VR Lights change.
-    fluxvr_static: Vec<[glam::Vec3; 4]>,
-    /// World position per FluxVR probe (parallel to `fluxvr_static`), so dynamic
-    /// Flux VR Lights can be mixed into the baked base each frame.
-    fluxvr_positions: Vec<glam::Vec3>,
-    /// FluxVR volume metas to upload with the probes (world_to_local, size,
+    /// FluxVoxel BAKED static base: SH-L1 accumulator per probe (all volumes
+    /// concatenated), rebuilt only when volumes / static FluxVoxel Lights change.
+    flux_voxel_static: Vec<[glam::Vec3; 4]>,
+    /// World position per FluxVoxel probe (parallel to `flux_voxel_static`), so dynamic
+    /// FluxVoxel Lights can be mixed into the baked base each frame.
+    flux_voxel_positions: Vec<glam::Vec3>,
+    /// FluxVoxel volume metas to upload with the probes (world_to_local, size,
     /// counts, base offset).
-    fluxvr_meta: Vec<VolUpload>,
+    flux_voxel_meta: Vec<VolUpload>,
     /// Hash of (volumes + static lights); the static base is re-baked only when
     /// this changes.
-    fluxvr_hash: u64,
+    flux_voxel_hash: u64,
+    /// Hash of the dynamic (moving) lights last uploaded. When unchanged AND the
+    /// static base didn't rebuild, the per-frame clone+inject+upload is skipped
+    /// entirely — a steady scene (nothing moving) costs ~zero per frame.
+    flux_voxel_dyn_hash: u64,
+    /// Cached per-probe DDGI distance moments (SH-L1 of distance-to-geometry +
+    /// its square), parallel to `flux_voxel_static`. Computed once from the scene
+    /// occupancy when the static base rebuilds; the shader's Chebyshev uses them to
+    /// occlude voxel light leak-free, free per frame. Empty / zero = occlusion off.
+    flux_voxel_dist: Vec<[f32; 4]>,
+    flux_voxel_dist2: Vec<[f32; 4]>,
 }
 
 impl RealtimeGiState {
@@ -133,40 +143,65 @@ impl RealtimeGiState {
         self.force = true;
     }
 
-    /// Drop the cached FluxVR static base so the next `update_fluxvr` reseeds it
+    /// Drop the cached FluxVoxel static base so the next `update_flux_voxel` reseeds it
     /// (from a freshly completed build-time bake, or from the analytic fallback).
-    pub fn invalidate_fluxvr(&mut self) {
-        self.fluxvr_hash = 0;
+    pub fn invalidate_flux_voxel(&mut self) {
+        self.flux_voxel_hash = 0;
     }
 
-    /// FluxVR backend. Injects the scene's Flux VR Lights into author-placed
+    /// FluxVoxel backend. Injects the scene's FluxVoxel Lights into author-placed
     /// FluxVolume voxel grids (or one auto whole-scene volume). STATIC sources are
     /// BAKED into a cached base (rebuilt only when volumes/static lights change);
     /// DYNAMIC sources mix into a clone of that base every frame (the cheap "fake
     /// GI on moving lights"). The standard shader samples the result via
     /// `sample_probes`. No ray tracing.
-    fn update_fluxvr(&mut self, renderer: &mut Renderer, scene: &mut LoadedScene) {
-        let volumes = scene.fluxvr_volumes();
+    fn update_flux_voxel(&mut self, renderer: &mut Renderer, scene: &mut LoadedScene) {
+        // Camera position (last frame) lets the CameraClipmap grid follow the view.
+        let view_pos = renderer.last_view_pos();
+        let volumes = scene.flux_voxel_volumes_view(view_pos);
         if volumes.is_empty() {
             renderer.set_baked_probes(&[], &[]);
-            self.fluxvr_hash = 0;
+            self.flux_voxel_hash = 0;
             return;
         }
-        let lights = scene.fluxvr_lights();
+        let lights = scene.flux_voxel_lights();
         let static_lights: Vec<citrus_render::BakeLight> =
             lights.iter().filter(|(_, s)| *s).map(|(l, _)| *l).collect();
         let dynamic_lights: Vec<citrus_render::BakeLight> =
             lights.iter().filter(|(_, s)| !*s).map(|(l, _)| *l).collect();
+        // Expensive GI work (occupancy build, occluded inject, propagation,
+        // relocation) all happens in the CACHED static-base rebuild below — NOT per
+        // frame. Per frame is only the cheap dynamic-light direct inject. (Doing the
+        // occupancy rebuild + whole-grid propagation every frame was the FluxVoxel
+        // perf regression — it's the cheap VR backend, the per-frame cost must stay
+        // tiny.) These toggles (default on) gate the cached work and fold into the
+        // hash so flipping one reseeds the base.
+        let occlusion_on = scene.environment.realtime_gi.voxel_ddgi_occlusion;
+        let propagate = scene.environment.realtime_gi.voxel_propagation;
+        const PROP_ITERS: u32 = 3;
+        const PROP_GAIN: f32 = 0.12;
 
         // Prefer the BUILD-TIME baked static base (multi-bounce voxels persisted to
         // .lightdata): seed the static SH straight from disk so runtime does zero
         // per-voxel range/falloff work — just the additive dynamic-light pass below.
         // Falls back to the analytic direct-only injection when no bake exists.
-        let baked = scene.fluxvr_baked();
+        //
+        // BUT the bake is at a FIXED resolution. If the live volume density (or the
+        // auto-grid density) now differs, drop the bake and re-grid analytically so
+        // the density slider actually takes effect live (otherwise the grid stays
+        // locked to the bake until a re-bake). Same volume count + same per-volume
+        // counts => the bake still matches => keep it.
+        let baked = scene.flux_voxel_baked().filter(|(_, _, meta)| {
+            meta.len() == volumes.len()
+                && meta
+                    .iter()
+                    .zip(&volumes)
+                    .all(|((_, _, baked_counts, _), (_, _, live_counts))| baked_counts == live_counts)
+        });
         let h = match &baked {
             // Content-derived hash so a different bake (or a freshly reloaded scene)
             // reseeds the static base; identical baked voxels keep the cache warm.
-            // `invalidate_fluxvr` (called after a bake) zeroes the hash to be safe.
+            // `invalidate_flux_voxel` (called after a bake) zeroes the hash to be safe.
             Some((acc, _, _)) => {
                 let mut hh = 0x9E37_79B9_u64 ^ acc.len() as u64;
                 if let Some(f) = acc.first() {
@@ -177,27 +212,83 @@ impl RealtimeGiState {
                 }
                 hh | 1 // never collide with a "disabled" 0
             }
-            None => fluxvr_static_hash(&volumes, &static_lights),
+            None => flux_voxel_static_hash(&volumes, &static_lights),
         };
-        if h != self.fluxvr_hash {
-            self.fluxvr_hash = h;
-            self.fluxvr_static.clear();
-            self.fluxvr_positions.clear();
-            self.fluxvr_meta.clear();
+        // Fold the toggles in so flipping DDGI occlusion / propagation reseeds the
+        // cached static base (which now bakes in the occlusion + the propagated bounce).
+        let mut h = h;
+        if occlusion_on {
+            h = h.rotate_left(7) ^ 0xDD61;
+        }
+        if propagate {
+            h = h.rotate_left(3) ^ 0x9F17;
+        }
+        let rebuilt = h != self.flux_voxel_hash;
+        if rebuilt {
+            self.flux_voxel_hash = h;
+            self.flux_voxel_static.clear();
+            self.flux_voxel_positions.clear();
+            self.flux_voxel_meta.clear();
+            self.flux_voxel_dist.clear();
+            self.flux_voxel_dist2.clear();
+            // Build the occupancy grid ONCE here (cached path); used for relocation +
+            // the DDGI distance moments. Injection itself is always the cheap analytic
+            // (non-occluded) path — the shader's Chebyshev does the occlusion from the
+            // moments, so DDGI costs ~zero per frame (no per-probe DDA anywhere).
+            let occ = if occlusion_on { scene.flux_occupancy() } else { None };
             if let Some((acc, positions, meta)) = baked {
-                self.fluxvr_static = acc;
-                self.fluxvr_positions = positions;
-                self.fluxvr_meta = meta;
+                // Moments for the disk-baked base too, so its voxel light occludes.
+                if let Some(o) = &occ {
+                    let (d, d2) = crate::sw_gi::flux_distance_moments(&positions, o);
+                    self.flux_voxel_dist = d;
+                    self.flux_voxel_dist2 = d2;
+                }
+                self.flux_voxel_static = acc;
+                self.flux_voxel_positions = positions;
+                self.flux_voxel_meta = meta;
             } else {
                 let mut base = 0u32;
                 for (center, size, counts) in &volumes {
-                    let positions = crate::sw_gi::flux_volume_positions(*center, *size, *counts);
+                    let mut positions =
+                        crate::sw_gi::flux_volume_positions(*center, *size, *counts);
+                    // Probe relocation: nudge probes out of solid geometry so they
+                    // inject from open space. We do NOT zero trapped probes — that
+                    // punched dark holes into the field (interior probes DO carry
+                    // light, and the DDGI moments already prevent leaks at sample
+                    // time), which showed as darker blobs inside the couch.
+                    if let Some(o) = &occ {
+                        let _ = crate::sw_gi::relocate_probes(&mut positions, o);
+                    }
                     let mut acc = vec![[glam::Vec3::ZERO; 4]; positions.len()];
                     crate::sw_gi::flux_inject(&mut acc, &positions, &static_lights);
+                    // Propagate the STATIC base now (cached) instead of per frame:
+                    // static lights + emissive (the dominant lighting) carry the
+                    // bounce; dynamic movers stay direct-only for speed.
+                    if propagate {
+                        crate::sw_gi::flux_propagate(&mut acc, *counts, PROP_ITERS, PROP_GAIN);
+                    }
+                    // Smooth the cached base so a static-only scene (no movers, the
+                    // per-frame early-out) is also a soft gradient, not blobby.
+                    crate::sw_gi::blur_acc(&mut acc, *counts, 2);
+                    // DDGI distance moments for this volume's probes (cached).
+                    let (mut d, mut d2) = match &occ {
+                        Some(o) => crate::sw_gi::flux_distance_moments(&positions, o),
+                        None => (
+                            vec![[0.0f32; 4]; positions.len()],
+                            vec![[0.0f32; 4]; positions.len()],
+                        ),
+                    };
+                    // Smooth the moments across the grid too — otherwise the per-probe
+                    // distance variation makes the Chebyshev draw the grid as fixed
+                    // dots on surfaces. Softens the shadow edge slightly; removes dots.
+                    crate::sw_gi::blur_moments(&mut d, *counts, 2);
+                    crate::sw_gi::blur_moments(&mut d2, *counts, 2);
                     let n = positions.len() as u32;
-                    self.fluxvr_static.extend(acc);
-                    self.fluxvr_positions.extend(positions);
-                    self.fluxvr_meta.push((
+                    self.flux_voxel_static.extend(acc);
+                    self.flux_voxel_positions.extend(positions);
+                    self.flux_voxel_dist.append(&mut d);
+                    self.flux_voxel_dist2.append(&mut d2);
+                    self.flux_voxel_meta.push((
                         glam::Mat4::from_translation(-*center),
                         size.to_array(),
                         *counts,
@@ -208,12 +299,57 @@ impl RealtimeGiState {
             }
         }
 
-        // Mix dynamic lights into a clone of the baked base, then upload.
-        let mut acc = self.fluxvr_static.clone();
-        crate::sw_gi::flux_inject(&mut acc, &self.fluxvr_positions, &dynamic_lights);
-        let probes: Vec<citrus_render::ProbeSh> =
-            acc.iter().map(crate::sw_gi::acc_to_probe).collect();
-        renderer.set_baked_probes(&probes, &self.fluxvr_meta);
+        // PER FRAME (cheap): skip everything when nothing moved since the last
+        // upload — a steady scene re-uploads zero probes. Only a static rebuild or a
+        // changed dynamic-light set re-does the work.
+        let dyn_hash = flux_voxel_static_hash(&[], &dynamic_lights);
+        if !rebuilt && dyn_hash == self.flux_voxel_dyn_hash {
+            return;
+        }
+        self.flux_voxel_dyn_hash = dyn_hash;
+        // Mix the dynamic lights' DIRECT (analytic, NON-occluded) term into a clone
+        // of the cached base. No occlusion DDA, no propagation here — those are baked
+        // into the cached static base, so the per-frame cost (and stability) does NOT
+        // depend on DDGI being on. Moving lights stay smooth + cheap.
+        let mut acc = self.flux_voxel_static.clone();
+        crate::sw_gi::flux_inject(&mut acc, &self.flux_voxel_positions, &dynamic_lights);
+        // Smooth the field so it reads as a soft gradient, not blotchy per-probe
+        // blobs (each emitter lights nearby probes with a sharp falloff). Per-volume
+        // box blur; cheap O(probes) and keeps the soft Lumen-style look.
+        for (_, _, counts, base) in &self.flux_voxel_meta {
+            let n = (counts[0].max(2) * counts[1].max(2) * counts[2].max(2)) as usize;
+            let b = *base as usize;
+            if b + n <= acc.len() {
+                // 1 iteration here — the cached static base is already pre-blurred;
+                // this just smooths the per-frame dynamic-light addition.
+                crate::sw_gi::blur_acc(&mut acc[b..b + n], *counts, 1);
+            }
+        }
+        // Build probes, attaching the cached DDGI distance moments (geometry-based,
+        // so independent of the dynamic lights) when present. The shader's Chebyshev
+        // uses them to occlude voxel light leak-free — free per frame.
+        let have_moments = self.flux_voxel_dist.len() == acc.len();
+        let probes: Vec<citrus_render::ProbeSh> = acc
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if have_moments {
+                    crate::sw_gi::acc_to_probe_moments(s, self.flux_voxel_dist[i], self.flux_voxel_dist2[i])
+                } else {
+                    crate::sw_gi::acc_to_probe(s)
+                }
+            })
+            .collect();
+        // Per frame, only the SH payload changes (the volume layout is fixed
+        // until a rebuild). `set_baked_probes` does a device_wait_idle + buffer
+        // realloc + descriptor rewrite on EVERY call — a full GPU stall — which at
+        // this per-frame cadence was the FluxVoxel bottleneck (it ran SLOWER than
+        // Flux/FluxRT, which already use the cheap in-place path below, despite
+        // doing less GPU work). Use the stall-free in-place SSBO rewrite; only fall
+        // back to the full resize path on a rebuild or an actual probe-count change.
+        if rebuilt || !renderer.update_probe_sh(&probes) {
+            renderer.set_baked_probes(&probes, &self.flux_voxel_meta);
+        }
     }
 
     pub fn update(
@@ -224,7 +360,7 @@ impl RealtimeGiState {
         vr_active: bool,
     ) {
         // The realtime GI backend the scene selected: Flux (software SDF march),
-        // FluxRT (hardware ray-query), or FluxVR (analytic voxel volume).
+        // FluxRT (hardware ray-query), or FluxVoxel (analytic voxel volume).
         let mut gi = scene.environment.realtime_gi;
         let backend = gi.mode;
         // The GDF + emitter feed Flux samples must refresh every frame so moving
@@ -238,12 +374,12 @@ impl RealtimeGiState {
         } else {
             None
         };
-        // FluxVR backend: fill the probe grid from the FluxVolume voxels and skip
+        // FluxVoxel backend: fill the probe grid from the FluxVolume voxels and skip
         // the Flux march entirely. No GDF is built, so the screen-space gather stays
         // off and the forward shader samples THESE probes directly (desktop preview
         // and VR eye render). This runs even when a bake exists (unlike Flux/FluxRT)
-        // BECAUSE the build-time baked voxels ARE its static base — `update_fluxvr`
-        // seeds from them, then adds dynamic Flux VR Lights live each frame.
+        // BECAUSE the build-time baked voxels ARE its static base — `update_flux_voxel`
+        // seeds from them, then adds dynamic FluxVoxel Lights live each frame.
         if backend == citrus_assets::GiMode::FluxVoxel {
             // FluxVoxel fills the probe grid directly; the screen-space GDF trace
             // never runs, so keep its gate off.
@@ -251,11 +387,11 @@ impl RealtimeGiState {
             self.job = None;
             self.gpu_pending = None;
             if gi.enabled {
-                self.update_fluxvr(renderer, scene);
+                self.update_flux_voxel(renderer, scene);
                 self.active = true;
             } else if self.active {
                 renderer.set_baked_probes(&[], &[]);
-                self.fluxvr_hash = 0;
+                self.flux_voxel_hash = 0;
                 self.active = false;
             }
             return;

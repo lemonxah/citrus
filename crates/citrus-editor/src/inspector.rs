@@ -47,6 +47,9 @@ pub enum InspectorContent<'a> {
         editor_components: &'a EditorComponents,
         /// (id, name) of every scene object, for `ObjectRef` picker dropdowns.
         objects: &'a [(ObjectId, String)],
+        /// Layer display names, so layer pickers (camera culling mask) stay
+        /// consistent with the Layers window.
+        layer_names: &'a [String],
     },
     MaterialFile {
         path: String,
@@ -220,6 +223,7 @@ impl InspectorPanel {
                 registry,
                 editor_components,
                 objects,
+                layer_names,
             } => {
                 self.object_ui(
                     ui,
@@ -230,6 +234,7 @@ impl InspectorPanel {
                     registry,
                     editor_components,
                     objects,
+                    layer_names,
                     shaders,
                     &mut response,
                 );
@@ -297,6 +302,7 @@ impl InspectorPanel {
         registry: &ComponentRegistry,
         editor_components: &EditorComponents,
         objects: &[(ObjectId, String)],
+        layer_names: &[String],
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
@@ -320,7 +326,7 @@ impl InspectorPanel {
         // Components (Unity-style: list + Add Component at the bottom).
         ui.separator();
         ui.label(RichText::new("Components").strong());
-        let comp = components_ui(ui, components, registry, editor_components, objects);
+        let comp = components_ui(ui, components, registry, editor_components, objects, layer_names);
         response.object_changed |= comp.changed;
         response.add_component = comp.add;
         response.remove_component = comp.remove;
