@@ -3931,6 +3931,7 @@ impl EngineApp {
             bounces: settings.bounces,
             samples: settings.samples,
             probes_only: false,
+            gpu_idle_frac: settings.gpu_throttle.clamp(0.0, 4.0),
         };
         let job = match renderer.bake_begin(&input) {
             Ok(j) => j,
@@ -4117,6 +4118,7 @@ impl EngineApp {
                         bounces: runner.settings.bounces,
                         samples: runner.settings.samples,
                         probes_only: true,
+                        gpu_idle_frac: runner.settings.gpu_throttle.clamp(0.0, 4.0),
                     };
                     match self.renderer.as_ref().map(|r| r.bake_begin(&fin)) {
                         Some(Ok(job)) => {
@@ -7893,6 +7895,15 @@ impl EditorTabs<'_> {
                                 ui.selectable_value(&mut bake.max_lightmap, s, format!("{s}"));
                             }
                         });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("GPU Throttle");
+                    ui.add(Slider::new(&mut bake.gpu_throttle, 0.0..=2.0).step_by(0.1))
+                        .on_hover_text(
+                            "Idle the GPU for this fraction of each bake dispatch so the desktop \
+                             stays responsive while baking. 0 = fastest bake (hogs the GPU, can \
+                             freeze the machine); 1 ≈ 50% GPU duty (≈2× slower, system usable).",
+                        );
                 });
 
                 ui.separator();

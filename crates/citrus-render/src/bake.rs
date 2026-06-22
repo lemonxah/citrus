@@ -40,29 +40,26 @@ const LIGHTMAP_BAND_GROUPS: u32 = 8;
 /// probes per chunk). Same idea as the lightmap bands — keep each submission short.
 const PROBE_CHUNK_GROUPS: u32 = 16;
 
-/// Fraction of each heavy GPU bake submission's duration to then idle the GPU, so
-/// the desktop compositor gets a real share instead of the bake keeping the GPU
-/// ~100% busy back-to-back (which still froze the whole machine even with tiling).
-/// 1.0 ≈ a 50% GPU duty cycle: the bake runs ~2× slower but the system stays
-/// usable. Lower it for faster bakes, raise it if the desktop still stutters.
-const BAKE_GPU_IDLE_FRAC: f32 = 1.0;
-
-/// Submit a one-time command buffer, wait for it, then sleep for a fraction of how
+/// Submit a one-time command buffer, wait for it, then sleep for `idle_frac` of how
 /// long it took — deliberately idling the GPU between heavy bake dispatches so the
 /// rest of the system (compositor, other apps) gets GPU time. Tiling alone only
 /// creates scheduler boundaries; this guarantees the GPU is actually free part of
-/// the time, which is what keeps the machine responsive during a bake.
+/// the time, which is what keeps the machine responsive during a bake. `idle_frac`
+/// = 0 disables the sleep (the realtime-GI preview path uses 0 so it stays fast).
 fn throttled_submit(
     device: &ash::Device,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
+    idle_frac: f32,
     f: impl FnOnce(vk::CommandBuffer),
 ) -> Result<()> {
     let t = std::time::Instant::now();
     alloc::one_time_submit(device, command_pool, queue, f)?;
-    let idle = t.elapsed().mul_f32(BAKE_GPU_IDLE_FRAC);
-    if idle > std::time::Duration::ZERO {
-        std::thread::sleep(idle);
+    if idle_frac > 0.0 {
+        let idle = t.elapsed().mul_f32(idle_frac);
+        if idle > std::time::Duration::ZERO {
+            std::thread::sleep(idle);
+        }
     }
     Ok(())
 }
@@ -169,6 +166,7 @@ pub struct BakeJob {
     bounces: u32,
     samples: u32,
     probes_only: bool,
+    gpu_idle_frac: f32,
     output: BakeOutput,
     destroyed: bool,
 }
@@ -293,6 +291,7 @@ impl BakeJob {
             bounces: input.bounces,
             samples: input.samples,
             probes_only: input.probes_only,
+            gpu_idle_frac: input.gpu_idle_frac,
             output: BakeOutput::default(),
             destroyed: false,
         })
@@ -308,8 +307,13 @@ impl BakeJob {
         command_pool: vk::CommandPool,
         meshes: &[GpuMesh],
     ) -> Result<BakeStep> {
-        let (sky_color, bounces, samples, probes_only) =
-            (self.sky_color, self.bounces, self.samples, self.probes_only);
+        let (sky_color, bounces, samples, probes_only, gpu_idle_frac) = (
+            self.sky_color,
+            self.bounces,
+            self.samples,
+            self.probes_only,
+            self.gpu_idle_frac,
+        );
 
         if self.lightmap.is_some() && self.cursor < self.units.len() {
             let (mesh_idx, transform, size) = self.units[self.cursor];
@@ -326,6 +330,7 @@ impl BakeJob {
                     bounces,
                     samples,
                     probes_only,
+                    gpu_idle_frac,
                 };
                 bake_one_lightmap(
                     ctx,
@@ -365,6 +370,7 @@ impl BakeJob {
                         bounces,
                         samples,
                         probes_only,
+                        gpu_idle_frac,
                     };
                     Some(
                         bake_probes(
@@ -1515,7 +1521,7 @@ fn bake_one_lightmap(
     let mut y0 = 0u32;
     while y0 < groups {
         let bg = LIGHTMAP_BAND_GROUPS.min(groups - y0);
-        throttled_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        throttled_submit(device, command_pool, ctx.queue, input.gpu_idle_frac, |cb| unsafe {
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, lightmap.pipeline);
             device.cmd_bind_descriptor_sets(
                 cb,
@@ -1782,7 +1788,7 @@ fn bake_probes(
     let mut g0 = 0u32;
     while g0 < groups {
         let cg = PROBE_CHUNK_GROUPS.min(groups - g0);
-        throttled_submit(device, command_pool, ctx.queue, |cb| unsafe {
+        throttled_submit(device, command_pool, ctx.queue, input.gpu_idle_frac, |cb| unsafe {
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
                 cb,

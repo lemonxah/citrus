@@ -519,6 +519,11 @@ pub struct BakeInput<'a> {
     /// instances still act as occluders/bouncers). Used by the realtime-GI
     /// preview, which only needs probe SH each update.
     pub probes_only: bool,
+    /// Fraction of each GPU bake submission's duration to then idle the GPU, so the
+    /// desktop compositor gets a share instead of the bake hogging the GPU (which
+    /// froze the machine). 0 = no throttle (the realtime-GI preview uses 0 so it
+    /// stays responsive); the offline bake passes the user's `gpu_throttle`.
+    pub gpu_idle_frac: f32,
 }
 
 /// One baked lightmap: `size`×`size` RGBA32F (rgb = irradiance, a = validity).

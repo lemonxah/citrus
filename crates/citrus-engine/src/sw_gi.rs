@@ -1124,6 +1124,22 @@ mod tests {
     use super::*;
     use citrus_render::sdf::generate_sdf;
 
+    #[test]
+    fn bake_worker_count_leaves_headroom() {
+        let n = bake_worker_count();
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(4)
+            .max(1);
+        assert!(n >= 1, "must always use at least one worker");
+        assert!(n <= cores, "never more workers than cores");
+        // ~80% cap; on >1 core machines at least one core stays free for the UI/OS.
+        assert!(n <= (cores * 8) / 10 || cores == 1);
+        if cores > 1 {
+            assert!(n < cores, "a free core must remain for the UI/OS");
+        }
+    }
+
     // A probe above a lit floor cube must gather non-zero bounced radiance.
     #[test]
     fn probe_gathers_bounced_light() {

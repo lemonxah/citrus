@@ -1205,7 +1205,7 @@ fn list_dir(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (dirs, files)
 }
 
-/// Destination for `source` inside `dir`, de-duplicated (`name_1.ext`, …).
+/// Destination for `source` inside `dir`, de-duplicated (`name(1).ext`, …).
 fn unique_in_dir(dir: &Path, source: &Path) -> PathBuf {
     let stem = source
         .file_stem()
@@ -1213,10 +1213,12 @@ fn unique_in_dir(dir: &Path, source: &Path) -> PathBuf {
         .unwrap_or_else(|| "file".into());
     let ext = source.extension().map(|e| e.to_string_lossy().into_owned());
     let make = |n: u32| {
+        // `name(N)` to match object duplication. The stem is kept whole (not
+        // stripped) so importing a file that legitimately ends in `(1)` keeps it.
         let name = if n == 0 {
             stem.clone()
         } else {
-            format!("{stem}_{n}")
+            format!("{stem}({n})")
         };
         match &ext {
             Some(ext) => dir.join(format!("{name}.{ext}")),

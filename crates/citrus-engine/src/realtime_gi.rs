@@ -674,6 +674,9 @@ impl RealtimeGiState {
                             bounces: gi.bounces.clamp(0, 8),
                             samples: gi.samples.clamp(1, 1024),
                             probes_only: true,
+                            // Realtime preview: never idle the GPU — it must stay
+                            // responsive, and this runs on a worker thread anyway.
+                            gpu_idle_frac: 0.0,
                         };
                         match renderer.bake_lighting(&input) {
                             Ok(o) => fresh = Some((o.probes, vols, counts, k)),

@@ -466,9 +466,12 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (`PROBE_CHUNK_GROUPS`) since a dense FluxVoxel auto-grid can be tens of thousands of probes.
   Output is identical (tiles cover the same grid). Because tiling alone still kept the GPU ~100%
   busy back-to-back (the machine still stalled), each heavy submission also goes through
-  `throttled_submit`, which idles the GPU for `BAKE_GPU_IDLE_FRAC` (= 1.0 → ~50% duty cycle) of
-  the time the submission took — genuinely freeing the GPU for the compositor. Lower the const for
-  faster bakes, raise it if the desktop still stutters.
+  `throttled_submit`, which idles the GPU for a fraction of the time the submission took —
+  genuinely freeing the GPU for the compositor. The fraction is the **GPU Throttle** bake setting
+  (`BakeSettings.gpu_throttle`, default 1.0 ≈ 50% duty / ~2× slower; slider 0–2 in the Baker tab):
+  0 = fastest bake (hogs the GPU), higher = more responsive desktop. Threaded through
+  `BakeInput.gpu_idle_frac`; the realtime-GI preview passes **0** so it stays fast (it reuses the
+  same GPU bake in `probes_only` mode — without this it would have been throttled too).
 
 - [done] **Realtime/Mixed lights in FluxVoxel** (correct, no double-count): Realtime/Mixed
   `LightComponent` lights now direct-light the forward pass in FluxVoxel mode (they used to be

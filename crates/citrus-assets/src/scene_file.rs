@@ -541,6 +541,15 @@ pub struct BakeSettings {
     pub samples: u32,
     /// Upper clamp on a single object's lightmap resolution.
     pub max_lightmap: u32,
+    /// GPU throttle: fraction of each GPU bake dispatch's time to then idle the GPU
+    /// so the desktop stays responsive while baking. 0 = max speed (bake hogs the
+    /// GPU), 1 = ~50% duty cycle (≈2× slower bake, system stays usable).
+    #[serde(default = "default_gpu_throttle")]
+    pub gpu_throttle: f32,
+}
+
+fn default_gpu_throttle() -> f32 {
+    1.0
 }
 
 impl Default for BakeSettings {
@@ -558,6 +567,7 @@ impl Default for BakeSettings {
             bounces: 6,
             samples: 512,
             max_lightmap: 2048,
+            gpu_throttle: default_gpu_throttle(),
         }
     }
 }
@@ -637,6 +647,23 @@ pub struct EditorCamera {
 #[cfg(test)]
 mod rgi_compat_tests {
     use super::*;
+
+    #[test]
+    fn voxel_grid_mode_all_covers_every_variant_with_labels() {
+        assert_eq!(VoxelGridMode::ALL.len(), 4);
+        for m in VoxelGridMode::ALL {
+            assert!(!m.label().is_empty());
+        }
+        // Default is the simplest whole-scene grid (current behaviour).
+        assert_eq!(VoxelGridMode::default(), VoxelGridMode::WholeScene);
+    }
+
+    #[test]
+    fn realtime_gi_default_has_grid_mode_and_clipmap_extent() {
+        let gi = RealtimeGi::default();
+        assert_eq!(gi.voxel_grid_mode, VoxelGridMode::WholeScene);
+        assert!(gi.voxel_clipmap_extent > 0.0);
+    }
 
     #[test]
     fn legacy_bool_and_struct_both_parse() {
