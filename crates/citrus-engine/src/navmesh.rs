@@ -1,285 +1,528 @@
-//! Navigation grid + A* pathfinding (ENGINE_FEATURE_CHECKLIST T1 #24).
+//! Navigation: a height-aware walkable grid baked from the physics world, A*
+//! path search with string pulling, and `NavAgent` steering.
 //!
-//! A walkability grid baked from the scene (cells blocked by static geometry) plus
-//! A* search with diagonal moves and a straight-line (line-of-sight) string-pull so
-//! agents follow natural paths instead of staircase grid steps. This is the CPU
-//! pathfinding core; a polygon navmesh is a later upgrade, but a grid covers most
-//! top-down / arena / level AI and is fully testable.
+//! Bake (per `NavMeshSurface`): one downward ray per cell finds the ground; a
+//! cell is walkable when the surface is flat enough and an upward ray finds
+//! `agent_height` of headroom. Walkable cells next to blocked ones are eroded by
+//! the agent radius. Neighbouring cells connect when their heights differ by at
+//! most `step_height`, so wall tops and ledges stay separate.
 
-use std::collections::BinaryHeap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 
-use glam::Vec3;
+use citrus_core::{NavAgent, NavMeshSurface, NavQuery, ObjectId, PhysicsQuery, RayFilter};
+use glam::{Quat, Vec3};
 
-/// A walkability grid in the XZ plane (Y is up). `cell` metres per cell.
+use crate::physics::PhysicsWorld;
+use crate::scene::LoadedScene;
+
+/// A baked walkable grid. `heights[z * w + x]` is the ground height, or NaN
+/// when the cell isn't walkable.
 #[derive(Clone, Debug)]
 pub struct NavGrid {
-    origin: Vec3, // world position of cell (0,0)'s corner
-    cell: f32,
-    w: i32,
-    h: i32,
-    blocked: Vec<bool>, // row-major [z*w + x]
+    pub min: Vec3,
+    pub cell: f32,
+    pub w: i32,
+    pub h: i32,
+    pub heights: Vec<f32>,
+    pub step: f32,
 }
 
 impl NavGrid {
-    /// Empty (all walkable) grid covering `[min,max]` in world XZ at `cell` size.
-    pub fn new(min: Vec3, max: Vec3, cell: f32) -> Self {
-        let cell = cell.max(0.05);
-        let w = (((max.x - min.x) / cell).ceil() as i32).max(1);
-        let h = (((max.z - min.z) / cell).ceil() as i32).max(1);
-        Self {
-            origin: Vec3::new(min.x, min.y, min.z),
-            cell,
-            w,
-            h,
-            blocked: vec![false; (w * h) as usize],
-        }
+    fn idx(&self, x: i32, z: i32) -> Option<usize> {
+        (x >= 0 && z >= 0 && x < self.w && z < self.h).then(|| (z * self.w + x) as usize)
     }
 
-    pub fn dims(&self) -> (i32, i32) {
-        (self.w, self.h)
+    pub fn height(&self, x: i32, z: i32) -> Option<f32> {
+        self.idx(x, z).map(|i| self.heights[i]).filter(|h| !h.is_nan())
     }
 
-    fn idx(&self, x: i32, z: i32) -> usize {
-        (z * self.w + x) as usize
-    }
-
-    fn in_bounds(&self, x: i32, z: i32) -> bool {
-        x >= 0 && z >= 0 && x < self.w && z < self.h
-    }
-
-    /// Mark a cell blocked/clear.
-    pub fn set_blocked(&mut self, x: i32, z: i32, blocked: bool) {
-        if self.in_bounds(x, z) {
-            let i = self.idx(x, z);
-            self.blocked[i] = blocked;
-        }
-    }
-
-    /// Block every cell whose centre falls inside a world-space AABB (e.g. a static
-    /// obstacle's bounds). Used to bake the grid from scene geometry.
-    pub fn block_aabb(&mut self, min: Vec3, max: Vec3) {
-        let (x0, z0) = self.world_to_cell(Vec3::new(min.x, 0.0, min.z));
-        let (x1, z1) = self.world_to_cell(Vec3::new(max.x, 0.0, max.z));
-        for z in z0.min(z1)..=z0.max(z1) {
-            for x in x0.min(x1)..=x0.max(x1) {
-                self.set_blocked(x, z, true);
-            }
-        }
-    }
-
-    pub fn is_blocked(&self, x: i32, z: i32) -> bool {
-        !self.in_bounds(x, z) || self.blocked[self.idx(x, z)]
-    }
-
-    /// World position → cell coords (clamped to the grid).
-    pub fn world_to_cell(&self, p: Vec3) -> (i32, i32) {
-        let x = ((p.x - self.origin.x) / self.cell).floor() as i32;
-        let z = ((p.z - self.origin.z) / self.cell).floor() as i32;
-        (x.clamp(0, self.w - 1), z.clamp(0, self.h - 1))
-    }
-
-    /// Cell centre in world space (keeps the grid's Y origin).
-    pub fn cell_to_world(&self, x: i32, z: i32) -> Vec3 {
-        Vec3::new(
-            self.origin.x + (x as f32 + 0.5) * self.cell,
-            self.origin.y,
-            self.origin.z + (z as f32 + 0.5) * self.cell,
+    pub fn cell_of(&self, p: Vec3) -> (i32, i32) {
+        (
+            ((p.x - self.min.x) / self.cell).floor() as i32,
+            ((p.z - self.min.z) / self.cell).floor() as i32,
         )
     }
 
-    /// A* from `start` to `goal` (world space). Returns world-space waypoints
-    /// (string-pulled to skip collinear / line-of-sight-clear cells), or `None` if
-    /// unreachable. Diagonal moves are allowed but never cut a blocked corner.
-    pub fn find_path(&self, start: Vec3, goal: Vec3) -> Option<Vec<Vec3>> {
-        let s = self.world_to_cell(start);
-        let g = self.world_to_cell(goal);
-        if self.is_blocked(g.0, g.1) || self.is_blocked(s.0, s.1) {
-            return None;
-        }
-        let cells = self.astar(s, g)?;
-        Some(self.string_pull(&cells, start, goal))
+    pub fn center(&self, x: i32, z: i32) -> Option<Vec3> {
+        let y = self.height(x, z)?;
+        Some(Vec3::new(
+            self.min.x + (x as f32 + 0.5) * self.cell,
+            y,
+            self.min.z + (z as f32 + 0.5) * self.cell,
+        ))
     }
 
-    fn astar(&self, start: (i32, i32), goal: (i32, i32)) -> Option<Vec<(i32, i32)>> {
-        let n = (self.w * self.h) as usize;
-        let mut g_cost = vec![f32::INFINITY; n];
-        let mut came: Vec<Option<usize>> = vec![None; n];
-        let mut open = BinaryHeap::new();
-        let si = self.idx(start.0, start.1);
-        g_cost[si] = 0.0;
-        open.push(Node { f: heur(start, goal), idx: si });
-        // 8-connected moves: (dx, dz, cost). Diagonals cost √2.
-        const M: [(i32, i32, f32); 8] = [
-            (1, 0, 1.0),
-            (-1, 0, 1.0),
-            (0, 1, 1.0),
-            (0, -1, 1.0),
-            (1, 1, 1.41421),
-            (1, -1, 1.41421),
-            (-1, 1, 1.41421),
-            (-1, -1, 1.41421),
-        ];
-        let gi = self.idx(goal.0, goal.1);
-        while let Some(Node { idx, .. }) = open.pop() {
-            if idx == gi {
-                // Reconstruct.
-                let mut path = vec![idx];
-                let mut cur = idx;
-                while let Some(p) = came[cur] {
-                    path.push(p);
-                    cur = p;
+    fn connected(&self, a: (i32, i32), b: (i32, i32)) -> bool {
+        match (self.height(a.0, a.1), self.height(b.0, b.1)) {
+            (Some(ha), Some(hb)) => (ha - hb).abs() <= self.step,
+            _ => false,
+        }
+    }
+
+    pub fn contains(&self, p: Vec3) -> bool {
+        let (x, z) = self.cell_of(p);
+        self.idx(x, z).is_some()
+    }
+
+    /// Nearest walkable cell to `p` within `radius` cells (spiral search),
+    /// preferring cells whose height is close to `p.y`.
+    pub fn nearest(&self, p: Vec3, radius: i32) -> Option<(i32, i32)> {
+        let (cx, cz) = self.cell_of(p);
+        let mut best: Option<((i32, i32), f32)> = None;
+        for r in 0..=radius {
+            for dz in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dz.abs() != r {
+                        continue;
+                    }
+                    let (x, z) = (cx + dx, cz + dz);
+                    if let Some(c) = self.center(x, z) {
+                        let d = c.distance_squared(p);
+                        if best.is_none_or(|(_, b)| d < b) {
+                            best = Some(((x, z), d));
+                        }
+                    }
                 }
-                path.reverse();
-                return Some(
-                    path.into_iter()
-                        .map(|i| (i as i32 % self.w, i as i32 / self.w))
-                        .collect(),
-                );
             }
-            let (cx, cz) = (idx as i32 % self.w, idx as i32 / self.w);
-            for (dx, dz, cost) in M {
-                let (nx, nz) = (cx + dx, cz + dz);
-                if self.is_blocked(nx, nz) {
+            if best.is_some() {
+                break;
+            }
+        }
+        best.map(|(c, _)| c)
+    }
+
+    /// A* over 8-connected cells (no corner cutting), then string pulling.
+    pub fn find_path(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        let start = self.nearest(from, 8)?;
+        let goal = self.nearest(to, 8)?;
+        let h = |c: (i32, i32)| (((c.0 - goal.0).pow(2) + (c.1 - goal.1).pow(2)) as f32).sqrt();
+        let mut open = BinaryHeap::new();
+        let mut came: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
+        let mut g: HashMap<(i32, i32), f32> = HashMap::new();
+        g.insert(start, 0.0);
+        open.push(Node { cell: start, f: h(start) });
+        let max_nodes = (self.w * self.h) as usize;
+        let mut expanded = 0;
+        while let Some(Node { cell, .. }) = open.pop() {
+            if cell == goal {
+                let mut cells = vec![cell];
+                let mut c = cell;
+                while let Some(&p) = came.get(&c) {
+                    cells.push(p);
+                    c = p;
+                }
+                cells.reverse();
+                return Some(self.smooth(from, to, &cells));
+            }
+            expanded += 1;
+            if expanded > max_nodes {
+                break;
+            }
+            let gc = g[&cell];
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                let n = (cell.0 + dx, cell.1 + dz);
+                if !self.connected(cell, n) {
                     continue;
                 }
-                // No corner-cutting: a diagonal needs both orthogonal cells clear.
-                if dx != 0 && dz != 0 && (self.is_blocked(cx + dx, cz) || self.is_blocked(cx, cz + dz)) {
+                if dx != 0 && dz != 0 && !(self.connected(cell, (cell.0 + dx, cell.1)) && self.connected(cell, (cell.0, cell.1 + dz))) {
                     continue;
                 }
-                let ni = self.idx(nx, nz);
-                let tentative = g_cost[idx] + cost;
-                if tentative < g_cost[ni] {
-                    g_cost[ni] = tentative;
-                    came[ni] = Some(idx);
-                    open.push(Node { f: tentative + heur((nx, nz), goal), idx: ni });
+                let step = if dx != 0 && dz != 0 { std::f32::consts::SQRT_2 } else { 1.0 };
+                let ng = gc + step;
+                if g.get(&n).is_none_or(|&old| ng < old) {
+                    g.insert(n, ng);
+                    came.insert(n, cell);
+                    open.push(Node { cell: n, f: ng + h(n) });
                 }
             }
         }
         None
     }
 
-    /// True if a straight line between two cell centres crosses no blocked cell
-    /// (supercover line). Used by the string-pull.
+    /// Walkable straight line between two cells (sampled per half cell).
     fn line_clear(&self, a: (i32, i32), b: (i32, i32)) -> bool {
-        let (mut x0, mut z0) = (a.0, a.1);
-        let (x1, z1) = (b.0, b.1);
-        let dx = (x1 - x0).abs();
-        let dz = (z1 - z0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sz = if z0 < z1 { 1 } else { -1 };
-        let mut err = dx - dz;
-        loop {
-            if self.is_blocked(x0, z0) {
-                return false;
-            }
-            if x0 == x1 && z0 == z1 {
-                return true;
-            }
-            let e2 = 2 * err;
-            if e2 > -dz {
-                err -= dz;
-                x0 += sx;
-            }
-            if e2 < dx {
-                err += dx;
-                z0 += sz;
+        let (Some(pa), Some(pb)) = (self.center(a.0, a.1), self.center(b.0, b.1)) else {
+            return false;
+        };
+        let steps = (((b.0 - a.0).abs().max((b.1 - a.1).abs())) * 2).max(1);
+        let mut prev = a;
+        for k in 1..=steps {
+            let t = k as f32 / steps as f32;
+            let p = pa.lerp(pb, t);
+            let c = self.cell_of(p);
+            if c != prev {
+                if !self.connected(prev, c) {
+                    return false;
+                }
+                // Diagonal moves must not clip a blocked corner.
+                if c.0 != prev.0 && c.1 != prev.1
+                    && !(self.connected(prev, (c.0, prev.1)) && self.connected(prev, (prev.0, c.1)))
+                {
+                    return false;
+                }
+                prev = c;
             }
         }
+        true
     }
 
-    /// Greedy string-pull: keep the farthest cell still in line-of-sight, dropping
-    /// intermediate staircase waypoints. Endpoints use the true world start/goal.
-    fn string_pull(&self, cells: &[(i32, i32)], start: Vec3, goal: Vec3) -> Vec<Vec3> {
-        if cells.len() <= 2 {
-            return vec![start, goal];
-        }
-        let mut out = vec![start];
-        let mut anchor = 0usize;
-        let mut i = 1usize;
-        while i < cells.len() - 1 {
-            if self.line_clear(cells[anchor], cells[i + 1]) {
-                i += 1; // can still see one further; extend
-            } else {
-                out.push(self.cell_to_world(cells[i].0, cells[i].1));
-                anchor = i;
-                i += 1;
+    fn smooth(&self, from: Vec3, to: Vec3, cells: &[(i32, i32)]) -> Vec<Vec3> {
+        let mut keep = vec![cells[0]];
+        let mut anchor = 0;
+        let mut i = 1;
+        while i < cells.len() {
+            if !self.line_clear(cells[anchor], cells[i]) {
+                anchor = i - 1;
+                keep.push(cells[anchor]);
             }
+            i += 1;
         }
-        out.push(goal);
-        out
+        let last = *cells.last().unwrap();
+        if keep.last() != Some(&last) {
+            keep.push(last);
+        }
+        let mut path: Vec<Vec3> = keep.iter().filter_map(|&(x, z)| self.center(x, z)).collect();
+        // Exact endpoints (snapped onto the walkable height).
+        if let Some(first) = path.first_mut() {
+            *first = Vec3::new(from.x, first.y, from.z);
+        }
+        if let Some(goal) = path.last_mut()
+            && self.cell_of(to) == last
+        {
+            *goal = Vec3::new(to.x, goal.y, to.z);
+        }
+        path
     }
 }
 
+#[derive(PartialEq)]
 struct Node {
+    cell: (i32, i32),
     f: f32,
-    idx: usize,
-}
-impl PartialEq for Node {
-    fn eq(&self, o: &Self) -> bool {
-        self.f == o.f
-    }
 }
 impl Eq for Node {}
 impl Ord for Node {
-    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        // Min-heap on f: reverse so BinaryHeap (max-heap) pops the smallest f.
-        o.f.partial_cmp(&self.f).unwrap_or(std::cmp::Ordering::Equal)
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.f.total_cmp(&self.f)
     }
 }
 impl PartialOrd for Node {
-    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(o))
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
-fn heur(a: (i32, i32), b: (i32, i32)) -> f32 {
-    // Octile distance (admissible for 8-connected grids).
-    let dx = (a.0 - b.0).abs() as f32;
-    let dz = (a.1 - b.1).abs() as f32;
-    (dx + dz) + (1.41421 - 2.0) * dx.min(dz)
+/// Bake a surface's grid by ray casting the physics world.
+pub fn bake(physics: &PhysicsWorld, center: Vec3, s: &NavMeshSurface) -> NavGrid {
+    let cell = s.cell_size.max(0.05);
+    let half = Vec3::from(s.size) * 0.5;
+    let min = center - half;
+    let w = ((s.size[0] / cell).ceil() as i32).clamp(1, 4096);
+    let h = ((s.size[2] / cell).ceil() as i32).clamp(1, 4096);
+    let filter = RayFilter {
+        layer_mask: s.layer_mask,
+        include_triggers: false,
+        exclude: None,
+    };
+    let min_normal_y = s.max_slope.clamp(0.0, 89.0).to_radians().cos();
+    let top = center.y + half.y;
+    let mut heights = vec![f32::NAN; (w * h) as usize];
+    for z in 0..h {
+        for x in 0..w {
+            let px = min.x + (x as f32 + 0.5) * cell;
+            let pz = min.z + (z as f32 + 0.5) * cell;
+            let Some(hit) = physics.raycast(Vec3::new(px, top, pz), Vec3::NEG_Y, s.size[1], &filter) else {
+                continue;
+            };
+            if hit.normal.y < min_normal_y {
+                continue;
+            }
+            let up = hit.point + Vec3::Y * 0.02;
+            if physics.raycast(up, Vec3::Y, s.agent_height, &filter).is_some() {
+                continue;
+            }
+            heights[(z * w + x) as usize] = hit.point.y;
+        }
+    }
+    let mut grid = NavGrid { min, cell, w, h, heights, step: s.step_height };
+    erode(&mut grid, (s.agent_radius / cell).ceil() as i32);
+    grid
+}
+
+/// Drop walkable cells within `r` cells of a blocked cell or a ledge.
+fn erode(grid: &mut NavGrid, r: i32) {
+    if r <= 0 {
+        return;
+    }
+    let edge: Vec<bool> = (0..grid.h)
+        .flat_map(|z| (0..grid.w).map(move |x| (x, z)))
+        .map(|(x, z)| {
+            grid.height(x, z).is_some()
+                && [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .any(|(dx, dz)| !grid.connected((x, z), (x + dx, z + dz)))
+        })
+        .collect();
+    let mut out = grid.heights.clone();
+    for z in 0..grid.h {
+        for x in 0..grid.w {
+            if !edge[(z * grid.w + x) as usize] {
+                continue;
+            }
+            for dz in -(r - 1)..=(r - 1) {
+                for dx in -(r - 1)..=(r - 1) {
+                    if dx * dx + dz * dz <= (r - 1) * (r - 1)
+                        && let Some(i) = grid.idx(x + dx, z + dz)
+                    {
+                        out[i] = f32::NAN;
+                    }
+                }
+            }
+        }
+    }
+    grid.heights = out;
+}
+
+/// Baked grids for the scene's surfaces + agent movement.
+#[derive(Default)]
+pub struct NavSystem {
+    grids: Vec<(ObjectId, NavGrid)>,
+    baked: bool,
+}
+
+impl NavSystem {
+    pub fn needs_bake(&self) -> bool {
+        !self.baked
+    }
+
+    pub fn invalidate(&mut self) {
+        self.baked = false;
+    }
+
+    pub fn bake(&mut self, scene: &LoadedScene, physics: &PhysicsWorld) {
+        self.baked = true;
+        self.grids.clear();
+        let active = scene.active_flags();
+        let world = scene.world_transforms();
+        for (i, o) in scene.objects.iter().enumerate() {
+            if !active[i] {
+                continue;
+            }
+            if let Some(s) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<NavMeshSurface>()) {
+                self.grids.push((o.id, bake(physics, world[i].w_axis.truncate(), s)));
+            }
+        }
+    }
+
+    pub fn grids(&self) -> impl Iterator<Item = &NavGrid> {
+        self.grids.iter().map(|(_, g)| g)
+    }
+
+    fn grid_for(&self, p: Vec3) -> Option<&NavGrid> {
+        self.grids.iter().map(|(_, g)| g).find(|g| g.contains(p))
+    }
+
+    /// Re-plan and steer every active agent by `dt`.
+    pub fn move_agents(&self, scene: &mut LoadedScene, physics: &mut PhysicsWorld, dt: f32) {
+        if self.grids.is_empty() || dt <= 0.0 {
+            return;
+        }
+        let active = scene.active_flags();
+        for (i, &is_active) in active.iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let pos = scene.world_transform(i).w_axis.truncate();
+            let has_cc = scene.objects[i]
+                .components
+                .iter()
+                .any(|c| c.as_any().is::<citrus_core::CharacterController>());
+            let Some(agent) = scene.objects[i]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<NavAgent>())
+            else {
+                continue;
+            };
+            if agent.state.replan {
+                agent.state.replan = false;
+                let path = agent.state.destination.and_then(|d| self.find_path(pos, d));
+                agent.state.unreachable = path.is_none();
+                agent.state.path = path.unwrap_or_default();
+                agent.state.next = 1.min(agent.state.path.len());
+            }
+            let s = &mut agent.state;
+            if s.destination.is_none() || s.next >= s.path.len() {
+                s.velocity = Vec3::ZERO;
+                continue;
+            }
+            let goal = s.path[s.next];
+            let flat = Vec3::new(goal.x - pos.x, 0.0, goal.z - pos.z);
+            let last = s.next + 1 == s.path.len();
+            let reach = if last { agent.stopping_distance.max(0.02) } else { 0.15 };
+            if flat.length() <= reach {
+                s.next += 1;
+                if s.next >= s.path.len() {
+                    s.destination = None;
+                    s.velocity = Vec3::ZERO;
+                }
+                continue;
+            }
+            let step = flat.normalize() * (agent.speed * dt).min(flat.length());
+            s.velocity = step / dt;
+            let turn = agent.turn_speed;
+            if has_cc {
+                // Small downward bias keeps the controller grounded on slopes.
+                physics.move_character(scene, i, step + Vec3::NEG_Y * 0.05);
+            } else {
+                let mut world = pos + step;
+                world.y = goal.y + (pos.y - goal.y) * 0.5;
+                let local = match scene.objects[i].parent {
+                    Some(p) => scene.world_transform(p).inverse().transform_point3(world),
+                    None => world,
+                };
+                scene.objects[i].translation = local;
+            }
+            if turn > 0.0 {
+                let target = Quat::from_rotation_y((-step.x).atan2(-step.z));
+                let o = &mut scene.objects[i];
+                let angle = o.rotation.angle_between(target);
+                let max = (turn * dt).to_radians();
+                o.rotation = if angle <= max { target } else { o.rotation.slerp(target, max / angle) };
+            }
+        }
+    }
+}
+
+/// Overlay mesh of a grid's walkable cells (editor preview).
+pub fn preview_mesh(grid: &NavGrid, color: [f32; 4]) -> citrus_render::MeshData {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let half = grid.cell * 0.45;
+    for z in 0..grid.h {
+        for x in 0..grid.w {
+            let Some(c) = grid.center(x, z) else {
+                continue;
+            };
+            let base = vertices.len() as u32;
+            for (dx, dz) in [(-half, -half), (half, -half), (half, half), (-half, half)] {
+                vertices.push(citrus_render::Vertex {
+                    position: [c.x + dx, c.y + 0.03, c.z + dz],
+                    normal: [0.0, 1.0, 0.0],
+                    uv: [0.5, 0.5],
+                    color,
+                    tangent: [1.0, 0.0, 0.0, 1.0],
+                    uv1: [0.0, 0.0],
+                    joints: [0; 4],
+                    weights: [0.0; 4],
+                });
+            }
+            indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+        }
+    }
+    citrus_render::MeshData { vertices, indices, has_lightmap_uv: false }
+}
+
+impl citrus_core::NavQuery for NavSystem {
+    fn find_path(&self, from: Vec3, to: Vec3) -> Option<Vec<Vec3>> {
+        self.grid_for(from).or_else(|| self.grid_for(to))?.find_path(from, to)
+    }
+
+    fn nearest_walkable(&self, p: Vec3) -> Option<Vec3> {
+        let g = self.grid_for(p)?;
+        let (x, z) = g.nearest(p, 16)?;
+        g.center(x, z)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::SceneObject;
+    use citrus_assets::ObjectSource;
+    use citrus_core::{BoxCollider, Component};
 
-    #[test]
-    fn straight_path_in_open_grid_is_two_points() {
-        let grid = NavGrid::new(Vec3::ZERO, Vec3::new(10.0, 0.0, 10.0), 1.0);
-        let path = grid
-            .find_path(Vec3::new(0.5, 0.0, 0.5), Vec3::new(9.5, 0.0, 9.5))
-            .unwrap();
-        // Clear line of sight -> string-pull collapses to start + goal.
-        assert_eq!(path.len(), 2);
-        assert!((path[0] - Vec3::new(0.5, 0.0, 0.5)).length() < 1e-3);
+    fn obj(scene: &mut LoadedScene, pos: Vec3, components: Vec<Box<dyn Component>>) {
+        scene.objects.push(SceneObject {
+            id: ObjectId::new(),
+            name: String::new(),
+            render: None,
+            extra_render: Vec::new(),
+            source: ObjectSource::Empty,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            layer: 0,
+            parent: None,
+            translation: pos,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            components,
+        });
+    }
+
+    fn boxc(size: [f32; 3]) -> Box<dyn Component> {
+        Box::new(BoxCollider { size, ..Default::default() })
+    }
+
+    /// 20 x 20 floor with a wall across x = 0 that has a gap near z = +8.
+    fn level() -> (LoadedScene, PhysicsWorld) {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::new(0.0, -0.5, 0.0), vec![boxc([20.0, 1.0, 20.0])]);
+        obj(&mut scene, Vec3::new(0.0, 1.0, -2.0), vec![boxc([0.5, 2.0, 16.0])]);
+        obj(
+            &mut scene,
+            Vec3::ZERO,
+            vec![Box::new(NavMeshSurface {
+                size: [20.0, 6.0, 20.0],
+                ..Default::default()
+            })],
+        );
+        let mut pw = PhysicsWorld::build(&scene);
+        pw.step();
+        (scene, pw)
     }
 
     #[test]
-    fn routes_around_a_wall() {
-        let mut grid = NavGrid::new(Vec3::ZERO, Vec3::new(10.0, 0.0, 10.0), 1.0);
-        // A vertical wall at x=5 with a gap at the top.
-        for z in 0..9 {
-            grid.set_blocked(5, z, true);
-        }
-        let path = grid
-            .find_path(Vec3::new(1.0, 0.0, 1.0), Vec3::new(9.0, 0.0, 1.0))
-            .unwrap();
-        // Must detour (more than a straight 2-point path) and avoid the wall.
-        assert!(path.len() > 2, "path should bend around the wall: {path:?}");
-        // No waypoint sits on the wall column.
-        for p in &path {
-            let (cx, _) = grid.world_to_cell(*p);
-            assert!(cx != 5 || grid.is_blocked(5, grid.world_to_cell(*p).1) == false);
-        }
+    fn bakes_floor_and_blocks_wall() {
+        let (scene, pw) = level();
+        let mut nav = NavSystem::default();
+        nav.bake(&scene, &pw);
+        let g = &nav.grids[0].1;
+        let (fx, fz) = g.cell_of(Vec3::new(5.0, 0.0, 5.0));
+        assert!(g.height(fx, fz).is_some_and(|h| h.abs() < 0.01), "floor walkable at y=0");
+        let (wx, wz) = g.cell_of(Vec3::new(0.0, 0.0, -2.0));
+        assert!(g.height(wx, wz).is_none(), "wall (and its top) not reachable as floor");
+        let (ex, ez) = g.cell_of(Vec3::new(0.0, 0.0, 9.9));
+        assert!(g.height(ex, ez).is_none(), "level edge eroded by the agent radius");
     }
 
     #[test]
-    fn unreachable_goal_returns_none() {
-        let mut grid = NavGrid::new(Vec3::ZERO, Vec3::new(6.0, 0.0, 6.0), 1.0);
-        // Fully wall off the goal cell.
-        grid.block_aabb(Vec3::new(4.0, 0.0, 4.0), Vec3::new(6.0, 0.0, 6.0));
-        assert!(grid
-            .find_path(Vec3::new(0.5, 0.0, 0.5), Vec3::new(5.0, 0.0, 5.0))
-            .is_none());
+    fn path_goes_around_the_wall_through_the_gap() {
+        let (scene, pw) = level();
+        let mut nav = NavSystem::default();
+        nav.bake(&scene, &pw);
+        let from = Vec3::new(-5.0, 0.0, -5.0);
+        let to = Vec3::new(5.0, 0.0, -5.0);
+        let path = nav.find_path(from, to).expect("reachable via the gap");
+        assert!(path.iter().any(|p| p.z > 6.0), "detours through the gap: {path:?}");
+        assert!(path.len() < 12, "string-pulled to few waypoints: {}", path.len());
+        assert!((path[0] - from).length() < 0.6 && (path.last().unwrap() - to).length() < 0.6);
+    }
+
+    #[test]
+    fn agent_walks_to_destination() {
+        let (mut scene, mut pw) = level();
+        let mut agent = NavAgent::default();
+        agent.set_destination(Vec3::new(5.0, 0.0, -5.0));
+        obj(&mut scene, Vec3::new(-5.0, 0.0, -5.0), vec![Box::new(agent)]);
+        let mut nav = NavSystem::default();
+        nav.bake(&scene, &pw);
+        for _ in 0..600 {
+            nav.move_agents(&mut scene, &mut pw, 1.0 / 60.0);
+        }
+        let p = scene.objects[3].translation;
+        assert!((p - Vec3::new(5.0, 0.0, -5.0)).length() < 0.3, "arrived at {p}");
     }
 }

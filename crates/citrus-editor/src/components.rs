@@ -11,16 +11,17 @@
 use std::collections::HashMap;
 
 use citrus_core::{
-    AudioListener, AudioRolloff, AudioSource, Bob, BodyKind, BoxCollider, CameraComponent,
-    Component, ComponentRegistry, ControlMode, FluxVolume, FluxVoxelLight, LightComponent, LightKind,
+    Animator, JointKind, PortalMode, ScenePortal, NavAgent, NavMeshSurface, ParticleEmitter, PhysicsJoint, AudioListener, AudioRolloff, AudioSource, AcousticMaterial, AcousticPreset, AudioProbeVolume, Bob, BodyKind, BoxCollider, CameraComponent,
+    CharacterController, Component, UiAlign, UiButton, UiCanvas, UiImage, UiPanel, UiRect, UiRenderMode,
+    UiScaleMode, UiSlider, UiText, UiTextField, UiToggle, UiAction, UiFillDirection, UiPauseMenu, UiProgressBar, ComponentRegistry, ControlMode, FluxVolume, FluxVoxelLight, LightComponent, LightKind,
     LightMode, LightProbeVolume, LodComponent, LodLevel, MeshCollider, ObjectId, ObjectRef, Pawn,
-    ReflectionProbe, RigidBody, ShadowType,
+    PlanarReflection, ReflectionProbe, RigidBody, ShadowType,
     Spin,
     SpawnPoint, SphereCollider, Sync, TypedComponent, VolumeComponent,
     COLLISION_LAYERS,
 };
-use egui::collapsing_header::{CollapsingState, paint_default_icon};
-use egui::{DragValue, Label, RichText, ScrollArea, Sense, Ui};
+use egui::{DragValue, RichText, ScrollArea, Sense, Ui};
+use egui_phosphor::regular as ph;
 
 /// egui-memory key under which the Scene tree publishes the index of the object
 /// currently being dragged (a `usize`, so its slot is shared across the
@@ -98,7 +99,7 @@ impl InspectCtx<'_> {
                 *target = ObjectRef::new(*id);
                 changed = true;
             }
-            if target.is_set() && ui.small_button("✕").on_hover_text("Clear").clicked() {
+            if target.is_set() && ui.small_button(ph::X).on_hover_text("Clear").clicked() {
                 *target = ObjectRef::NONE;
                 changed = true;
             }
@@ -263,10 +264,13 @@ impl EditorComponents {
         e.register::<LightComponent>();
         e.register::<LightProbeVolume>();
         e.register::<ReflectionProbe>();
+        e.register::<PlanarReflection>();
         e.register::<FluxVoxelLight>();
         e.register::<FluxVolume>();
         e.register::<AudioSource>();
         e.register::<AudioListener>();
+        e.register::<AcousticMaterial>();
+        e.register::<AudioProbeVolume>();
         e.register::<BoxCollider>();
         e.register::<SphereCollider>();
         e.register::<MeshCollider>();
@@ -274,6 +278,24 @@ impl EditorComponents {
         e.register::<Bob>();
         e.register::<LodComponent>();
         e.register::<RigidBody>();
+        e.register::<CharacterController>();
+        e.register::<Animator>();
+        e.register::<PhysicsJoint>();
+        e.register::<NavMeshSurface>();
+        e.register::<NavAgent>();
+        e.register::<ParticleEmitter>();
+        e.register::<ScenePortal>();
+        e.register::<UiCanvas>();
+        e.register::<UiRect>();
+        e.register::<UiPanel>();
+        e.register::<UiImage>();
+        e.register::<UiText>();
+        e.register::<UiButton>();
+        e.register::<UiToggle>();
+        e.register::<UiSlider>();
+        e.register::<UiTextField>();
+        e.register::<UiProgressBar>();
+        e.register::<UiPauseMenu>();
         e.register::<VolumeComponent>();
         e.register::<Pawn>();
         e.register::<SpawnPoint>();
@@ -355,113 +377,103 @@ pub fn components_ui(
     ui.style_mut().interaction.selectable_labels = false;
     for (index, component) in components.iter_mut().enumerate() {
         let id = ui.make_persistent_id(("citrus-component", index, component.type_name()));
-        let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
-        let header = ui.horizontal(|ui| {
-            state.show_toggle_button(ui, paint_default_icon);
-            let label = ui.add(
-                Label::new(RichText::new(component.type_name()).strong()).sense(Sense::click()),
-            );
-            if label.clicked() {
-                state.toggle(ui);
-            }
-            if label.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("✕")
-                    .on_hover_text("Remove component")
-                    .clicked()
-                {
+        crate::widgets::divider(ui);
+        let (icon, color) = component_icon(component.type_name());
+        let (open, _) = crate::widgets::section_header(ui, id, Some((icon, color)), component.type_name(), None, |ui| {
+            let kebab = crate::widgets::icon_button(ui, crate::icons::Icon::Kebab, "Component options", false);
+            egui::Popup::menu(&kebab).show(|ui| {
+                if ui.button("Remove component").clicked() {
                     response.remove = Some(index);
+                    ui.close();
                 }
             });
         });
-        state.show_body_indented(&header.response, ui, |ui| {
-            response.changed |= editor.inspect(component.as_mut(), ui, &inspect_ctx);
-        });
-        state.store(ui.ctx());
+        if open {
+            egui::Frame::new()
+                .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 })
+                .show(ui, |ui| {
+                    response.changed |= editor.inspect(component.as_mut(), ui, &inspect_ctx);
+                });
+        }
     }
+    crate::widgets::divider(ui);
 
-    ui.add_space(4.0);
-    ui.vertical_centered_justified(|ui| {
-        egui::containers::menu::MenuButton::new("➕ Add Component")
-            .config(
-                egui::containers::menu::MenuConfig::new()
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-            )
-            .ui(ui, |ui| {
-                let search_id = ui.make_persistent_id("citrus-add-component-search");
-                let mut search: String = ui.data(|d| d.get_temp(search_id).unwrap_or_default());
-
-                let size_id = ui.make_persistent_id("citrus-add-component-size");
-                let mut size: egui::Vec2 =
-                    ui.data(|d| d.get_temp(size_id).unwrap_or(egui::vec2(240.0, 240.0)));
-                ui.set_min_width(size.x);
-                ui.set_max_width(size.x);
-
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut search)
-                        .hint_text("🔍 Search…")
-                        .desired_width(f32::INFINITY),
-                );
-                if edit.changed() {
-                    ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
-                }
-                let needle = search.to_lowercase();
-                ui.separator();
-                ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .max_height(size.y)
-                    .show(ui, |ui| {
-                        let mut any = false;
-                        for name in registry.names() {
-                            // Camera is intrinsic to camera objects.
-                            if name == "Camera" {
-                                continue;
-                            }
-                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-                                continue;
-                            }
-                            any = true;
-                            if ui
-                                .add(egui::Button::new(name).min_size(egui::vec2(
-                                    ui.available_width(),
-                                    0.0,
-                                )))
-                                .clicked()
-                            {
-                                response.add = Some(name);
-                                ui.data_mut(|d| d.remove::<String>(search_id));
-                                ui.close();
-                            }
-                        }
-                        if !any {
-                            ui.label(RichText::new("No matches").weak());
-                        }
-                    });
-
-                let (grip_rect, grip) =
-                    ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), Sense::drag());
-                let corner = grip_rect.right_bottom();
-                let col = ui.visuals().weak_text_color();
-                for i in 1..=3 {
-                    let o = i as f32 * 3.0;
-                    ui.painter().line_segment(
-                        [corner - egui::vec2(o, 1.0), corner - egui::vec2(1.0, o)],
-                        egui::Stroke::new(1.0, col),
+    ui.add_space(12.0);
+    let add = crate::widgets::dashed_button(ui, Some(crate::icons::Icon::Plus), "Add component");
+    egui::Popup::menu(&add)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            let search_id = ui.make_persistent_id("citrus-add-component-search");
+            let mut search: String = ui.data(|d| d.get_temp(search_id).unwrap_or_default());
+            let width = add.rect.width().max(240.0);
+            ui.set_min_width(width);
+            ui.set_max_width(width);
+            let edit = crate::widgets::search_field(ui, &mut search, "Search components", width);
+            if edit.changed() {
+                ui.data_mut(|d| d.insert_temp(search_id, search.clone()));
+            }
+            let needle = search.to_lowercase();
+            ui.add_space(4.0);
+            ScrollArea::vertical().auto_shrink([false, true]).max_height(320.0).show(ui, |ui| {
+                let mut any = false;
+                for name in registry.names() {
+                    // Camera is intrinsic to camera objects.
+                    if name == "Camera" {
+                        continue;
+                    }
+                    if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    any = true;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, crate::theme::H_TOOLBAR), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, crate::theme::R_ROW, crate::theme::BG_BUTTON);
+                    }
+                    let (icon, color) = component_icon(name);
+                    crate::icons::paint(
+                        ui.painter(),
+                        egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(14.0, 14.0)),
+                        icon,
+                        color,
                     );
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 32.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(crate::theme::SIZE_BODY),
+                        if resp.hovered() { crate::theme::TEXT_STRONG } else { crate::theme::TEXT_SECONDARY },
+                    );
+                    if resp.clicked() {
+                        response.add = Some(name);
+                        ui.data_mut(|d| d.remove::<String>(search_id));
+                        ui.close();
+                    }
                 }
-                if grip.dragged() {
-                    let d = grip.drag_delta();
-                    size.x = (size.x + d.x).clamp(180.0, 600.0);
-                    size.y = (size.y + d.y).clamp(120.0, 600.0);
-                    ui.data_mut(|d| d.insert_temp(size_id, size));
+                if !any {
+                    ui.label(RichText::new("No matches").color(crate::theme::TEXT_DIM));
                 }
-                grip.on_hover_cursor(egui::CursorIcon::ResizeNwSe);
             });
-    });
+        });
     response
+}
+
+/// Header icon and colour for a component type (editor spec §2.4).
+pub fn component_icon(name: &str) -> (crate::icons::Icon, egui::Color32) {
+    use crate::icons::Icon;
+    use crate::theme;
+    match name {
+        "Light" => (Icon::LightPoint, theme::TYPE_LIGHT),
+        "Camera" => (Icon::Camera, theme::TYPE_CAMERA),
+        "UI Canvas" => (Icon::UiCanvas, theme::TYPE_UI),
+        "UI Toggle" => (Icon::UiToggle, theme::TYPE_UI),
+        "UI Text" | "UI Text Field" => (Icon::UiText, theme::TYPE_UI),
+        n if n.starts_with("UI ") => (Icon::UiCanvas, theme::TYPE_UI),
+        "Reflection Probe" | "Planar Reflection" => (Icon::ReflectionProbe, theme::TYPE_GI),
+        "Flux Volume" | "Light Probe Volume" | "FluxVoxel Light" => (Icon::FluxVolume, theme::TYPE_GI),
+        "Audio Source" | "Audio Listener" => (Icon::Audio, theme::TYPE_GROUP),
+        "Animator" | "LOD Group" => (Icon::Model, theme::TYPE_MESH),
+        _ => (Icon::Gear, theme::TYPE_GROUP),
+    }
 }
 
 // ----------------------------------------------------------------- helpers
@@ -472,30 +484,16 @@ fn property_row(
     changed: &mut bool,
     widget: impl FnOnce(&mut Ui) -> egui::Response,
 ) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if widget(ui).changed() {
-                *changed = true;
-            }
-        });
+    crate::widgets::property_row(ui, label, |ui| {
+        if widget(ui).changed() {
+            *changed = true;
+        }
     });
 }
 
 fn axis_row(ui: &mut Ui, label: &str, axis: &mut [f32; 3], changed: &mut bool) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for (name, value) in ["Z", "Y", "X"].iter().zip(axis.iter_mut().rev()) {
-                *changed |= ui
-                    .add_sized(
-                        [48.0, 18.0],
-                        DragValue::new(value).speed(0.02).max_decimals(2),
-                    )
-                    .changed();
-                ui.label(RichText::new(*name).weak());
-            }
-        });
+    crate::widgets::property_row(ui, label, |ui| {
+        *changed |= crate::widgets::vec3_field(ui, axis, 2, 0.02);
     });
 }
 
@@ -733,7 +731,7 @@ impl Inspect for LodComponent {
                 changed |= ui
                     .add(egui::TextEdit::singleline(&mut level.model).hint_text("model path (blank = base mesh)"))
                     .changed();
-                if ui.small_button("✕").clicked() {
+                if ui.small_button(ph::X).clicked() {
                     remove = Some(i);
                 }
             });
@@ -828,6 +826,656 @@ impl Inspect for RigidBody {
 }
 impl Gizmo for RigidBody {}
 
+impl Inspect for CharacterController {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Radius", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.radius).speed(0.01).range(0.01..=10.0))
+        });
+        property_row(ui, "Height", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.height).speed(0.01).range(0.02..=20.0))
+        });
+        axis_row(ui, "Center", &mut self.center, &mut changed);
+        property_row(ui, "Step height", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.step_height).speed(0.01).range(0.0..=2.0))
+        });
+        property_row(ui, "Max slope (deg)", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.max_slope).speed(0.5).range(0.0..=89.0))
+        });
+        property_row(ui, "Snap to ground", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.snap_to_ground).speed(0.01).range(0.0..=2.0))
+        });
+        changed
+    }
+}
+impl Gizmo for CharacterController {}
+
+fn range_row(ui: &mut Ui, label: &str, v: &mut [f32; 2], speed: f64, changed: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            *changed |= ui.add(DragValue::new(&mut v[1]).speed(speed).prefix("max ")).changed();
+            *changed |= ui.add(DragValue::new(&mut v[0]).speed(speed).prefix("min ")).changed();
+        });
+    });
+}
+
+impl Inspect for ParticleEmitter {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Play on start", &mut changed, |ui| ui.checkbox(&mut self.play_on_start, ""));
+        property_row(ui, "Looping", &mut changed, |ui| ui.checkbox(&mut self.looping, ""));
+        if !self.looping {
+            property_row(ui, "Duration (s)", &mut changed, |ui| ui.add(DragValue::new(&mut self.duration).speed(0.05).range(0.0..=600.0)));
+        }
+        property_row(ui, "Rate (/s)", &mut changed, |ui| ui.add(DragValue::new(&mut self.rate).speed(0.5).range(0.0..=10000.0)));
+        property_row(ui, "Burst", &mut changed, |ui| ui.add(DragValue::new(&mut self.burst).range(0..=10000)));
+        property_row(ui, "Max particles", &mut changed, |ui| ui.add(DragValue::new(&mut self.max_particles).range(1..=20000)));
+        range_row(ui, "Lifetime (s)", &mut self.lifetime, 0.02, &mut changed);
+        range_row(ui, "Speed", &mut self.speed, 0.05, &mut changed);
+        axis_row(ui, "Direction", &mut self.direction, &mut changed);
+        property_row(ui, "Cone angle", &mut changed, |ui| ui.add(DragValue::new(&mut self.cone_angle).speed(0.5).range(0.0..=180.0)));
+        property_row(ui, "Spawn radius", &mut changed, |ui| ui.add(DragValue::new(&mut self.shape_radius).speed(0.01).range(0.0..=100.0)));
+        property_row(ui, "Gravity", &mut changed, |ui| ui.add(DragValue::new(&mut self.gravity).speed(0.02)));
+        property_row(ui, "Drag", &mut changed, |ui| ui.add(DragValue::new(&mut self.drag).speed(0.02).range(0.0..=50.0)));
+        range_row(ui, "Size (start/end)", &mut self.size, 0.01, &mut changed);
+        rgba_row(ui, "Color start", &mut self.color_start, &mut changed);
+        rgba_row(ui, "Color end", &mut self.color_end, &mut changed);
+        property_row(ui, "Texture", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.texture).hint_text("soft dot"))
+        });
+        property_row(ui, "World space", &mut changed, |ui| ui.checkbox(&mut self.world_space, ""));
+        ui.horizontal(|ui| {
+            if ui.button("Restart").clicked() {
+                self.control.clear = true;
+                self.control.play = true;
+            }
+            ui.label(egui::RichText::new(format!("{} alive", self.control.alive)).small().weak());
+        });
+        changed
+    }
+}
+impl Gizmo for ParticleEmitter {}
+
+impl Inspect for ScenePortal {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Scene", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.scene).hint_text("scenes/level2.scene"))
+        });
+        enum_row(ui, "Mode", "citrus-portal-mode", &mut self.mode, &PortalMode::ALL, PortalMode::label, &mut changed);
+        changed |= ctx.object_ref(ui, "Activator", &mut self.activator);
+        if !self.activator.is_set() {
+            ui.label(egui::RichText::new("Unset: any object with a Pawn").small().weak());
+        }
+        if self.mode != PortalMode::Unload {
+            property_row(ui, "Preload distance", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.preload_distance).speed(0.5).range(0.0..=10000.0))
+            });
+        }
+        if self.mode == PortalMode::Switch {
+            property_row(ui, "Keep activator", &mut changed, |ui| ui.checkbox(&mut self.keep_activator, ""));
+        }
+        property_row(ui, "One shot", &mut changed, |ui| ui.checkbox(&mut self.one_shot, ""));
+        ui.label(
+            egui::RichText::new("Needs a trigger collider on this object. Preloads while the activator approaches.")
+                .small()
+                .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for ScenePortal {}
+
+impl Inspect for NavMeshSurface {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        axis_row(ui, "Bounds size", &mut self.size, &mut changed);
+        property_row(ui, "Cell size", &mut changed, |ui| ui.add(DragValue::new(&mut self.cell_size).speed(0.01).range(0.05..=4.0)));
+        property_row(ui, "Agent radius", &mut changed, |ui| ui.add(DragValue::new(&mut self.agent_radius).speed(0.01).range(0.0..=10.0)));
+        property_row(ui, "Agent height", &mut changed, |ui| ui.add(DragValue::new(&mut self.agent_height).speed(0.01).range(0.1..=20.0)));
+        property_row(ui, "Max slope", &mut changed, |ui| ui.add(DragValue::new(&mut self.max_slope).speed(0.5).range(0.0..=89.0)));
+        property_row(ui, "Step height", &mut changed, |ui| ui.add(DragValue::new(&mut self.step_height).speed(0.01).range(0.0..=5.0)));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_preview, "Show navmesh");
+            if ui.button("Rebake").clicked() {
+                self.rebake_preview = true;
+                self.show_preview = true;
+            }
+        });
+        ui.label(
+            egui::RichText::new("Baked from colliders when play starts; ctx.rebake_navmesh() at runtime")
+                .small()
+                .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for NavMeshSurface {}
+
+impl Inspect for NavAgent {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Speed", &mut changed, |ui| ui.add(DragValue::new(&mut self.speed).speed(0.05).range(0.0..=100.0)));
+        property_row(ui, "Turn speed", &mut changed, |ui| ui.add(DragValue::new(&mut self.turn_speed).speed(5.0).range(0.0..=5000.0)));
+        property_row(ui, "Stopping distance", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.stopping_distance).speed(0.01).range(0.0..=50.0))
+        });
+        ui.label(egui::RichText::new("Gameplay: ctx.set_destination(agent, point)").small().weak());
+        changed
+    }
+}
+impl Gizmo for NavAgent {}
+
+impl Inspect for PhysicsJoint {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        enum_row(ui, "Type", "citrus-joint-kind", &mut self.kind, &JointKind::ALL, JointKind::label, &mut changed);
+        changed |= ctx.object_ref(ui, "Connected body", &mut self.connected);
+        if !self.connected.is_set() {
+            ui.label(egui::RichText::new("Unset: attached to its start point in the world").small().weak());
+        }
+        axis_row(ui, "Anchor", &mut self.anchor, &mut changed);
+        let k = self.kind;
+        if matches!(k, JointKind::Hinge | JointKind::Slider) {
+            axis_row(ui, "Axis", &mut self.axis, &mut changed);
+            property_row(ui, "Limits", &mut changed, |ui| ui.checkbox(&mut self.limits_enabled, ""));
+            if self.limits_enabled {
+                let unit = if k == JointKind::Hinge { " deg" } else { " m" };
+                ui.horizontal(|ui| {
+                    ui.label("Range");
+                    changed |= ui.add(DragValue::new(&mut self.limits[0]).speed(0.5).suffix(unit)).changed();
+                    changed |= ui.add(DragValue::new(&mut self.limits[1]).speed(0.5).suffix(unit)).changed();
+                });
+            }
+            property_row(ui, "Motor", &mut changed, |ui| ui.checkbox(&mut self.motor_enabled, ""));
+            if self.motor_enabled {
+                property_row(ui, "Motor speed", &mut changed, |ui| ui.add(DragValue::new(&mut self.motor_speed).speed(1.0)));
+                property_row(ui, "Max force", &mut changed, |ui| {
+                    ui.add(DragValue::new(&mut self.motor_max_force).speed(1.0).range(0.0..=1e7))
+                });
+            }
+        }
+        if matches!(k, JointKind::Spring | JointKind::Rope) {
+            property_row(ui, "Rest length", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.rest_length).speed(0.01).range(0.0..=1000.0))
+            });
+            ui.label(egui::RichText::new("0 = distance at start").small().weak());
+        }
+        if k == JointKind::Spring {
+            property_row(ui, "Stiffness", &mut changed, |ui| ui.add(DragValue::new(&mut self.stiffness).speed(0.5).range(0.0..=1e6)));
+            property_row(ui, "Damping", &mut changed, |ui| ui.add(DragValue::new(&mut self.damping).speed(0.05).range(0.0..=1e4)));
+        }
+        property_row(ui, "Collide connected", &mut changed, |ui| ui.checkbox(&mut self.collide_connected, ""));
+        ui.label(egui::RichText::new("Needs a collider + Rigid Body on this object").small().weak());
+        changed
+    }
+}
+impl Gizmo for PhysicsJoint {}
+
+impl Inspect for Animator {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        let clips = self.state.clips.clone();
+        let choices: Vec<String> = clips
+            .iter()
+            .cloned()
+            .chain(self.blend_trees.iter().map(|t| t.name.clone()))
+            .collect();
+        property_row(ui, "Clip", &mut changed, |ui| {
+            let shown = if self.clip.is_empty() { "(first clip)" } else { self.clip.as_str() };
+            let mut resp = egui::ComboBox::from_id_salt("citrus-animator-clip")
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    let mut clicked = ui.selectable_value(&mut self.clip, String::new(), "(first clip)").clicked();
+                    for c in &choices {
+                        clicked |= ui.selectable_value(&mut self.clip, c.clone(), c).clicked();
+                    }
+                    clicked
+                });
+            if resp.inner == Some(true) {
+                resp.response.mark_changed();
+            }
+            resp.response
+        });
+        if clips.is_empty() {
+            ui.label(egui::RichText::new("No clips found on this object's model").small().weak());
+        }
+        property_row(ui, "Speed", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.speed).speed(0.02).range(-10.0..=10.0))
+        });
+        property_row(ui, "Loop", &mut changed, |ui| ui.checkbox(&mut self.looping, ""));
+        property_row(ui, "Play on start", &mut changed, |ui| ui.checkbox(&mut self.play_on_start, ""));
+        property_row(ui, "Root motion", &mut changed, |ui| ui.checkbox(&mut self.root_motion, ""));
+        property_row(ui, "GPU skinning", &mut changed, |ui| ui.checkbox(&mut self.gpu_skinning, ""));
+
+        let clip_combo = |ui: &mut Ui, salt: String, value: &mut String, clips: &[String]| -> bool {
+            let mut clicked = false;
+            egui::ComboBox::from_id_salt(salt)
+                .selected_text(if value.is_empty() { "(clip)" } else { value.as_str() })
+                .show_ui(ui, |ui| {
+                    for c in clips {
+                        clicked |= ui.selectable_value(value, c.clone(), c).clicked();
+                    }
+                });
+            clicked
+        };
+
+        egui::CollapsingHeader::new(format!("Blend trees ({})", self.blend_trees.len()))
+            .id_salt("citrus-anim-trees")
+            .show(ui, |ui| {
+                let mut remove = None;
+                for (t, tree) in self.blend_trees.iter_mut().enumerate() {
+                    ui.separator();
+                    property_row(ui, "Name", &mut changed, |ui| ui.text_edit_singleline(&mut tree.name));
+                    property_row(ui, "Parameter", &mut changed, |ui| ui.text_edit_singleline(&mut tree.parameter));
+                    property_row(ui, "Parameter Y (2D)", &mut changed, |ui| ui.text_edit_singleline(&mut tree.parameter_y));
+                    let two_d = tree.is_2d();
+                    let mut remove_motion = None;
+                    for (m, motion) in tree.motions.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            changed |= clip_combo(ui, format!("citrus-tree-{t}-{m}"), &mut motion.clip, &clips);
+                            changed |= ui.add(DragValue::new(&mut motion.position[0]).speed(0.05)).changed();
+                            if two_d {
+                                changed |= ui.add(DragValue::new(&mut motion.position[1]).speed(0.05)).changed();
+                            }
+                            if ui.small_button("x").clicked() {
+                                remove_motion = Some(m);
+                            }
+                        });
+                    }
+                    if let Some(m) = remove_motion {
+                        tree.motions.remove(m);
+                        changed = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Add motion").clicked() {
+                            tree.motions.push(Default::default());
+                            changed = true;
+                        }
+                        if ui.button("Remove tree").clicked() {
+                            remove = Some(t);
+                        }
+                    });
+                }
+                if let Some(t) = remove {
+                    self.blend_trees.remove(t);
+                    changed = true;
+                }
+                if ui.button("Add blend tree").clicked() {
+                    self.blend_trees.push(citrus_core::BlendTree {
+                        name: format!("Blend {}", self.blend_trees.len() + 1),
+                        parameter: "Speed".into(),
+                        ..Default::default()
+                    });
+                    changed = true;
+                }
+            });
+
+        egui::CollapsingHeader::new(format!("Events ({})", self.events.len()))
+            .id_salt("citrus-anim-events")
+            .show(ui, |ui| {
+                let mut remove = None;
+                for (k, e) in self.events.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        changed |= clip_combo(ui, format!("citrus-anim-ev-{k}"), &mut e.clip, &clips);
+                        changed |= ui.add(DragValue::new(&mut e.time).speed(0.01).range(0.0..=1000.0).suffix(" s")).changed();
+                        changed |= ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(90.0)).changed();
+                        if ui.small_button("x").clicked() {
+                            remove = Some(k);
+                        }
+                    });
+                }
+                if let Some(k) = remove {
+                    self.events.remove(k);
+                    changed = true;
+                }
+                if ui.button("Add event").clicked() {
+                    self.events.push(citrus_core::AnimEvent {
+                        clip: clips.first().cloned().unwrap_or_default(),
+                        time: 0.0,
+                        name: "Event".into(),
+                    });
+                    changed = true;
+                }
+            });
+        if let Some(cur) = &self.state.current {
+            ui.label(
+                egui::RichText::new(format!("Playing: {cur} ({:.2}s / {:.2}s)", self.state.time, self.state.duration))
+                    .small()
+                    .weak(),
+            );
+        }
+        changed
+    }
+}
+impl Gizmo for Animator {}
+
+fn rgba_row(ui: &mut Ui, label: &str, c: &mut [f32; 4], changed: &mut bool) {
+    property_row(ui, label, changed, |ui| crate::widgets::color_hex(ui, c));
+}
+
+fn vec2_row(ui: &mut Ui, label: &str, v: &mut [f32; 2], speed: f64, changed: &mut bool) {
+    crate::widgets::property_row(ui, label, |ui| {
+        let w = ((ui.available_width() - 4.0) / 2.0).max(40.0);
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for (a, value) in v.iter_mut().enumerate() {
+            *changed |= crate::widgets::axis_field(ui, a, value, 2, speed, w).changed();
+        }
+    });
+}
+
+fn enum_row<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    label: &str,
+    salt: &str,
+    value: &mut T,
+    all: &[T],
+    name: fn(T) -> &'static str,
+    changed: &mut bool,
+) {
+    property_row(ui, label, changed, |ui| {
+        let mut resp = egui::ComboBox::from_id_salt(salt)
+            .width(ui.available_width())
+            .selected_text(name(*value))
+            .show_ui(ui, |ui| {
+                let mut clicked = false;
+                for &k in all {
+                    clicked |= ui.selectable_value(value, k, name(k)).clicked();
+                }
+                clicked
+            });
+        if resp.inner == Some(true) {
+            resp.response.mark_changed();
+        }
+        resp.response
+    });
+}
+
+impl Inspect for UiCanvas {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        enum_row(ui, "Render mode", "citrus-ui-render", &mut self.render_mode, &UiRenderMode::ALL, UiRenderMode::label, &mut changed);
+        if self.render_mode == UiRenderMode::World {
+            vec2_row(ui, "Size (m)", &mut self.world_size, 0.01, &mut changed);
+            property_row(ui, "Pixels per meter", &mut changed, |ui| {
+                ui.add(DragValue::new(&mut self.pixels_per_meter).speed(5.0).range(50.0..=4000.0))
+            });
+            let [w, h] = self.world_pixels();
+            ui.label(
+                egui::RichText::new(format!("{w} x {h} px panel in the object's XY plane, facing +Z"))
+                    .small()
+                    .weak(),
+            );
+        }
+        enum_row(ui, "Scale mode", "citrus-ui-scale", &mut self.scale_mode, &UiScaleMode::ALL, UiScaleMode::label, &mut changed);
+        if self.scale_mode == UiScaleMode::ScaleWithScreen {
+            vec2_row(ui, "Reference size", &mut self.reference_size, 1.0, &mut changed);
+            property_row(ui, "Match width/height", &mut changed, |ui| {
+                ui.add(egui::Slider::new(&mut self.match_height, 0.0..=1.0))
+            });
+        }
+        property_row(ui, "Sort order", &mut changed, |ui| ui.add(DragValue::new(&mut self.sort_order)));
+        ui.label(
+            egui::RichText::new("Children with UI components are laid out inside this canvas.")
+                .small()
+                .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for UiCanvas {}
+
+impl Inspect for UiRect {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        // Spec §8.3: 3x3 anchor preset grid (active anchor filled accent), plus
+        // Stretch to fill the parent.
+        crate::widgets::property_row(ui, "Anchor", |ui| {
+            let cell = 18.0;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(cell * 3.0 + 8.0, cell * 3.0 + 8.0), Sense::hover());
+            let p = ui.painter();
+            p.rect(rect, crate::theme::R_FIELD, crate::theme::BG_FIELD, egui::Stroke::new(1.0_f32, crate::theme::LINE_FIELD), egui::StrokeKind::Inside);
+            for row in 0..3 {
+                for col in 0..3 {
+                    let a = [col as f32 * 0.5, row as f32 * 0.5];
+                    let r = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(4.0 + col as f32 * cell, 4.0 + row as f32 * cell),
+                        egui::vec2(cell, cell),
+                    )
+                    .shrink(3.0);
+                    let id = ui.id().with(("citrus-anchor", row, col));
+                    let resp = ui.interact(r, id, Sense::click());
+                    let active = self.anchor_min == a && self.anchor_max == a;
+                    let fill = if active {
+                        crate::theme::accent()
+                    } else if resp.hovered() {
+                        crate::theme::TEXT_MUTED
+                    } else {
+                        crate::theme::BG_SEGMENT_ACTIVE
+                    };
+                    ui.painter().rect_filled(r, crate::theme::R_SWATCH, fill);
+                    let name = UiRect::PRESETS.iter().find(|(_, x, y)| *x == a && *y == a).map_or("", |(n, _, _)| n);
+                    if resp.on_hover_text(name).clicked() {
+                        self.anchor_min = a;
+                        self.anchor_max = a;
+                        self.pivot = a;
+                        changed = true;
+                    }
+                }
+            }
+            let stretch = self.anchor_min == [0.0, 0.0] && self.anchor_max == [1.0, 1.0];
+            if crate::widgets::segment(ui, stretch, "Stretch").on_hover_text("Fill the parent").clicked() && !stretch {
+                self.anchor_min = [0.0, 0.0];
+                self.anchor_max = [1.0, 1.0];
+                self.size = [0.0, 0.0];
+                self.position = [0.0, 0.0];
+                self.pivot = [0.5, 0.5];
+                changed = true;
+            }
+        });
+        vec2_row(ui, "Position", &mut self.position, 1.0, &mut changed);
+        let stretch = self.anchor_min != self.anchor_max;
+        vec2_row(ui, if stretch { "Size delta" } else { "Size" }, &mut self.size, 1.0, &mut changed);
+        egui::CollapsingHeader::new("Anchors & pivot").id_salt("citrus-ui-rect-adv").show(ui, |ui| {
+            vec2_row(ui, "Anchor min", &mut self.anchor_min, 0.01, &mut changed);
+            vec2_row(ui, "Anchor max", &mut self.anchor_max, 0.01, &mut changed);
+            vec2_row(ui, "Pivot", &mut self.pivot, 0.01, &mut changed);
+        });
+        changed
+    }
+}
+impl Gizmo for UiRect {}
+
+impl Inspect for UiPanel {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        rgba_row(ui, "Color", &mut self.color, &mut changed);
+        property_row(ui, "Corner radius", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.corner_radius).speed(0.2).range(0.0..=200.0))
+        });
+        property_row(ui, "Border width", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.border_width).speed(0.1).range(0.0..=50.0))
+        });
+        if self.border_width > 0.0 {
+            rgba_row(ui, "Border color", &mut self.border_color, &mut changed);
+        }
+        changed
+    }
+}
+impl Gizmo for UiPanel {}
+
+impl Inspect for UiImage {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Texture", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.texture).hint_text("textures/icon.png"))
+        });
+        rgba_row(ui, "Tint", &mut self.tint, &mut changed);
+        property_row(ui, "Preserve aspect", &mut changed, |ui| ui.checkbox(&mut self.preserve_aspect, ""));
+        changed
+    }
+}
+impl Gizmo for UiImage {}
+
+impl Inspect for UiText {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        ui.label("Text");
+        if ui
+            .add(egui::TextEdit::multiline(&mut self.text).desired_rows(2).desired_width(f32::INFINITY))
+            .changed()
+        {
+            changed = true;
+        }
+        property_row(ui, "Size", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.size).speed(0.2).range(1.0..=500.0))
+        });
+        rgba_row(ui, "Color", &mut self.color, &mut changed);
+        enum_row(ui, "Align X", "citrus-ui-ax", &mut self.align_x, &UiAlign::ALL, UiAlign::label, &mut changed);
+        enum_row(ui, "Align Y", "citrus-ui-ay", &mut self.align_y, &UiAlign::ALL, UiAlign::label, &mut changed);
+        property_row(ui, "Wrap", &mut changed, |ui| ui.checkbox(&mut self.wrap, ""));
+        property_row(ui, "Font", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.font).hint_text("built-in"))
+        });
+        changed
+    }
+}
+impl Gizmo for UiText {}
+
+impl Inspect for UiButton {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Interactable", &mut changed, |ui| ui.checkbox(&mut self.interactable, ""));
+        rgba_row(ui, "Normal", &mut self.normal, &mut changed);
+        rgba_row(ui, "Hovered", &mut self.hovered, &mut changed);
+        rgba_row(ui, "Pressed", &mut self.pressed, &mut changed);
+        rgba_row(ui, "Disabled", &mut self.disabled, &mut changed);
+        ui.separator();
+        ui.label("On click");
+        let mut remove = None;
+        for (k, action) in self.on_click.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt(("citrus-ui-action", k))
+                    .selected_text(action.label())
+                    .width(110.0)
+                    .show_ui(ui, |ui| {
+                        for kind in UiAction::kinds() {
+                            let same = std::mem::discriminant(&kind) == std::mem::discriminant(action);
+                            if ui.selectable_label(same, kind.label()).clicked() && !same {
+                                *action = action.with_kind_of(&kind);
+                                changed = true;
+                            }
+                        }
+                    });
+                let hint = if matches!(action, UiAction::LoadScene(_)) { "scenes/level.scene" } else { "object name" };
+                if let Some(target) = action.target_mut() {
+                    let w = (ui.available_width() - 28.0).max(40.0);
+                    changed |= ui.add(egui::TextEdit::singleline(target).hint_text(hint).desired_width(w)).changed();
+                }
+                if ui.small_button(ph::X).on_hover_text("Remove action").clicked() {
+                    remove = Some(k);
+                }
+            });
+        }
+        if let Some(k) = remove {
+            self.on_click.remove(k);
+            changed = true;
+        }
+        if ui.button(format!("{} Add action", ph::PLUS)).clicked() {
+            self.on_click.push(UiAction::Show(String::new()));
+            changed = true;
+        }
+        ui.label(egui::RichText::new("Code: ctx.ui_clicked(button_ref)").small().weak());
+        changed
+    }
+}
+impl Gizmo for UiButton {}
+
+impl Inspect for UiToggle {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "On", &mut changed, |ui| ui.checkbox(&mut self.on, ""));
+        property_row(ui, "Interactable", &mut changed, |ui| ui.checkbox(&mut self.interactable, ""));
+        rgba_row(ui, "Box", &mut self.box_color, &mut changed);
+        rgba_row(ui, "Check", &mut self.check_color, &mut changed);
+        changed
+    }
+}
+impl Gizmo for UiToggle {}
+
+impl Inspect for UiSlider {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Min", &mut changed, |ui| ui.add(DragValue::new(&mut self.min).speed(0.1)));
+        property_row(ui, "Max", &mut changed, |ui| ui.add(DragValue::new(&mut self.max).speed(0.1)));
+        let (lo, hi) = (self.min.min(self.max), self.max.max(self.min));
+        property_row(ui, "Value", &mut changed, |ui| ui.add(egui::Slider::new(&mut self.value, lo..=hi)));
+        property_row(ui, "Whole numbers", &mut changed, |ui| ui.checkbox(&mut self.whole_numbers, ""));
+        property_row(ui, "Interactable", &mut changed, |ui| ui.checkbox(&mut self.interactable, ""));
+        rgba_row(ui, "Track", &mut self.track_color, &mut changed);
+        rgba_row(ui, "Fill", &mut self.fill_color, &mut changed);
+        rgba_row(ui, "Handle", &mut self.handle_color, &mut changed);
+        property_row(ui, "Audio bus", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.audio_bus).hint_text("none (e.g. Music)"))
+                .on_hover_text("Drives this Audio Mixer bus's volume (0..1 along the slider)")
+        });
+        changed
+    }
+}
+impl Gizmo for UiSlider {}
+
+impl Inspect for UiProgressBar {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Value", &mut changed, |ui| ui.add(egui::Slider::new(&mut self.value, 0.0..=1.0)));
+        enum_row(ui, "Direction", "citrus-ui-fill", &mut self.direction, &UiFillDirection::ALL, UiFillDirection::label, &mut changed);
+        rgba_row(ui, "Background", &mut self.background, &mut changed);
+        rgba_row(ui, "Fill", &mut self.fill, &mut changed);
+        property_row(ui, "Corner radius", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.corner_radius).speed(0.2).range(0.0..=200.0))
+        });
+        ui.label(egui::RichText::new("Gameplay: ctx.modify::<UiProgressBar>(bar, |b| b.value = hp)").small().weak());
+        changed
+    }
+}
+impl Gizmo for UiProgressBar {}
+
+impl Inspect for UiPauseMenu {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Panel", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.panel).hint_text("object name"))
+        });
+        property_row(ui, "Pause time", &mut changed, |ui| ui.checkbox(&mut self.pause_time, ""));
+        property_row(ui, "Lock cursor in game", &mut changed, |ui| ui.checkbox(&mut self.lock_cursor_in_game, ""));
+        ui.label(
+            egui::RichText::new("Escape / gamepad back toggles the panel. Resume button: Hide <panel>.")
+                .small()
+                .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for UiPauseMenu {}
+
+impl Inspect for UiTextField {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Text", &mut changed, |ui| ui.text_edit_singleline(&mut self.text));
+        property_row(ui, "Placeholder", &mut changed, |ui| ui.text_edit_singleline(&mut self.placeholder));
+        property_row(ui, "Max length", &mut changed, |ui| ui.add(DragValue::new(&mut self.max_length).range(0..=10000)));
+        property_row(ui, "Size", &mut changed, |ui| ui.add(DragValue::new(&mut self.size).speed(0.2).range(1.0..=300.0)));
+        rgba_row(ui, "Text color", &mut self.text_color, &mut changed);
+        rgba_row(ui, "Placeholder color", &mut self.placeholder_color, &mut changed);
+        property_row(ui, "Password", &mut changed, |ui| ui.checkbox(&mut self.password, ""));
+        property_row(ui, "Interactable", &mut changed, |ui| ui.checkbox(&mut self.interactable, ""));
+        ui.label(egui::RichText::new("Gameplay: ctx.ui_submitted(field) on Enter").small().weak());
+        changed
+    }
+}
+impl Gizmo for UiTextField {}
+
 impl Inspect for LightProbeVolume {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
         let mut changed = false;
@@ -873,6 +1521,18 @@ impl Inspect for ReflectionProbe {
     fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
         let mut changed = false;
         axis_row(ui, "Size", &mut self.size, &mut changed);
+        // Unity's box offset: the box aligns to the room while the OBJECT stays
+        // where reflections should look right from (eye height).
+        axis_row(ui, "Box Offset", &mut self.box_offset, &mut changed);
+        property_row(ui, "Lock box in world", &mut changed, |ui| {
+            ui.checkbox(&mut self.lock_box, "")
+                .on_hover_text(
+                    "Freeze the box in world space: moving the probe object then only \
+                     repositions the capture point inside the box (Box Offset auto-compensates). \
+                     Align the box to the room first, then enable this and place the capture \
+                     point freely.",
+                )
+        });
         ui.horizontal(|ui| {
             ui.label("Resolution");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -921,7 +1581,7 @@ impl Inspect for ReflectionProbe {
             });
         });
         if ui
-            .button("✨ Bake This Probe")
+            .button(format!("{} Bake This Probe", ph::SPARKLE))
             .on_hover_text("Capture this probe's cubemap from the current scene and save it as a .reflprobe sidecar")
             .clicked()
         {
@@ -954,10 +1614,31 @@ impl Inspect for ReflectionProbe {
         changed
     }
 }
+impl Inspect for PlanarReflection {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Max roughness", &mut changed, |ui| {
+            ui.add(egui::Slider::new(&mut self.max_roughness, 0.05..=0.95))
+        });
+        ui.label(
+            RichText::new(
+                "True mirror: the scene re-renders every frame from the camera \
+                 mirrored about this object's local +Y (up) plane — put it on a floor \
+                 or a wall-mirror quad. Fades back to the reflection probe above the \
+                 roughness cutoff. Each active surface costs a scene pass (max 4).",
+            )
+            .small()
+            .weak(),
+        );
+        changed
+    }
+}
+impl Gizmo for PlanarReflection {}
+
 impl Gizmo for ReflectionProbe {
     fn gizmos(&self) -> Vec<GizmoSpec> {
         vec![GizmoSpec::Box {
-            center: glam::Vec3::ZERO,
+            center: glam::Vec3::from(self.box_offset),
             half_extents: glam::Vec3::from(self.size) * 0.5,
             object_anchored: true,
             blend: self.blend_distance.max(0.0),
@@ -1043,8 +1724,11 @@ impl Inspect for AudioSource {
                 )
                 .changed();
         });
+        property_row(ui, "Mixer bus", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.bus).desired_width(110.0))
+        });
         ui.label(
-            RichText::new(".wav · .flac · .mp3 (project-relative)")
+            RichText::new(".wav · .flac · .mp3 · .ogg (project-relative)")
                 .small()
                 .weak(),
         );
@@ -1087,7 +1771,43 @@ impl Inspect for AudioSource {
                         });
                 });
             });
+            property_row(ui, "HRTF (binaural)", &mut changed, |ui| {
+                ui.checkbox(&mut self.hrtf, "").on_hover_text("Off: plain stereo panning")
+            });
+            property_row(ui, "Air absorption", &mut changed, |ui| ui.checkbox(&mut self.air_absorption, ""));
+            property_row(ui, "Occlusion", &mut changed, |ui| {
+                ui.checkbox(&mut self.occlusion, "")
+                    .on_hover_text("Static geometry between source and listener muffles it")
+            });
+            property_row(ui, "Directivity", &mut changed, |ui| {
+                ui.add(egui::Slider::new(&mut self.directivity, 0.0..=1.0))
+                    .on_hover_text("0 omnidirectional, 0.5 cardioid, 1 dipole along the object's forward (-Z)")
+            });
+            if self.directivity > 0.0 {
+                property_row(ui, "Sharpness", &mut changed, |ui| {
+                    ui.add(egui::Slider::new(&mut self.directivity_sharpness, 0.0..=8.0))
+                });
+            }
+            property_row(ui, "Reflections", &mut changed, |ui| {
+                ui.checkbox(&mut self.reflections, "")
+                    .on_hover_text("Simulate this source's own reflections; off uses the listener reverb")
+            });
+            property_row(ui, "Pathing", &mut changed, |ui| {
+                ui.checkbox(&mut self.pathing, "")
+                    .on_hover_text("Sound bends around corners (needs a baked Audio Probe Volume)")
+            });
+            property_row(ui, "Via ambisonics", &mut changed, |ui| {
+                ui.checkbox(&mut self.spatialize_via_ambisonics, "")
+                    .on_hover_text("Encode to ambisonics and decode instead of direct HRTF")
+            });
         }
+        const ORDERS: [u8; 4] = [0, 1, 2, 3];
+        enum_row(ui, "Ambisonic clip", "citrus-audio-ambi", &mut self.ambisonic_order, &ORDERS, |o| match o {
+            0 => "No",
+            1 => "1st order",
+            2 => "2nd order",
+            _ => "3rd order",
+        }, &mut changed);
         changed
     }
 }
@@ -1300,3 +2020,96 @@ impl Inspect for Sync {
     }
 }
 impl Gizmo for Sync {}
+
+impl Inspect for AcousticMaterial {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        let before = self.preset;
+        enum_row(ui, "Preset", "citrus-acoustic-preset", &mut self.preset, &AcousticPreset::ALL, AcousticPreset::label, &mut changed);
+        if self.preset != before
+            && let Some((a, sc, t)) = before.values()
+            && self.preset == AcousticPreset::Custom
+        {
+            // Start a custom material from the preset it replaces.
+            (self.absorption, self.scattering, self.transmission) = (a, sc, t);
+        }
+        let custom = self.preset == AcousticPreset::Custom;
+        let (mut a, mut sc, mut t) = self.values();
+        ui.add_enabled_ui(custom, |ui| {
+            for (label, band) in [("Absorption", &mut a), ("Transmission", &mut t)] {
+                property_row(ui, label, &mut changed, |ui| {
+                    let mut any = false;
+                    let mut resp = ui.horizontal(|ui| {
+                        for v in band.iter_mut() {
+                            any |= ui.add(DragValue::new(v).speed(0.005).range(0.0..=1.0).max_decimals(3)).changed();
+                        }
+                    }).response;
+                    if any {
+                        resp.mark_changed();
+                    }
+                    resp
+                });
+            }
+            property_row(ui, "Scattering", &mut changed, |ui| ui.add(egui::Slider::new(&mut sc, 0.0..=1.0)));
+        });
+        if custom {
+            (self.absorption, self.scattering, self.transmission) = (a, sc, t);
+        }
+        ui.label(RichText::new("Bands: low / mid / high").small().weak());
+        property_row(ui, "Moving occluder", &mut changed, |ui| {
+            ui.checkbox(&mut self.dynamic, "")
+                .on_hover_text("Occlude and reflect even when not Static (follows the object)")
+        });
+        changed
+    }
+}
+impl Gizmo for AcousticMaterial {}
+
+impl Inspect for AudioProbeVolume {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        axis_row(ui, "Size", &mut self.size, &mut changed);
+        property_row(ui, "Spacing", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.spacing).speed(0.05).range(0.25..=50.0).suffix(" m"))
+        });
+        property_row(ui, "Height", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.height).speed(0.05).range(0.0..=20.0).suffix(" m"))
+        });
+        property_row(ui, "Bake reverb", &mut changed, |ui| ui.checkbox(&mut self.reverb, ""));
+        property_row(ui, "Bake pathing", &mut changed, |ui| ui.checkbox(&mut self.pathing, ""));
+        ui.label(RichText::new("Probes sit on floor geometry inside the box. Tools > Bake Audio.").small().weak());
+        changed
+    }
+}
+impl Gizmo for AudioProbeVolume {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        let half = glam::Vec3::from(self.size) * 0.5;
+        let mut g = vec![GizmoSpec::Box {
+            center: glam::Vec3::ZERO,
+            half_extents: half,
+            object_anchored: true,
+            blend: 0.0,
+            color: crate::theme::TYPE_GI,
+        }];
+        // Preview of the floor grid (the bake snaps probes to real floors).
+        let step = self.spacing.max(0.25);
+        let (nx, nz) = (((half.x * 2.0) / step).floor() as usize + 1, ((half.z * 2.0) / step).floor() as usize + 1);
+        if let Some(positions) = display_points(nx * nz, || {
+            let mut p = Vec::with_capacity(nx * nz);
+            for ix in 0..nx {
+                for iz in 0..nz {
+                    p.push(glam::Vec3::new(-half.x + ix as f32 * step, -half.y + self.height, -half.z + iz as f32 * step));
+                }
+            }
+            p
+        }) {
+            g.push(GizmoSpec::Points { positions, color: crate::theme::with_alpha(crate::theme::TYPE_GI, 0.7) });
+        }
+        g
+    }
+    fn apply_gizmo_edit(&mut self, edit: GizmoEdit) {
+        if let GizmoEdit::Box { half_extents, .. } = edit {
+            self.size = (half_extents * 2.0).to_array();
+        }
+    }
+}

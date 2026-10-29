@@ -1,0 +1,38 @@
+#version 450
+// GPU linear-blend skinning: base vertices + joint palette -> skinned vertices.
+// Vertex layout (floats): pos 0-2, normal 3-5, uv 6-7, color 8-11, tangent 12-15,
+// uv1 16-17, joints 18-21 (uint bits), weights 22-25.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Base { float base_v[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Out { float out_v[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Palette { mat4 palette[]; };
+layout(push_constant) uniform Push {
+    uint vertex_count;
+    uint stride;
+    uint joint_count;
+} pc;
+
+void main() {
+    uint v = gl_GlobalInvocationID.x;
+    if (v >= pc.vertex_count) return;
+    uint o = v * pc.stride;
+    for (uint i = 0; i < pc.stride; ++i) out_v[o + i] = base_v[o + i];
+
+    vec4 w = vec4(base_v[o + 22], base_v[o + 23], base_v[o + 24], base_v[o + 25]);
+    float sum = w.x + w.y + w.z + w.w;
+    if (sum <= 1e-5) return;
+    mat4 m = mat4(0.0);
+    for (uint k = 0; k < 4; ++k) {
+        uint j = floatBitsToUint(base_v[o + 18 + k]);
+        if (w[k] > 0.0 && j < pc.joint_count) m += w[k] * palette[j];
+    }
+    m /= sum;
+    vec3 p = (m * vec4(base_v[o], base_v[o + 1], base_v[o + 2], 1.0)).xyz;
+    mat3 r = mat3(m);
+    vec3 n = normalize(r * vec3(base_v[o + 3], base_v[o + 4], base_v[o + 5]));
+    vec3 t = r * vec3(base_v[o + 12], base_v[o + 13], base_v[o + 14]);
+    t = length(t) > 1e-6 ? normalize(t) : t;
+    out_v[o] = p.x; out_v[o + 1] = p.y; out_v[o + 2] = p.z;
+    out_v[o + 3] = n.x; out_v[o + 4] = n.y; out_v[o + 5] = n.z;
+    out_v[o + 12] = t.x; out_v[o + 13] = t.y; out_v[o + 14] = t.z;
+}

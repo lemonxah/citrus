@@ -12,6 +12,7 @@ use egui::{Event, Key, Modifiers, RichText, Ui};
 
 use crate::inspector::CodeDiagnostic;
 use crate::vim::{VimMode, VimOutcome, VimState};
+use egui_phosphor::regular as ph;
 
 /// One completion candidate from the language server.
 pub struct CompletionItem {
@@ -119,14 +120,14 @@ impl CodeEditor {
             let warns = diagnostics.len() - errors;
             if errors > 0 {
                 ui.label(
-                    RichText::new(format!("⛔ {errors}"))
+                    RichText::new(format!("{} {errors}", ph::X_CIRCLE))
                         .small()
                         .color(ui.visuals().error_fg_color),
                 );
             }
             if warns > 0 {
                 ui.label(
-                    RichText::new(format!("⚠ {warns}"))
+                    RichText::new(format!("{} {warns}", ph::WARNING))
                         .small()
                         .color(ui.visuals().warn_fg_color),
                 );

@@ -61,6 +61,9 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Audio playback + decoding (.wav/.flac/.mp3 via the default decoders).
 rodio = "0.19"
+# Steam Audio (HRTF, occlusion) via its safe wrapper; `auto-install` downloads
+# the official SDK (libphonon) at build time.
+audionimbus = { version = "0.16", default-features = false, features = ["auto-install"] }
 libc = "0.2"
 
 # internal crates

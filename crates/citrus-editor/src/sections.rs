@@ -9,6 +9,7 @@ use egui::collapsing_header::{CollapsingState, paint_default_icon};
 use egui::{ComboBox, DragValue, Frame, Label, RichText, Sense, Slider, Ui};
 
 use citrus_core::{AlphaModeModel, MatcapBlend, MaterialModel, ShaderPropKindUi, ShaderUiInfo};
+use egui_phosphor::regular as ph;
 
 /// Section metadata for search: (title, keywords).
 const SECTIONS: [(&str, &[&str]); 6] = [
@@ -75,7 +76,7 @@ fn texture_row(
             ui.horizontal(|ui| {
                 ui.label(label);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if current.is_some() && ui.small_button("✖").on_hover_text("Clear").clicked() {
+                    if current.is_some() && ui.small_button(ph::X).on_hover_text("Clear").clicked() {
                         *slot = None;
                         cleared = true;
                     }
@@ -158,7 +159,7 @@ pub fn material_editor_ui(
         let display = if known {
             m.shader.clone()
         } else {
-            format!("⚠ {}", m.shader)
+            format!("{} {}", ph::WARNING, m.shader)
         };
         ComboBox::from_id_salt("shader-select")
             .selected_text(display)
@@ -197,7 +198,7 @@ pub fn material_editor_ui(
     }
 
     ui.horizontal(|ui| {
-        ui.label("🔍");
+        ui.label(ph::MAGNIFYING_GLASS);
         ui.text_edit_singleline(search);
     });
     ui.separator();
@@ -225,7 +226,7 @@ pub fn material_editor_ui(
                     .on_hover_text(
                         "Per-material reflection strength (1 = default, 0 = matte). \
                          The reflection TECHNIQUE (Reflection Probes / SSR / Ray-traced) \
-                         is a global scene setting — Environment → Reflections — not a \
+                         is a global scene setting — Environment -> Reflections — not a \
                          per-material toggle (matching Unreal).",
                     )
             });
@@ -254,7 +255,7 @@ pub fn material_editor_ui(
             let has_rough = m.textures.roughness.is_some();
             ui.add_enabled_ui(has_rough, |ui| {
                 *changed |= ui
-                    .checkbox(&mut m.roughness_invert, "Invert (smoothness → roughness)")
+                    .checkbox(&mut m.roughness_invert, "Invert (smoothness -> roughness)")
                     .changed();
             });
             *changed |= texture_row(ui, "Metallic", 14, m.textures.slot_mut(14).unwrap(), tex_dropped);

@@ -141,7 +141,9 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   swapped in, looped by elapsed time. The Vulkan renderer build also runs on a worker thread
   (it's `Send`; the scene with non-`Send` `dyn Component`s can't be, so it stays on main) so
   the splash animates during the build; the status line updates across later plugin/scene
-  phases. Closed after the first editor frame.
+  phases. Closed after the first editor frame. Plugin `cargo build` runs on its own worker in
+  parallel with the renderer build (`PluginHost::build_all` / `load_built`); only the dylib
+  load + registration stays on main.
 - [done] **Background-task system** (`tasks.rs` + status bar): heavy CPU work runs on worker
   threads (parse off-thread, GPU-apply on main); the status bar gets a **Background Tasks**
   button with aggregate progress that expands to a per-task list with progress bars + **Cancel**,
@@ -370,6 +372,51 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   previously in FluxVoxel mode it lost every light and reflections of geometry came out black
   (only the skybox + self-emissive survived). This was the actual cause of the "black scene in
   reflections" reports.
+- [done] **Reflection capture descriptor-set fix (stale/dangling bindings)**: the dedicated
+  `refl_capture_set` was written once at renderer init and never maintained, so every later
+  rebind (lightmap array load after a bake, `swap_reflection_env`, probe-SH buffer replace,
+  shadow-atlas resize) left the capture pass sampling the 1×1 **black** placeholder lightmap or a
+  **destroyed** view. In a baked scene the captured cube showed only emissive surfaces (couch /
+  walls / floor black) — reflections looked like "not a reflection". All rebind sites now go
+  through `shared_binding_sets()` (frame sets + camera preview + capture set). Also fixed the
+  **Bake Reflections readback race**: the readback waited a fixed 2 frames but the capture takes
+  ~7 (one face/frame), so it persisted the PRE-capture cube to `.reflprobe`; it now waits for
+  `reflection_capture_in_flight()` to clear before the countdown starts.
+- [done] **Reflection-probe Box Offset (Unity parity)**: `ReflectionProbe.box_offset` decouples
+  the parallax box from the capture point — box center = object position + offset, capture stays
+  at the object position (Lagarde: "the box center doesn't need to match the cubemap center").
+  Author the probe OBJECT at eye height (so interior objects — a helmet on a stand — occupy the
+  cube directions eye-level reflection rays actually sample) and offset the box up so it still
+  hugs floor/ceiling/walls. Plumbed as `refl_box` through the frame UBO, SSR-resolve, and RT
+  uniforms + all three shaders' box projection; inspector "Box Offset" row; the box gizmo draws
+  at the offset. Also: flush-with-box surfaces (wall mirrors, the floor) now pass the inside-box
+  test (2% tolerance + backward-hit clamp), matching across standard/SSR/RT paths.
+- [done] **Planar reflections (true mirrors)**: add a **Planar Reflection** component to any flat
+  drawn surface (floor, wall-mirror quad); the scene re-renders each frame from the main camera
+  mirrored about the object's world +Y plane (Householder reflect × view), with a Lengyel
+  **oblique near-plane** projection ([0,1] depth) clipping everything behind the mirror, into a
+  half-res RT array (set 0, **binding 8**, up to `MAX_PLANAR`=4 planes/frame, recorded in the
+  frame cb right after shadows). Same negative-height viewport as the main pass, so the forward
+  shader composites by **screen UV** (`gl_FragCoord / screen`) — exact per-pixel parallax. The
+  per-draw layer + roughness-fade cutoff ride the free `emission.w` push lane (layer+1 integer,
+  cutoff fraction); `frame.refl_box.w` = plane count gates sampling so the capture/preview/VR/
+  planar passes themselves fall back to the probe (no recursion; VR eyes zero it explicitly).
+  The plane's own draws are excluded from its pass; mirrored winding handled by force-no-cull.
+  Smooth surfaces get the mirror, rougher ones fade back to the probe (`max_roughness` slider).
+- [done] **Reflection-probe "Lock box in world"**: with the toggle on, `box_offset`
+  auto-compensates for object movement each frame (`sync_draws_multi`), so dragging the probe
+  repositions ONLY the capture point inside the room-aligned box; the box gizmo stays put.
+  Align the box first, then lock it and place the capture point freely.
+- [done] **Realtime probes refresh continuously + Baked probes capture static-only**: a
+  Realtime-mode probe now re-requests its capture whenever the previous one lands (one face per
+  frame → fresh cube every ~7 frames, editor and game runtime both), so dynamic lighting (an
+  emissive orb's FluxVoxel glow, moved objects) tracks in reflections instead of freezing at the
+  scene-load snapshot; paused while a manual bake awaits readback. **Bake Reflections** now uses
+  `request_reflection_capture_static`: only `static_geometry` draws render into the cube and the
+  capture shader drops the realtime probe-GI term (`debug.z = -1`), so dynamic objects, their
+  emission, and their GI bounce never persist into the `.reflprobe` (Unity baked-probe
+  semantics). Known gap: dynamic casters can still shadow the static capture via the shared
+  shadow atlas.
 - [done] **Reflection-probe math reference + debug views**: `REFLECTION_PROBES_MATH.md` documents
   the full cubemap/parallax/split-sum math (Vulkan face table, `R=reflect(-V,N)`, Lagarde box
   projection, Karis split-sum, Vulkan capture-orientation pitfalls, a bug→symptom checklist) with
@@ -569,6 +616,46 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Menu bar (File/Edit/Tools/View/Help), New/Open/Save scene
 - [done] Viewport widget filter (per-billboard visibility + size)
 - [done] Billboard widgets: lights, cameras (frustum), probe volumes (3 bulbs), audio (speaker)
+- [partial] **Editor redesign** (docs/design/editor-ui-spec.md, how-to + conversion plan in
+  docs/design/editor-ui-guide.md): `citrus-editor` `theme.rs` (spec tokens, runtime accent with faint/soft
+  variants, egui + egui_dock styles), `icons.rs` (spec SVG icon set drawn from path data, logo), `widgets.rs`
+  (buttons, troughs/segments, icon toggles, badges, chips, type tile, axis vector fields, property rows,
+  section headers, info notes, dashed add button, search field); IBM Plex Sans/Mono embedded. Converted: menu
+  bar (logo, centred transport with Play/Pause/Step + game camera, breadcrumb, Ctrl K command palette,
+  settings gear), status bar, dock tabs (36 px, accent underline, tab icons), spec layout sizes, hierarchy
+  (type icons/colours, eye toggle, count badges, header + Add, filter by name/type, `Name (2)` duplicates),
+  inspector header (type tile, borderless name, type line, Active, Layer, Static), Transform (axis fields,
+  scrub, reset), component section headers + dashed Add component, themed row helpers (all inspectors),
+  viewport overlays (Select/Move/Rotate/Scale/Rect tools with Q-T keys, Pivot/Global/Snap trough, playing
+  chip, orientation widget with click-to-snap, stats pill, tab-strip shading/gizmos/stats/view controls,
+  play outline, UI canvas frame), Log (segmented filter with counts, coloured mono rows, warn tint, empty
+  state), Files (folder tree, toolbar with search / Size / Create, tiles), Environment + FluxBaker (themed rows,
+  eyebrows, In-this-scene card, primary Bake), UI Rect 3x3 anchor grid, accent presets in Project Settings >
+  Appearance. Remaining phases are tracked in the guide.
+- [done] **UI Editor tab** (`ui_editor.rs`, `ui_edit.rs`, `ui_templates.rs`): canvas preview at a
+  chosen resolution (or the 3D panel's pixels), click-select, drag-move, 8 resize handles keeping
+  the opposite edge fixed for any pivot/anchors, anchor markers, snap (off/1/5/10/20, Ctrl = 10),
+  arrow nudge, Add menu, 2D/3D switch, hidden pages laid out while selected (`reveal`). Same
+  handles in the viewport over the Game UI overlay (3D gizmo hidden for screen UI, click picks UI
+  first). Templates: Main Menu, Pause Menu, Settings, HUD, Overlay, Dialog, Loading Screen.
+- [done] Code-free UI behaviour: `UiButton.on_click` (`UiAction`: load scene, show / hide / toggle
+  by name, quit), `UiPauseMenu` (Escape toggles a panel, time scale + cursor), `UiSlider.audio_bus`,
+  new `UiProgressBar`. 2D and 3D canvases scale from the same reference size.
+- [done] Editor icons: glyphs missing from egui's fonts (the empty boxes on remove-component and
+  elsewhere) replaced with Phosphor icons; arrows in UI text are ASCII.
+- [done] Resize artifacts (ghost copies of geometry that never cleared): the reflection / fog
+  resolve read depth from the Flux screen-GI depth prepass, which is only drawn while screen GI
+  traces (never with the FluxVoxel backend, not while the camera is still). After a resize that
+  image was new and held leftover memory, so fog / SSR drew ghost shapes from it. Both the editor
+  viewport and the game path now resolve against the scene pass's own stored depth. Also: the
+  viewport target is recreated at frame start and tracks its own GI freshness, and screen GI /
+  SSR reject non-finite history.
+- [done] UI canvas billboard (window icon, own filter entry) and the "Game UI overlay" toggle
+  moved from the menu bar into the billboard widgets menu, under Orientation cross.
+- [done] Menu bar: hovering another top-level menu while one is open switches to it (egui's
+  `MenuBar` only opens on click; `top_menu` / `switch_hovered_menu`).
+- [done] Swapchain rebuilds whenever the window size differs from the size it was built for,
+  not only on a Resized event / OUT_OF_DATE.
 - [done] Global bottom status bar: project + object count, live rust-analyzer activity
   spinner, and compile/result messages ("Compiling components…", shader reloads). Global
   minimum text size (folder-explorer 13px) so nothing renders unreadably small
@@ -597,7 +684,19 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] `TypedComponent` trait (serde + Default + inspector UI + start/update/late_update),
   `ComponentRegistry`, serialize into `.scene`, participate in undo
 - [done] Built-ins: Camera, Light, LightProbeVolume, AudioSource, AudioListener,
-  BoxCollider, SphereCollider, MeshCollider, Spin, Bob
+  BoxCollider, SphereCollider, MeshCollider, RigidBody, CharacterController, Pawn,
+  SpawnPoint, Spin, Bob
+- [done] **Editor Play shows the game camera**: the viewport renders from the scene's active
+  camera while playing (Pawn possession etc.), with a "Game camera" toolbar toggle to fly the
+  editor camera instead. Previously Play always rendered from the editor fly camera.
+- [done] **Screen / pointer API**: `ctx.screen_size`, `pointer_position`, `screen_ray(px)`,
+  `pointer_ray()`, `world_to_screen(p)` (click-to-select / click-to-move with `raycast`).
+- [done] **Shared play loop** (`play.rs` `PlaySession`): the editor's Play mode and a
+  shipped game run the identical frame: `start` for newly active objects, fixed 60 Hz steps
+  (`fixed_update` + physics), collision/trigger callbacks, `update`, `late_update`, audio.
+  Components on inactive objects don't run. Stop-restore matches objects by id, removes
+  objects spawned during play, and reloads the scene from disk if play destroyed objects.
+  Headless tests in `play.rs` cover the loop end to end.
 - [done] Rust component plugins (`plugins/*` workspace crates, cargo-built + dylib-loaded,
   `citrus_register`, hot reload)
 - [done] Runtime scene switching: `ComponentCtx::load_scene(path)` lets gameplay
@@ -611,23 +710,108 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 
 ### Audio
 - [done] AudioSource (clip, play-on-start, loop, volume, pitch) + Spatial toggle (min/max
-  distance, linear/log rolloff); AudioListener; driven in Play mode
+  distance, linear/log rolloff); AudioListener; driven in editor Play mode **and in a
+  shipped game** (the runtime previously never opened an audio device)
+- [done] Gameplay audio: `ctx.play_sound` / `play_sound_at` one-shots,
+  `ctx.play_audio` / `stop_audio` for Audio Sources; sources on spawned objects start when
+  they activate and stop when their object is destroyed or disabled
+- [done] **Steam Audio spatialization** (`steam_audio.rs`, `audionimbus` 0.16 / Steam Audio 4.8.1, Apache-2.0;
+  cargo feature `steam-audio`, on for the editor): spatial Audio Sources and `play_sound_at` one-shots render
+  through Steam Audio — HRTF binaural (or stereo panning), distance attenuation (the source's rolloff),
+  air absorption, directivity (weighted dipole along the object's -Z). Each voice is a rodio Source rendering
+  1024-sample frames at 48 kHz; the game thread pushes per-voice parameters through a shared slot. The listener
+  is a full pose (Audio Listener transform, else the camera).
+- [done] **Occlusion + transmission**: a worker thread ray-traces active static-geometry meshes (one merged
+  Steam Audio static mesh, rebuilt only when the static set changes) against every occluding voice every
+  ~33 ms; results feed each voice's direct effect.
+- [done] libphonon is downloaded at build time (`auto-install`), copied next to the editor binary with an
+  `$ORIGIN` rpath (`crates/citrus/build.rs`), and shipped next to built games (`bundle.rs`). Feature off /
+  init failure: the old distance-volume path.
+- [done] **Steam Audio, full interface** (`steam_audio.rs`, audionimbus FFI to Valve's libphonon 4.8.1):
+  real-time reflections (Convolution / Parametric / Hybrid) per source or as listener-centric reverb,
+  decoded binaurally; acoustic materials (`Acoustic Material`: 11 Steam presets + custom) per static
+  triangle; moving occluders (instanced meshes, transforms updated per tick); probe baking (`Audio Probe
+  Volume`, Tools > Bake Audio -> `<scene>.audiobake`, loaded with the scene; baked reverb inside probe
+  volumes, real-time elsewhere); pathing from baked probes; ambisonic clips (order 1-3, listener
+  rotation + binaural / speaker decode) and ambisonic encode for sources; SOFA HRTFs (fallback to
+  default); output layouts Headphones / Stereo / Quad / 5.1 / 7.1 with virtual surround for beds; ray
+  tracer Default / Embree / Radeon Rays with fallback. Project Settings > Spatial Audio
+  (`SpatialAudioSettings` in project.citrus). Game builds ship STEAM_AUDIO_LICENSE.txt + third-party notices.
+- [todo] TrueAudioNext (AMD GPU convolution); per-volume bake flags (one probe batch today); shared
+  reverb bus (listener reverb is convolved per voice); reflections for one-shots. First build after
+  `cargo clean` needs a second build to place libphonon next to the editor.
 
 ### Physics / collision
 - [done] Collider components (Box / Sphere / Mesh-convex) with is_trigger + layer, spawnable
   standalone or as components, yellow editable viewport widgets
 - [partial] Physics simulation (rapier3d): a `RigidBody` component (Dynamic / Kinematic /
-  Fixed, mass, restitution, friction, gravity scale). On Play (editor) and scene load
-  (game) the engine builds a rapier world: colliders become cuboid/ball shapes (Mesh ->
-  AABB cuboid), `RigidBody` objects get that body kind, collider-only objects become fixed
-  (static) bodies, steps it under gravity each frame, and writes the simulated transforms
-  back. **Layer-collision matrix** (done): colliders carry rapier `InteractionGroups` from the
-  scene's `LayerSettings` (membership = the object's layer bit, filter = its collision-matrix
-  row), so the Unity-style "which layers collide" matrix is enforced by the solver. Still todo:
-  joints, queries (raycast/overlap), trigger events, CCD tuning, parented-body world↔local
-  conversion.
+  Fixed, mass, restitution, friction, gravity scale); collider-only objects are static.
+  **Layer-collision matrix** (done): colliders carry rapier `InteractionGroups` from the
+  scene's `LayerSettings`.
+- [done] Physics rework (`physics.rs`): bodies keyed by `ObjectId`, so spawn / destroy /
+  enable mid-play add and remove bodies; **fixed 60 Hz step** with interpolated write-back
+  (was variable `dt`); every collider component on an object becomes part of its body;
+  **Mesh Collider** uses exact triangles for static geometry and a convex hull for moving
+  bodies (was an AABB box); kinematic bodies follow their transform (previously overwritten
+  by the sim); gameplay writes to a dynamic body teleport it; parented bodies write back
+  in local space; CCD on dynamic bodies. Static-only worlds now step, so raycasts work in
+  them.
+- [done] **Collision + trigger callbacks**: `on_collision_enter/exit`,
+  `on_trigger_enter/exit(other)` delivered to every component on both objects.
+- [done] **Queries + forces** for gameplay: `ctx.raycast` / `raycast_filtered` (layer mask,
+  triggers, exclude), `ctx.overlap_sphere` (exact shape test), `ctx.velocity`,
+  `add_force` / `add_impulse` / `add_torque` / `set_velocity`.
+- [done] **Character Controller** component (rapier kinematic character controller):
+  capsule, step height, max slope, snap to ground; `ctx.move_character(delta)` +
+  `ctx.is_grounded()`. `Pawn` walks through it when present (was a flat floor).
+- [todo] Joints, contact points/impulses in collision callbacks, character pushing dynamic
+  bodies, shape casts, live collider edits during play.
 
 ---
+
+### Game-readiness push, part 3 (2026-10-29)
+- [done] **World-space UI**: `UI Canvas` render mode World renders into a texture (per-canvas
+  egui context, painted inside the frame command buffer) shown on an unlit quad; mouse ray +
+  right VR controller ray interaction; `Create -> UI -> World Canvas (VR)`.
+- [done] **UI text fields** (`UI Text Field`, `ctx.ui_submitted`), **keyboard / gamepad
+  navigation** (focus, submit, cancel, slider steps), `ctx.ui_cancel_pressed`.
+- [done] **Animation**: blend trees (1D / 2D, phase-synced), animation events
+  (`on_animation_event` + `AnimationEvent`), root motion (through the Character Controller),
+  **GPU skinning** (compute pass writing the vertex buffer; CPU fallback per Animator).
+- [done] **Physics joints** (`Joint`: fixed / hinge / ball / slider / spring / rope, limits,
+  motors, `ctx.set_joint_motor`).
+- [done] **Navigation**: height-aware navmesh baked from colliders (slope, step, clearance,
+  radius erosion), A* + string pulling, `Nav Agent` steering, `ctx.set_destination` /
+  `find_path` / `rebake_navmesh`, editor "Show navmesh" preview.
+- [done] **Particles**: `Particle Emitter` (CPU sim, camera-facing unlit quads, color / size
+  over life, bursts, gameplay control), previews in the editor.
+- [done] **Seamless loading / multi-scene**: shared background loader (`scene_loader.rs`) for
+  editor and runtime (models, textures, skybox, baked lighting, shaders all off the main
+  thread; skybox / bake applied over following frames). `ctx.preload_scene`, instant
+  `load_scene`, `load_scene_additive` / `unload_scene`, `keep_on_scene_change`, `Scene Portal`
+  component. Editor Open Scene is now asynchronous (was a main-thread stall), as are all
+  editor reloads (Stop-restore, reimport, lightmap-UV regen, focus reimport) and Play
+  refuses to start while one is pending. Scene switches never block: `SceneFlow::request_switch`
+  starts the load, the current scene keeps running, `poll_switch` installs it when ready
+  (kept objects serialized at install time). The runtime boot scene loads the same way
+  (no frames until it's in; a failed boot load still exits with the error).
+- [done] **Material texture means off the main thread**: `apply_material`'s albedo / emission /
+  mask / ORM averages (GI emitter scale, bake albedo/metalness) used to decode every texture
+  synchronously per material. Now `citrus_assets::texture_mean` caches them on disk
+  (`.citrus_texcache/<file>.<srgb>.mean`, invalidated by mtime/size) and the loader worker
+  warms the cache in parallel (`collect_material_mean_refs`).
+- [todo] Remaining main-thread work during loads: the scene install itself (pipelines,
+  materials; one step), post-load skybox upload / baked-lighting upload / reflection capture
+  (one frame each, with device waits), `set_material_textures`' `device_wait_idle`, the VR
+  renderer build (must be created against the OpenXR instance), the runtime `Renderer::new`,
+  and the in-editor plugin rebuild / Open Project cargo builds.
+- [done] June modules resolved: savegame (`ctx.save_value` / `write_save` / `load_save`),
+  localization (`ctx.tr`, `localization/*.loc`), audio mixer (saved in `project.citrus`, applied
+  to Audio Source buses, `ctx.set_bus_volume`), LOD Group (model swap by distance, hysteresis,
+  culling). Superseded modules (`events`, `anim_graph`, `asset_handle`, `streaming`,
+  `shader_graph`, `ui_canvas`, engine copies of `savegame` / `localization` / `lod`) deleted.
+- [todo] Visual shader graph (the old `shader_graph` codegen had no editor), additive-scene
+  baked lightmaps, joint breaking, contact points in collision callbacks.
 
 ## 2. Goals — to be implemented
 
@@ -719,7 +903,11 @@ component **its own local TRS + dt/time**. Goal: a real API surface that non-edi
 components use to read/affect the world, identical in editor Play mode and in a built
 game.
 
-- [todo] Expand `ComponentCtx` (or a new `World`/`Api` handle) with:
+Status 2026-10-29: the core gameplay surface landed (see docs/components.md for the
+reference): other-component access, events, spawn/destroy/enable, physics, audio, app
+control. Items below are marked individually.
+
+- [partial] Expand `ComponentCtx` (or a new `World`/`Api` handle) with:
   - [partial] **Self transform**: local read/write (done); `self_transform()` world read
     (done); `set_world_position(world)` world-space *write* (done; converts through the
     parent chain via `parent_world`, so a nested object lands at the right world spot);
@@ -737,16 +925,20 @@ game.
     create, serialized in `.scene`); `ObjectRef` field type + inspector **drag-drop
     target** (drag an object from the Scene tree onto the reference box; ✕ clears);
     resolve via `ctx.resolve`/`transform_of`/`position_of`/`index_of`/`self_id`;
-    `find_object(name)` kept as a convenience. tags, parent/children, spawn/despawn,
-    set-active still todo
+    `find_object(name)` kept as a convenience. **Spawn / destroy / set-active done**:
+    `ctx.spawn_prefab(path, pos, rot)` (loads `.prefab`, returns the new id immediately),
+    `ctx.instantiate(template, pos, rot)`, `ctx.destroy` / `destroy_self`,
+    `ctx.set_active` / `is_active`. Tags and reparenting still todo
   - [partial] **Transforms of other objects**: any object resolves to a `Transform`
     (translation/rotation/scale, + forward/right/up/matrix) via `object_transform` /
     `object_transform_named` / `object_position` / `object_matrix` (world snapshot);
     *set* still todo
-  - [todo] **Components**: get/add/remove a component on any object; typed access
-  - [todo] **Input**: read the binding-system action snapshot (2C)
-  - [todo] **Physics queries**: raycast, shape-cast, overlap; apply force/impulse; collision/
-    trigger enter/stay/exit callbacks delivered to components
+  - [partial] **Components**: typed read `ctx.get::<T>(obj)` / `get_self::<T>()` (siblings
+    included) and deferred write `ctx.modify::<T>(obj, |c| ...)` done; add/remove todo
+  - [done] **Input**: `ctx.input` action snapshot (2C)
+  - [done] **Physics queries**: raycast, overlap, velocity; force/impulse/torque/velocity;
+    collision + trigger enter/exit callbacks; character controller. Shape-cast and
+    "stay" callbacks todo
   - [todo] **Shaders / materials**: set material properties + shader params at runtime
     (the pragma-declared props), swap materials
   - [todo] **Colliders**: toggle, resize, change layer at runtime
@@ -757,17 +949,20 @@ game.
     in-game settings menu can change resolution/quality live
   - [done] **Networked messaging**: `ctx.broadcast(text)` / `ctx.send_to(peer, text)` +
     `ctx.messages()` (2G)
-  - [todo] **Audio**: play/stop one-shots, change volume/pitch, spatial params
+  - [partial] **Audio**: one-shots (`play_sound`, `play_sound_at`) and Audio Source
+    play/stop done; runtime volume/pitch/spatial changes todo
   - [todo] **Lights**: color/intensity/range/enabled at runtime
-  - [partial] **Time / scene**: time scale, pause, app quit [todo]; **load/switch scene
-    is done**: `ComponentCtx::load_scene(path)` (the first in-game-API slice) queues a
+  - [done] **Time / scene / app**: `ctx.set_time_scale` (0 pauses; `ctx.unscaled_dt` for
+    menus), `ctx.quit()`, `ctx.set_cursor_locked` (Escape releases in the editor, clicking
+    the viewport re-locks); **load/switch scene is done**: `ComponentCtx::load_scene(path)` (the first in-game-API slice) queues a
     `ComponentCommand` the engine applies after the update pass; switches levels / menu
     -> game during Play, continues playing in the new scene, and Stop returns to the
     pre-play scene.
-  - [todo] **Events / messaging**: component-to-component messages or a simple event bus
-- [todo] Stable, safe surface usable from plugin components (not just built-ins) without
-  reaching into editor internals; likely a `citrus-api` crate both editor and plugins
-  depend on
+  - [done] **Events / messaging**: typed broadcast bus, `ctx.emit(event)` /
+    `ctx.events::<T>()` (readable the following frame)
+- [done] Stable surface usable from plugin components without reaching into editor
+  internals: everything lives in `citrus-core` (`ComponentCtx`, `PhysicsQuery`,
+  `ComponentLookup`), implemented by the engine
 
 ### 2E. Editor-only vs gameplay components [todo]
 Two component kinds sharing one trait; the only difference is whether they run in a
@@ -782,7 +977,33 @@ shipped game.
 - [todo] Registry/inspector aware of the distinction (badge editor-only components); ensure
   serialization + the future game-build path strip editor-only behavior cleanly
 
-### 2F. Game UI system (runtime UI) [todo]
+### 2F. Game UI system (runtime UI) [partial]
+
+Status 2026-10-29: the retained screen-space system (A) is working in editor Play and in a
+built game (`game_ui.rs`, components in `citrus-core/src/ui.rs`, reference in
+docs/components.md "UI"):
+- [done] Components: `UI Canvas` (constant-pixel / scale-with-screen + match width/height,
+  sort order), `UI Rect` (anchors / pivot / position / size, y-down, anchor presets in the
+  Inspector), `UI Panel` (color, corner radius, border), `UI Image` (texture, tint,
+  preserve aspect), `UI Text` (size, color, X/Y alignment, wrap, custom .ttf/.otf font),
+  `UI Button` (state colors, interactable), `UI Toggle`, `UI Slider`.
+- [done] Layout: canvas roots, children laid out top-down in hierarchy order; an element
+  without a `UI Rect` fills its parent.
+- [done] Rendering: painted through the renderer's existing egui pass (no new Vulkan pass);
+  egui provides the font atlas, text layout and texture upload. The runtime owns an egui
+  context sized to the window; the editor paints into its own context over the viewport
+  rect, so the result matches.
+- [done] Interaction: press/release click semantics, hover/pressed states, slider drag,
+  toggle flip; `ctx.ui_clicked(button)`, `ctx.pointer_over_ui()`. Clicks on UI no longer
+  select objects behind them in editor Play.
+- [done] Editor: Create -> UI -> Canvas / Panel / Text / Button / Image / Toggle / Slider
+  (parents under the selected UI tree or the first canvas, making one if needed); live
+  layout preview over the viewport in edit mode ("UI" toolbar toggle) with the selected
+  element outlined.
+- [todo] World-space canvases + VR controller-ray interaction, 9-slice images, masks /
+  scroll views, text input fields, keyboard / gamepad navigation, visual rect handles in the
+  viewport. `ui_canvas.rs` (the earlier unwired layout solver) is superseded and can be
+  removed.
 In-game menus / inventory / HUD. **The developer picks the approach per project**;
 both are first-class and can coexist (e.g. egui debug overlay on top of a retained HUD):
 
@@ -1047,9 +1268,17 @@ Still to do:
   B) needs no feature flag; it's a matter of `run_game` handing the per-frame egui
   `Context` to a game callback (the egui render pass is already there). The default game
   links egui but never invokes it (`FrameInput.egui = None`).
-- [todo] **Shader precompilation**: shaders compile via `glslc` at runtime today; the
-  bundler compiles every material/custom shader to **SPIR-V** ahead of time and ships the
-  `.spv`, so the player's machine needs no `shaderc`/`glslc`.
+- [done] **Shader precompilation**: Build Game compiles every custom `.frag` in the copied
+  assets to a `.frag.spv` sidecar; `load_shader_file` uses the sidecar when it isn't older
+  than the source, so the player's machine needs no `glslc`. Built-in shaders were already
+  embedded at compile time.
+- [done] **Prefabs in the editor**: drag a `.prefab` from Files onto the viewport to place
+  it under the cursor (surface hit, else ground plane), or select it and press "Place in
+  scene". Runtime spawning is `ctx.spawn_prefab`.
+- [done] **Copy every content folder**: Build Game copied only `scenes/materials/shaders/
+  textures`, so models, audio and prefabs were missing from a built game. It now copies
+  every top-level project folder except `build/`, `target/`, `src/`, `plugins/` and hidden
+  ones; New Project also scaffolds `models/`, `audio/`, `prefabs/`.
 - [todo] **Asset collection**: walk the scenes reachable from the boot scene (and their
   materials → textures → meshes → audio → bake sidecars `.lightmap`/`.lightdata`) and copy
   only what's referenced into `build/assets/`. Path resolution switches from
@@ -1166,8 +1395,16 @@ per-feature "what's done / what's left" table.
 - [done] **Audio mixer** (`audio_mixer.rs`, T0 #14) — bus graph (master/music/sfx/voice/ui),
   per-bus volume + mute, `effective_gain` chains up the tree, cycle guard. **Tools → Audio Mixer.**
 - [wip] **Animation state machine** (`anim_graph.rs`, T1 #21) — states, param/trigger
-  transitions, cross-fade blend, 1D blend trees, `current_pose` clip weights. Feeding weights
-  into skinning + a graph editor remain.
+  transitions, cross-fade blend, 1D blend trees, `current_pose` clip weights. Still unwired;
+  the working path is the `Animator` component below.
+- [done] **Animator component** (2026-10-29): plays a named clip per object with
+  cross-fades (`ctx.play_animation(target, clip, fade)`, `stop_animation`, `Animator::play`,
+  `finished()`), speed, loop, play-on-start; Inspector clip dropdown from the model's clips.
+  Each object with an Animator gets its **own skinned vertex buffers**, so spawned copies of a
+  model animate independently (previously every instance shared one pose). Clips are tied to
+  the skeleton they came from. Objects without an Animator keep the old shared path (first
+  clip of their own skeleton, VR humanoid IK). Still todo: blend trees / state graph on top,
+  animation events, root motion, GPU skinning.
 - [done] **Navmesh + pathfinding** (`navmesh.rs`, T1 #24) — walkability grid, A* (8-connected,
   no corner-cutting), line-of-sight string-pull to natural waypoints. Scene-bake + agent
   component remain.

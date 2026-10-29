@@ -5,14 +5,19 @@
 
 use std::collections::HashSet;
 
-use egui::{Align2, FontId, RichText, ScrollArea, Sense, Ui};
+use egui::{FontId, RichText, ScrollArea, Sense, Ui};
+use egui_phosphor::regular as ph;
+
+use crate::icons::{self, Icon};
+use crate::theme::{self, ObjectKind};
+use crate::widgets;
 
 pub struct SceneObjectRow {
     pub name: String,
     pub parent: Option<usize>,
-    /// Small glyph for the object kind (mesh/empty/camera).
-    pub icon: &'static str,
-    /// Disabled objects render dimmed (gray) in the tree.
+    /// Type family: icon + colour.
+    pub kind: ObjectKind,
+    /// The object's own active flag (the eye toggles it).
     pub enabled: bool,
 }
 
@@ -34,6 +39,51 @@ pub enum SpawnKind {
     Sphere,
     Capsule,
     Plane,
+    Ui(UiPreset),
+}
+
+/// Ready-made UI objects for the "UI" create menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiPreset {
+    Canvas,
+    WorldCanvas,
+    Panel,
+    Text,
+    Button,
+    Image,
+    Toggle,
+    Slider,
+    TextField,
+    ProgressBar,
+}
+
+impl UiPreset {
+    pub const ALL: [UiPreset; 10] = [
+        Self::Canvas,
+        Self::WorldCanvas,
+        Self::Panel,
+        Self::Text,
+        Self::Button,
+        Self::Image,
+        Self::Toggle,
+        Self::Slider,
+        Self::TextField,
+        Self::ProgressBar,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Canvas => "Canvas",
+            Self::WorldCanvas => "World Canvas (VR)",
+            Self::Panel => "Panel",
+            Self::Text => "Text",
+            Self::Button => "Button",
+            Self::Image => "Image",
+            Self::Toggle => "Toggle",
+            Self::Slider => "Slider",
+            Self::TextField => "Text Field",
+            Self::ProgressBar => "Progress Bar",
+        }
+    }
 }
 
 impl SpawnKind {
@@ -53,6 +103,7 @@ impl SpawnKind {
             Self::Sphere => "Sphere",
             Self::Capsule => "Capsule",
             Self::Plane => "Plane",
+            Self::Ui(p) => p.label(),
         }
     }
 }
@@ -73,6 +124,8 @@ pub struct ScenePanelResponse {
     pub rename: Option<(usize, String)>,
     /// A model file dropped onto the tree (import it into the scene).
     pub import_model: Option<std::path::PathBuf>,
+    /// Eye clicked: flip this object's active flag.
+    pub toggle_enabled: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,6 +201,14 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             }
         }
     });
+    ui.menu_button("UI", |ui| {
+        for preset in UiPreset::ALL {
+            if ui.button(preset.label()).clicked() {
+                response.spawn = Some(SpawnKind::Ui(preset));
+                ui.close();
+            }
+        }
+    });
     if ui.button("Audio Source").clicked() {
         response.spawn = Some(SpawnKind::AudioSource);
         ui.close();
@@ -168,7 +229,6 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
 pub struct ScenePanel {
     filter: String,
     collapsed: HashSet<usize>,
-    root_collapsed: bool,
     /// Inline rename in progress: (object index, edit buffer, focus-on-first-frame).
     renaming: Option<(usize, String, bool)>,
     /// Full multi-selection (object indices). Synced from the engine's canonical
@@ -212,11 +272,34 @@ impl ScenePanel {
         selected: &mut Option<usize>,
     ) -> ScenePanelResponse {
         let mut response = ScenePanelResponse::default();
-        ui.horizontal(|ui| {
-            ui.label("🔍");
-            ui.text_edit_singleline(&mut self.filter);
+        // Header strip: title + count, Add menu, kebab.
+        egui::Frame::new().inner_margin(egui::Margin::symmetric(theme::PAD as i8, 0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_height(theme::H_TAB_STRIP);
+                ui.label(RichText::new("Scene").font(theme::semibold(theme::SIZE_BODY)).color(theme::TEXT_STRONG));
+                widgets::badge(ui, &rows.len().to_string());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let kebab = widgets::icon_button(ui, Icon::Kebab, "More", false);
+                    egui::Popup::menu(&kebab).show(|ui| {
+                        if ui.button("Expand all").clicked() {
+                            self.collapsed.clear();
+                            ui.close();
+                        }
+                        if ui.button("Collapse all").clicked() {
+                            self.collapsed = (0..rows.len()).collect();
+                            ui.close();
+                        }
+                    });
+                    let add = widgets::secondary_button_sized(ui, Some(Icon::Plus), "Add", theme::H_BUTTON_SMALL);
+                    egui::Popup::menu(&add).show(|ui| spawn_menu(ui, &mut response));
+                });
+            });
         });
-        ui.separator();
+        widgets::divider(ui);
+        egui::Frame::new().inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+            let w = ui.available_width();
+            widgets::search_field(ui, &mut self.filter, "Filter by name or type", w);
+        });
         let filter = self.filter.to_lowercase();
 
         // F2 starts an inline rename of the selected object, unless a text
@@ -249,66 +332,26 @@ impl ScenePanel {
                 // reliable than a trailing rect, which can be mis-sized.
                 let deselect_bg =
                     ui.interact(ui.max_rect(), ui.id().with("tree-deselect-bg"), Sense::click());
-                // Root "Scene" node: everything lives under it; dropping a
-                // row here unparents it, clicking toggles the whole tree.
-                let root = self.row_widget(
-                    ui,
-                    "",
-                    "Scene",
-                    0,
-                    false,
-                    !roots.is_empty(),
-                    self.root_collapsed,
-                    true,
-                    true,
-                    &[],
-                );
-                if root.clicked() {
-                    self.root_collapsed = !self.root_collapsed;
-                    // Alt: cascade the whole scene open/closed.
-                    if ui.input(|i| i.modifiers.alt) {
-                        let collapse = self.root_collapsed;
-                        for &r in &roots {
-                            self.cascade(&children, r, collapse);
-                        }
-                    }
-                }
-                if let Some(payload) = root.dnd_release_payload::<usize>() {
-                    response.reparent.push((*payload, None));
-                }
-                root.context_menu(|ui| spawn_menu(ui, &mut response));
-
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let hidden = hidden_flags(rows);
                 if filter.is_empty() {
-                    if !self.root_collapsed {
-                        let mut ancestry: Vec<bool> = Vec::new();
-                        let last = roots.len().saturating_sub(1);
-                        for (n, &index) in roots.iter().enumerate() {
-                            self.tree_row(
-                                ui,
-                                rows,
-                                &children,
-                                index,
-                                1,
-                                n == last,
-                                &mut ancestry,
-                                selected,
-                                &mut response,
-                            );
-                        }
+                    for &index in &roots {
+                        self.tree_row(ui, rows, &children, &hidden, index, 0, selected, &mut response);
                     }
                 } else {
-                    // Filtered: flat list (no tree lines).
+                    // Filtered: flat list, matching name or type.
                     for (i, row) in rows.iter().enumerate() {
-                        if row.name.to_lowercase().contains(&filter) {
-                            self.object_row(
-                                ui, rows, &children, false, i, 1, true, &[], selected,
-                                &mut response,
-                            );
+                        if row.name.to_lowercase().contains(&filter) || row.kind.label().to_lowercase().contains(&filter) {
+                            self.object_row(ui, rows, &children, &hidden, false, i, 0, selected, &mut response);
                         }
                     }
                 }
                 if rows.is_empty() {
-                    ui.label(RichText::new("    Scene is empty").weak());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(theme::PAD);
+                        ui.label(RichText::new("Scene is empty").color(theme::TEXT_DIM));
+                    });
                 }
                 // Remaining empty space: drop target to unparent and
                 // right-click target for the Add Object menu.
@@ -362,10 +405,9 @@ impl ScenePanel {
         ui: &mut Ui,
         rows: &[SceneObjectRow],
         children: &[Vec<usize>],
+        hidden: &[bool],
         index: usize,
         depth: usize,
-        is_last: bool,
-        ancestry: &mut Vec<bool>,
         selected: &mut Option<usize>,
         response: &mut ScenePanelResponse,
     ) {
@@ -373,112 +415,98 @@ impl ScenePanel {
             return;
         }
         let has_children = !children[index].is_empty();
-        self.object_row(
-            ui, rows, children, has_children, index, depth, is_last, ancestry, selected,
-            response,
-        );
+        self.object_row(ui, rows, children, hidden, has_children, index, depth, selected, response);
         if has_children && !self.collapsed.contains(&index) {
-            // This node's column continues for its children iff it has a
-            // following sibling.
-            ancestry.push(!is_last);
-            let last = children[index].len() - 1;
-            for (n, &child) in children[index].iter().enumerate() {
-                self.tree_row(
-                    ui,
-                    rows,
-                    children,
-                    child,
-                    depth + 1,
-                    n == last,
-                    ancestry,
-                    selected,
-                    response,
-                );
+            for &child in &children[index] {
+                self.tree_row(ui, rows, children, hidden, child, depth + 1, selected, response);
             }
-            ancestry.pop();
         }
     }
 
-    /// One full-width row: tree connector lines + hover highlight + collapse
-    /// arrow + icon + name, left-aligned at its depth. Returns the response.
+    /// One 26 px row: caret (space kept on leaves), type icon, name, child
+    /// count when collapsed, and the eye toggle on the right. Returns the row
+    /// response and whether the eye was clicked.
     #[allow(clippy::too_many_arguments)]
     fn row_widget(
         &mut self,
         ui: &mut Ui,
-        icon: &str,
-        name: &str,
+        row_data: &SceneObjectRow,
         depth: usize,
         is_selected: bool,
-        has_children: bool,
+        child_count: usize,
         collapsed: bool,
-        enabled: bool,
-        is_last: bool,
-        ancestry: &[bool],
-    ) -> egui::Response {
-        let (rect, row) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 20.0),
-            Sense::click_and_drag(),
-        );
-        let indent = 4.0 + depth as f32 * 14.0;
+        hidden: bool,
+    ) -> (egui::Response, bool) {
+        let (rect, row) = ui.allocate_exact_size(egui::vec2(ui.available_width(), theme::H_ROW), Sense::click_and_drag());
+        let inner = rect.shrink2(egui::vec2(6.0, 1.0));
         if is_selected {
-            ui.painter()
-                .rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+            ui.painter().rect_filled(inner, theme::R_ROW, theme::accent_faint());
         } else if row.hovered() {
-            ui.painter()
-                .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            ui.painter().rect_filled(inner, theme::R_ROW, theme::with_alpha(theme::BG_BUTTON, 0.6));
         }
-        // Tree connector lines: faint verticals down each ancestor column that
-        // still has rows below, plus an ├/└ connector into this row.
-        if depth >= 1 {
-            let stroke = egui::Stroke::new(1.0, ui.visuals().weak_text_color().gamma_multiply(0.5));
-            let gx = |d: usize| rect.left() + 4.0 + d as f32 * 14.0 + 6.0;
-            let cy = rect.center().y;
-            for (level, &cont) in ancestry.iter().enumerate() {
-                if cont {
-                    ui.painter()
-                        .vline(gx(level), rect.y_range(), stroke);
-                }
-            }
-            let px = gx(depth - 1);
-            ui.painter()
-                .line_segment([egui::pos2(px, rect.top()), egui::pos2(px, cy)], stroke);
-            ui.painter()
-                .line_segment([egui::pos2(px, cy), egui::pos2(gx(depth) - 2.0, cy)], stroke);
-            if !is_last {
-                ui.painter()
-                    .line_segment([egui::pos2(px, cy), egui::pos2(px, rect.bottom())], stroke);
-            }
-        }
-        if has_children {
-            ui.painter().text(
-                egui::pos2(rect.left() + indent + 6.0, rect.center().y),
-                Align2::CENTER_CENTER,
-                if collapsed { "⏵" } else { "⏷" },
-                FontId::proportional(10.0),
-                ui.visuals().weak_text_color(),
+        let x0 = inner.left() + 4.0 + depth as f32 * theme::INDENT;
+        let cy = rect.center().y;
+        if child_count > 0 {
+            crate::widgets::paint_caret(
+                ui.painter(),
+                egui::Rect::from_center_size(egui::pos2(x0 + 8.0, cy), egui::vec2(12.0, 12.0)),
+                !collapsed,
+                theme::TEXT_DIM,
             );
         }
-        let color = if is_selected {
-            ui.visuals().selection.stroke.color
-        } else if enabled {
-            // Enabled objects read as plain white; disabled ones dim to gray.
-            egui::Color32::from_gray(235)
-        } else {
-            egui::Color32::from_gray(120)
-        };
-        let label = if icon.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{icon} {name}")
-        };
-        ui.painter().text(
-            egui::pos2(rect.left() + indent + 14.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(13.0),
-            color,
+        let icon_color = if hidden { theme::with_alpha(row_data.kind.color(), 0.45) } else { row_data.kind.color() };
+        icons::paint(
+            ui.painter(),
+            egui::Rect::from_center_size(egui::pos2(x0 + 16.0 + 9.0, cy), egui::vec2(14.0, 14.0)),
+            row_data.kind.icon(),
+            icon_color,
         );
-        row
+        // Eye toggle (22 px) on the right.
+        let eye_rect = egui::Rect::from_center_size(egui::pos2(inner.right() - 13.0, cy), egui::vec2(22.0, 22.0));
+        let eye = ui.interact(eye_rect, row.id.with("eye"), Sense::click());
+        let eye_color = if hidden {
+            theme::TEXT_SECONDARY
+        } else if eye.hovered() {
+            theme::TEXT_STRONG
+        } else if is_selected {
+            theme::TEXT_MUTED
+        } else {
+            theme::EYE_QUIET
+        };
+        icons::paint(
+            ui.painter(),
+            egui::Rect::from_center_size(eye_rect.center(), egui::vec2(14.0, 14.0)),
+            if row_data.enabled && !hidden { Icon::Eye } else { Icon::EyeOff },
+            eye_color,
+        );
+        let eye_clicked = eye.on_hover_text(if row_data.enabled { format!("Hide {}", row_data.name) } else { format!("Show {}", row_data.name) }).clicked();
+
+        let name_color = if hidden {
+            theme::TEXT_HIDDEN
+        } else if is_selected {
+            theme::TEXT_SELECTED
+        } else {
+            theme::TEXT_SECONDARY
+        };
+        let name_left = x0 + 16.0 + 22.0;
+        let mut name_right = eye_rect.left() - 6.0;
+        if collapsed && child_count > 0 {
+            let text = child_count.to_string();
+            let galley = ui.painter().layout_no_wrap(text, theme::mono(theme::SIZE_TINY), theme::TEXT_MUTED);
+            let badge = egui::Rect::from_center_size(
+                egui::pos2(name_right - galley.size().x * 0.5 - 5.0, cy),
+                egui::vec2(galley.size().x + 10.0, 16.0),
+            );
+            ui.painter().rect_filled(badge, theme::R_FIELD, theme::LINE_PANEL);
+            ui.painter().galley(badge.center() - galley.size() * 0.5, galley, theme::TEXT_MUTED);
+            name_right = badge.left() - 6.0;
+        }
+        let font = FontId::proportional(theme::SIZE_BODY);
+        let mut job = egui::text::LayoutJob::simple_singleline(row_data.name.clone(), font, name_color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width((name_right - name_left).max(0.0));
+        let galley = ui.painter().layout_job(job);
+        ui.painter().galley(egui::pos2(name_left, cy - galley.size().y * 0.5), galley, name_color);
+        (row, eye_clicked)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -487,11 +515,10 @@ impl ScenePanel {
         ui: &mut Ui,
         rows: &[SceneObjectRow],
         children: &[Vec<usize>],
+        hidden: &[bool],
         has_children: bool,
         index: usize,
         depth: usize,
-        is_last: bool,
-        ancestry: &[bool],
         selected: &mut Option<usize>,
         response: &mut ScenePanelResponse,
     ) {
@@ -502,7 +529,7 @@ impl ScenePanel {
 
         // Inline rename editor in place of the normal row.
         if matches!(&self.renaming, Some((i, _, _)) if *i == index) {
-            let indent = 4.0 + depth as f32 * 14.0;
+            let indent = 10.0 + depth as f32 * theme::INDENT + 38.0;
             let mut commit = false;
             let mut cancel = false;
             ui.horizontal(|ui| {
@@ -535,19 +562,20 @@ impl ScenePanel {
             return;
         }
 
-        let row = self.row_widget(
+        let (row, eye_clicked) = self.row_widget(
             ui,
-            row_data.icon,
-            &row_data.name,
+            row_data,
             depth,
             is_selected,
-            has_children,
+            if has_children { children[index].len() } else { 0 },
             collapsed,
-            row_data.enabled,
-            is_last,
-            ancestry,
+            hidden[index],
         );
-        let indent = 4.0 + depth as f32 * 14.0;
+        if eye_clicked {
+            response.toggle_enabled = Some(index);
+            return;
+        }
+        let indent = 10.0 + depth as f32 * theme::INDENT;
 
         row.dnd_set_drag_payload(index);
         // Also publish the dragged index into egui memory as a plain usize, so
@@ -570,25 +598,16 @@ impl ScenePanel {
                 let pad = egui::vec2(8.0, 4.0);
                 let origin = pos + egui::vec2(14.0, 6.0);
                 let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
-                painter.rect_filled(
-                    rect,
-                    4.0,
-                    egui::Color32::from_rgba_unmultiplied(60, 46, 110, 235),
-                );
-                painter.rect_stroke(
-                    rect,
-                    4.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 120, 220)),
-                    egui::StrokeKind::Inside,
-                );
-                painter.galley(origin + pad, galley, egui::Color32::WHITE);
+                painter.rect_filled(rect, theme::R_ROW, theme::BG_SEGMENT_ACTIVE);
+                painter.rect_stroke(rect, theme::R_ROW, egui::Stroke::new(1.0_f32, theme::accent()), egui::StrokeKind::Inside);
+                painter.galley(origin + pad, galley, theme::TEXT_STRONG);
             }
         }
         if row.clicked() {
             let on_arrow = has_children
                 && row
                     .interact_pointer_pos()
-                    .is_some_and(|p| p.x < row.rect.left() + indent + 12.0);
+                    .is_some_and(|p| p.x < row.rect.left() + indent + 16.0);
             if on_arrow {
                 let collapse = !self.collapsed.contains(&index);
                 // Alt: cascade the whole subtree; plain click toggles one node.
@@ -661,7 +680,7 @@ impl ScenePanel {
             .dnd_hover_payload::<usize>()
             .is_some_and(|p| *p != index)
         {
-            let color = ui.visuals().selection.stroke.color;
+            let color = theme::accent();
             let painter = ui.painter();
             match cursor_y.map_or(DropZone::Onto, |y| drop_zone(row.rect, y)) {
                 DropZone::Onto => {
@@ -694,7 +713,7 @@ impl ScenePanel {
                 ui.close();
             }
             if ui
-                .button("🗑 Delete")
+                .button(format!("{} Delete", ph::TRASH))
                 .on_hover_text("Delete this object and its children")
                 .clicked()
             {
@@ -705,4 +724,25 @@ impl ScenePanel {
             spawn_menu(ui, response);
         });
     }
+}
+
+/// Rows hidden by their own flag or any hidden ancestor.
+fn hidden_flags(rows: &[SceneObjectRow]) -> Vec<bool> {
+    (0..rows.len())
+        .map(|i| {
+            let mut k = Some(i);
+            let mut depth = 0;
+            while let Some(j) = k.filter(|&j| j < rows.len()) {
+                if !rows[j].enabled {
+                    return true;
+                }
+                depth += 1;
+                if depth > 64 {
+                    break;
+                }
+                k = rows[j].parent;
+            }
+            false
+        })
+        .collect()
 }

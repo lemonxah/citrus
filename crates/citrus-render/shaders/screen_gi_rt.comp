@@ -321,21 +321,29 @@ void main() {
     float cam_dist = length(p - pc.cam.xyz);
     float alpha = clamp(pc.march.z, 0.02, 1.0);
     vec4 pclip = pc.prev_view_proj * vec4(p, 1.0);
-    if (pclip.w > 0.0001) {
+    // alpha 1 = no usable history (first frame / resized targets): skip the
+    // blend entirely, since NaN history survives even a weight of 0.
+    if (alpha < 0.999 && pclip.w > 0.0001) {
         vec2 pn = pclip.xy / pclip.w;
         if (pc.misc.w != 0u) pn.y = -pn.y;
         vec2 puv = pn * 0.5 + 0.5;
         if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
             vec4 h = texture(u_history, puv);
             float prev_dist = length(p - pc.prev_cam.xyz);
-            if (abs(h.a - prev_dist) < max(prev_dist * 0.08, 0.1)) {
+            bool h_ok = !any(isnan(h)) && !any(isinf(h));
+            if (h_ok && abs(h.a - prev_dist) < max(prev_dist * 0.08, 0.1)) {
                 irr = mix(h.rgb, irr, alpha);
                 ivec2 pp = clamp(ivec2(puv * vec2(sw, sh)), ivec2(0), ivec2(sw, sh) - 1);
                 uint pj = uint(pp.y) * sw + uint(pp.x);
-                sh0 = mix(sh_prev[pj].c[0].rgb, sh0, alpha);
-                sh1 = mix(sh_prev[pj].c[1].rgb, sh1, alpha);
-                sh2 = mix(sh_prev[pj].c[2].rgb, sh2, alpha);
-                sh3 = mix(sh_prev[pj].c[3].rgb, sh3, alpha);
+                vec3 p0 = sh_prev[pj].c[0].rgb, p1 = sh_prev[pj].c[1].rgb;
+                vec3 p2 = sh_prev[pj].c[2].rgb, p3 = sh_prev[pj].c[3].rgb;
+                vec3 psum = p0 + p1 + p2 + p3;
+                if (!any(isnan(psum)) && !any(isinf(psum))) {
+                    sh0 = mix(p0, sh0, alpha);
+                    sh1 = mix(p1, sh1, alpha);
+                    sh2 = mix(p2, sh2, alpha);
+                    sh3 = mix(p3, sh3, alpha);
+                }
             }
         }
     }

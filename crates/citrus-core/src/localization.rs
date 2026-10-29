@@ -44,7 +44,7 @@ impl Localization {
     }
 
     /// Load a `.loc` file from disk.
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let s = std::fs::read_to_string(path)?;
         Ok(Self::from_ron(&s)?)
     }

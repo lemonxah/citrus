@@ -17,6 +17,43 @@ use glam::{Mat4, Quat, Vec3};
 
 use crate::shaders::ShaderLibrary;
 
+/// Per-pass inputs for [`LoadedScene::run_pass`].
+pub struct PassEnv<'a> {
+    pub dt: f32,
+    pub unscaled_dt: f32,
+    pub time: f32,
+    pub time_scale: f32,
+    pub input: &'a citrus_core::InputState,
+    pub net: &'a citrus_core::NetView,
+    pub physics: Option<&'a dyn citrus_core::PhysicsQuery>,
+    pub nav: Option<&'a dyn citrus_core::NavQuery>,
+    pub events: &'a [citrus_core::AnyBox],
+    pub screen: &'a citrus_core::ScreenInfo,
+    pub save: &'a citrus_core::SaveGame,
+    pub strings: &'a citrus_core::Localization,
+}
+
+/// Component lookup for one pass step: every object's components, except the
+/// running object, whose components are split around the one executing.
+struct PassLookup<'a> {
+    objects: &'a [SceneObject],
+    self_index: usize,
+    before: &'a [Box<dyn Component>],
+    after: &'a [Box<dyn Component>],
+}
+
+impl citrus_core::ComponentLookup for PassLookup<'_> {
+    fn component(&self, object: usize, type_id: std::any::TypeId) -> Option<&dyn Component> {
+        let matches = |c: &&Box<dyn Component>| c.as_any().type_id() == type_id;
+        let found = if object == self.self_index {
+            self.before.iter().chain(self.after.iter()).find(matches)
+        } else {
+            self.objects.get(object)?.components.iter().find(matches)
+        };
+        found.map(|c| c.as_ref())
+    }
+}
+
 /// Render data for mesh objects; empties and cameras have none.
 #[derive(Clone, Copy)]
 pub struct RenderInfo {
@@ -151,6 +188,14 @@ struct SkinnedMesh {
     skeleton: usize,
 }
 
+/// An object's own skinned vertex buffers, driven by its `Animator`.
+struct AnimInstance {
+    /// (source skinned mesh index, this object's GPU copy).
+    slots: Vec<(usize, MeshHandle)>,
+    /// Skinned by the GPU compute pass (else CPU-written).
+    gpu: bool,
+}
+
 pub struct LoadedScene {
     /// Rebuilt every frame from renderable objects.
     pub draws: Vec<DrawCmd>,
@@ -161,6 +206,10 @@ pub struct LoadedScene {
     skeletons: Vec<citrus_assets::Skeleton>,
     animations: Vec<citrus_assets::AnimationClip>,
     skinned_meshes: Vec<SkinnedMesh>,
+    /// Skeleton index each entry of `animations` animates (parallel).
+    clip_skeleton: Vec<usize>,
+    /// Per-object skinned copies for objects with an `Animator`.
+    anim_instances: HashMap<ObjectId, AnimInstance>,
     /// Global animation playback clock (seconds), advanced each frame.
     anim_time: f32,
     /// Full-body IK targets for humanoid avatars (from VR trackers, gameplay,
@@ -195,13 +244,13 @@ pub struct LoadedScene {
     /// model path -> base index of its meshes in the scene arrays
     /// (a model's primitives are appended contiguously).
     model_mesh_base: HashMap<PathBuf, usize>,
+    /// Imported model path -> (first mesh index, template material per model
+    /// mesh). Lets scene entries and runtime prefab spawns reuse uploaded models.
+    model_templates: HashMap<String, (usize, Vec<usize>)>,
+    /// Builtin test-scene meshes: (first mesh index, template materials).
+    builtin_template: Option<(usize, Vec<usize>)>,
     material_file_cache: HashMap<PathBuf, usize>,
     texture_file_cache: HashMap<(PathBuf, bool), TextureHandle>,
-    /// Mean LINEAR RGB per emission-map file, used to scale GI emitters so a
-    /// mostly-black map doesn't flood the scene. Computed once per file.
-    emission_mean_cache: HashMap<PathBuf, [f32; 3]>,
-    /// Mean `.r` coverage per emission-mask file (same purpose, scalar).
-    emission_mask_mean_cache: HashMap<PathBuf, f32>,
     /// Project-relative equirectangular skybox image (None = procedural sky).
     pub skybox: Option<String>,
     /// World lighting / environment (ambient + sun + skybox toggle).
@@ -215,9 +264,22 @@ pub struct LoadedScene {
     /// Baked lighting result (None until a bake runs). Re-uploaded to the
     /// renderer for runtime sampling.
     pub baked: Option<BakedData>,
+    /// Steam Audio bake (serialized probe batch, `<scene>.audiobake`).
+    pub audio_bake: Option<std::sync::Arc<Vec<u8>>>,
     /// Camera a possessed pawn activated this play session (2A). Overrides the
     /// default "smallest camera id" selection while set. Cleared on Stop.
     pub active_camera_override: Option<ObjectId>,
+    /// Draws not tied to an object's render slots (world-UI quads, particles),
+    /// refilled by the host every frame and appended by `sync_draws`.
+    pub extra_draws: Vec<DrawCmd>,
+    /// Camera position for LOD selection (set by the host before `sync_draws`).
+    pub lod_camera: Option<Vec3>,
+    /// Current LOD level per object (hysteresis).
+    lod_state: HashMap<ObjectId, Option<usize>>,
+    /// LOD models that failed to load (don't retry every frame).
+    lod_failed: std::collections::HashSet<String>,
+    /// Scene file each additively loaded object came from (for unloading).
+    pub object_origin: HashMap<ObjectId, String>,
 }
 
 /// One probe volume's runtime metadata: where it sits and which SH range it
@@ -270,6 +332,8 @@ impl LoadedScene {
             skeletons: Vec::new(),
             animations: Vec::new(),
             skinned_meshes: Vec::new(),
+            clip_skeleton: Vec::new(),
+            anim_instances: HashMap::new(),
             anim_time: 0.0,
             ik_targets: None,
             foot_ik: None,
@@ -284,15 +348,21 @@ impl LoadedScene {
             primitive_meshes: HashMap::new(),
             default_material: None,
             model_mesh_base: HashMap::new(),
+            model_templates: HashMap::new(),
+            builtin_template: None,
+            extra_draws: Vec::new(),
+            lod_camera: None,
+            lod_state: HashMap::new(),
+            lod_failed: Default::default(),
+            object_origin: HashMap::new(),
             material_file_cache: HashMap::new(),
             texture_file_cache: HashMap::new(),
-            emission_mean_cache: HashMap::new(),
-            emission_mask_mean_cache: HashMap::new(),
             skybox: None,
             environment: citrus_assets::WorldEnvironment::default(),
             layers: citrus_core::LayerSettings::default(),
             visible_layers: citrus_core::all_layers_mask(),
             baked: None,
+            audio_bake: None,
             active_camera_override: None,
         }
     }
@@ -670,6 +740,8 @@ impl LoadedScene {
         let skel_base = self.skeletons.len();
         self.skeletons.extend(scene.skeletons.iter().cloned());
         self.animations.extend(scene.animations.iter().cloned());
+        self.clip_skeleton
+            .extend(std::iter::repeat_n(skel_base, scene.animations.len()));
         let has_skeleton = !scene.skeletons.is_empty();
         for mesh in &scene.meshes {
             // A mesh is skinned if any vertex carries skin weights and the model
@@ -842,6 +914,8 @@ impl LoadedScene {
         let skel_base = self.skeletons.len();
         self.skeletons.extend(scene.skeletons.iter().cloned());
         self.animations.extend(scene.animations.iter().cloned());
+        self.clip_skeleton
+            .extend(std::iter::repeat_n(skel_base, scene.animations.len()));
         for (i, mesh) in scene.meshes.iter().enumerate() {
             self.mesh_handles.push(mesh_handles[i]);
             if skinned.get(i).copied().unwrap_or(false) {
@@ -1196,75 +1270,15 @@ impl LoadedScene {
         }
     }
 
+    /// Mean linear RGB of a project-relative texture, or `[1,1,1]` without one.
+    /// Disk-cached by citrus-assets (warmed by the scene loader's worker), so
+    /// this never decodes on the main thread after the first load.
+    fn texture_mean(project_root: &Path, rel: Option<&PathBuf>, srgb: bool) -> [f32; 3] {
+        rel.map_or([1.0; 3], |rel| citrus_assets::texture_mean(project_root.join(rel), srgb))
+    }
+
     /// Push one material's inspector model into the renderer, resolving its
     /// shader (compiling custom shaders on first use).
-    /// Mean LINEAR RGB of an emission map (project-relative), cached per file.
-    /// `None` (no map) → `[1,1,1]`: the whole surface emits, so the emitter uses
-    /// the full emission colour. A load error is treated the same (no scaling).
-    fn emission_map_mean(&mut self, project_root: &Path, rel: Option<&PathBuf>) -> [f32; 3] {
-        let Some(rel) = rel else { return [1.0; 3] };
-        let abs = project_root.join(rel);
-        if let Some(m) = self.emission_mean_cache.get(&abs) {
-            return *m;
-        }
-        // Emission maps are colour data (loaded sRGB), so decode to linear before
-        // averaging — matching what the shader samples.
-        let mean = match citrus_assets::load_texture_file(&abs, true) {
-            Ok(data) => texture_mean_linear(&data),
-            Err(_) => [1.0; 3],
-        };
-        self.emission_mean_cache.insert(abs, mean);
-        mean
-    }
-
-    /// Mean coverage of the emission MASK's `.r` channel (linear data, so no sRGB
-    /// decode), cached by path. `None` (no mask) → `1.0`: the whole emission map
-    /// applies. Multiplied into the emitter flux alongside the emission-map mean
-    /// so a small masked emissive region produces a proportionally dim GI light.
-    fn emission_mask_mean(&mut self, project_root: &Path, rel: Option<&PathBuf>) -> f32 {
-        let Some(rel) = rel else { return 1.0 };
-        let abs = project_root.join(rel);
-        if let Some(m) = self.emission_mask_mean_cache.get(&abs) {
-            return *m;
-        }
-        let mean = match citrus_assets::load_texture_file(&abs, false) {
-            Ok(data) => texture_mean_linear(&data)[0],
-            Err(_) => 1.0,
-        };
-        self.emission_mask_mean_cache.insert(abs, mean);
-        mean
-    }
-
-    /// Mean LINEAR RGB of an albedo map (sRGB texture → linear), for the bake.
-    /// `None` (no map) → `[1,1,1]` so only the scalar base_color applies. Cached
-    /// in the emission map-mean cache map (keyed by abs path; albedo and emission
-    /// files never collide).
-    fn albedo_map_mean(&mut self, project_root: &Path, rel: Option<&PathBuf>) -> [f32; 3] {
-        let Some(rel) = rel else { return [1.0; 3] };
-        let abs = project_root.join(rel);
-        if let Some(m) = self.emission_mean_cache.get(&abs) {
-            return *m;
-        }
-        let mean = match citrus_assets::load_texture_file(&abs, true) {
-            Ok(data) => texture_mean_linear(&data),
-            Err(_) => [1.0; 3],
-        };
-        self.emission_mean_cache.insert(abs, mean);
-        mean
-    }
-
-    /// Mean metalness from an ORM map's `.b` channel (linear data), for the bake.
-    /// `None` (no map) → `1.0` so only the scalar metallic applies. Not cached
-    /// (apply_material is infrequent; the mask cache stores a different channel).
-    fn orm_metallic_mean(&self, project_root: &Path, rel: Option<&PathBuf>) -> f32 {
-        let Some(rel) = rel else { return 1.0 };
-        let abs = project_root.join(rel);
-        match citrus_assets::load_texture_file(&abs, false) {
-            Ok(data) => texture_mean_linear(&data)[2], // .b = metalness (ORM)
-            Err(_) => 1.0,
-        }
-    }
-
     pub fn apply_material(
         &mut self,
         renderer: &mut Renderer,
@@ -1295,8 +1309,8 @@ impl LoadedScene {
         // small masked emissive region still acts as a full-flux GI emitter.
         let emission_path = self.materials[index].model.textures.emission.clone();
         let mask_path = self.materials[index].model.textures.emission_mask.clone();
-        let map_mean = self.emission_map_mean(project_root, emission_path.as_ref());
-        let mask_mean = self.emission_mask_mean(project_root, mask_path.as_ref());
+        let map_mean = Self::texture_mean(project_root, emission_path.as_ref(), true);
+        let mask_mean = Self::texture_mean(project_root, mask_path.as_ref(), false)[0];
         let emission_mean = [
             map_mean[0] * mask_mean,
             map_mean[1] * mask_mean,
@@ -1310,8 +1324,9 @@ impl LoadedScene {
         // this a textured helmet would bake fully metallic (zero diffuse → black).
         let albedo_path = self.materials[index].model.textures.albedo.clone();
         let orm_path = self.materials[index].model.textures.orm.clone();
-        let albedo_mean = self.albedo_map_mean(project_root, albedo_path.as_ref());
-        let orm_metallic_mean = self.orm_metallic_mean(project_root, orm_path.as_ref());
+        let albedo_mean = Self::texture_mean(project_root, albedo_path.as_ref(), true);
+        // ORM .b = metalness.
+        let orm_metallic_mean = Self::texture_mean(project_root, orm_path.as_ref(), false)[2];
         let bc = self.materials[index].model.base_color;
         let bake_albedo = [
             albedo_mean[0] * bc[0],
@@ -1455,13 +1470,31 @@ impl LoadedScene {
         file: &SceneFile,
         project_root: &Path,
     ) -> Vec<(PathBuf, bool)> {
+        Self::collect_texture_refs(file, project_root, texture_slot_order)
+    }
+
+    /// Textures `apply_material` averages (albedo, emission, emission mask,
+    /// ORM), so the loader worker can warm their mean cache.
+    pub fn collect_material_mean_refs(file: &SceneFile, project_root: &Path) -> Vec<(PathBuf, bool)> {
+        Self::collect_texture_refs(file, project_root, |p| {
+            [
+                (p.albedo.clone(), true),
+                (p.emission.clone(), true),
+                (p.emission_mask.clone(), false),
+                (p.orm.clone(), false),
+            ]
+        })
+    }
+
+    fn collect_texture_refs<I: IntoIterator<Item = (Option<PathBuf>, bool)>>(
+        file: &SceneFile,
+        project_root: &Path,
+        slots: impl Fn(&citrus_core::MaterialTexturePaths) -> I,
+    ) -> Vec<(PathBuf, bool)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         let mut add = |paths: &citrus_core::MaterialTexturePaths| {
-            for (rel, srgb) in texture_slot_order(paths)
-                .into_iter()
-                .filter_map(|(p, s)| p.map(|p| (p, s)))
-            {
+            for (rel, srgb) in slots(paths).into_iter().filter_map(|(p, s)| p.map(|p| (p, s))) {
                 let abs = project_root.join(&rel);
                 if seen.insert((abs.clone(), srgb)) {
                     out.push((abs, srgb));
@@ -1635,26 +1668,24 @@ impl LoadedScene {
         Some((view, proj, position))
     }
 
-    /// Call one lifecycle hook on every component. Deferred engine requests
-    /// (e.g. load-scene) are appended to `commands` for the caller to drain.
-    #[allow(clippy::too_many_arguments)]
-    fn each_component(
+    /// Run one lifecycle pass over the components of every active object for
+    /// which `filter(index)` holds. `call` gets the object index. Each object's
+    /// components are detached while it runs so the context can expose read
+    /// access to every other component (`ctx.get`), including siblings.
+    pub fn run_pass(
         &mut self,
-        dt: f32,
-        time: f32,
-        input: &citrus_core::InputState,
-        net: &citrus_core::NetView,
+        env: &PassEnv,
         commands: &mut Vec<citrus_core::ComponentCommand>,
-        mut call: impl FnMut(&mut Box<dyn citrus_core::Component>, &mut ComponentCtx),
+        filter: impl Fn(usize) -> bool,
+        mut call: impl FnMut(usize, &mut Box<dyn Component>, &mut ComponentCtx),
     ) {
-        // Read-only world snapshot for object references (computed once at the
-        // start of the pass; parallel to `objects`). Stale-by-one-frame for
-        // objects updated earlier this pass, which is fine for references.
+        // Snapshot at the start of the pass; stale-by-one-pass for objects
+        // updated earlier in it, which is fine for references.
         let world_transforms: Vec<Mat4> = self.world_transforms();
         let object_names: Vec<String> = self.objects.iter().map(|o| o.name.clone()).collect();
         let object_ids: Vec<ObjectId> = self.objects.iter().map(|o| o.id).collect();
-        // Spawn points (2, spawn points): object index + tag for every object
-        // carrying a SpawnPoint component, so a pawn can teleport to one.
+        let id_index = self.id_index();
+        let active = self.active_flags();
         let spawn_points: Vec<(usize, String)> = self
             .objects
             .iter()
@@ -1666,62 +1697,127 @@ impl LoadedScene {
                     .map(|sp| (i, sp.tag.clone()))
             })
             .collect();
-        for (index, object) in self.objects.iter_mut().enumerate() {
-            let parent_world = object.parent.and_then(|p| world_transforms.get(p).copied());
-            let SceneObject {
-                components,
-                translation,
-                rotation,
-                scale,
-                ..
-            } = object;
-            for component in components.iter_mut() {
+        for index in 0..self.objects.len() {
+            if !active[index] || !filter(index) || self.objects[index].components.is_empty() {
+                continue;
+            }
+            let parent_world = self.objects[index]
+                .parent
+                .and_then(|p| world_transforms.get(p).copied());
+            let mut components = std::mem::take(&mut self.objects[index].components);
+            let mut translation = self.objects[index].translation;
+            let mut rotation = self.objects[index].rotation;
+            let mut scale = self.objects[index].scale;
+            for k in 0..components.len() {
+                let (before, rest) = components.split_at_mut(k);
+                let (current, after) = rest.split_first_mut().expect("k < len");
+                let lookup = PassLookup {
+                    objects: &self.objects,
+                    self_index: index,
+                    before,
+                    after,
+                };
                 call(
-                    component,
+                    index,
+                    current,
                     &mut ComponentCtx {
-                        dt,
-                        time,
-                        translation,
-                        rotation,
-                        scale,
+                        dt: env.dt,
+                        unscaled_dt: env.unscaled_dt,
+                        time: env.time,
+                        translation: &mut translation,
+                        rotation: &mut rotation,
+                        scale: &mut scale,
                         commands,
                         world_transforms: &world_transforms,
                         object_names: &object_names,
                         object_ids: &object_ids,
                         self_index: index,
                         parent_world,
-                        input,
-                        net,
+                        input: env.input,
+                        net: env.net,
                         spawn_points: &spawn_points,
+                        id_index: &id_index,
+                        active: &active,
+                        lookup: &lookup,
+                        physics: env.physics,
+                        nav: env.nav,
+                        events: env.events,
+                        time_scale: env.time_scale,
+                        screen: env.screen,
+                        save: env.save,
+                        strings: env.strings,
                     },
                 );
             }
+            let object = &mut self.objects[index];
+            object.components = components;
+            object.translation = translation;
+            object.rotation = rotation;
+            object.scale = scale;
         }
     }
 
-    /// Play started: every component's `start` hook.
-    pub fn start_components(
-        &mut self,
-        time: f32,
-        input: &citrus_core::InputState,
-        net: &citrus_core::NetView,
-        commands: &mut Vec<citrus_core::ComponentCommand>,
-    ) {
-        self.each_component(0.0, time, input, net, commands, |c, ctx| c.start(ctx));
+    /// Stable id -> current index.
+    pub fn id_index(&self) -> HashMap<ObjectId, usize> {
+        self.objects.iter().enumerate().map(|(i, o)| (o.id, i)).collect()
     }
 
-    /// Run all components for one frame (Play mode): all `update`s, then
-    /// all `late_update`s.
-    pub fn update_components(
-        &mut self,
-        dt: f32,
-        time: f32,
-        input: &citrus_core::InputState,
-        net: &citrus_core::NetView,
-        commands: &mut Vec<citrus_core::ComponentCommand>,
-    ) {
-        self.each_component(dt, time, input, net, commands, |c, ctx| c.update(ctx));
-        self.each_component(dt, time, input, net, commands, |c, ctx| c.late_update(ctx));
+    pub fn index_of(&self, id: ObjectId) -> Option<usize> {
+        self.objects.iter().position(|o| o.id == id)
+    }
+
+    /// `is_active` for every object in one pass (parents resolved once).
+    pub fn active_flags(&self) -> Vec<bool> {
+        self.active_flags_revealing(None)
+    }
+
+    /// Like [`Self::active_flags`], but `reveal` and its ancestors count as
+    /// enabled (the editor shows a hidden menu page while it's selected).
+    pub fn active_flags_revealing(&self, reveal: Option<usize>) -> Vec<bool> {
+        let n = self.objects.len();
+        let mut revealed = Vec::new();
+        let mut k = reveal.filter(|&r| r < n);
+        while let Some(i) = k {
+            if revealed.contains(&i) || revealed.len() >= 64 {
+                break;
+            }
+            revealed.push(i);
+            k = self.objects[i].parent.filter(|&p| p < n);
+        }
+        // 0 = unknown, 1 = inactive, 2 = active.
+        let mut state = vec![0u8; n];
+        for i in 0..n {
+            let mut chain = Vec::new();
+            let mut cur = i;
+            let resolved = loop {
+                if state[cur] != 0 {
+                    break state[cur];
+                }
+                if !self.objects[cur].enabled && !revealed.contains(&cur) {
+                    break 1;
+                }
+                chain.push(cur);
+                match self.objects[cur].parent {
+                    Some(p) if p < n && chain.len() < 64 && !chain.contains(&p) => cur = p,
+                    _ => break 2,
+                }
+            };
+            for c in chain {
+                state[c] = resolved;
+            }
+            if state[i] == 0 {
+                state[i] = resolved;
+            }
+        }
+        state.into_iter().map(|s| s == 2).collect()
+    }
+
+    /// CPU-side triangle geometry of a mesh (positions, indices), if kept.
+    pub fn mesh_geometry(&self, mesh: usize) -> Option<(&[Vec3], &[u32])> {
+        self.mesh_geometry
+            .get(mesh)
+            .filter(|(p, i)| !p.is_empty() && !i.is_empty())
+            .map(|(p, i)| (p.as_slice(), i.as_slice()))
     }
 
     /// Apply `ComponentCommand::SetActiveCamera` (2A): make the camera object the
@@ -1899,11 +1995,16 @@ impl LoadedScene {
     /// scene path with its extension removed (e.g. `scenes/world`). Shared by
     /// the editor and the game runtime so both light the scene from a bake.
     pub fn load_bake_sidecars(&mut self, base: &std::path::Path) {
+        self.baked = Self::read_bake_sidecars(base);
+    }
+
+    /// Read + parse the `.lightmap` / `.lightdata` sidecars (no GPU work, so a
+    /// loader thread can do it). None when the scene has no bake.
+    pub fn read_bake_sidecars(base: &std::path::Path) -> Option<BakedData> {
         let lm_path = base.with_extension("lightmap");
         let ld_path = base.with_extension("lightdata");
         if !lm_path.exists() && !ld_path.exists() {
-            self.baked = None;
-            return;
+            return None;
         }
         let mut baked = BakedData::default();
         if let Ok(lm) = citrus_assets::load_lightmaps(&lm_path) {
@@ -1949,7 +2050,7 @@ impl LoadedScene {
             baked.lightmaps.len(),
             baked.probe_sh.len()
         );
-        self.baked = Some(baked);
+        Some(baked)
     }
 
     /// Coarse scene ambient from the baked probe SH (average L0 radiance), or
@@ -3002,8 +3103,87 @@ impl LoadedScene {
         if self.skinned_meshes.is_empty() {
             return;
         }
-        // IK targets (any source) pose humanoid avatars when present; otherwise
-        // the first animation clip plays (no clip + no IK = static rest pose).
+        let skinned_by_mesh: HashMap<usize, usize> = self
+            .skinned_meshes
+            .iter()
+            .enumerate()
+            .map(|(k, sm)| (sm.mesh_index, k))
+            .collect();
+        let active = self.active_flags();
+        let world = self.world_transforms();
+        // Source meshes still drawn by some object without an Animator; only
+        // those need the shared (whole-scene) pose.
+        let mut shared_users: std::collections::HashSet<usize> = Default::default();
+        let mut alive: std::collections::HashSet<ObjectId> = Default::default();
+
+        for i in 0..self.objects.len() {
+            if !active[i] {
+                continue;
+            }
+            let skinned_slots: Vec<usize> = self.objects[i]
+                .render_slots()
+                .map(|r| r.mesh)
+                .filter(|m| skinned_by_mesh.contains_key(m))
+                .collect();
+            if skinned_slots.is_empty() {
+                continue;
+            }
+            let id = self.objects[i].id;
+            let Some(animator) = self.objects[i]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>())
+            else {
+                shared_users.extend(skinned_slots);
+                continue;
+            };
+            alive.insert(id);
+            let skeleton = self.skinned_meshes[skinned_by_mesh[&skinned_slots[0]]].skeleton;
+            let Some(skel) = self.skeletons.get(skeleton) else {
+                continue;
+            };
+            let clips: Vec<usize> = (0..self.animations.len())
+                .filter(|&c| self.clip_skeleton.get(c) == Some(&skeleton))
+                .collect();
+            let (locals, root_local) = advance_animator(animator, skel, &self.animations, &clips, dt);
+            animator.state.root_delta = world[i].transform_vector3(root_local);
+            let gpu = animator.gpu_skinning;
+            let palette = skel.palette(&locals);
+
+            if self.anim_instances.get(&id).is_none_or(|inst| inst.gpu != gpu) {
+                let mut slots = Vec::new();
+                for &m in &skinned_slots {
+                    let sm = &self.skinned_meshes[skinned_by_mesh[&m]];
+                    let data = citrus_render::MeshData {
+                        vertices: sm.base_vertices.clone(),
+                        indices: self.mesh_geometry[m].1.clone(),
+                        has_lightmap_uv: false,
+                    };
+                    let uploaded = if gpu {
+                        renderer.upload_mesh_gpu_skinned(&data, skel.joints.len())
+                    } else {
+                        renderer.upload_mesh_skinned(&data)
+                    };
+                    match uploaded {
+                        Ok(handle) => slots.push((m, handle)),
+                        Err(e) => tracing::error!("animator mesh upload: {e:#}"),
+                    }
+                }
+                self.anim_instances.insert(id, AnimInstance { slots, gpu });
+            }
+            for &(m, handle) in &self.anim_instances[&id].slots {
+                if gpu {
+                    renderer.skin_mesh_gpu(handle, &palette);
+                } else {
+                    let sm = &self.skinned_meshes[skinned_by_mesh[&m]];
+                    renderer.update_mesh_vertices(handle, &skin_vertices(&sm.base_vertices, &palette));
+                }
+            }
+        }
+        self.anim_instances.retain(|id, _| alive.contains(id));
+
+        // Shared path (objects without an Animator): IK targets pose humanoid
+        // avatars when present; otherwise the skeleton's first clip loops.
         let ik = self.ik_targets;
         let ik_active = ik
             .map(|t| {
@@ -3020,16 +3200,25 @@ impl LoadedScene {
         }
         self.anim_time += dt;
         for sm in &self.skinned_meshes {
+            if !shared_users.contains(&sm.mesh_index) {
+                continue;
+            }
             let Some(skel) = self.skeletons.get(sm.skeleton) else {
                 continue;
             };
+            let first_clip = (0..self.animations.len())
+                .find(|&c| self.clip_skeleton.get(c) == Some(&sm.skeleton))
+                .unwrap_or(0);
             let mut locals = match ik {
                 Some(targets)
                     if ik_active && crate::humanoid::HumanoidRig::map(skel).is_humanoid() =>
                 {
                     crate::humanoid::pose_from_trackers(skel, &targets)
                 }
-                _ => self.animations[0].sample(skel, self.anim_time),
+                _ => match self.animations.get(first_clip) {
+                    Some(clip) => clip.sample(skel, self.anim_time),
+                    None => skel.rest_locals(),
+                },
             };
             // Terrain foot IK: plant the feet on the ground under them. The ground
             // sampler caps hits at the foot height + max_lift so the avatar never
@@ -3043,25 +3232,20 @@ impl LoadedScene {
                 }
             }
             let palette = skel.palette(&locals);
-            let mut verts = sm.base_vertices.clone();
-            for v in &mut verts {
-                v.position = citrus_assets::skin_position(
-                    Vec3::from(v.position),
-                    v.joints,
-                    v.weights,
-                    &palette,
-                )
-                .to_array();
-                v.normal = citrus_assets::skin_direction(
-                    Vec3::from(v.normal),
-                    v.joints,
-                    v.weights,
-                    &palette,
-                )
-                .to_array();
-            }
-            renderer.update_mesh_vertices(self.mesh_handles[sm.mesh_index], &verts);
+            renderer.update_mesh_vertices(
+                self.mesh_handles[sm.mesh_index],
+                &skin_vertices(&sm.base_vertices, &palette),
+            );
         }
+    }
+
+    /// GPU mesh to draw for an object's render slot: its Animator copy when it
+    /// has one, else the shared mesh.
+    fn draw_mesh(&self, id: ObjectId, mesh: usize) -> MeshHandle {
+        self.anim_instances
+            .get(&id)
+            .and_then(|inst| inst.slots.iter().find(|(m, _)| *m == mesh).map(|(_, h)| *h))
+            .unwrap_or(self.mesh_handles[mesh])
     }
 
     /// Distinct model paths (project-relative) used by active objects that have a
@@ -3150,7 +3334,10 @@ impl LoadedScene {
             else {
                 continue;
             };
-            let center = self.world_transform(i).w_axis.truncate();
+            let capture = self.world_transform(i).w_axis.truncate();
+            // The box (parallax proxy) can be offset from the capture point so
+            // the capture sits at eye height while the box hugs the room.
+            let center = capture + Vec3::from(probe.box_offset);
             let half = Vec3::from(probe.size) * 0.5 * self.objects[i].scale;
             let d = (camera_pos - center).abs() - half;
             let outside = d.max(Vec3::ZERO).length();
@@ -3159,10 +3346,12 @@ impl LoadedScene {
             let key = (contains, probe.importance, -volume, -outside);
             let candidate = citrus_render::ReflectionProbeBox {
                 center: center.to_array(),
+                capture: capture.to_array(),
                 half_extents: half.to_array(),
                 intensity: probe.intensity.max(0.0),
                 box_projection: probe.box_projection,
                 resolution: probe.resolution,
+                realtime: probe.mode == citrus_core::ReflectionProbeMode::Realtime,
             };
             let better = match &best {
                 None => true,
@@ -3179,6 +3368,49 @@ impl LoadedScene {
             }
         }
         best.map(|(_, p)| p)
+    }
+
+    /// Whether object `i` counts as a planar-reflection surface this frame:
+    /// active, drawn (has a mesh, layer visible) and carries the component.
+    /// Shared by `sync_draws_multi` (index assignment) and `planar_surfaces()`
+    /// (per-frame list) so indices line up.
+    fn planar_surface_eligible(&self, i: usize) -> bool {
+        self.objects[i].render.is_some()
+            && self.is_active(i)
+            && self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) != 0
+            && self.objects[i]
+                .components
+                .iter()
+                .any(|c| c.as_any().is::<citrus_core::PlanarReflection>())
+    }
+
+    /// Active planar-reflection surfaces (first `MAX_PLANAR` eligible objects),
+    /// index-aligned with the `DrawCmd::planar_index` values from `sync_draws`.
+    /// The plane is the object's world +Y through its origin.
+    pub fn planar_surfaces(&self) -> Vec<citrus_render::PlanarSurface> {
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            if out.len() >= citrus_render::MAX_PLANAR {
+                break;
+            }
+            if !self.planar_surface_eligible(i) {
+                continue;
+            }
+            let Some(p) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::PlanarReflection>())
+            else {
+                continue;
+            };
+            let world = self.world_transform(i);
+            out.push(citrus_render::PlanarSurface {
+                point: world.w_axis.truncate().to_array(),
+                normal: world.y_axis.truncate().normalize_or(Vec3::Y).to_array(),
+                max_roughness: p.max_roughness,
+            });
+        }
+        out
     }
 
     /// Scene fog parameters for the renderer, or `None` when fog is disabled.
@@ -3310,7 +3542,7 @@ impl LoadedScene {
                 .find_map(|c| c.as_any().downcast_ref::<AudioSource>())
             {
                 let pos = self.world_transform(i).w_axis.truncate();
-                cues.push(crate::audio::AudioCue::from_source(i, src, pos));
+                cues.push(crate::audio::AudioCue::from_source(self.objects[i].id, src, pos));
             }
         }
         cues
@@ -3348,6 +3580,44 @@ impl LoadedScene {
         self.draws.clear();
         // One O(n) memoized pass instead of re-walking each parent chain per object.
         let world = self.world_transforms();
+        // Locked reflection-probe boxes stay fixed in world space: compensate
+        // box_offset by however far the object moved since last frame, so
+        // dragging the probe repositions only the capture point inside the box.
+        for i in 0..self.objects.len() {
+            let pos = world[i].w_axis.truncate();
+            let Some(probe) = self.objects[i]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::ReflectionProbe>())
+            else {
+                continue;
+            };
+            if probe.lock_box
+                && let Some(last) = probe.last_world_pos
+            {
+                let delta = pos - Vec3::from(last);
+                if delta.length_squared() > 0.0 {
+                    probe.box_offset = (Vec3::from(probe.box_offset) - delta).to_array();
+                }
+            }
+            probe.last_world_pos = Some(pos.to_array());
+        }
+        // Planar-reflection surfaces: assign each drawn object with a
+        // PlanarReflection component its layer index, in the SAME order (and
+        // with the same visibility filter) as `planar_surfaces()` builds the
+        // per-frame list, so DrawCmd.planar_index matches FrameInput.planar.
+        let mut planar_idx = vec![-1i32; self.objects.len()];
+        let mut planar_n = 0i32;
+        for i in 0..self.objects.len() {
+            if planar_n >= citrus_render::MAX_PLANAR as i32 {
+                break;
+            }
+            if !self.planar_surface_eligible(i) {
+                continue;
+            }
+            planar_idx[i] = planar_n;
+            planar_n += 1;
+        }
         for i in 0..self.objects.len() {
             if self.objects[i].render.is_none() {
                 continue;
@@ -3381,11 +3651,17 @@ impl LoadedScene {
             };
             let transform = world[i];
             let highlight = if selected.contains(&i) { highlight } else { 0.0 };
+            let Ok(lod) = self.lod_level(i, transform.w_axis.truncate()) else {
+                continue;
+            };
             // One draw per material slot (slot 0 + extras), all at this transform.
-            for render in self.objects[i].render_slots().collect::<Vec<_>>() {
+            for (k, mut render) in self.objects[i].render_slots().collect::<Vec<_>>().into_iter().enumerate() {
+                if let Some((base, count)) = lod {
+                    render.mesh = base + k.min(count - 1);
+                }
                 let (mn, mx) = self.mesh_aabb(render.mesh);
                 self.draws.push(DrawCmd {
-                    mesh: self.mesh_handles[render.mesh],
+                    mesh: self.draw_mesh(self.objects[i].id, render.mesh),
                     material: self.materials[render.material].handle,
                     transform,
                     highlight,
@@ -3393,9 +3669,12 @@ impl LoadedScene {
                     bound_radius: ((mx - mn) * 0.5).length(),
                     lightmap_layer,
                     lightmap_size,
+                    static_geometry: self.objects[i].static_geometry,
+                    planar_index: planar_idx[i],
                 });
             }
         }
+        self.draws.extend(self.extra_draws.iter().copied());
     }
 
     /// Delete an object and its whole subtree, remapping the surviving
@@ -3435,6 +3714,11 @@ impl LoadedScene {
                 next += 1;
             }
         }
+        if let Some(cam) = self.active_camera_override
+            && self.objects.iter().zip(&remove).any(|(o, &r)| r && o.id == cam)
+        {
+            self.active_camera_override = None;
+        }
         let mut i = 0;
         self.objects.retain(|_| {
             let keep = !remove[i];
@@ -3444,6 +3728,27 @@ impl LoadedScene {
         for object in &mut self.objects {
             object.parent = object.parent.and_then(|p| remap.get(p).copied().flatten());
         }
+        // Baked lightmap assignments are keyed by object index.
+        if let Some(baked) = self.baked.as_mut() {
+            baked.object_lightmap = baked
+                .object_lightmap
+                .drain()
+                .filter_map(|(old, layer)| remap.get(old).copied().flatten().map(|new| (new, layer)))
+                .collect();
+        }
+    }
+
+    /// Name for a duplicate (editor spec §5): `base (N)` with the smallest free
+    /// N >= 2, where `base` is `src_name` without a trailing `(N)` or `Copy`
+    /// chain. `Spot Light` -> `Spot Light (2)`, then `(3)`; never `Copy Copy`.
+    fn next_duplicate_name(&self, src_name: &str) -> String {
+        let base = strip_dup_suffix(src_name);
+        let existing: std::collections::HashSet<&str> =
+            self.objects.iter().map(|o| o.name.as_str()).collect();
+        (2..)
+            .map(|n| format!("{base} ({n})"))
+            .find(|c| !existing.contains(c.as_str()))
+            .unwrap()
     }
 
     /// Duplicate an object and its whole subtree. Clones each object's
@@ -3452,19 +3757,6 @@ impl LoadedScene {
     /// re-parents the copies among themselves; the duplicated root becomes a
     /// sibling of the original. Returns the new root index. Not undoable (like
     /// object deletion).
-    /// Name for a duplicate: `base(N)` with the smallest free N >= 1, where `base`
-    /// is `src_name` with any trailing `(N)` stripped. So `file` -> `file(1)`,
-    /// duplicating `file(1)` -> `file(2)`, etc. — never the stacking `Copy Copy`.
-    fn next_duplicate_name(&self, src_name: &str) -> String {
-        let base = strip_dup_suffix(src_name);
-        let existing: std::collections::HashSet<&str> =
-            self.objects.iter().map(|o| o.name.as_str()).collect();
-        (1..)
-            .map(|n| format!("{base}({n})"))
-            .find(|c| !existing.contains(c.as_str()))
-            .unwrap()
-    }
-
     pub fn duplicate_object(
         &mut self,
         index: usize,
@@ -3781,6 +4073,307 @@ impl LoadedScene {
         }
     }
 
+    /// Load any LOD-level models not uploaded yet (cheap when all are loaded).
+    pub fn prepare_lods(&mut self, renderer: &mut Renderer, project_root: &Path) {
+        let mut wanted = Vec::new();
+        for o in &self.objects {
+            if let Some(lod) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::LodComponent>()) {
+                for level in &lod.levels {
+                    if !level.model.is_empty()
+                        && !self.model_templates.contains_key(&level.model)
+                        && !self.lod_failed.contains(&level.model)
+                        && !wanted.contains(&level.model)
+                    {
+                        wanted.push(level.model.clone());
+                    }
+                }
+            }
+        }
+        for path in wanted {
+            let result = citrus_assets::load_model_with_meta(project_root.join(&path))
+                .and_then(|asset| self.install_model_template(renderer, &path, &asset, None));
+            if let Err(e) = result {
+                tracing::warn!("LOD model {path}: {e:#}");
+                self.lod_failed.insert(path);
+            }
+        }
+    }
+
+    /// LOD level for object `i` at its world position, with a 5 % distance
+    /// band so objects don't flicker at a boundary. `Err(())` = culled.
+    fn lod_level(&mut self, i: usize, pos: Vec3) -> Result<Option<(usize, usize)>, ()> {
+        let (Some(cam), Some(lod)) = (
+            self.lod_camera,
+            self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::LodComponent>()),
+        ) else {
+            return Ok(None);
+        };
+        let d = pos.distance(cam);
+        let id = self.objects[i].id;
+        let near = lod.select_lod(d * 0.95);
+        let far = lod.select_lod(d * 1.05);
+        let current = self.lod_state.get(&id).copied();
+        let level = match current {
+            Some(cur) if (cur == near || cur == far) => cur,
+            _ => lod.select_lod(d),
+        };
+        self.lod_state.insert(id, level);
+        let Some(level) = level else {
+            return Err(());
+        };
+        let model = &lod.levels[level].model;
+        Ok(self
+            .model_templates
+            .get(model)
+            .map(|(base, mats)| (*base, mats.len().max(1))))
+    }
+
+    /// Upload the builtin test-scene meshes once and remember their templates.
+    fn ensure_builtin_template(&mut self, renderer: &mut Renderer) -> Result<()> {
+        if self.builtin_template.is_some() {
+            return Ok(());
+        }
+        let test = citrus_assets::test_scene();
+        let mesh_base = self.mesh_handles.len();
+        let object_start = self.objects.len();
+        self.add_asset_scene(renderer, &test, None)?;
+        let template_materials: Vec<usize> = self.objects[object_start..]
+            .iter()
+            .filter_map(|o| o.render.map(|r| r.material))
+            .collect();
+        self.objects.truncate(object_start);
+        self.draws.clear();
+        self.builtin_template = Some((mesh_base, template_materials));
+        Ok(())
+    }
+
+    /// Upload an imported model (or install its pre-uploaded GPU data) and
+    /// record its mesh base + per-mesh template materials. No objects are kept;
+    /// scene entries create the placements.
+    pub(crate) fn install_model_template(
+        &mut self,
+        renderer: &mut Renderer,
+        path: &str,
+        asset: &citrus_assets::Scene,
+        prepared: Option<citrus_render::PreparedScene>,
+    ) -> Result<()> {
+        if self.model_templates.contains_key(path) {
+            return Ok(());
+        }
+        let mesh_base = self.mesh_handles.len();
+        let object_start = self.objects.len();
+        match prepared {
+            Some(prep) => {
+                let (mh, th, sk) = renderer.install_prepared(prep);
+                self.add_installed_asset(renderer, asset, &mh, &th, &sk, Some(Path::new(path)))?;
+            }
+            None => self.add_asset_scene(renderer, asset, Some(Path::new(path)))?,
+        }
+        let mut per_mesh_material = vec![0usize; asset.meshes.len()];
+        for object in &self.objects[object_start..] {
+            for render in object.render_slots() {
+                per_mesh_material[render.mesh - mesh_base] = render.material;
+            }
+        }
+        self.objects.truncate(object_start);
+        self.draws.clear();
+        self.model_templates
+            .insert(path.to_owned(), (mesh_base, per_mesh_material));
+        Ok(())
+    }
+
+    /// Create objects for `entries` (parent indices local to `entries`),
+    /// appended after the existing objects. Model / builtin templates must
+    /// already be installed. Returns the index of the first new object.
+    fn push_entries(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        registry: &ComponentRegistry,
+        entries: &[SceneEntry],
+    ) -> Result<usize> {
+        let base = self.objects.len();
+        for entry in entries {
+            // (mesh, template material) for every render slot of this source.
+            let slots: Vec<(usize, usize)> = match &entry.source {
+                ObjectSource::Model {
+                    path,
+                    mesh,
+                    extra_meshes,
+                } => {
+                    let (mesh_base, materials) = self
+                        .model_templates
+                        .get(path)
+                        .context("scene references a model that failed to load")?
+                        .clone();
+                    let resolve = |m: usize| {
+                        let local = m.min(materials.len().saturating_sub(1));
+                        (mesh_base + local, materials[local])
+                    };
+                    std::iter::once(resolve(*mesh))
+                        .chain(extra_meshes.iter().map(|m| resolve(*m)))
+                        .collect()
+                }
+                ObjectSource::Builtin { mesh } => {
+                    let (mesh_base, materials) = self
+                        .builtin_template
+                        .as_ref()
+                        .context("scene references builtin meshes but none loaded")?;
+                    let local = (*mesh).min(2);
+                    let material = materials.get(local).copied().unwrap_or(0);
+                    vec![(mesh_base + local, material)]
+                }
+                ObjectSource::Primitive { shape } => {
+                    let mesh = self.ensure_primitive_mesh(renderer, *shape)?;
+                    let material = self.ensure_default_material(renderer)?;
+                    vec![(mesh, material)]
+                }
+                ObjectSource::Empty | ObjectSource::Camera | ObjectSource::Light => Vec::new(),
+            };
+
+            let mut render = None;
+            let mut extra_render = Vec::new();
+            for (k, &(mesh, default_material)) in slots.iter().enumerate() {
+                let mref = if k == 0 {
+                    Some(&entry.material)
+                } else {
+                    entry.extra_materials.get(k - 1)
+                };
+                let material = match mref {
+                    Some(m) => self.resolve_material_ref(renderer, shaders, project_root, m, default_material),
+                    None => default_material,
+                };
+                let info = RenderInfo { mesh, material };
+                if k == 0 {
+                    render = Some(info);
+                } else {
+                    extra_render.push(info);
+                }
+            }
+
+            self.objects.push(SceneObject {
+                // Use the saved id; generate one for legacy scenes (empty).
+                id: entry.id.parse().unwrap_or_else(|_| ObjectId::new()),
+                name: entry.name.clone(),
+                render,
+                extra_render,
+                source: entry.source.clone(),
+                enabled: entry.enabled,
+                static_geometry: entry.static_geometry,
+                lightmap_scale: entry.lightmap_scale,
+                layer: entry.layer,
+                parent: None,
+                translation: Vec3::from(entry.translation),
+                rotation: Quat::from_array(entry.rotation),
+                scale: Vec3::from(entry.scale),
+                components: entry
+                    .components
+                    .iter()
+                    .filter_map(|c| registry.load(&c.kind, &c.data))
+                    .collect(),
+            });
+        }
+        for (k, entry) in entries.iter().enumerate() {
+            if let Some(parent) = entry.parent
+                && parent < entries.len()
+                && parent != k
+            {
+                self.objects[base + k].parent = Some(base + parent);
+            }
+        }
+        Ok(base)
+    }
+
+    /// Add a worker-loaded scene to this one (additive streaming): installs its
+    /// pre-uploaded models + textures, creates its objects (keeping their ids)
+    /// and tags them with `origin` for `unload_origin`. Baked lighting of the
+    /// added scene is not applied (it uses probes / realtime lighting).
+    pub fn append_loaded(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        registry: &ComponentRegistry,
+        data: crate::scene_loader::LoadedSceneData,
+        origin: &str,
+    ) -> Result<usize> {
+        for (rel, compiled) in data.shaders {
+            shaders.preload(renderer, project_root, &rel, compiled);
+        }
+        if let Some((refs, prep)) = data.material_textures {
+            let (_mh, th, _sk) = renderer.install_prepared(prep);
+            for ((abs, srgb), handle) in refs.into_iter().zip(th) {
+                self.texture_file_cache.entry((abs, srgb)).or_insert(handle);
+            }
+        }
+        let mut prepared = data.prepared.unwrap_or_default();
+        for (path, asset) in &data.models {
+            self.install_model_template(renderer, path, asset, prepared.remove(path))?;
+        }
+        let first = self.append_entries(renderer, shaders, project_root, registry, &data.file.entries)?;
+        for o in &self.objects[first..] {
+            self.object_origin.insert(o.id, origin.to_owned());
+        }
+        Ok(first)
+    }
+
+    /// Remove every object that `append_loaded` brought in from `origin`.
+    pub fn unload_origin(&mut self, origin: &str) -> usize {
+        let mut removed = 0;
+        for i in (0..self.objects.len()).rev() {
+            if i < self.objects.len()
+                && self.object_origin.get(&self.objects[i].id).is_some_and(|o| o == origin)
+            {
+                self.remove_object(i);
+                removed += 1;
+            }
+        }
+        let alive: std::collections::HashSet<ObjectId> = self.objects.iter().map(|o| o.id).collect();
+        self.object_origin.retain(|id, _| alive.contains(id));
+        removed
+    }
+
+    /// Add `entries` to a live scene (runtime prefab spawn): imports any model
+    /// not loaded yet (synchronously), creates the objects, and pushes the
+    /// materials they use to the renderer. Returns the first new index.
+    pub fn append_entries(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        registry: &ComponentRegistry,
+        entries: &[SceneEntry],
+    ) -> Result<usize> {
+        for entry in entries {
+            match &entry.source {
+                ObjectSource::Model { path, .. } if !self.model_templates.contains_key(path) => {
+                    let asset = citrus_assets::load_model_with_meta(&project_root.join(path))
+                        .with_context(|| format!("importing {path}"))?;
+                    self.install_model_template(renderer, path, &asset, None)?;
+                }
+                ObjectSource::Builtin { .. } => self.ensure_builtin_template(renderer)?,
+                _ => {}
+            }
+        }
+        let materials_before = self.materials.len();
+        let base = self.push_entries(renderer, shaders, project_root, registry, entries)?;
+        let mut touched: Vec<usize> = (materials_before..self.materials.len()).collect();
+        for (k, entry) in entries.iter().enumerate() {
+            if matches!(entry.material, MaterialRef::Inline { .. })
+                && let Some(r) = self.objects[base + k].render
+            {
+                touched.push(r.material);
+            }
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for m in touched {
+            self.apply_material(renderer, shaders, project_root, m);
+        }
+        Ok(base)
+    }
+
     /// Rebuild the whole scene from a SceneFile. The renderer's scene
     /// resources must have been reset by the caller.
     /// Parse every model a scene file references (the slow, CPU-only part) so it
@@ -3878,144 +4471,19 @@ impl LoadedScene {
             }
         }
 
-        // Builtin meshes/materials come from the test scene; imported models
-        // bring their own materials for Inline overrides.
-        let mut builtin_template: Option<(usize, Vec<usize>)> = None; // (mesh base, material per mesh... )
         if needs_builtin {
-            let test = citrus_assets::test_scene();
-            let mesh_base = scene.mesh_handles.len();
-            scene.add_asset_scene(renderer, &test, None)?;
-            // Remove the template objects; entries recreate placements.
-            let template_materials: Vec<usize> = scene
-                .objects
-                .iter()
-                .filter_map(|o| o.render.map(|r| r.material))
-                .collect();
-            scene.objects.clear();
-            scene.draws.clear();
-            builtin_template = Some((mesh_base, template_materials));
+            scene.ensure_builtin_template(renderer)?;
         }
-
-        let mut model_info: HashMap<String, (usize, Vec<usize>)> = HashMap::new();
         for path in model_object_template.keys() {
             let asset = models
                 .get(path)
                 .with_context(|| format!("model {path} was not pre-parsed"))?;
             progress(&format!("Uploading {path}…"));
-            let mesh_base = scene.mesh_handles.len();
-            let object_start = scene.objects.len();
-            match prepared.as_mut().and_then(|m| m.remove(path)) {
-                Some(prep) => {
-                    let (mh, th, sk) = renderer.install_prepared(prep);
-                    scene.add_installed_asset(renderer, asset, &mh, &th, &sk, Some(Path::new(path)))?;
-                }
-                None => scene.add_asset_scene(renderer, asset, Some(Path::new(path)))?,
-            }
-            // Template: per model-local mesh index → material index (all slots).
-            let mut per_mesh_material = vec![0usize; asset.meshes.len()];
-            for object in &scene.objects[object_start..] {
-                for render in object.render_slots() {
-                    per_mesh_material[render.mesh - mesh_base] = render.material;
-                }
-            }
-            scene.objects.truncate(object_start);
-            scene.draws.truncate(object_start);
-            model_info.insert(path.clone(), (mesh_base, per_mesh_material));
+            let prep = prepared.as_mut().and_then(|m| m.remove(path));
+            scene.install_model_template(renderer, path, asset, prep)?;
         }
 
-        for entry in &file.entries {
-            // (mesh, template material) for every render slot of this source.
-            // Slot 0 first, then any extra material slots.
-            let slots: Vec<(usize, usize)> = match &entry.source {
-                ObjectSource::Model {
-                    path,
-                    mesh,
-                    extra_meshes,
-                } => {
-                    let (base, materials) = model_info
-                        .get(path)
-                        .context("scene references a model that failed to load")?;
-                    let resolve = |m: usize| {
-                        let local = m.min(materials.len().saturating_sub(1));
-                        (base + local, materials[local])
-                    };
-                    std::iter::once(resolve(*mesh))
-                        .chain(extra_meshes.iter().map(|m| resolve(*m)))
-                        .collect()
-                }
-                ObjectSource::Builtin { mesh } => {
-                    let (base, materials) = builtin_template
-                        .as_ref()
-                        .context("scene references builtin meshes but none loaded")?;
-                    // Builtin material template is per-object; use mesh index
-                    // clamped into the material list as a fallback.
-                    let local = (*mesh).min(2);
-                    let material = materials.get(local).copied().unwrap_or(0);
-                    vec![(base + local, material)]
-                }
-                ObjectSource::Primitive { shape } => {
-                    let mesh = scene.ensure_primitive_mesh(renderer, *shape)?;
-                    let material = scene.ensure_default_material(renderer)?;
-                    vec![(mesh, material)]
-                }
-                ObjectSource::Empty | ObjectSource::Camera | ObjectSource::Light => Vec::new(),
-            };
-
-            // Resolve slot 0 from `entry.material`, extras from
-            // `entry.extra_materials` (falling back to the template material).
-            let mut render = None;
-            let mut extra_render = Vec::new();
-            for (k, &(mesh, default_material)) in slots.iter().enumerate() {
-                let mref = if k == 0 {
-                    Some(&entry.material)
-                } else {
-                    entry.extra_materials.get(k - 1)
-                };
-                let material = match mref {
-                    Some(m) => scene
-                        .resolve_material_ref(renderer, shaders, project_root, m, default_material),
-                    None => default_material,
-                };
-                let info = RenderInfo { mesh, material };
-                if k == 0 {
-                    render = Some(info);
-                } else {
-                    extra_render.push(info);
-                }
-            }
-
-            scene.objects.push(SceneObject {
-                // Use the saved id; generate one for legacy scenes (empty).
-                id: entry.id.parse().unwrap_or_else(|_| ObjectId::new()),
-                name: entry.name.clone(),
-                render,
-                extra_render,
-                source: entry.source.clone(),
-                enabled: entry.enabled,
-                static_geometry: entry.static_geometry,
-                lightmap_scale: entry.lightmap_scale,
-                layer: entry.layer,
-                parent: None, // applied below once all objects exist
-                translation: Vec3::from(entry.translation),
-                rotation: Quat::from_array(entry.rotation),
-                scale: Vec3::from(entry.scale),
-                components: entry
-                    .components
-                    .iter()
-                    .filter_map(|c| registry.load(&c.kind, &c.data))
-                    .collect(),
-            });
-        }
-
-        // Parent links (entry order == object order in a fresh scene).
-        for (i, entry) in file.entries.iter().enumerate() {
-            if let Some(parent) = entry.parent
-                && parent < scene.objects.len()
-                && parent != i
-            {
-                scene.objects[i].parent = Some(parent);
-            }
-        }
+        scene.push_entries(renderer, shaders, project_root, registry, &file.entries)?;
 
         // Push all material models (incl. inline overrides) to the renderer
         // (shader compiles happen here, so report per material).
@@ -4027,39 +4495,224 @@ impl LoadedScene {
     }
 }
 
-/// sRGB → linear for a single normalized channel (the standard IEC transfer).
-fn srgb_to_linear(c: f32) -> f32 {
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
+/// CPU linear-blend skinning of a vertex list by a joint palette.
+fn skin_vertices(base: &[citrus_render::Vertex], palette: &[Mat4]) -> Vec<citrus_render::Vertex> {
+    let mut verts = base.to_vec();
+    for v in &mut verts {
+        v.position = citrus_assets::skin_position(Vec3::from(v.position), v.joints, v.weights, palette).to_array();
+        v.normal = citrus_assets::skin_direction(Vec3::from(v.normal), v.joints, v.weights, palette).to_array();
     }
+    verts
 }
 
-/// Mean of an emission texture's RGB in LINEAR space. RGBA8 sRGB is decoded
-/// per channel; HDR (f16 linear) maps return `[1,1,1]` (no scaling) since their
-/// values can exceed 1 and aren't a simple coverage factor. Empty → `[1,1,1]`.
-fn texture_mean_linear(data: &citrus_render::TextureData) -> [f32; 3] {
-    if data.hdr || data.pixels.len() < 4 {
-        return [1.0; 3];
+/// The clip carrying most weight in a motion (clip or blend tree) at `time`,
+/// with its local time and duration. Drives events and root motion.
+fn dominant_clip(
+    animator: &citrus_core::Animator,
+    animations: &[citrus_assets::AnimationClip],
+    find: &dyn Fn(&str) -> Option<usize>,
+    name: &str,
+    time: f32,
+) -> Option<(usize, f32, f32)> {
+    if let Some(tree) = animator.blend_trees.iter().find(|t| t.name == name) {
+        let p = [animator.get_float(&tree.parameter), animator.get_float(&tree.parameter_y)];
+        let w = tree.weights(p);
+        let motions: Vec<(usize, f32)> = tree
+            .motions
+            .iter()
+            .zip(&w)
+            .filter_map(|(m, &w)| find(&m.clip).map(|c| (c, w)))
+            .collect();
+        let dur: f32 = motions.iter().map(|&(c, w)| w * animations[c].duration).sum();
+        let (c, _) = motions.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let cd = animations[c].duration;
+        let local = if dur > 1e-6 { time / dur * cd } else { 0.0 };
+        return Some((c, local, cd));
     }
-    let mut acc = [0.0f64; 3];
-    let mut n = 0u64;
-    for px in data.pixels.chunks_exact(4) {
-        for c in 0..3 {
-            let s = px[c] as f32 / 255.0;
-            acc[c] += if data.srgb { srgb_to_linear(s) } else { s } as f64;
+    let c = find(name)?;
+    Some((c, time, animations[c].duration))
+}
+
+/// Pose of a clip or blend tree at `time` (blend-tree clips phase-synced).
+fn sample_motion(
+    animator: &citrus_core::Animator,
+    skel: &citrus_assets::Skeleton,
+    animations: &[citrus_assets::AnimationClip],
+    find: &dyn Fn(&str) -> Option<usize>,
+    name: &str,
+    time: f32,
+) -> Option<(Vec<Mat4>, f32)> {
+    let looping = animator.looping;
+    let sample = |clip: usize, t: f32| {
+        let c = &animations[clip];
+        let t = if looping { t } else { t.clamp(0.0, (c.duration - 1e-4).max(0.0)) };
+        c.sample(skel, t)
+    };
+    if let Some(tree) = animator.blend_trees.iter().find(|t| t.name == name) {
+        let p = [animator.get_float(&tree.parameter), animator.get_float(&tree.parameter_y)];
+        let w = tree.weights(p);
+        let motions: Vec<(usize, f32)> = tree
+            .motions
+            .iter()
+            .zip(&w)
+            .filter(|(_, w)| **w > 1e-4)
+            .filter_map(|(m, &w)| find(&m.clip).map(|c| (c, w)))
+            .collect();
+        if motions.is_empty() {
+            return None;
         }
-        n += 1;
+        let dur: f32 = motions.iter().map(|&(c, w)| w * animations[c].duration).sum();
+        let phase = if dur > 1e-6 { time / dur } else { 0.0 };
+        let poses: Vec<(Vec<Mat4>, f32)> = motions
+            .iter()
+            .map(|&(c, w)| (sample(c, phase * animations[c].duration), w))
+            .collect();
+        return Some((blend_many(&poses), dur));
     }
-    if n == 0 {
-        return [1.0; 3];
+    let c = find(name)?;
+    Some((sample(c, time), animations[c].duration))
+}
+
+/// Advance an Animator by `dt`: returns the blended joint locals and the
+/// root-motion delta (skeleton space, horizontal). Fires events into
+/// `state.fired`. `clips` index `animations` for this skeleton.
+fn advance_animator(
+    animator: &mut citrus_core::Animator,
+    skel: &citrus_assets::Skeleton,
+    animations: &[citrus_assets::AnimationClip],
+    clips: &[usize],
+    dt: f32,
+) -> (Vec<Mat4>, Vec3) {
+    let find = |name: &str| clips.iter().copied().find(|&c| animations[c].name == name);
+    animator.state.fired.clear();
+    if animator.state.clips.len() != clips.len() {
+        animator.state.clips = clips.iter().map(|&c| animations[c].name.clone()).collect();
     }
-    [
-        (acc[0] / n as f64) as f32,
-        (acc[1] / n as f64) as f32,
-        (acc[2] / n as f64) as f32,
-    ]
+    if !animator.state.started {
+        animator.state.started = true;
+        if animator.play_on_start {
+            let name = if animator.clip.is_empty() {
+                clips.first().map(|&c| animations[c].name.clone())
+            } else {
+                Some(animator.clip.clone())
+            };
+            animator.state.current = name;
+            animator.state.playing = animator.state.current.is_some();
+        }
+    }
+    let speed = animator.speed;
+    let prev_time = animator.state.time;
+    if animator.state.playing {
+        let s = &mut animator.state;
+        s.time += dt * speed;
+        s.fade_elapsed += dt;
+        if let Some((_, t)) = s.previous.as_mut() {
+            *t += dt * speed;
+        }
+    }
+    let Some(current) = animator.state.current.clone() else {
+        animator.state.duration = 0.0;
+        return (skel.rest_locals(), Vec3::ZERO);
+    };
+    let Some((mut pose, duration)) = sample_motion(animator, skel, animations, &find, &current, animator.state.time) else {
+        animator.state.duration = 0.0;
+        return (skel.rest_locals(), Vec3::ZERO);
+    };
+    animator.state.duration = duration;
+    if !animator.looping && duration > 0.0 {
+        animator.state.time = animator.state.time.min(duration);
+    }
+
+    // Events + root motion follow the dominant clip.
+    let mut root_delta = Vec3::ZERO;
+    if let (Some((c, a, cd)), Some((_, b, _))) = (
+        dominant_clip(animator, animations, &find, &current, prev_time),
+        dominant_clip(animator, animations, &find, &current, animator.state.time),
+    ) && cd > 1e-6
+    {
+        let (a, b) = if animator.looping { (a, b) } else { (a.clamp(0.0, cd), b.clamp(0.0, cd)) };
+        let clip_name = &animations[c].name;
+        if b > a {
+            for e in animator.events.iter().filter(|e| &e.clip == clip_name) {
+                let first = (a / cd).floor() as i64;
+                let last = (b / cd).floor() as i64;
+                for k in first..=last {
+                    let t = k as f32 * cd + e.time;
+                    if t > a && t <= b {
+                        animator.state.fired.push(e.name.clone());
+                    }
+                }
+            }
+        }
+        if animator.root_motion
+            && let Some(root) = skel.joints.iter().position(|j| j.parent.is_none())
+        {
+            let clip = &animations[c];
+            let root_at = |t: f32| clip.sample(skel, t)[root].w_axis.truncate();
+            let wrap = |t: f32| t.rem_euclid(cd);
+            let start = root_at(0.0);
+            let mut d = if animator.looping && (b / cd).floor() > (a / cd).floor() {
+                (root_at(cd - 1e-4) - root_at(wrap(a))) + (root_at(wrap(b)) - start)
+            } else {
+                root_at(if animator.looping { wrap(b) } else { b }) - root_at(if animator.looping { wrap(a) } else { a })
+            };
+            d.y = 0.0;
+            root_delta = d;
+            // Keep the skeleton in place horizontally; the object moves instead.
+            let t = pose[root].w_axis;
+            pose[root].w_axis = glam::Vec4::new(start.x, t.y, start.z, t.w);
+        }
+    }
+
+    let s = &mut animator.state;
+    let weight = if s.fade_duration > 0.0 { (s.fade_elapsed / s.fade_duration).min(1.0) } else { 1.0 };
+    if weight >= 1.0 {
+        animator.state.previous = None;
+    }
+    let previous = animator.state.previous.clone();
+    let pose = match previous.and_then(|(name, t)| sample_motion(animator, skel, animations, &find, &name, t)) {
+        Some((prev, _)) => blend_locals(&prev, &pose, weight),
+        None => pose,
+    };
+    (pose, root_delta)
+}
+
+/// Weighted per-joint TRS average of several poses (weights sum to ~1).
+fn blend_many(poses: &[(Vec<Mat4>, f32)]) -> Vec<Mat4> {
+    let Some((first, _)) = poses.first() else {
+        return Vec::new();
+    };
+    let total: f32 = poses.iter().map(|(_, w)| *w).sum::<f32>().max(1e-6);
+    (0..first.len())
+        .map(|j| {
+            let (mut s, mut t) = (Vec3::ZERO, Vec3::ZERO);
+            let mut q = glam::Vec4::ZERO;
+            let reference = first[j].to_scale_rotation_translation().1;
+            for (pose, w) in poses {
+                let (ps, pr, pt) = pose[j].to_scale_rotation_translation();
+                let w = w / total;
+                s += ps * w;
+                t += pt * w;
+                // Same hemisphere so the nlerp doesn't take the long way round.
+                let pr = if pr.dot(reference) < 0.0 { -pr } else { pr };
+                q += glam::Vec4::from(pr) * w;
+            }
+            let r = Quat::from_vec4(q).normalize();
+            Mat4::from_scale_rotation_translation(s, r, t)
+        })
+        .collect()
+}
+
+/// Per-joint TRS blend of two poses (`t` = 0 -> `a`, 1 -> `b`).
+fn blend_locals(a: &[Mat4], b: &[Mat4], t: f32) -> Vec<Mat4> {
+    a.iter()
+        .zip(b)
+        .map(|(ma, mb)| {
+            let (sa, ra, ta) = ma.to_scale_rotation_translation();
+            let (sb, rb, tb) = mb.to_scale_rotation_translation();
+            Mat4::from_scale_rotation_translation(sa.lerp(sb, t), ra.slerp(rb, t), ta.lerp(tb, t))
+        })
+        .collect()
 }
 
 pub fn model_from_material(
@@ -4287,15 +4940,23 @@ fn tracker_poses_from_targets(t: &citrus_core::TrackerTargets) -> crate::humanoi
 /// Strip a trailing `(N)` (N = digits) from a duplicate name so re-duplicating
 /// `file(2)` yields `file(3)`, not `file(2)(1)`. Returns the base, trimmed.
 fn strip_dup_suffix(name: &str) -> &str {
-    if let Some(open) = name.rfind('(') {
-        if name.ends_with(')') {
+    let mut name = name.trim_end();
+    loop {
+        if let Some(rest) = name.strip_suffix(" Copy") {
+            name = rest.trim_end();
+            continue;
+        }
+        if let Some(open) = name.rfind('(')
+            && name.ends_with(')')
+        {
             let inner = &name[open + 1..name.len() - 1];
             if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
-                return name[..open].trim_end();
+                name = name[..open].trim_end();
+                continue;
             }
         }
+        return name;
     }
-    name
 }
 
 /// Shader's per-fragment probe-volume cap (`MAX_PROBE_VOLUMES` in standard.frag).
@@ -4422,6 +5083,9 @@ mod tests {
         assert_eq!(strip_dup_suffix("file()"), "file()");
         // A space before the suffix is trimmed.
         assert_eq!(strip_dup_suffix("file (3)"), "file");
+        // Legacy "Copy" chains collapse to the base name.
+        assert_eq!(strip_dup_suffix("Spot Light Copy Copy Copy"), "Spot Light");
+        assert_eq!(strip_dup_suffix("Spot Light Copy (2)"), "Spot Light");
     }
 
     #[test]
@@ -4432,5 +5096,218 @@ mod tests {
         ];
         cluster_aabbs(&mut boxes, 4);
         assert_eq!(boxes.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod animator_tests {
+    use super::*;
+    use citrus_assets::{AnimChannel, AnimationClip, ChannelPath, Joint, Skeleton};
+    use citrus_core::Animator;
+
+    fn skeleton() -> Skeleton {
+        Skeleton {
+            joints: vec![Joint {
+                name: "root".into(),
+                parent: None,
+                inverse_bind: Mat4::IDENTITY,
+                rest_translation: Vec3::ZERO,
+                rest_rotation: Quat::IDENTITY,
+                rest_scale: Vec3::ONE,
+            }],
+        }
+    }
+
+    /// Moves the root from 0 to `to` over one second.
+    fn clip(name: &str, to: Vec3) -> AnimationClip {
+        AnimationClip {
+            name: name.into(),
+            duration: 1.0,
+            channels: vec![AnimChannel {
+                joint: 0,
+                path: ChannelPath::Translation,
+                times: vec![0.0, 1.0],
+                vec_values: vec![Vec3::ZERO, to],
+                quat_values: vec![],
+            }],
+        }
+    }
+
+    fn root_pos(locals: &[Mat4]) -> Vec3 {
+        locals[0].w_axis.truncate()
+    }
+
+    fn advance_animator_pose(
+        a: &mut Animator,
+        skel: &Skeleton,
+        clips: &[AnimationClip],
+        idx: &[usize],
+        dt: f32,
+    ) -> Vec<Mat4> {
+        advance_animator(a, skel, clips, idx, dt).0
+    }
+
+    #[test]
+    fn blend_tree_mixes_clips_by_parameter() {
+        let skel = skeleton();
+        let clips = vec![clip("Walk", Vec3::X), clip("Run", Vec3::Y)];
+        let mut a = Animator {
+            clip: "Move".into(),
+            blend_trees: vec![citrus_core::BlendTree {
+                name: "Move".into(),
+                parameter: "Speed".into(),
+                parameter_y: String::new(),
+                motions: vec![
+                    citrus_core::BlendMotion { clip: "Walk".into(), position: [1.0, 0.0] },
+                    citrus_core::BlendMotion { clip: "Run".into(), position: [3.0, 0.0] },
+                ],
+            }],
+            ..Default::default()
+        };
+        a.set_float("Speed", 2.0);
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &[0, 1], 0.5));
+        assert!((p - Vec3::new(0.25, 0.25, 0.0)).length() < 1e-3, "{p}");
+        a.set_float("Speed", 3.0);
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &[0, 1], 0.0));
+        assert!((p - Vec3::new(0.0, 0.5, 0.0)).length() < 1e-3, "{p}");
+    }
+
+    #[test]
+    fn events_fire_once_per_pass_including_loop_wrap() {
+        let skel = skeleton();
+        let clips = vec![clip("Walk", Vec3::X)];
+        let mut a = Animator {
+            events: vec![citrus_core::AnimEvent { clip: "Walk".into(), time: 0.25, name: "Step".into() }],
+            ..Default::default()
+        };
+        advance_animator(&mut a, &skel, &clips, &[0], 0.2);
+        assert!(a.state.fired.is_empty());
+        advance_animator(&mut a, &skel, &clips, &[0], 0.1);
+        assert_eq!(a.state.fired, vec!["Step".to_string()]);
+        advance_animator(&mut a, &skel, &clips, &[0], 0.5);
+        assert!(a.state.fired.is_empty());
+        // 0.8 -> 1.3 wraps past 1.25.
+        advance_animator(&mut a, &skel, &clips, &[0], 0.5);
+        assert_eq!(a.state.fired, vec!["Step".to_string()]);
+    }
+
+    #[test]
+    fn root_motion_moves_object_not_skeleton() {
+        let skel = skeleton();
+        let clips = vec![clip("Walk", Vec3::new(0.0, 0.0, 2.0))];
+        let mut a = Animator {
+            root_motion: true,
+            ..Default::default()
+        };
+        let (pose, d) = advance_animator(&mut a, &skel, &clips, &[0], 0.25);
+        assert!((d - Vec3::new(0.0, 0.0, 0.5)).length() < 1e-3, "{d}");
+        assert!(root_pos(&pose).z.abs() < 1e-4, "root pinned in place");
+        // Across the loop: 0.25 -> 1.25 is one full cycle = 2 m.
+        let (_, d) = advance_animator(&mut a, &skel, &clips, &[0], 1.0);
+        assert!((d.z - 2.0).abs() < 1e-2, "{d}");
+    }
+
+    #[test]
+    fn plays_first_clip_and_cross_fades() {
+        let skel = skeleton();
+        let clips = vec![clip("Walk", Vec3::X), clip("Jump", Vec3::Y)];
+        let idx = [0, 1];
+        let mut a = Animator::default();
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &idx, 0.5));
+        assert_eq!(a.state.current.as_deref(), Some("Walk"));
+        assert_eq!(a.state.clips, vec!["Walk".to_string(), "Jump".to_string()]);
+        assert!((p - Vec3::new(0.5, 0.0, 0.0)).length() < 1e-4);
+
+        a.play("Jump", 1.0);
+        // Halfway through the fade: Walk at t=1.0 (wraps to 0) blends with Jump at t=0.5.
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &idx, 0.5));
+        assert!((p.y - 0.25).abs() < 1e-3, "{p}");
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &idx, 0.6));
+        assert!(a.state.previous.is_none(), "fade finished");
+        assert!((p.x).abs() < 1e-4 && p.y > 0.0);
+    }
+
+    #[test]
+    fn non_looping_clip_holds_last_frame_and_finishes() {
+        let skel = skeleton();
+        let clips = vec![clip("Die", Vec3::X)];
+        let mut a = Animator {
+            looping: false,
+            ..Default::default()
+        };
+        advance_animator_pose(&mut a, &skel, &clips, &[0], 0.4);
+        assert!(!a.finished());
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &[0], 2.0));
+        assert!(a.finished());
+        assert!((p.x - 1.0).abs() < 1e-2, "{p}");
+    }
+
+    #[test]
+    fn no_play_on_start_stays_in_rest_pose() {
+        let skel = skeleton();
+        let clips = vec![clip("Walk", Vec3::X)];
+        let mut a = Animator {
+            play_on_start: false,
+            ..Default::default()
+        };
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &[0], 0.5));
+        assert_eq!(p, Vec3::ZERO);
+        a.play("Walk", 0.0);
+        let p = root_pos(&advance_animator_pose(&mut a, &skel, &clips, &[0], 0.25));
+        assert!((p.x - 0.25).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod lod_tests {
+    use super::*;
+    use citrus_core::{LodComponent, LodLevel};
+
+    fn scene_with_lod() -> LoadedScene {
+        let mut scene = LoadedScene::empty();
+        scene.objects.push(SceneObject {
+            id: ObjectId::new(),
+            name: String::new(),
+            render: None,
+            extra_render: Vec::new(),
+            source: ObjectSource::Empty,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            layer: 0,
+            parent: None,
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            components: vec![Box::new(LodComponent {
+                levels: vec![
+                    LodLevel { max_distance: 10.0, model: String::new() },
+                    LodLevel { max_distance: 20.0, model: String::new() },
+                ],
+                cull_distance: 30.0,
+            })],
+        });
+        scene
+    }
+
+    fn level_at(scene: &mut LoadedScene, d: f32) -> Option<Option<usize>> {
+        scene.lod_camera = Some(Vec3::new(d, 0.0, 0.0));
+        scene.lod_level(0, Vec3::ZERO).ok()?;
+        Some(scene.lod_state[&scene.objects[0].id])
+    }
+
+    #[test]
+    fn lod_switches_with_hysteresis_and_culls() {
+        let mut s = scene_with_lod();
+        assert_eq!(level_at(&mut s, 5.0), Some(Some(0)));
+        // Just past the boundary stays on level 0 (inside the 5% band).
+        assert_eq!(level_at(&mut s, 10.3), Some(Some(0)));
+        assert_eq!(level_at(&mut s, 11.0), Some(Some(1)));
+        // Coming back, level 1 holds until clearly inside level 0's range.
+        assert_eq!(level_at(&mut s, 9.8), Some(Some(1)));
+        assert_eq!(level_at(&mut s, 9.0), Some(Some(0)));
+        // Past the last level keeps the coarsest; past cull_distance culls.
+        assert_eq!(level_at(&mut s, 25.0), Some(Some(1)));
+        assert_eq!(level_at(&mut s, 40.0), None);
     }
 }

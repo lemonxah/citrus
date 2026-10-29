@@ -315,3 +315,117 @@ fn read_cache(path: &Path, src_mtime: u64, src_len: u64) -> Option<CompressedTex
         mips,
     })
 }
+
+const MEAN_MAGIC: &[u8; 8] = b"CITRMN01";
+
+/// Mean linear RGB of a texture (sRGB sources decoded to linear; HDR and
+/// unreadable files give `[1,1,1]`). Cached as `<filename>.<srgb>.mean` beside
+/// the BC cache, so only the first load ever decodes the source for it.
+pub fn texture_mean(path: impl AsRef<Path>, srgb: bool) -> [f32; 3] {
+    let path = path.as_ref();
+    let meta = std::fs::metadata(path).ok();
+    let src_mtime = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let src_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let cache = cache_path(path, srgb).map(|p| p.with_extension("mean"));
+    if let Some(cache) = &cache
+        && let Some(mean) = read_mean(cache, src_mtime, src_len)
+    {
+        return mean;
+    }
+    let mean = match load_texture_file(path, srgb) {
+        Ok(data) => texture_mean_linear(&data),
+        Err(_) => return [1.0; 3],
+    };
+    if let Some(cache) = &cache {
+        let mut buf = Vec::with_capacity(36);
+        buf.extend_from_slice(MEAN_MAGIC);
+        buf.extend_from_slice(&src_mtime.to_le_bytes());
+        buf.extend_from_slice(&src_len.to_le_bytes());
+        for c in mean {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        let written = cache
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(cache, &buf));
+        if let Err(e) = written {
+            tracing::debug!("texture mean cache write {}: {e:#}", cache.display());
+        }
+    }
+    mean
+}
+
+fn read_mean(path: &Path, src_mtime: u64, src_len: u64) -> Option<[f32; 3]> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() != 36 || &bytes[..8] != MEAN_MAGIC {
+        return None;
+    }
+    let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    if u64_at(8) != src_mtime || u64_at(16) != src_len {
+        return None;
+    }
+    let f = |o: usize| f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    Some([f(24), f(28), f(32)])
+}
+
+/// Mean RGB in linear space. HDR maps return `[1,1,1]`: their values exceed 1
+/// and aren't a simple coverage factor.
+pub fn texture_mean_linear(data: &citrus_render::TextureData) -> [f32; 3] {
+    if data.hdr || data.pixels.len() < 4 {
+        return [1.0; 3];
+    }
+    let mut acc = [0.0f64; 3];
+    let mut n = 0u64;
+    for px in data.pixels.chunks_exact(4) {
+        for c in 0..3 {
+            let s = px[c] as f32 / 255.0;
+            acc[c] += if data.srgb { srgb_to_linear(s) } else { s } as f64;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return [1.0; 3];
+    }
+    [
+        (acc[0] / n as f64) as f32,
+        (acc[1] / n as f64) as f32,
+        (acc[2] / n as f64) as f32,
+    ]
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_mean_is_cached_and_invalidated() {
+        let dir = std::env::temp_dir().join(format!("citrus_mean_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("grey.png");
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 128, 255, 255])).save(&png).unwrap();
+
+        let mean = texture_mean(&png, false);
+        assert!((mean[0] - 0.0).abs() < 1e-4 && (mean[1] - 128.0 / 255.0).abs() < 1e-4 && (mean[2] - 1.0).abs() < 1e-4);
+        let sidecar = dir.join(".citrus_texcache/grey.png.0.mean");
+        assert!(sidecar.exists());
+        assert_eq!(texture_mean(&png, false), mean);
+
+        // A different source (size changes) must not reuse the stale mean.
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255])).save(&png).unwrap();
+        assert_eq!(texture_mean(&png, false), [1.0; 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

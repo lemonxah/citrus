@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use egui::{Align2, FontId, RichText, ScrollArea, Sense, Ui};
+use egui_phosphor::regular as ph;
 
 const TILE: egui::Vec2 = egui::vec2(78.0, 88.0);
 
@@ -34,6 +35,8 @@ struct Renaming {
 
 pub struct FileBrowser {
     pub root: PathBuf,
+    /// Toolbar search: filters the current folder's tiles by name.
+    search: String,
     /// Folder whose contents the grid shows.
     current_dir: PathBuf,
     /// Expanded folders in the tree (the root is always open).
@@ -104,6 +107,7 @@ impl FileBrowser {
         Self {
             current_dir: root.clone(),
             root,
+            search: String::new(),
             open_dirs: HashSet::new(),
             clipboard: None,
             renaming: None,
@@ -281,8 +285,9 @@ impl FileBrowser {
 
         egui::SidePanel::left(ui.id().with("files-tree"))
             .resizable(true)
-            .default_width(150.0)
+            .default_width(188.0)
             .width_range(90.0..=320.0)
+            .frame(egui::Frame::new().fill(crate::theme::BG_PANEL).inner_margin(egui::Margin::symmetric(6, 6)))
             .show_inside(ui, |ui| {
                 ScrollArea::vertical()
                     .id_salt("files-tree-scroll")
@@ -305,41 +310,38 @@ impl FileBrowser {
                     });
             });
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(crate::theme::BG_PANEL).inner_margin(egui::Margin::symmetric(10, 0)))
+            .show_inside(ui, |ui| {
+            use crate::{icons::Icon, theme, widgets};
             ui.horizontal(|ui| {
+                ui.set_height(40.0);
                 let at_root = self.current_dir == self.root;
                 if ui
-                    .add_enabled(!at_root, egui::Button::new("⬆"))
-                    .on_hover_text("Parent folder")
+                    .add_enabled_ui(!at_root, |ui| widgets::icon_button_sized(ui, Icon::ArrowUp, "Parent folder", false, egui::vec2(26.0, 26.0)))
+                    .inner
                     .clicked()
                     && let Some(parent) = self.current_dir.parent()
                 {
                     self.current_dir = parent.to_owned();
                 }
-                let crumb = self
-                    .current_dir
-                    .strip_prefix(&self.root)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                let crumb = if crumb.is_empty() {
-                    "(project)".to_owned()
+                let name = if at_root {
+                    "Project".to_owned()
                 } else {
-                    crumb
+                    self.current_dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
                 };
-                ui.label(RichText::new(crumb).size(14.0).weak());
+                ui.label(RichText::new(name).font(theme::medium(theme::SIZE_BODY)).color(theme::TEXT_STRONG))
+                    .on_hover_text(self.current_dir.strip_prefix(&self.root).map(|p| p.display().to_string()).unwrap_or_default());
+                let (dirs, files) = list_dir(&self.current_dir);
+                ui.label(RichText::new(format!("{} items", dirs.len() + files.len())).size(theme::SIZE_META).color(theme::TEXT_DIM));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let dir = self.current_dir.clone();
-                    ui.menu_button("➕ Create", |ui| {
-                        self.create_menu(ui, &dir, &mut response);
-                    });
-                    // Tile-size slider: larger tiles = bigger image previews.
-                    ui.spacing_mut().slider_width = 90.0;
-                    ui.add(
-                        egui::Slider::new(&mut self.tile_px, TILE.x..=176.0)
-                            .show_value(false),
-                    )
-                    .on_hover_text("Tile size");
-                    ui.label(RichText::new(egui_phosphor::regular::IMAGE).weak());
+                    let create = widgets::primary_button_sized(ui, Some(Icon::Plus), "Create", theme::H_FIELD);
+                    egui::Popup::menu(&create).show(|ui| self.create_menu(ui, &dir, &mut response));
+                    ui.spacing_mut().slider_width = 70.0;
+                    ui.add(egui::Slider::new(&mut self.tile_px, TILE.x..=176.0).show_value(false)).on_hover_text("Tile size");
+                    ui.label(RichText::new("Size").size(theme::SIZE_META).color(theme::TEXT_MUTED));
+                    widgets::search_field(ui, &mut self.search, "Search files", 180.0);
                 });
             });
             ui.separator();
@@ -398,30 +400,29 @@ impl FileBrowser {
             // Full-width row: clicks, right-clicks, hover and drops work
             // across the whole line, not just over the text.
             let (rect, row) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), Sense::click());
-            let indent = 4.0 + depth as f32 * 12.0;
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), Sense::click());
+            let indent = 4.0 + depth as f32 * 22.0;
             let current = dir == self.current_dir;
             if current {
-                ui.painter()
-                    .rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+                ui.painter().rect_filled(rect, crate::theme::R_ROW, crate::theme::accent_faint());
             } else if row.hovered() {
-                ui.painter()
-                    .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                ui.painter().rect_filled(rect, crate::theme::R_ROW, crate::theme::with_alpha(crate::theme::BG_BUTTON, 0.6));
             }
-            let text_color = if current {
-                ui.visuals().selection.stroke.color
-            } else {
-                ui.visuals().text_color()
-            };
+            let text_color = if current { crate::theme::TEXT_STRONG } else { crate::theme::TEXT_SECONDARY };
             if !subdirs.is_empty() {
-                ui.painter().text(
-                    egui::pos2(rect.left() + indent + 6.0, rect.center().y),
-                    Align2::CENTER_CENTER,
-                    if open { "⏷" } else { "⏵" },
-                    FontId::proportional(10.0),
-                    ui.visuals().weak_text_color(),
+                crate::widgets::paint_caret(
+                    &ui.painter(),
+                    egui::Rect::from_center_size(egui::pos2(rect.left() + indent + 6.0, rect.center().y), egui::vec2(11.0, 11.0)),
+                    open,
+                    crate::theme::TEXT_DIM,
                 );
             }
+            crate::icons::paint(
+                &ui.painter(),
+                egui::Rect::from_center_size(egui::pos2(rect.left() + indent + 21.0, rect.center().y), egui::vec2(14.0, 14.0)),
+                crate::icons::Icon::Folder,
+                if current { crate::theme::accent() } else { crate::theme::TEXT_MUTED },
+            );
             let name = if is_root {
                 "Project".to_owned()
             } else {
@@ -430,10 +431,10 @@ impl FileBrowser {
                     .unwrap_or_default()
             };
             ui.painter().text(
-                egui::pos2(rect.left() + indent + 14.0, rect.center().y),
+                egui::pos2(rect.left() + indent + 33.0, rect.center().y),
                 Align2::LEFT_CENTER,
-                format!("🗀 {name}"),
-                FontId::proportional(13.0),
+                name,
+                FontId::proportional(crate::theme::SIZE_BODY),
                 text_color,
             );
             // Aggregate problem badge for the folder's contents.
@@ -509,16 +510,23 @@ impl FileBrowser {
         selected: Option<&Path>,
         response: &mut FileBrowserResponse,
     ) {
-        let (dirs, files) = list_dir(&self.current_dir);
+        let (mut dirs, mut files) = list_dir(&self.current_dir);
+        let needle = self.search.to_lowercase();
+        if !needle.is_empty() {
+            let keep = |p: &PathBuf| p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&needle));
+            dirs.retain(keep);
+            files.retain(keep);
+        }
         if dirs.is_empty() && files.is_empty() {
-            ui.label(RichText::new("Empty folder").weak());
+            let msg = if needle.is_empty() { "Empty folder" } else { "No matching files" };
+            ui.label(RichText::new(msg).color(crate::theme::TEXT_DIM));
             return;
         }
         // Record the visible order (dirs then files) so shift-range can resolve
         // the span between the anchor and the shift-clicked entry.
         self.order = dirs.iter().chain(files.iter()).cloned().collect();
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             for path in dirs {
                 self.tile(ui, &path, true, selected, response);
             }
@@ -546,11 +554,15 @@ impl FileBrowser {
         }
         let is_selected = selected == Some(path) || self.multi.contains(path);
         if is_selected {
-            ui.painter()
-                .rect_filled(rect, 6.0, ui.visuals().selection.bg_fill);
+            ui.painter().rect(
+                rect,
+                crate::theme::R_TOOLBAR,
+                crate::theme::accent_faint(),
+                egui::Stroke::new(1.0_f32, crate::theme::with_alpha(crate::theme::accent(), 0.45)),
+                egui::StrokeKind::Inside,
+            );
         } else if tile.hovered() {
-            ui.painter()
-                .rect_filled(rect, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            ui.painter().rect_filled(rect, crate::theme::R_TOOLBAR, crate::theme::with_alpha(crate::theme::BG_BUTTON, 0.6));
         }
 
         let is_rust = !is_dir
@@ -561,11 +573,7 @@ impl FileBrowser {
         // Centre the icon/preview in the area above the fixed name band.
         let name_top = rect.bottom() - 32.0;
         let icon_center = egui::pos2(rect.center().x, (rect.top() + name_top) * 0.5);
-        let icon_color = if is_selected {
-            ui.visuals().selection.stroke.color
-        } else {
-            ui.visuals().text_color()
-        };
+        let icon_color = crate::theme::TEXT_MUTED;
         if is_rust {
             // Monochrome Ferris silhouette for .rs files. ~30px tall, keep aspect.
             let tex = self.ferris_texture(ui.ctx());
@@ -614,18 +622,24 @@ impl FileBrowser {
         } else {
             // Phosphor icon glyph for the file/folder type (also the fallback
             // for an image whose thumbnail isn't decoded yet / failed).
-            let glyph = if is_dir {
-                egui_phosphor::regular::FOLDER
-            } else {
-                phosphor_icon(icon_kind(path))
-            };
-            ui.painter().text(
-                icon_center,
-                Align2::CENTER_CENTER,
-                glyph,
-                FontId::proportional(30.0 * s),
-                icon_color,
-            );
+            match spec_icon(path, is_dir) {
+                Some((icon, color)) => crate::icons::paint_with(
+                    &ui.painter(),
+                    egui::Rect::from_center_size(icon_center, egui::vec2(34.0 * s, 34.0 * s)),
+                    icon,
+                    color,
+                    0.9,
+                ),
+                None => {
+                    ui.painter().text(
+                        icon_center,
+                        Align2::CENTER_CENTER,
+                        phosphor_icon(icon_kind(path)),
+                        FontId::proportional(30.0 * s),
+                        icon_color,
+                    );
+                }
+            }
         }
 
         // LSP problem badge at the icon's top-right.
@@ -648,11 +662,7 @@ impl FileBrowser {
             // Name under the icon, single line, cropped with `…`. Known asset
             // extensions are hidden (the icon conveys the type).
             let name = display_name(path, is_dir);
-            let color = if is_selected {
-                ui.visuals().selection.stroke.color
-            } else {
-                ui.visuals().text_color()
-            };
+            let color = if is_selected { crate::theme::TEXT_STRONG } else { crate::theme::TEXT_SECONDARY };
             let mut job = egui::text::LayoutJob::default();
             job.append(
                 &name,
@@ -711,18 +721,9 @@ impl FileBrowser {
                 let pad = egui::vec2(8.0, 4.0);
                 let origin = pos + egui::vec2(14.0, 6.0);
                 let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
-                painter.rect_filled(
-                    rect,
-                    4.0,
-                    egui::Color32::from_rgba_unmultiplied(60, 46, 110, 235),
-                );
-                painter.rect_stroke(
-                    rect,
-                    4.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 120, 220)),
-                    egui::StrokeKind::Inside,
-                );
-                painter.galley(origin + pad, galley, egui::Color32::WHITE);
+                painter.rect_filled(rect, crate::theme::R_ROW, crate::theme::BG_SEGMENT_ACTIVE);
+                painter.rect_stroke(rect, crate::theme::R_ROW, egui::Stroke::new(1.0_f32, crate::theme::accent()), egui::StrokeKind::Inside);
+                painter.galley(origin + pad, galley, crate::theme::TEXT_STRONG);
             }
         }
         if tile.double_clicked() {
@@ -868,7 +869,7 @@ impl FileBrowser {
         }
         ui.separator();
         if ui
-            .button("🗑 Delete")
+            .button(format!("{} Delete", ph::TRASH))
             .on_hover_text("Delete this file or folder")
             .clicked()
         {
@@ -1297,9 +1298,26 @@ fn display_name(path: &Path, is_dir: bool) -> String {
     part.map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Spec icon + colour for folders and the file types the design covers
+/// (spec §7.1); other types fall back to a Phosphor glyph.
+fn spec_icon(path: &Path, is_dir: bool) -> Option<(crate::icons::Icon, egui::Color32)> {
+    use crate::icons::Icon;
+    use crate::theme;
+    if is_dir {
+        return Some((Icon::Folder, theme::TYPE_GROUP));
+    }
+    match icon_kind(path) {
+        IconKind::Scene | IconKind::Model => Some((Icon::Model, theme::TYPE_MESH)),
+        IconKind::Citrus => Some((Icon::Gear, theme::accent())),
+        IconKind::Config => Some((Icon::File, theme::TYPE_LIGHT)),
+        IconKind::Markdown => Some((Icon::FileDoc, theme::TEXT_SECONDARY)),
+        IconKind::Doc => Some((Icon::File, theme::TEXT_MUTED)),
+        _ => None,
+    }
+}
+
 /// Phosphor icon glyph for a file kind.
 fn phosphor_icon(kind: IconKind) -> &'static str {
-    use egui_phosphor::regular as ph;
     match kind {
         IconKind::Scene => ph::GLOBE_HEMISPHERE_WEST,
         IconKind::Material => ph::SPHERE,

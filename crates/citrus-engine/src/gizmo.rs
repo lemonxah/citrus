@@ -16,9 +16,13 @@ use transform_gizmo_egui::{
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GizmoTool {
+    /// Pick only, no transform handles.
+    Select,
     Move,
     Rotate,
     Scale,
+    /// 2D rect handles (UI elements); 3D objects get no handles.
+    Rect,
 }
 
 /// Where the gizmo sits and what transformations pivot around.
@@ -53,6 +57,7 @@ impl GizmoTool {
             Self::Scale => enum_set!(
                 GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ | GizmoMode::ScaleUniform
             ),
+            Self::Select | Self::Rect => EnumSet::empty(),
         }
     }
 }

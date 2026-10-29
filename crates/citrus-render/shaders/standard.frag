@@ -49,10 +49,11 @@ layout(set = 0, binding = 0) uniform FrameData {
     mat4 inv_view;
     mat4 inv_proj;
     vec4 ssr; // x = enabled, y = intensity, z = max view-space dist, w = roughness cutoff
-    vec4 refl_center;  // xyz = probe box center, w = intensity (0 = no probe zone)
+    vec4 refl_center;  // xyz = probe CAPTURE position (re-vector anchor), w = intensity (0 = no zone)
     vec4 refl_extents; // xyz = probe box half-extents, w = box-projection enabled
     vec4 fog_color;    // xyz = fog colour, w = density (0 = no fog)
     vec4 fog_params;   // x = height falloff, y = height ref, z = start distance
+    vec4 refl_box;     // xyz = probe box CENTER (capture + box offset), w unused
 } frame;
 
 // Bindings 5 (scene depth) and 6 (prev colour) feed the deferred SSR resolve
@@ -60,6 +61,9 @@ layout(set = 0, binding = 0) uniform FrameData {
 // Reflection probe: prefiltered environment cubemap (mirror at mip 0, rougher
 // toward higher mips). Sampled by reflection direction + roughness.
 layout(set = 0, binding = 7) uniform samplerCube u_env;
+// Planar reflections: per-plane mirrored scene renders, sampled at screen UV
+// by surfaces whose push constant carries a planar layer (pc.emission.w >= 1).
+layout(set = 0, binding = 8) uniform sampler2DArray u_planar;
 // Max roughness mip = (mip count - 1) of the CURRENTLY bound cube, queried at
 // runtime so it's correct whether u_env is the 64px skybox cube (7 mips) or a
 // higher-res captured reflection-probe cube (e.g. 256px = 9 mips). A hardcoded
@@ -847,7 +851,11 @@ void main() {
         // Use the SMOOTH (non-occluded) probe sample — the lightmap already carries
         // the static occlusion, and the DDGI Chebyshev's per-probe variation showed
         // as fixed dots on the bright baked surface. Returns 0 with no realtime GI.
-        indirect += sample_irradiance_smooth(v_world_pos, N);
+        // debug.z < -0.5 = static bake capture: realtime GI (dynamic emitters'
+        // bounce) must not bake into the reflection cube.
+        if (frame.debug.z > -0.5) {
+            indirect += sample_irradiance_smooth(v_world_pos, N);
+        }
     } else if (frame.debug.z > 0.5) {
         // Screen-space GI: depth-aware upsample of the sparse screen probes.
         // Emissive surfaces are in the depth prepass again, so they sample their
@@ -868,9 +876,14 @@ void main() {
         // has no occlusion to lose, and the SDF/RT march already bakes occlusion into
         // the probe values, so dropping the Chebyshev here only removes interpolation
         // leak-guarding — a fair trade for the smooth, even result.
-        vec3 occ_irr;
-        float cov = sample_probes(v_world_pos, N, occ_irr);
-        indirect = mix(frame.ambient.rgb, sample_irradiance_smooth(v_world_pos, N), cov);
+        if (frame.debug.z < -0.5) {
+            // Static bake capture: no realtime probe GI, flat ambient only.
+            indirect = frame.ambient.rgb;
+        } else {
+            vec3 occ_irr;
+            float cov = sample_probes(v_world_pos, N, occ_irr);
+            indirect = mix(frame.ambient.rgb, sample_irradiance_smooth(v_world_pos, N), cov);
+        }
     }
     // Energy-conserving ambient: split indirect into diffuse (non-reflected) and
     // a cheap specular share so metals/smooth surfaces pick up environment colour
@@ -892,22 +905,33 @@ void main() {
     // infinitely distant. `refl_center.w` = probe intensity (0 = no zone).
     float probe_intensity = frame.refl_center.w;
     if (probe_intensity > 0.0 && frame.refl_extents.w > 0.5) {
-        vec3 bmin = frame.refl_center.xyz - frame.refl_extents.xyz;
-        vec3 bmax = frame.refl_center.xyz + frame.refl_extents.xyz;
+        // Box (proxy geometry) around refl_box (its own center, offsettable from
+        // the capture point); re-vector below anchors on refl_center = CAPTURE
+        // position — Lagarde's "box center doesn't need to match cubemap center".
+        vec3 bmin = frame.refl_box.xyz - frame.refl_extents.xyz;
+        vec3 bmax = frame.refl_box.xyz + frame.refl_extents.xyz;
         // Only box-project surfaces INSIDE the probe box. The box is a proxy for the
         // room geometry as seen from the capture point; for a surface OUTSIDE it (a
         // floor extending past the probe, say) the ray-box intersection lands on the
         // wrong face and the reflection is mis-placed — so fall back to the infinite-
         // cube direction (raw R) there instead of producing a garbage parallax hit.
         // (REFLECTION_PROBES_MATH.md 6.4: wrong box coverage = offset reflections.)
-        bool inside = all(greaterThanEqual(v_world_pos, bmin))
-                   && all(lessThanEqual(v_world_pos, bmax));
+        // Small tolerance so surfaces FLUSH with a box face (a mirror on the
+        // wall, the floor itself) still count as inside — the common authoring
+        // is walls exactly on the box, and float error must not drop them to
+        // the no-parallax fallback.
+        vec3 eps = frame.refl_extents.xyz * 0.02 + 0.02;
+        bool inside = all(greaterThanEqual(v_world_pos, bmin - eps))
+                   && all(lessThanEqual(v_world_pos, bmax + eps));
         if (inside) {
             vec3 invR = 1.0 / R;
             vec3 t1 = (bmax - v_world_pos) * invR;
             vec3 t2 = (bmin - v_world_pos) * invR;
             vec3 tmax = max(t1, t2);
             float dist = min(min(tmax.x, tmax.y), tmax.z);
+            // A fragment just outside the box (eps tolerance) can produce a
+            // negative exit distance; clamp so the hit never lands behind it.
+            dist = max(dist, 0.0);
             vec3 hit = v_world_pos + R * dist;
             R = hit - frame.refl_center.xyz;
         }
@@ -922,6 +946,21 @@ void main() {
     // angle — never the dark diffuse-GI stand-in. The fullscreen SSR resolve pass
     // (deferred, current-frame) overlays screen-space reflections on top of this.
     vec3 spec_env = textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * env_scale;
+    // Planar reflection: this surface has its own mirrored scene render
+    // (pc.emission.w = layer+1 in the integer part, roughness fade cutoff in
+    // the fraction). Rendered with the same camera/viewport convention as this
+    // pass, so the reflection for THIS pixel sits at the same screen UV — a
+    // true mirror with per-pixel parallax, replacing the probe/env on smooth
+    // surfaces and fading back to it as roughness rises. frame.refl_box.w = 0
+    // in the planar/capture/preview passes themselves (no recursion).
+    if (pc.emission.w >= 1.0 && frame.refl_box.w > 0.5) {
+        float planar_layer = floor(pc.emission.w) - 1.0;
+        float cutoff = max(fract(pc.emission.w), 0.05);
+        vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
+        vec3 planar_col = texture(u_planar, vec3(suv, planar_layer)).rgb;
+        float w = 1.0 - smoothstep(cutoff * 0.5, cutoff, roughness);
+        spec_env = mix(spec_env, planar_col, w);
+    }
     // Reflectance weight that multiplies environment radiance. The resolve pass
     // re-derives env radiance from this same cube and swaps in the SSR hit:
     //   final += reflectance * conf * (ssr_radiance - env_radiance)

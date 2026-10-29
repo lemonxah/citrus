@@ -13,6 +13,7 @@ mod pipeline;
 mod post;
 mod profiler_window;
 pub mod sdf;
+mod skin;
 mod rt_reflect;
 mod ssr;
 mod swapchain;
@@ -50,6 +51,7 @@ pub use bake::{BakeJob, BakeStep};
 pub use gpu_gi::{GpuGiEmitter, GpuGiMarch, GpuGiMaterial};
 pub use types::*;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -229,7 +231,8 @@ struct FrameUbo {
     /// Screen-space reflections: x = enabled (>0.5), y = intensity,
     /// z = max ray distance (view-space units), w = roughness cutoff (no SSR above).
     ssr: [f32; 4],
-    /// Reflection-probe zone: xyz = box center (world), w = intensity (0 = no probe).
+    /// Reflection-probe zone: xyz = CAPTURE position (world, the parallax
+    /// re-vector anchor), w = intensity (0 = no probe).
     refl_center: [f32; 4],
     /// Reflection-probe zone: xyz = box half-extents (world), w = box-projection on.
     refl_extents: [f32; 4],
@@ -237,6 +240,9 @@ struct FrameUbo {
     fog_color: [f32; 4],
     /// Fog: x = height falloff, y = height ref (world Y), z = start distance, w unused.
     fog_params: [f32; 4],
+    /// Reflection-probe zone: xyz = box CENTER (world; capture + box offset),
+    /// w unused. Appended last so shaders that don't read it stay compatible.
+    refl_box: [f32; 4],
 }
 
 #[repr(C)]
@@ -691,7 +697,7 @@ impl DepthTarget {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { ctx.device.create_image(&info, None)? };
         let requirements = unsafe { ctx.device.get_image_memory_requirements(image) };
@@ -903,6 +909,162 @@ struct ReflCaptureJob {
     depth_view: vk::ImageView,
     /// Faces rendered so far (0..6); at 6 the next step finalizes.
     next_face: usize,
+    /// Baked-probe capture: draw only static geometry and no realtime GI, so
+    /// dynamic objects and their light bounces never bake into the cube.
+    static_only: bool,
+}
+
+/// Most planar-reflection surfaces rendered per frame (each costs a full
+/// mirrored scene pass); extras fall back to the reflection probe.
+pub const MAX_PLANAR: usize = 4;
+
+/// Render targets for planar reflections: a 2D array (one layer per active
+/// plane) rendered by mirrored scene passes and sampled by the main pass at
+/// screen UV (set 0, binding 8). Recreated when the main target extent changes.
+/// Uses the pipeline cache's color format (same pipelines as the main pass);
+/// rendered with the inline tonemap and sampled as environment radiance, like
+/// the probe cube.
+struct PlanarTargets {
+    extent: vk::Extent2D,
+    image: vk::Image,
+    alloc: Option<Allocation>,
+    /// Sampled view over all layers.
+    array_view: vk::ImageView,
+    /// Per-layer attachment views for the mirrored passes.
+    layer_views: Vec<vk::ImageView>,
+    depth_img: vk::Image,
+    depth_alloc: Option<Allocation>,
+    depth_view: vk::ImageView,
+}
+
+impl PlanarTargets {
+    fn new(
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        extent: vk::Extent2D,
+        format: vk::Format,
+    ) -> Result<Self> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(MAX_PLANAR as u32)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let alloc = allocator.allocate(&AllocationCreateDesc {
+            name: "planar reflection array",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, alloc.memory(), alloc.offset())? };
+        let array_view = {
+            let info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(MAX_PLANAR as u32),
+                );
+            unsafe { device.create_image_view(&info, None)? }
+        };
+        let mut layer_views = Vec::with_capacity(MAX_PLANAR);
+        for layer in 0..MAX_PLANAR as u32 {
+            let info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_array_layer(layer)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            layer_views.push(unsafe { device.create_image_view(&info, None)? });
+        }
+        let (depth_img, depth_alloc) = create_image(
+            device,
+            allocator,
+            DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            extent,
+            "planar reflection depth",
+        )?;
+        let depth_view = create_view(device, depth_img, DEPTH_FORMAT, vk::ImageAspectFlags::DEPTH)?;
+        Ok(Self {
+            extent,
+            image,
+            alloc: Some(alloc),
+            array_view,
+            layer_views,
+            depth_img,
+            depth_alloc: Some(depth_alloc),
+            depth_view,
+        })
+    }
+
+    fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
+        unsafe {
+            device.destroy_image_view(self.array_view, None);
+            for v in self.layer_views.drain(..) {
+                device.destroy_image_view(v, None);
+            }
+            device.destroy_image_view(self.depth_view, None);
+            device.destroy_image(self.image, None);
+            device.destroy_image(self.depth_img, None);
+        }
+        if let Some(a) = self.alloc.take() {
+            let _ = allocator.free(a);
+        }
+        if let Some(a) = self.depth_alloc.take() {
+            let _ = allocator.free(a);
+        }
+    }
+}
+
+/// Householder reflection about the plane through `point` with unit `normal`:
+/// mirrors world space across the plane (applied to the view matrix for planar
+/// reflection rendering).
+fn mirror_matrix(point: glam::Vec3, normal: glam::Vec3) -> glam::Mat4 {
+    let n = normal.normalize_or(glam::Vec3::Y);
+    let d = n.dot(point);
+    glam::Mat4::from_cols(
+        glam::vec4(1.0 - 2.0 * n.x * n.x, -2.0 * n.x * n.y, -2.0 * n.x * n.z, 0.0),
+        glam::vec4(-2.0 * n.y * n.x, 1.0 - 2.0 * n.y * n.y, -2.0 * n.y * n.z, 0.0),
+        glam::vec4(-2.0 * n.z * n.x, -2.0 * n.z * n.y, 1.0 - 2.0 * n.z * n.z, 0.0),
+        glam::vec4(2.0 * d * n.x, 2.0 * d * n.y, 2.0 * d * n.z, 1.0),
+    )
+}
+
+/// Oblique near-plane projection (Lengyel), [0,1] depth: replace the z row so
+/// the near plane IS `clip_view` (a plane in view space, normal toward the
+/// camera side). Clips everything behind the mirror plane, which a plain near
+/// plane can't do for a mirrored camera.
+fn oblique_projection(proj: glam::Mat4, clip_view: glam::Vec4) -> glam::Mat4 {
+    // Far-corner point opposite the plane normal, in view space.
+    let q = proj.inverse()
+        * glam::vec4(clip_view.x.signum(), clip_view.y.signum(), 1.0, 1.0);
+    // Scale the plane so at q: z' = w' (depth 1 at the far corner); on the
+    // plane itself z' = 0 (the new near plane).
+    let row3 = proj.row(3);
+    let c = clip_view * (row3.dot(q) / clip_view.dot(q));
+    let mut m = proj;
+    // glam is column-major: write row 2 across the columns.
+    m.x_axis.z = c.x;
+    m.y_axis.z = c.y;
+    m.z_axis.z = c.z;
+    m.w_axis.z = c.w;
+    m
 }
 
 /// A prefiltered environment reflection cubemap (the runtime side of a
@@ -1773,9 +1935,10 @@ impl CameraPreview {
                             descriptor_count: FRAMES_IN_FLIGHT as u32,
                         },
                         vk::DescriptorPoolSize {
-                            // shadow(1)+lightmap(3)+GI(4)+SSR depth(5)+color(6)+env cube(7)
+                            // shadow(1)+lightmap(3)+GI(4)+SSR depth(5)+color(6)
+                            // +env cube(7)+planar(8)
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 6 * FRAMES_IN_FLIGHT as u32,
+                            descriptor_count: 7 * FRAMES_IN_FLIGHT as u32,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -1871,6 +2034,13 @@ impl CameraPreview {
                     .dst_binding(7)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&env_info),
+                // Binding 8 (planar reflections) — never sampled by the preview
+                // (its UBO leaves the planar flag 0); valid placeholder only.
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(8)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&lightmap_info),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
             ubos.push(buffer);
@@ -1955,6 +2125,10 @@ struct ViewportTarget {
     /// Rect-sized Flux targets for the editor main-camera trace (the game keeps
     /// the renderer's own `self.sgi`).
     sgi: ScreenGiTargets,
+    /// The `sgi` images hold no history yet (just created). The temporal
+    /// state is shared with the main path, which can re-validate it before the
+    /// viewport's first trace, so the target tracks its own freshness.
+    sgi_fresh: bool,
     /// Previous-frame colour for SSR in the editor viewport.
     ssr_color: ColorHistory,
     /// HDR scene target + post descriptor set: the viewport scene renders linear
@@ -2040,7 +2214,7 @@ impl ViewportTarget {
             device,
             allocator,
             DEPTH_FORMAT,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
             extent,
             "viewport depth",
         )?;
@@ -2066,6 +2240,7 @@ impl ViewportTarget {
             depth_view,
             depth_alloc: Some(depth_alloc),
             sgi,
+            sgi_fresh: true,
             ssr_color,
             hdr_image,
             hdr_view,
@@ -2265,10 +2440,16 @@ pub struct Renderer {
     refl_capture_pool: vk::DescriptorPool,
     refl_capture_set: vk::DescriptorSet,
     refl_capture_ubo: Buffer,
+    /// Planar reflections: RT array (lazily sized to the main target) + one
+    /// pre-allocated set-0/UBO per plane pass (all recorded in the frame cb).
+    /// The sets live in `refl_capture_pool`.
+    planar_targets: Option<PlanarTargets>,
+    planar_sets: Vec<vk::DescriptorSet>,
+    planar_ubos: Vec<Buffer>,
     /// World-space center for the next scene reflection capture; `Some` requests a
     /// (re)capture on the next frame (the scene reflects its surroundings, not just
     /// the sky). Consumed once into `refl_job`, then cleared.
-    recapture_reflection: Option<(glam::Vec3, u32)>,
+    recapture_reflection: Option<(glam::Vec3, u32, bool)>,
     /// In-progress reflection capture, stepped one cube face per frame so the
     /// 6-face render (plus first-time pipeline compile) never stalls a single
     /// frame. `None` when idle.
@@ -2325,6 +2506,9 @@ pub struct Renderer {
     frames: Vec<Frame>,
     frame_index: usize,
     needs_resize: bool,
+    /// Window size the swapchain was last built for. A frame at any other
+    /// size rebuilds it, even if the Resized event was missed or coalesced.
+    swapchain_size: (u32, u32),
 
     pipeline_cache: PipelineCache,
     descriptor_pool: vk::DescriptorPool,
@@ -2368,6 +2552,14 @@ pub struct Renderer {
     /// approach) instead destroyed the live reused texture -> use-after-free ->
     /// SIGSEGV in egui's next draw (seen on window resize / thumbnail churn).
     egui_pending_free: Vec<egui::TextureId>,
+    /// GPU skinning pass (created on the first GPU-skinned mesh).
+    skinner: Option<skin::GpuSkinner>,
+    /// egui renderer for world-space UI canvases (own texture set: the game
+    /// UI's egui context is separate from the editor's).
+    world_egui: HashMap<usize, egui_ash_renderer::Renderer>,
+    world_egui_pending_free: Vec<(usize, Vec<egui::TextureId>)>,
+    /// Built-in unlit custom shader, registered on first use.
+    unlit_shader: Option<ShaderId>,
     /// Offscreen main-camera target, created lazily the first frame the Camera
     /// tab asks for it.
     camera_preview: Option<CameraPreview>,
@@ -2559,9 +2751,10 @@ impl Renderer {
                 descriptor_count: FRAMES_IN_FLIGHT as u32,
             },
             vk::DescriptorPoolSize {
-                // shadow(1)+lightmap(3)+screen-GI(4)+SSR depth(5)+SSR color(6)+env cube(7)
+                // shadow(1)+lightmap(3)+screen-GI(4)+SSR depth(5)+SSR color(6)
+                // +env cube(7)+planar array(8)
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 6 * FRAMES_IN_FLIGHT as u32,
+                descriptor_count: 7 * FRAMES_IN_FLIGHT as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -2774,6 +2967,13 @@ impl Renderer {
                     .dst_binding(7)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&env_info),
+                // Binding 8 (planar reflections): black lightmap placeholder;
+                // re-pointed at the planar RT array on frames that render one.
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(8)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&color_info),
             ];
             unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
         }
@@ -2781,45 +2981,29 @@ impl Renderer {
         // Dedicated set-0 + UBO for the scene reflection capture, bound with the
         // same shadow/probe/lightmap/SGI/env resources as the frame sets (the
         // capture reuses the live lighting). Its UBO is rewritten per cube face.
-        let (refl_capture_pool, refl_capture_set, refl_capture_ubo) = {
+        let (refl_capture_pool, refl_capture_set, refl_capture_ubo, planar_sets, planar_ubos) = {
+            // 1 capture set + MAX_PLANAR planar-pass sets, same layout/pattern.
+            let total_sets = 1 + MAX_PLANAR as u32;
             let pool = unsafe {
                 ctx.device.create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[
+                    &vk::DescriptorPoolCreateInfo::default().max_sets(total_sets).pool_sizes(&[
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::UNIFORM_BUFFER,
-                            descriptor_count: 1,
+                            descriptor_count: total_sets,
                         },
                         vk::DescriptorPoolSize {
+                            // bindings 1,3,4,5,6,7,8 per set
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: 5,
+                            descriptor_count: 7 * total_sets,
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::STORAGE_BUFFER,
-                            descriptor_count: 1,
+                            descriptor_count: total_sets,
                         },
                     ]),
                     None,
                 )?
             };
-            let layouts = [pipeline_cache.set0_layout];
-            let set = unsafe {
-                ctx.device.allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(pool)
-                        .set_layouts(&layouts),
-                )?[0]
-            };
-            let ubo = Buffer::new(
-                &ctx.device,
-                &mut allocator.lock().unwrap(),
-                size_of::<FrameUbo>() as u64,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                MemoryLocation::CpuToGpu,
-                "refl capture ubo",
-            )?;
-            let buffer_info = [vk::DescriptorBufferInfo::default()
-                .buffer(ubo.handle)
-                .range(size_of::<FrameUbo>() as u64)];
             let shadow_info = [vk::DescriptorImageInfo::default()
                 .sampler(shadow_atlas.sampler)
                 .image_view(shadow_atlas.array_view)
@@ -2839,21 +3023,58 @@ impl Renderer {
                 .sampler(sampler)
                 .image_view(reflection_env.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let mk = |binding: u32, ty: vk::DescriptorType| {
-                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding).descriptor_type(ty)
+            let alloc_set_ubo = |name: &str| -> Result<(vk::DescriptorSet, Buffer)> {
+                let layouts = [pipeline_cache.set0_layout];
+                let set = unsafe {
+                    ctx.device.allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(pool)
+                            .set_layouts(&layouts),
+                    )?[0]
+                };
+                let ubo = Buffer::new(
+                    &ctx.device,
+                    &mut allocator.lock().unwrap(),
+                    size_of::<FrameUbo>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                    name,
+                )?;
+                let buffer_info = [vk::DescriptorBufferInfo::default()
+                    .buffer(ubo.handle)
+                    .range(size_of::<FrameUbo>() as u64)];
+                let mk = |binding: u32, ty: vk::DescriptorType| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(binding)
+                        .descriptor_type(ty)
+                };
+                let writes = [
+                    mk(0, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&buffer_info),
+                    mk(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&shadow_info),
+                    mk(2, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&probe_info),
+                    mk(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
+                    mk(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
+                    mk(5, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&depth_info),
+                    mk(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
+                    mk(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_info),
+                    // Binding 8 (planar array): valid placeholder; a pass that
+                    // reads it (main frame sets) gets the real array re-pointed
+                    // per frame. These offscreen sets never sample it.
+                    mk(8, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
+                ];
+                unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
+                Ok((set, ubo))
             };
-            let writes = [
-                mk(0, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&buffer_info),
-                mk(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&shadow_info),
-                mk(2, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&probe_info),
-                mk(3, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
-                mk(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
-                mk(5, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&depth_info),
-                mk(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_info),
-                mk(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_info),
-            ];
-            unsafe { ctx.device.update_descriptor_sets(&writes, &[]) };
-            (pool, set, ubo)
+            let (capture_set, capture_ubo) = alloc_set_ubo("refl capture ubo")?;
+            let mut planar_sets = Vec::with_capacity(MAX_PLANAR);
+            let mut planar_ubos = Vec::with_capacity(MAX_PLANAR);
+            for i in 0..MAX_PLANAR {
+                let (s, u) = alloc_set_ubo(&format!("planar ubo {i}"))?;
+                planar_sets.push(s);
+                planar_ubos.push(u);
+            }
+            (pool, capture_set, capture_ubo, planar_sets, planar_ubos)
         };
 
         // 1x1 defaults, indexed by texture slot (see create_material's slot list):
@@ -3010,6 +3231,9 @@ impl Renderer {
             refl_capture_pool,
             refl_capture_set,
             refl_capture_ubo,
+            planar_targets: None,
+            planar_sets,
+            planar_ubos,
             recapture_reflection: None,
             refl_job: None,
             capturing_refl: false,
@@ -3033,6 +3257,7 @@ impl Renderer {
             frames,
             frame_index: 0,
             needs_resize: false,
+            swapchain_size: (size.width, size.height),
             pipeline_cache,
             descriptor_pool,
             material_pool,
@@ -3052,6 +3277,10 @@ impl Renderer {
             materials: Vec::new(),
             egui: Some(egui),
             egui_pending_free: Vec::new(),
+            skinner: None,
+            world_egui: HashMap::new(),
+            world_egui_pending_free: Vec::new(),
+            unlit_shader: None,
             camera_preview: None,
             viewport_target: None,
             probe_buffer,
@@ -3116,12 +3345,9 @@ impl Renderer {
             }
         };
         buf.write(0, bytemuck::cast_slice(&gpu));
-        // Re-point binding 2 on every frame set + the camera preview's sets.
-        let mut sets: Vec<vk::DescriptorSet> = self.frame_sets.clone();
-        if let Some(preview) = &self.camera_preview {
-            sets.extend_from_slice(&preview.sets);
-        }
-        for set in sets {
+        // Re-point binding 2 on every set that renders the scene (frame sets,
+        // camera preview, reflection capture).
+        for set in self.shared_binding_sets() {
             let info = [vk::DescriptorBufferInfo::default()
                 .buffer(buf.handle)
                 .range(vk::WHOLE_SIZE)];
@@ -3196,11 +3422,7 @@ impl Renderer {
                 return;
             }
         };
-        let mut sets: Vec<vk::DescriptorSet> = self.frame_sets.clone();
-        if let Some(preview) = &self.camera_preview {
-            sets.extend_from_slice(&preview.sets);
-        }
-        for set in sets {
+        for set in self.shared_binding_sets() {
             let info = [vk::DescriptorImageInfo::default()
                 .sampler(self.lightmap_sampler)
                 .image_view(tex.view)
@@ -3211,6 +3433,25 @@ impl Renderer {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&info);
             unsafe { self.ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
+        // The capture/planar sets' bindings 4/6/8 are placeholders pointing at
+        // the lightmap array (those passes never sample them, but they must stay
+        // valid); re-point them so destroying the old array can't dangle them.
+        let mut offscreen_sets = vec![self.refl_capture_set];
+        offscreen_sets.extend_from_slice(&self.planar_sets);
+        for set in offscreen_sets {
+            for binding in [4u32, 6, 8] {
+                let info = [vk::DescriptorImageInfo::default()
+                    .sampler(self.lightmap_sampler)
+                    .image_view(tex.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+                let write = vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&info);
+                unsafe { self.ctx.device.update_descriptor_sets(&[write], &[]) };
+            }
         }
         let mut old = std::mem::replace(&mut self.lightmaps, tex);
         old.destroy(&self.ctx.device, &mut alloc.lock().unwrap());
@@ -3318,6 +3559,199 @@ impl Renderer {
     pub fn update_mesh_vertices(&mut self, handle: MeshHandle, vertices: &[Vertex]) {
         if let Some(mesh) = self.meshes.get_mut(handle.0) {
             mesh.vertex_buffer.write(0, bytemuck::cast_slice(vertices));
+        }
+    }
+
+    /// Upload a mesh skinned on the GPU: its vertex buffer is rewritten each
+    /// frame by the skinning compute pass from a bind-pose copy, using the
+    /// palette given to [`skin_mesh_gpu`]. `joint_count` sizes the palette.
+    pub fn upload_mesh_gpu_skinned(&mut self, data: &MeshData, joint_count: usize) -> Result<MeshHandle> {
+        if self.skinner.is_none() {
+            self.skinner = Some(skin::GpuSkinner::new(&self.ctx.device)?);
+        }
+        let allocator = self.allocator();
+        let mut alloc = allocator.lock().unwrap();
+        let bytes: &[u8] = bytemuck::cast_slice(&data.vertices);
+        let vertex_buffer = alloc::upload_buffer(
+            &self.ctx.device,
+            &mut alloc,
+            self.command_pool,
+            self.ctx.queue,
+            bytes,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER,
+            "gpu skinned vertices",
+        )?;
+        let base = alloc::upload_buffer(
+            &self.ctx.device,
+            &mut alloc,
+            self.command_pool,
+            self.ctx.queue,
+            bytes,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "skin bind pose",
+        )?;
+        let index_buffer = alloc::upload_buffer(
+            &self.ctx.device,
+            &mut alloc,
+            self.command_pool,
+            self.ctx.queue,
+            bytemuck::cast_slice(&data.indices),
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            "gpu skinned indices",
+        )?;
+        let out = vertex_buffer.handle;
+        let mesh = self.meshes.len();
+        self.skinner.as_mut().unwrap().add(
+            &self.ctx.device,
+            &mut alloc,
+            mesh,
+            out,
+            base,
+            data.vertices.len() as u32,
+            joint_count,
+        )?;
+        self.meshes.push(GpuMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: data.indices.len() as u32,
+            vertex_count: data.vertices.len() as u32,
+        });
+        Ok(MeshHandle(mesh))
+    }
+
+    /// Set this frame's joint palette for a GPU-skinned mesh.
+    pub fn skin_mesh_gpu(&mut self, handle: MeshHandle, palette: &[glam::Mat4]) {
+        if let Some(skinner) = self.skinner.as_mut() {
+            skinner.queue(handle.0, palette);
+        }
+    }
+
+    /// The built-in unlit shader (albedo * vertex color, no lighting), for
+    /// world-space UI and particles. Pair with `set_material_shader`.
+    pub fn unlit_shader(&mut self) -> Result<ShaderId> {
+        if let Some(id) = self.unlit_shader {
+            return Ok(id);
+        }
+        const UNLIT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unlit.frag.spv"));
+        let id = self.register_shader(UNLIT_SPV)?;
+        self.unlit_shader = Some(id);
+        Ok(id)
+    }
+
+    /// A sampled color target for a world-space UI canvas.
+    pub fn create_ui_target(&mut self, width: u32, height: u32) -> Result<TextureHandle> {
+        let allocator = self.allocator();
+        let texture = GpuTexture::render_target(
+            &self.ctx.device,
+            &mut allocator.lock().unwrap(),
+            self.command_pool,
+            self.ctx.queue,
+            width.max(1),
+            height.max(1),
+            self.swapchain.format.format,
+        )?;
+        self.textures.push(texture);
+        Ok(TextureHandle(self.textures.len() - 1))
+    }
+
+    /// Apply texture deltas for this frame's world-UI draws (before recording).
+    fn prepare_world_ui(&mut self, draws: &[WorldUiDraw]) -> Result<()> {
+        if !self.world_egui_pending_free.is_empty() {
+            unsafe {
+                let _ = self.ctx.device.device_wait_idle();
+            }
+            for (target, ids) in std::mem::take(&mut self.world_egui_pending_free) {
+                if let Some(r) = self.world_egui.get_mut(&target) {
+                    let _ = r.free_textures(&ids);
+                }
+            }
+        }
+        for d in draws {
+            if !self.world_egui.contains_key(&d.target.0) {
+                let r = egui_ash_renderer::Renderer::with_gpu_allocator(
+                    self.allocator(),
+                    self.ctx.device.clone(),
+                    egui_ash_renderer::DynamicRendering {
+                        color_attachment_format: self.swapchain.format.format,
+                        depth_attachment_format: None,
+                    },
+                    egui_ash_renderer::Options {
+                        in_flight_frames: FRAMES_IN_FLIGHT,
+                        enable_depth_test: false,
+                        enable_depth_write: false,
+                        srgb_framebuffer: true,
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("creating world UI egui renderer: {e}"))?;
+                self.world_egui.insert(d.target.0, r);
+            }
+            let r = self.world_egui.get_mut(&d.target.0).unwrap();
+            if !d.draw.textures_delta.set.is_empty() {
+                r.set_textures(self.ctx.queue, self.command_pool, &d.draw.textures_delta.set)
+                    .map_err(|e| anyhow::anyhow!("world UI textures: {e}"))?;
+            }
+            if !d.draw.textures_delta.free.is_empty() {
+                self.world_egui_pending_free
+                    .push((d.target.0, d.draw.textures_delta.free.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Paint each world-UI canvas into its target (inside the frame's cb).
+    fn record_world_ui(&mut self, device: &ash::Device, cb: vk::CommandBuffer, draws: &[WorldUiDraw]) {
+        for d in draws {
+            let Some(tex) = self.textures.get(d.target.0) else {
+                continue;
+            };
+            let (image, view) = (tex.image, tex.view);
+            let Some(r) = self.world_egui.get_mut(&d.target.0) else {
+                continue;
+            };
+            let extent = vk::Extent2D {
+                width: d.extent[0].max(1),
+                height: d.extent[1].max(1),
+            };
+            image_barrier(
+                device, cb, image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            );
+            let atts = [vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0; 4] },
+                })];
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                .layer_count(1)
+                .color_attachments(&atts);
+            unsafe {
+                device.cmd_begin_rendering(cb, &info);
+                device.cmd_set_viewport(cb, 0, &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }]);
+                device.cmd_set_scissor(cb, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }]);
+            }
+            if let Err(e) = r.cmd_draw(cb, extent, d.draw.pixels_per_point, &d.draw.primitives) {
+                tracing::warn!("world UI draw: {e}");
+            }
+            unsafe { device.cmd_end_rendering(cb) };
+            image_barrier(
+                device, cb, image, vk::ImageAspectFlags::COLOR,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            );
         }
     }
 
@@ -3882,6 +4316,21 @@ impl Renderer {
 
     /// Replace the env reflection cube + re-point the `samplerCube` binding
     /// (set 0, binding 7) on every set that samples it (frame sets + preview).
+    /// Every long-lived set-0 descriptor set that mirrors the frame sets'
+    /// bindings: the per-frame sets, the camera-preview sets, and the
+    /// reflection-capture set. The capture set renders the scene with the same
+    /// layout, so any rebind that skips it leaves the capture sampling a stale
+    /// (or destroyed) resource — captures come out black/garbage.
+    fn shared_binding_sets(&self) -> Vec<vk::DescriptorSet> {
+        let mut sets = self.frame_sets.clone();
+        if let Some(preview) = &self.camera_preview {
+            sets.extend_from_slice(&preview.sets);
+        }
+        sets.push(self.refl_capture_set);
+        sets.extend_from_slice(&self.planar_sets);
+        sets
+    }
+
     fn swap_reflection_env(&mut self, new_env: ReflectionEnv) {
         let allocator = self.allocator();
         let mut old = std::mem::replace(&mut self.reflection_env, new_env);
@@ -3889,11 +4338,7 @@ impl Renderer {
 
         let view = self.reflection_env.view;
         let sampler = self.sampler;
-        let mut sets: Vec<vk::DescriptorSet> = self.frame_sets.clone();
-        if let Some(preview) = &self.camera_preview {
-            sets.extend_from_slice(&preview.sets);
-        }
-        for set in sets {
+        for set in self.shared_binding_sets() {
             let info = [vk::DescriptorImageInfo::default()
                 .sampler(sampler)
                 .image_view(view)
@@ -3936,7 +4381,22 @@ impl Renderer {
     /// just the sky), so reflective surfaces show real geometry. Call after a
     /// scene loads / lighting settles.
     pub fn request_reflection_capture(&mut self, center: glam::Vec3, resolution: u32) {
-        self.recapture_reflection = Some((center, resolution.clamp(32, 8192)));
+        self.recapture_reflection = Some((center, resolution.clamp(32, 8192), false));
+    }
+
+    /// Like `request_reflection_capture`, but draws ONLY static geometry and no
+    /// realtime GI (Unity baked-probe semantics): dynamic objects, their GI
+    /// bounces, and their emission never end up in a cube that's persisted to
+    /// disk. Used by the Bake Reflections path.
+    pub fn request_reflection_capture_static(&mut self, center: glam::Vec3, resolution: u32) {
+        self.recapture_reflection = Some((center, resolution.clamp(32, 8192), true));
+    }
+
+    /// True while a requested reflection capture hasn't finished all 6 faces +
+    /// the final mip-gen/swap (the capture runs one face per frame). The bake
+    /// readback must wait for this to clear, or it reads the pre-capture cube.
+    pub fn reflection_capture_in_flight(&self) -> bool {
+        self.refl_job.is_some() || self.recapture_reflection.is_some()
     }
 
     /// Read back the current reflection-env cube (mip 0, all 6 faces) to CPU as
@@ -4068,7 +4528,12 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     /// Allocate the capture cube + depth target for a new per-frame reflection
     /// capture job; faces are rendered one per frame by `step_refl_capture`.
-    fn begin_refl_capture(&mut self, center: glam::Vec3, resolution: u32) -> Result<ReflCaptureJob> {
+    fn begin_refl_capture(
+        &mut self,
+        center: glam::Vec3,
+        resolution: u32,
+        static_only: bool,
+    ) -> Result<ReflCaptureJob> {
         let size = resolution.clamp(32, 8192);
         let device = self.ctx.device.clone();
         let ext = vk::Extent2D { width: size, height: size };
@@ -4100,6 +4565,7 @@ impl Renderer {
             depth_alloc: Some(depth_alloc),
             depth_view,
             next_face: 0,
+            static_only,
         })
     }
 
@@ -4125,10 +4591,26 @@ impl Renderer {
         let depth_view = job.depth_view;
         let face_i = job.next_face;
         let center = job.center;
+        let static_only = job.static_only;
         let device = self.ctx.device.clone();
         let queue = self.ctx.queue;
         let pool = self.command_pool;
         let ext = vk::Extent2D { width: size, height: size };
+
+        // Baked-probe capture: only static geometry goes into the cube (Unity
+        // semantics) — a dynamic object, its emission, and its GI glow are
+        // transient and must not persist into a `.reflprobe`.
+        let static_order: Vec<usize>;
+        let order: &[usize] = if static_only {
+            static_order = order
+                .iter()
+                .copied()
+                .filter(|&i| input.draws[i].static_geometry)
+                .collect();
+            &static_order
+        } else {
+            order
+        };
 
         // All 6 faces rendered: finalize on this step instead.
         if face_i >= 6 {
@@ -4154,7 +4636,10 @@ impl Renderer {
                 &self.probe_volumes, [size as f32, size as f32],
             );
             ubo.debug[1] = 0.0; // never render a debug view-mode into the cube
-            ubo.debug[2] = 0.0; // no screen-GI in the cube capture
+            // debug.z in the capture: 0 = no screen-GI (realtime probe still gets
+            // FluxVoxel probe GI); -1 = static bake — the shader ALSO drops the
+            // realtime probe-GI term, so dynamic emitters' bounce stays out.
+            ubo.debug[2] = if static_only { -1.0 } else { 0.0 };
             ubo.debug[3] = 0.0; // inline tonemap -> LDR cube
             ubo.ssr = [0.0; 4];
             self.refl_capture_ubo.write(0, bytemuck::bytes_of(&ubo));
@@ -4397,6 +4882,224 @@ impl Renderer {
         Ok(())
     }
 
+    /// (Re)create the planar RT array at half the main target size. No-op when
+    /// already the right size. `device_wait_idle` guards the in-flight frame
+    /// still sampling the old array on resize.
+    fn ensure_planar_targets(&mut self, main_extent: [u32; 2]) -> Result<()> {
+        let extent = vk::Extent2D {
+            width: (main_extent[0] / 2).max(64),
+            height: (main_extent[1] / 2).max(64),
+        };
+        if let Some(t) = &self.planar_targets
+            && t.extent.width == extent.width
+            && t.extent.height == extent.height
+        {
+            return Ok(());
+        }
+        let allocator = self.allocator();
+        let mut alloc = allocator.lock().unwrap();
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+        if let Some(mut old) = self.planar_targets.take() {
+            old.destroy(&self.ctx.device, &mut alloc);
+        }
+        self.planar_targets = Some(PlanarTargets::new(
+            &self.ctx.device,
+            &mut alloc,
+            extent,
+            self.pipeline_cache.color_format(),
+        )?);
+        Ok(())
+    }
+
+    /// Record one mirrored scene pass per active planar surface into the planar
+    /// RT array (inside the frame command buffer, before the main scene pass).
+    /// Each pass renders from the main camera reflected about the plane, with an
+    /// oblique near plane clipping everything behind the mirror, and excludes
+    /// the plane's own draws. The main pass samples the layers at screen UV.
+    #[allow(clippy::too_many_arguments)]
+    fn record_planar_passes(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        input: &FrameInput,
+        lights: [GpuLight; MAX_LIGHTS],
+        count: usize,
+        shadow_vp: [[[f32; 4]; 4]; MAX_SHADOW_VIEWS],
+        cascade_splits: [f32; 4],
+        order: &[usize],
+        planar_n: usize,
+        main_extent: [f32; 2],
+    ) -> Result<()> {
+        use glam::Vec3;
+        let Some(targets) = &self.planar_targets else {
+            return Ok(());
+        };
+        let ext = targets.extent;
+        let depth_view = targets.depth_view;
+        let image = targets.image;
+        let layer_views = targets.layer_views.clone();
+        let depth_img = targets.depth_img;
+
+        for (i, plane) in input.planar.iter().take(planar_n).enumerate() {
+            // Plane normal toward the camera side, so the mirrored camera keeps
+            // (and the oblique near plane clips at) the right half-space.
+            let cam_pos = input.camera.position;
+            let p0 = Vec3::from(plane.point);
+            let mut n = Vec3::from(plane.normal).normalize_or(Vec3::Y);
+            if n.dot(cam_pos - p0) < 0.0 {
+                n = -n;
+            }
+            let mirror = mirror_matrix(p0, n);
+            let view = input.camera.view * mirror;
+            let mirrored_pos = mirror.transform_point3(cam_pos);
+            // Clip plane in view space of the mirrored camera; w < 0 puts the
+            // camera on the clipped side, as the oblique trick requires.
+            let plane_w = glam::vec4(n.x, n.y, n.z, -n.dot(p0));
+            let mut plane_v = view.inverse().transpose() * plane_w;
+            if plane_v.w > 0.0 {
+                plane_v = -plane_v;
+            }
+            let proj = oblique_projection(input.camera.proj, plane_v);
+            let cam = CameraData { view, proj, position: mirrored_pos };
+            let mut ubo = frame_ubo(
+                &cam, input, lights, count, shadow_vp, cascade_splits,
+                &self.probe_volumes, main_extent,
+            );
+            ubo.debug[1] = 0.0;
+            ubo.debug[2] = 0.0; // no screen-GI in the mirrored pass
+            ubo.debug[3] = 0.0; // inline tonemap -> LDR, sampled as radiance
+            ubo.ssr = [0.0; 4];
+            // Probe fallback stays available inside the mirror; planar sampling
+            // itself stays off (refl_box.w = 0) — no recursive mirrors.
+            if let Some(p) = input.reflection_probe {
+                ubo.refl_center =
+                    [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)];
+                ubo.refl_extents = [
+                    p.half_extents[0],
+                    p.half_extents[1],
+                    p.half_extents[2],
+                    if p.box_projection { 1.0 } else { 0.0 },
+                ];
+                ubo.refl_box = [p.center[0], p.center[1], p.center[2], 0.0];
+            }
+            self.planar_ubos[i].write(0, bytemuck::bytes_of(&ubo));
+
+            let face_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .base_array_layer(i as u32)
+                .layer_count(1);
+            unsafe {
+                let to_color = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .subresource_range(face_range);
+                let dep_b = vk::ImageMemoryBarrier::default()
+                    .image(depth_img)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_color, dep_b],
+                );
+                let color_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(layer_views[i])
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        color: vk::ClearColorValue { float32: input.clear_color },
+                    });
+                let depth_att = vk::RenderingAttachmentInfo::default()
+                    .image_view(depth_view)
+                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .clear_value(vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                    });
+                let atts = [color_att];
+                let info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext })
+                    .layer_count(1)
+                    .color_attachments(&atts)
+                    .depth_attachment(&depth_att);
+                device.cmd_begin_rendering(cb, &info);
+                // Same negative-height viewport as the main pass, so a world
+                // point lands at the same normalized framebuffer UV in both and
+                // the forward pass can sample by gl_FragCoord / screen.
+                let vp = vk::Viewport {
+                    x: 0.0,
+                    y: ext.height as f32,
+                    width: ext.width as f32,
+                    height: -(ext.height as f32),
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                device.cmd_set_viewport(cb, 0, &[vp]);
+                device.cmd_set_scissor(
+                    cb,
+                    0,
+                    &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: ext }],
+                );
+            }
+            // The mirrored view flips winding; force no-cull like the cube
+            // capture instead of flipping frontFace per pipeline.
+            self.capturing_refl = true;
+            if input.draw_skybox {
+                let _ = self.record_skybox(device, cb, self.planar_sets[i], false, false);
+            }
+            // The plane's own draws are excluded — a mirror can't contain
+            // itself (coplanar with the near plane anyway).
+            let pass_order: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|&d| input.draws[d].planar_index != i as i32)
+                .collect();
+            let _ =
+                self.record_scene_draws(device, cb, &pass_order, input, self.planar_sets[i], false);
+            self.capturing_refl = false;
+            unsafe {
+                device.cmd_end_rendering(cb);
+                let to_read = vk::ImageMemoryBarrier::default()
+                    .image(image)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .subresource_range(face_range);
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_read],
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Draw the fullscreen skybox into the active rendering pass (call after
     /// begin_rendering + viewport/scissor, before scene geometry).
     fn record_skybox(
@@ -4463,16 +5166,12 @@ impl Renderer {
         let mut old = std::mem::replace(&mut self.shadow_atlas, new_atlas);
         old.destroy(&self.ctx.device, &mut allocator.lock().unwrap());
 
-        // Re-point binding 1 on the frame sets and the camera-preview sets.
+        // Re-point binding 1 on every set that renders the scene.
         let info = [vk::DescriptorImageInfo::default()
             .sampler(self.shadow_atlas.sampler)
             .image_view(self.shadow_atlas.array_view)
             .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)];
-        let mut sets: Vec<vk::DescriptorSet> = self.frame_sets.clone();
-        if let Some(preview) = &self.camera_preview {
-            sets.extend_from_slice(&preview.sets);
-        }
-        for set in sets {
+        for set in self.shared_binding_sets() {
             let write = vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(1)
@@ -4580,6 +5279,12 @@ impl Renderer {
             material.fx_ubo.destroy(&self.ctx.device, &mut alloc);
         }
         self.materials.clear();
+        if let Some(skinner) = self.skinner.as_mut() {
+            skinner.clear(&self.ctx.device, &mut alloc);
+        }
+        drop(alloc);
+        self.world_egui.clear();
+        self.world_egui_pending_free.clear();
         unsafe {
             self.ctx
                 .device
@@ -4598,6 +5303,7 @@ impl Renderer {
         self.sgi.destroy(&self.ctx.device, &mut alloc);
         self.ssr_color.destroy(&self.ctx.device, &mut alloc);
         self.swapchain = Swapchain::new(&self.ctx, size.width, size.height, self.vsync)?;
+        self.swapchain_size = (size.width, size.height);
         self.depth = DepthTarget::new(&self.ctx, &mut alloc, self.swapchain.extent)?;
         self.sgi = ScreenGiTargets::new(&self.ctx, &mut alloc, self.swapchain.extent)?;
         self.ssr_color = ColorHistory::new(
@@ -4652,8 +5358,61 @@ impl Renderer {
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
-        if self.needs_resize {
+        if self.needs_resize || self.swapchain_size != (size.width, size.height) {
             self.recreate_swapchain()?;
+        }
+
+        // Editor RTT: (re)create the offscreen viewport target at the requested
+        // dock-rect size, before anything this frame reads its history. None (game) leaves it absent → renders to swapchain.
+        if let Some([vw, vh]) = input.viewport_extent {
+            let vw = vw.max(1);
+            let vh = vh.max(1);
+            let need = self
+                .viewport_target
+                .as_ref()
+                .map_or(true, |t| t.extent.width != vw || t.extent.height != vh);
+            if need && let Some(allocator) = self.allocator.clone() {
+                unsafe {
+                    let _ = self.ctx.device.device_wait_idle();
+                }
+                let mut alloc = allocator.lock().unwrap();
+                if let Some(mut old) = self.viewport_target.take() {
+                    old.destroy(&self.ctx.device, &mut alloc);
+                }
+                if let Some(mut old) = self.viewport_ssr.take() {
+                    old.destroy(&self.ctx.device, &mut alloc);
+                }
+                self.viewport_ssr = Some(self.ssr_resolve.create_target(
+                    &self.ctx.device,
+                    &mut alloc,
+                    self.post_pass.set_layout(),
+                    vk::Extent2D { width: vw, height: vh },
+                )?);
+                let fmt = self.swapchain.format.format;
+                let post_layout = self.post_pass.set_layout();
+                let post_sampler = self.post_pass.sampler();
+                self.viewport_target = Some(ViewportTarget::new(
+                    &self.ctx,
+                    &mut alloc,
+                    self.command_pool,
+                    self.ctx.queue,
+                    fmt,
+                    self.sampler,
+                    post_layout,
+                    post_sampler,
+                    vk::Extent2D { width: vw, height: vh },
+                    self.egui.as_mut().unwrap(),
+                )?);
+                // The viewport Flux trace shares the main-camera temporal state
+                // (sgi_history_valid/parity/last_view_proj) but writes into the
+                // viewport target's OWN sgi images, which we just recreated with
+                // undefined contents. Reprojecting from that stale-but-new
+                // history reads garbage (flickering colour bars on resize), so
+                // reset the temporal state exactly as recreate_swapchain does.
+                self.sgi_history_valid = false;
+                self.sgi_parity = 0;
+                self.sgi_last_view_proj = None;
+            }
         }
 
         // Release last frame's egui texture frees BEFORE applying this frame's
@@ -4676,6 +5435,8 @@ impl Renderer {
                 let _ = vr.free_textures(&ids);
             }
         }
+
+        self.prepare_world_ui(&input.world_ui)?;
 
         // Upload any new/changed egui textures before recording the frame.
         if let Some(egui_draw) = &input.egui
@@ -4869,13 +5630,14 @@ impl Renderer {
             [0.0; 4]
         };
         if let Some(p) = input.reflection_probe {
-            ubo.refl_center = [p.center[0], p.center[1], p.center[2], p.intensity.max(0.0)];
+            ubo.refl_center = [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)];
             ubo.refl_extents = [
                 p.half_extents[0],
                 p.half_extents[1],
                 p.half_extents[2],
                 if p.box_projection { 1.0 } else { 0.0 },
             ];
+            ubo.refl_box = [p.center[0], p.center[1], p.center[2], 0.0];
         }
         if let Some(f) = input.fog {
             ubo.fog_color = [f.color[0], f.color[1], f.color[2], f.density.max(0.0)];
@@ -4884,6 +5646,35 @@ impl Renderer {
         // fog_params.w doubles as the FluxVoxel specular-from-volume flag (set
         // unconditionally so it's independent of whether fog is enabled).
         ubo.fog_params[3] = if input.voxel_specular { 1.0 } else { 0.0 };
+        // Planar reflections: size the RT array to the main target and flag the
+        // main UBO with the plane count (refl_box.w > 0 = planar layers valid
+        // for THIS pass; the capture/preview/VR UBOs leave it 0 and fall back
+        // to the probe).
+        let planar_n = if input.planar.is_empty() {
+            0
+        } else {
+            match self.ensure_planar_targets(main_extent) {
+                Ok(()) => input.planar.len().min(MAX_PLANAR),
+                Err(e) => {
+                    tracing::warn!("planar reflection targets: {e:#}");
+                    0
+                }
+            }
+        };
+        ubo.refl_box[3] = planar_n as f32;
+        if planar_n > 0 {
+            let view = self.planar_targets.as_ref().unwrap().array_view;
+            let info = [vk::DescriptorImageInfo::default()
+                .sampler(self.lightmap_sampler)
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(self.frame_sets[self.frame_index])
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info);
+            unsafe { self.ctx.device.update_descriptor_sets(&[write], &[]) };
+        }
         self.frame_ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
         // Keep this frame's lights/shadows/probes so the VR eyes can reuse them
         // (only the camera matrices differ per eye).
@@ -5039,58 +5830,6 @@ impl Renderer {
             }
         }
 
-        // Editor RTT: (re)create the offscreen viewport target at the requested
-        // dock-rect size. None (game) leaves it absent → renders to swapchain.
-        if let Some([vw, vh]) = input.viewport_extent {
-            let vw = vw.max(1);
-            let vh = vh.max(1);
-            let need = self
-                .viewport_target
-                .as_ref()
-                .map_or(true, |t| t.extent.width != vw || t.extent.height != vh);
-            if need && let Some(allocator) = self.allocator.clone() {
-                unsafe {
-                    let _ = self.ctx.device.device_wait_idle();
-                }
-                let mut alloc = allocator.lock().unwrap();
-                if let Some(mut old) = self.viewport_target.take() {
-                    old.destroy(&self.ctx.device, &mut alloc);
-                }
-                if let Some(mut old) = self.viewport_ssr.take() {
-                    old.destroy(&self.ctx.device, &mut alloc);
-                }
-                self.viewport_ssr = Some(self.ssr_resolve.create_target(
-                    &self.ctx.device,
-                    &mut alloc,
-                    self.post_pass.set_layout(),
-                    vk::Extent2D { width: vw, height: vh },
-                )?);
-                let fmt = self.swapchain.format.format;
-                let post_layout = self.post_pass.set_layout();
-                let post_sampler = self.post_pass.sampler();
-                self.viewport_target = Some(ViewportTarget::new(
-                    &self.ctx,
-                    &mut alloc,
-                    self.command_pool,
-                    self.ctx.queue,
-                    fmt,
-                    self.sampler,
-                    post_layout,
-                    post_sampler,
-                    vk::Extent2D { width: vw, height: vh },
-                    self.egui.as_mut().unwrap(),
-                )?);
-                // The viewport Flux trace shares the main-camera temporal state
-                // (sgi_history_valid/parity/last_view_proj) but writes into the
-                // viewport target's OWN sgi images, which we just recreated with
-                // undefined contents. Reprojecting from that stale-but-new
-                // history reads garbage (flickering colour bars on resize), so
-                // reset the temporal state exactly as recreate_swapchain does.
-                self.sgi_history_valid = false;
-                self.sgi_parity = 0;
-                self.sgi_last_view_proj = None;
-            }
-        }
 
         let cb = command_buffer;
         let image = self.swapchain.images[image_index as usize];
@@ -5124,9 +5863,9 @@ impl Renderer {
         // mip-gen step), so the 6-face render + first-time pipeline compile never
         // stall a frame. A new request waits until the current job finishes.
         if self.refl_job.is_none()
-            && let Some((center, res)) = self.recapture_reflection.take()
+            && let Some((center, res, static_only)) = self.recapture_reflection.take()
         {
-            match self.begin_refl_capture(center, res) {
+            match self.begin_refl_capture(center, res, static_only) {
                 Ok(job) => self.refl_job = Some(job),
                 Err(e) => tracing::warn!("reflection capture begin failed: {e:#}"),
             }
@@ -5175,12 +5914,38 @@ impl Renderer {
             }
             self.gpu_zone_begin(cb, gpu_zone::FRAME);
 
+            // GPU skinning before anything draws the skinned meshes.
+            if let Some(skinner) = self.skinner.as_mut() {
+                skinner.record(&device, cb, self.frame_index);
+            }
+            // World-space UI targets, before any pass samples them.
+            self.record_world_ui(&device, cb, &input.world_ui);
+
             // Shadow maps first: both the camera-preview and the main scene
             // pass sample them, so they must be rendered + made readable up
             // front.
             self.gpu_zone_begin(cb, gpu_zone::SHADOWS);
             self.record_shadows(&device, cb, &shadow_views, input.draws)?;
             self.gpu_zone_end(cb, gpu_zone::SHADOWS);
+
+            // Planar reflections: mirrored scene passes into the RT array, one
+            // per active plane, before any pass that samples them.
+            if planar_n > 0 {
+                if let Err(e) = self.record_planar_passes(
+                    &device,
+                    cb,
+                    input,
+                    lights,
+                    count,
+                    shadow_vp,
+                    cascade_splits,
+                    &order,
+                    planar_n,
+                    [main_extent[0] as f32, main_extent[1] as f32],
+                ) {
+                    tracing::warn!("planar reflection pass: {e:#}");
+                }
+            }
 
             // Flux GI (game/swapchain path): depth prepass + GDF trace, folded
             // into this frame's cb. The editor viewport path records its own GI
@@ -5298,11 +6063,13 @@ impl Renderer {
                 .clear_value(vk::ClearValue {
                     color: vk::ClearColorValue { float32: [0.0; 4] },
                 });
+            // Stored: the reflection / fog resolve reads it (the Flux depth
+            // prepass only exists while screen GI traces).
             let depth_attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(self.depth.view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue {
                         depth: 1.0,
@@ -5519,6 +6286,15 @@ impl Renderer {
                     vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                     vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
                 );
+                if rt_on || ssr_on || fog_on {
+                    image_barrier(
+                        &device, cb, self.depth.image, vk::ImageAspectFlags::DEPTH,
+                        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_READ,
+                    );
+                }
                 // Reflections + fog write a resolved HDR image the post pass reads.
                 // Ray-traced (mode 2) takes precedence; else SSR/fog resolve.
                 let post_src = if rt_on {
@@ -5536,6 +6312,7 @@ impl Renderer {
                         camera_pos: ubo.camera_pos,
                         refl_center: ubo.refl_center,
                         refl_extents: ubo.refl_extents,
+                        refl_box: ubo.refl_box,
                         params: [
                             fs.ssr_roughness_cutoff,
                             fs.ssr_intensity,
@@ -5548,7 +6325,7 @@ impl Renderer {
                         screen: [extent.width as f32, extent.height as f32, 0.0, 0.0],
                     };
                     let env_view = self.reflection_env.view;
-                    let depth_view = self.sgi.depth_view;
+                    let depth_view = self.depth.view;
                     let resolved_image = self.ssr_targets[self.frame_index].resolved_image();
                     let resolved_view = self.ssr_targets[self.frame_index].resolved_view();
                     let post_set = self.ssr_targets[self.frame_index].post_set;
@@ -5581,7 +6358,7 @@ impl Renderer {
                     );
                     let uniforms = self.ssr_uniforms(input, extent, ssr_on);
                     let env_view = self.reflection_env.view;
-                    let depth_view = self.sgi.depth_view;
+                    let depth_view = self.depth.view;
                     self.ssr_resolve.record(
                         &device,
                         cb,
@@ -5814,6 +6591,7 @@ fn frame_ubo(
         // Reflection-probe zone; the renderer fills these from input.reflection_probe.
         refl_center: [0.0; 4],
         refl_extents: [0.0; 4],
+        refl_box: [0.0; 4],
         // Fog; the renderer fills these from input.fog.
         fog_color: [0.0; 4],
         fog_params: [0.0; 4],
@@ -6260,7 +7038,20 @@ impl Renderer {
                         p.emission_color[0] * p.emission_intensity,
                         p.emission_color[1] * p.emission_intensity,
                         p.emission_color[2] * p.emission_intensity,
-                        0.0,
+                        // Planar-reflection lane: 0 = none, else layer+1 in the
+                        // integer part and the roughness fade cutoff in the
+                        // fraction. Gated in-shader on frame.refl_box.w so the
+                        // planar/capture/preview passes never self-sample.
+                        if draw.planar_index >= 0
+                            && (draw.planar_index as usize) < input.planar.len()
+                        {
+                            let cutoff = input.planar[draw.planar_index as usize]
+                                .max_roughness
+                                .clamp(0.05, 0.95);
+                            (draw.planar_index + 1) as f32 + cutoff
+                        } else {
+                            0.0
+                        },
                     ],
                     params0: [p.metallic, p.roughness, p.toon_steps, p.pbr_toon_blend],
                     // w = baked-lightmap layer (-1 = none); the standard shader
@@ -6704,14 +7495,16 @@ impl Renderer {
         };
         let mut refl_center = [0.0; 4];
         let mut refl_extents = [0.0; 4];
+        let mut refl_box = [0.0; 4];
         if let Some(p) = input.reflection_probe {
-            refl_center = [p.center[0], p.center[1], p.center[2], p.intensity.max(0.0)];
+            refl_center = [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)];
             refl_extents = [
                 p.half_extents[0],
                 p.half_extents[1],
                 p.half_extents[2],
                 if p.box_projection { 1.0 } else { 0.0 },
             ];
+            refl_box = [p.center[0], p.center[1], p.center[2], 0.0];
         }
         let mut fog_color = [0.0; 4];
         let mut fog_params = [0.0; 4];
@@ -6730,6 +7523,7 @@ impl Renderer {
             ssr,
             refl_center,
             refl_extents,
+            refl_box,
             fog_color,
             fog_params,
             // Sun colour*intensity + forward-scatter anisotropy; sun dir + time.
@@ -7038,6 +7832,9 @@ impl Renderer {
         ubo.ssr = [0.0; 4];
         ubo.debug[2] = 0.0; // world-probe GI (screen-GI gather is desktop-camera-space)
         ubo.debug[3] = 0.0; // inline tonemap in the surface shader (no post pass)
+        // Planar reflections are rendered from the DESKTOP camera; their screen
+        // UVs are meaningless per-eye, so the eyes fall back to the probe.
+        ubo.refl_box[3] = 0.0;
         ubo.postfx2[3] = extent.width as f32;
         ubo.postfx3[3] = extent.height as f32;
 
@@ -7263,6 +8060,7 @@ impl Renderer {
             )
         };
         let frame_set = self.frame_sets[self.frame_index];
+        let sgi_fresh = self.viewport_target.as_ref().is_some_and(|t| t.sgi_fresh);
 
         // Deferred resolve for the viewport: render the reflectance G-buffer
         // (gbuf=true variants) and resolve SSR + volumetric fog. UNCOUPLED from the
@@ -7286,7 +8084,8 @@ impl Renderer {
         if self.gi_has_gdf() {
             let dp = self.pipeline_cache.get(device, PipelineKey::shadow())?;
             let view_proj = input.camera.proj * input.camera.view;
-            let camera_moved = self.sgi_last_view_proj != Some(view_proj);
+            // Fresh targets count as a camera move: trace now, no history.
+            let camera_moved = sgi_fresh || self.sgi_last_view_proj != Some(view_proj);
             if camera_moved {
                 self.sgi_still_frames = 0;
             } else {
@@ -7295,7 +8094,7 @@ impl Renderer {
             const CF: u32 = 120; // keep tracing long enough to fully settle at low alpha
             if camera_moved || self.sgi_still_frames < CF {
                 self.sgi_frame = self.sgi_frame.wrapping_add(1);
-                let hist_valid = self.sgi_history_valid;
+                let hist_valid = self.sgi_history_valid && !sgi_fresh;
                 let cur = self.sgi_parity & 1;
                 let prev_vp = self.sgi_last_view_proj.unwrap_or(view_proj);
                 let prev_cam = if self.sgi_last_view_proj.is_some() {
@@ -7328,6 +8127,9 @@ impl Renderer {
                 self.gpu_zone_end(cb, gpu_zone::GI);
                 if let Some(t) = t {
                     self.sgi_transients[self.frame_index] = Some(t);
+                }
+                if let Some(vt) = self.viewport_target.as_mut() {
+                    vt.sgi_fresh = false;
                 }
                 self.sgi_history_valid = true;
                 self.sgi_last_view_proj = Some(view_proj);
@@ -7413,11 +8215,14 @@ impl Renderer {
                 .clear_value(vk::ClearValue {
                     color: vk::ClearColorValue { float32: [0.0; 4] },
                 });
+            // Stored: the reflection / fog resolve reads it. (The Flux depth
+            // prepass is only drawn while screen GI traces, so it can be stale
+            // or, after a resize, uninitialised.)
             let depth_att = vk::RenderingAttachmentInfo::default()
                 .image_view(dep_view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
                     depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
                 });
@@ -7459,6 +8264,13 @@ impl Renderer {
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
         );
+        image_barrier(
+            device, cb, dep_img, vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+        );
         // Reflection resolve into the viewport's resolved HDR target: ray-traced
         // (mode 2) takes precedence, else the SSR/fog resolve.
         self.gpu_zone_begin(cb, gpu_zone::REFLECT);
@@ -7473,12 +8285,14 @@ impl Renderer {
             let cam = &input.camera;
             let mut refl_center = [0.0; 4];
             let mut refl_extents = [0.0; 4];
+            let mut refl_box = [0.0; 4];
             if let Some(p) = input.reflection_probe {
-                refl_center = [p.center[0], p.center[1], p.center[2], p.intensity.max(0.0)];
+                refl_center = [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)];
                 refl_extents = [
                     p.half_extents[0], p.half_extents[1], p.half_extents[2],
                     if p.box_projection { 1.0 } else { 0.0 },
                 ];
+                refl_box = [p.center[0], p.center[1], p.center[2], 0.0];
             }
             let fs = self.flux_settings;
             let rt_uniforms = rt_reflect::RtUniforms {
@@ -7487,6 +8301,7 @@ impl Renderer {
                 camera_pos: cam.position.extend(0.0).to_array(),
                 refl_center,
                 refl_extents,
+                refl_box,
                 params: [fs.ssr_roughness_cutoff, fs.ssr_intensity, lights.len() as f32, 0.0],
                 screen: [ext.width as f32, ext.height as f32, 0.0, 0.0],
             };
@@ -7501,7 +8316,7 @@ impl Renderer {
             if let (Some(rt), Some(allocator)) = (self.rt_reflect.as_mut(), allocator) {
                 if let Err(e) = rt.record(
                     &self.ctx, &allocator, command_pool, cb, frame_index, &self.meshes,
-                    &instances, &lights, resolved_image, resolved_view, hdr_view, s_depth_view,
+                    &instances, &lights, resolved_image, resolved_view, hdr_view, dep_view,
                     vp_gbuf_view, env_view, &rt_uniforms, ext,
                 ) {
                     tracing::warn!("viewport RT reflection failed: {e:#}");
@@ -7526,7 +8341,7 @@ impl Renderer {
             let env_view = self.reflection_env.view;
             let mut target = self.viewport_ssr.take().unwrap();
             self.ssr_resolve
-                .record(device, cb, &mut target, hdr_view, s_depth_view, env_view, &uniforms);
+                .record(device, cb, &mut target, hdr_view, dep_view, env_view, &uniforms);
             let set = target.post_set;
             self.viewport_ssr = Some(target);
             set
@@ -7609,6 +8424,7 @@ impl Drop for Renderer {
         // allocator, which must still be alive.
         drop(self.egui.take());
         drop(self.vr_egui.take());
+        self.world_egui.clear();
 
         let allocator = self.allocator.as_ref().unwrap().clone();
         {
@@ -7619,6 +8435,9 @@ impl Drop for Renderer {
             }
             for texture in &mut self.textures {
                 texture.destroy(device, &mut alloc);
+            }
+            if let Some(skinner) = &mut self.skinner {
+                skinner.destroy(device, &mut alloc);
             }
             for texture in &mut self.default_textures {
                 texture.destroy(device, &mut alloc);
@@ -7679,6 +8498,12 @@ impl Drop for Renderer {
             self.post_pass.destroy(device, &mut alloc);
             self.reflection_env.destroy(device, &mut alloc);
             self.refl_capture_ubo.destroy(device, &mut alloc);
+            for ubo in &mut self.planar_ubos {
+                ubo.destroy(device, &mut alloc);
+            }
+            if let Some(mut t) = self.planar_targets.take() {
+                t.destroy(device, &mut alloc);
+            }
         }
         unsafe {
             device.destroy_descriptor_pool(self.refl_capture_pool, None);

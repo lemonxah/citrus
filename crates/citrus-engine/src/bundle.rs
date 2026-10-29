@@ -13,7 +13,10 @@ use citrus_assets::{MaterialRef, ObjectSource, PrimitiveShape, ProjectFile, Scen
 use citrus_render::{MaterialFeatures, MaterialParams};
 
 /// Asset subfolders every project gets.
-const ASSET_DIRS: &[&str] = &["scenes", "materials", "shaders", "textures"];
+const ASSET_DIRS: &[&str] = &["scenes", "materials", "shaders", "textures", "models", "audio", "prefabs"];
+
+/// Top-level project folders that are code or build output, never game content.
+const NON_ASSET_DIRS: &[&str] = &["build", "target", "src", "plugins"];
 
 /// Locate the citrus checkout so generated projects can path-depend on its
 /// crates. Walks up from the running editor's executable looking for the
@@ -157,7 +160,7 @@ citrus-editor = {{ path = "{citrus_disp}/crates/citrus-editor" }}
 # Runtime only: default-features = false drops the editor (no citrus-editor,
 # egui_dock, gizmos, LSP) from the shipped game. It must be set HERE — a member
 # inheriting with `workspace = true` can't override default-features.
-citrus-engine = {{ path = "{citrus_disp}/crates/citrus-engine", default-features = false }}
+citrus-engine = {{ path = "{citrus_disp}/crates/citrus-engine", default-features = false, features = ["steam-audio"] }}
 egui = "0.33"
 serde = {{ version = "1", features = ["derive"] }}
 glam = "0.30"
@@ -267,9 +270,17 @@ pub fn build_game(
     let pkg = crate_name(&project.name);
 
     log(format!("cargo build --release ({pkg})…"));
+    // `cargo rustc` passes the rpath to the game binary only (no dependency
+    // rebuild), so it finds the Steam Audio library shipped next to it.
+    let mut args = vec!["rustc", "--release", "--bin", &pkg];
+    if cfg!(target_os = "linux") {
+        args.extend(["--", "-C", "link-arg=-Wl,-rpath,$ORIGIN"]);
+    } else if cfg!(target_os = "macos") {
+        args.extend(["--", "-C", "link-arg=-Wl,-rpath,@executable_path"]);
+    }
     let output = std::process::Command::new("cargo")
         .current_dir(project_root)
-        .args(["build", "--release", "--bin", &pkg])
+        .args(&args)
         .output()
         .context("running cargo build")?;
     if !output.status.success() {
@@ -297,14 +308,31 @@ pub fn build_game(
     let out_exe = build_dir.join(&exe_name);
     std::fs::copy(&built, &out_exe)
         .with_context(|| format!("copying {}", built.display()))?;
-
-    log("copying assets…".into());
-    for dir in ASSET_DIRS {
-        let src = project_root.join(dir);
-        if src.is_dir() {
-            copy_dir(&src, &assets_dir.join(dir))?;
+    if let Some(lib) = steam_audio_library(&project_root.join("target/release")) {
+        log("copying Steam Audio library…".into());
+        let name = lib.file_name().expect("library file name");
+        std::fs::copy(&lib, build_dir.join(name))
+            .with_context(|| format!("copying {}", lib.display()))?;
+        // Apache-2.0 requires the licence (and third-party notices) to ship with it.
+        std::fs::write(build_dir.join("STEAM_AUDIO_LICENSE.txt"), STEAM_AUDIO_LICENSE)
+            .context("writing the Steam Audio licence")?;
+        if let Some(notices) = lib
+            .parent()
+            .and_then(|out_lib| out_lib.parent())
+            .map(|out| out.join("steam_audio_cache/steamaudio_core/steamaudio/THIRDPARTY.md"))
+            .filter(|p| p.is_file())
+        {
+            std::fs::copy(&notices, build_dir.join("STEAM_AUDIO_THIRDPARTY.md"))
+                .with_context(|| format!("copying {}", notices.display()))?;
         }
     }
+
+    log("copying assets…".into());
+    for dir in asset_dirs(project_root)? {
+        copy_dir(&project_root.join(&dir), &assets_dir.join(&dir))?;
+    }
+    log("precompiling shaders…".into());
+    precompile_shaders(&assets_dir, &mut log);
     // The game reads boot_scene/title from project.citrus at startup.
     std::fs::copy(
         project_root.join("project.citrus"),
@@ -314,6 +342,68 @@ pub fn build_game(
 
     log(format!("done: {}", out_exe.display()));
     Ok(out_exe)
+}
+
+/// Steam Audio's licence text, shipped next to `libphonon` in game builds.
+const STEAM_AUDIO_LICENSE: &str = include_str!("../assets/licenses/steam-audio-LICENSE.txt");
+
+/// The Steam Audio shared library built for this profile (newest
+/// `build/audionimbus-sys-*/out/lib` copy), if the game uses it.
+fn steam_audio_library(profile_dir: &Path) -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "phonon.dll"
+    } else if cfg!(target_os = "macos") {
+        "libphonon.dylib"
+    } else {
+        "libphonon.so"
+    };
+    std::fs::read_dir(profile_dir.join("build"))
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("audionimbus-sys-"))
+        .map(|e| e.path().join("out/lib").join(name))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+}
+
+/// Compile every custom `.frag` under `dir` to a `.frag.spv` sidecar so the
+/// shipped game never needs `glslc`. Failures are logged, not fatal (the game
+/// then falls back to runtime compilation for that shader).
+fn precompile_shaders(dir: &Path, log: &mut impl FnMut(String)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            precompile_shaders(&path, log);
+        } else if path.extension().is_some_and(|e| e == "frag") {
+            if let Err(e) = citrus_assets::precompile_shader_file(&path) {
+                log(format!("warning: shader {} not precompiled: {e:#}", path.display()));
+            }
+        }
+    }
+}
+
+/// Every top-level content folder of a project: all subdirectories except
+/// code / build output and hidden ones (`.git`, `.citrus` caches).
+fn asset_dirs(project_root: &Path) -> Result<Vec<String>> {
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(project_root)
+        .with_context(|| format!("reading {}", project_root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || NON_ASSET_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        dirs.push(name);
+    }
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Build a project given only its root: loads `project.citrus` and logs to

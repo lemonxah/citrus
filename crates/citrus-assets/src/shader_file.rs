@@ -486,6 +486,42 @@ pub fn compile_shader(source: &ShaderSource, label: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Sidecar holding a shader's precompiled SPIR-V (`toon.frag` -> `toon.frag.spv`).
+pub fn precompiled_path(path: &Path) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".spv");
+    p.into()
+}
+
+/// The precompiled sidecar, if present and not older than the source. Built
+/// games ship these so players don't need `glslc`.
+fn read_precompiled(path: &Path) -> Option<Vec<u8>> {
+    let spv = precompiled_path(path);
+    let src_time = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let spv_time = std::fs::metadata(&spv).and_then(|m| m.modified()).ok()?;
+    if spv_time < src_time {
+        return None;
+    }
+    std::fs::read(spv).ok().filter(|b| b.len() >= 4 && b.len() % 4 == 0)
+}
+
+/// Compile a shader file and write its `.spv` sidecar next to it.
+pub fn precompile_shader_file(path: impl AsRef<Path>) -> Result<std::path::PathBuf> {
+    let path = path.as_ref();
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "shader".into());
+    let source =
+        parse_shader_source(&text, &name).with_context(|| format!("parsing {}", path.display()))?;
+    let spirv = compile_shader(&source, &path.display().to_string())?;
+    let out = precompiled_path(path);
+    std::fs::write(&out, spirv).with_context(|| format!("writing {}", out.display()))?;
+    Ok(out)
+}
+
 /// Read, parse, and compile a shader file.
 pub fn load_shader_file(path: impl AsRef<Path>) -> Result<(ShaderSource, Vec<u8>)> {
     let path = path.as_ref();
@@ -497,7 +533,10 @@ pub fn load_shader_file(path: impl AsRef<Path>) -> Result<(ShaderSource, Vec<u8>
         .unwrap_or_else(|| "shader".into());
     let source =
         parse_shader_source(&text, &name).with_context(|| format!("parsing {}", path.display()))?;
-    let spirv = compile_shader(&source, &path.display().to_string())?;
+    let spirv = match read_precompiled(path) {
+        Some(spirv) => spirv,
+        None => compile_shader(&source, &path.display().to_string())?,
+    };
     Ok((source, spirv))
 }
 
@@ -533,6 +572,26 @@ void main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn precompiled_sidecar_is_preferred_and_ignored_when_stale() {
+        let dir = std::env::temp_dir().join(format!("citrus-spv-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let frag = dir.join("tpl.frag");
+        std::fs::write(&frag, SHADER_TEMPLATE).unwrap();
+        let spv = precompile_shader_file(&frag).unwrap();
+        let (_, compiled) = load_shader_file(&frag).unwrap();
+        assert_eq!(compiled, std::fs::read(&spv).unwrap());
+        // A sidecar newer than the source is used verbatim.
+        std::fs::write(&spv, [0x03u8, 0x02, 0x23, 0x07]).unwrap();
+        assert_eq!(load_shader_file(&frag).unwrap().1, vec![0x03, 0x02, 0x23, 0x07]);
+        // Touching the source makes it stale -> recompiled.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&frag, SHADER_TEMPLATE).unwrap();
+        assert!(load_shader_file(&frag).unwrap().1.len() > 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     // The bundled Toon example shader must compile against the (expanded)

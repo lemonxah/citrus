@@ -6,7 +6,7 @@
 //! (authored content); a save captures *runtime* state.
 //!
 //! ```no_run
-//! # use citrus_engine::savegame::{SaveGame, SaveValue};
+//! # use citrus_core::{SaveGame, SaveValue};
 //! let mut save = SaveGame::new();
 //! save.set("level", 3i64);
 //! save.set("player.hp", 80.0f32);
@@ -163,7 +163,7 @@ impl SaveGame {
 
     /// Write to disk (atomically via a temp file + rename so a crash mid-write
     /// can't corrupt an existing save).
-    pub fn save(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let path = path.as_ref();
         let tmp = path.with_extension("save.tmp");
         std::fs::write(&tmp, self.to_ron())?;
@@ -172,7 +172,7 @@ impl SaveGame {
     }
 
     /// Read from disk.
-    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let s = std::fs::read_to_string(path)?;
         Ok(Self::from_ron(&s)?)
     }

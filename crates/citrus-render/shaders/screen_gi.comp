@@ -469,7 +469,9 @@ void main() {
     float cam_dist = length(p - pc.cam.xyz);
     float alpha = clamp(pc.march.z, 0.02, 1.0);
     vec4 pclip = pc.prev_view_proj * vec4(p, 1.0);
-    if (pclip.w > 0.0001) {
+    // alpha 1 = no usable history (first frame / resized targets): skip the
+    // blend entirely, since NaN history survives even a weight of 0.
+    if (alpha < 0.999 && pclip.w > 0.0001) {
         float nx = pclip.x / pclip.w;
         float ny = pclip.y / pclip.w;
         if (pc.misc.w != 0u) ny = -ny; // match the Y-flipped viewport
@@ -477,7 +479,8 @@ void main() {
         if (all(greaterThanEqual(puv, vec2(0.0))) && all(lessThanEqual(puv, vec2(1.0)))) {
             vec4 h = texture(u_history, puv);
             float prev_dist = length(p - pc.prev_cam.xyz);
-            if (abs(h.a - prev_dist) < max(prev_dist * 0.08, 0.1)) {
+            bool h_ok = !any(isnan(h)) && !any(isinf(h));
+            if (h_ok && abs(h.a - prev_dist) < max(prev_dist * 0.08, 0.1)) {
                 // Temporal variance / firefly clamp (screen-probe temporal model): a
                 // grazing (low-angle) light lights only a thin bright strip, so the
                 // random bounce occasionally returns a value far above the converged
@@ -507,10 +510,15 @@ void main() {
                 ivec2 pp = ivec2(puv * vec2(pc.misc.yz));
                 pp = clamp(pp, ivec2(0), ivec2(pc.misc.yz) - 1);
                 uint pj = uint(pp.y) * pc.misc.y + uint(pp.x);
-                sh0 = mix(sh_prev[pj].c[0].rgb, sh0, alpha);
-                sh1 = mix(sh_prev[pj].c[1].rgb, sh1, alpha);
-                sh2 = mix(sh_prev[pj].c[2].rgb, sh2, alpha);
-                sh3 = mix(sh_prev[pj].c[3].rgb, sh3, alpha);
+                vec3 p0 = sh_prev[pj].c[0].rgb, p1 = sh_prev[pj].c[1].rgb;
+                vec3 p2 = sh_prev[pj].c[2].rgb, p3 = sh_prev[pj].c[3].rgb;
+                vec3 psum = p0 + p1 + p2 + p3;
+                if (!any(isnan(psum)) && !any(isinf(psum))) {
+                    sh0 = mix(p0, sh0, alpha);
+                    sh1 = mix(p1, sh1, alpha);
+                    sh2 = mix(p2, sh2, alpha);
+                    sh3 = mix(p3, sh3, alpha);
+                }
             }
         }
     }

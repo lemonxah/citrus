@@ -180,6 +180,13 @@ pub(crate) struct PipelineCache {
 }
 
 impl PipelineCache {
+    /// Color attachment format every non-gbuf pipeline was built for. Offscreen
+    /// passes reusing these pipelines (planar reflections) must render into
+    /// this format.
+    pub fn color_format(&self) -> vk::Format {
+        self.color_format
+    }
+
     pub fn new(
         device: &ash::Device,
         color_format: vk::Format,
@@ -289,6 +296,13 @@ impl PipelineCache {
             // Reflection probe: prefiltered environment cubemap (samplerCube).
             vk::DescriptorSetLayoutBinding::default()
                 .binding(7)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Planar reflections: per-plane mirrored scene renders (2D array,
+            // one layer per active PlanarReflection surface).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),

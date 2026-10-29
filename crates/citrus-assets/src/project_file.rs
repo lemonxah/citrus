@@ -27,6 +27,12 @@ pub struct ProjectFile {
     /// shared by the editor Play mode and a shipped game.
     #[serde(default)]
     pub bindings: citrus_core::Bindings,
+    /// Audio buses (volumes / mutes), applied in the editor and a built game.
+    #[serde(default)]
+    pub audio_mixer: citrus_core::AudioMixer,
+    /// Steam Audio quality, reflections, HRTF and output layout.
+    #[serde(default)]
+    pub spatial_audio: citrus_core::SpatialAudioSettings,
 }
 
 impl Default for ProjectFile {
@@ -37,6 +43,8 @@ impl Default for ProjectFile {
             boot_scene: None,
             settings: ProjectSettings::default(),
             bindings: citrus_core::Bindings::default(),
+            audio_mixer: citrus_core::AudioMixer::default(),
+            spatial_audio: citrus_core::SpatialAudioSettings::default(),
         }
     }
 }
@@ -52,6 +60,8 @@ pub struct ProjectSettings {
     pub grid_size: f32,
     /// Vim modal editing in the code editor.
     pub vim_mode: bool,
+    /// Editor accent colour (sRGB), the only yellow in the UI; None = default.
+    pub accent: Option<[u8; 3]>,
 }
 
 impl Default for ProjectSettings {
@@ -63,6 +73,7 @@ impl Default for ProjectSettings {
             snap: false,
             grid_size: 0.5,
             vim_mode: false,
+            accent: None,
         }
     }
 }

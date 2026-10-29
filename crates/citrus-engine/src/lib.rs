@@ -8,25 +8,19 @@
 mod audio;
 mod bundle;
 mod humanoid;
-pub mod anim_graph;
-pub mod asset_handle;
 pub mod audio_mixer;
-pub mod events;
-pub mod localization;
-pub mod lod;
 pub mod navmesh;
 pub mod particles;
 pub mod prefab;
-pub mod savegame;
-pub mod shader_graph;
-pub mod streaming;
-pub mod ui_canvas;
 mod log_capture;
 pub mod physics;
 mod plugins;
+mod game_ui;
+mod play;
 mod realtime_gi;
 mod runtime;
 mod scene;
+mod scene_loader;
 // Public so the headless `gi_preview` example can drive the real probe march.
 pub mod sw_gi;
 mod input_engine;
@@ -62,6 +56,14 @@ pub fn init_logging() {
 }
 
 #[cfg(feature = "editor")]
+mod command_palette;
+#[cfg(feature = "editor")]
 mod editor_app;
+#[cfg(feature = "editor")]
+mod ui_edit;
+#[cfg(feature = "editor")]
+mod ui_editor;
+#[cfg(feature = "editor")]
+mod ui_templates;
 #[cfg(feature = "editor")]
 pub use editor_app::{AppConfig, run};

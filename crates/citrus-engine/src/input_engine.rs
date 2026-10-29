@@ -17,6 +17,9 @@ pub struct InputManager {
     state: InputState,
     /// Empty scheme used when bindings have none (keeps resolve total).
     fallback: ControlScheme,
+    /// UI navigation inputs held last frame / pressed this frame.
+    nav_held: crate::game_ui::UiNav,
+    nav: crate::game_ui::UiNav,
 }
 
 impl Default for InputManager {
@@ -43,6 +46,8 @@ impl InputManager {
                 name: "none".into(),
                 actions: Vec::new(),
             },
+            nav_held: Default::default(),
+            nav: Default::default(),
         }
     }
 
@@ -92,10 +97,43 @@ impl InputManager {
         self.poll_gamepads();
         let scheme = self.bindings.active_scheme().unwrap_or(&self.fallback);
         self.state = resolve(scheme, &self.raw, &self.state);
+        self.update_nav();
         // Per-frame deltas reset after resolving; held sets persist.
         self.raw.mouse_delta = glam::Vec2::ZERO;
         self.raw.wheel = 0.0;
         &self.state
+    }
+
+    /// UI navigation edges this frame (arrows / D-pad / left stick, Enter or
+    /// South to submit, Escape or East to cancel).
+    pub fn ui_nav(&self) -> crate::game_ui::UiNav {
+        self.nav
+    }
+
+    fn update_nav(&mut self) {
+        use citrus_core::{Key, PadAxis, PadButton};
+        let r = &self.raw;
+        let key = |k: Key| r.keys_down.contains(&k);
+        let pad = |b: PadButton| r.pad_down.contains(&b);
+        let axis = |a: PadAxis| r.pad_axes.get(&a).copied().unwrap_or(0.0);
+        let held = crate::game_ui::UiNav {
+            up: key(Key::Up) || pad(PadButton::DPadUp) || axis(PadAxis::LeftStickY) > 0.6,
+            down: key(Key::Down) || pad(PadButton::DPadDown) || axis(PadAxis::LeftStickY) < -0.6,
+            left: key(Key::Left) || pad(PadButton::DPadLeft) || axis(PadAxis::LeftStickX) < -0.6,
+            right: key(Key::Right) || pad(PadButton::DPadRight) || axis(PadAxis::LeftStickX) > 0.6,
+            submit: key(Key::Enter) || pad(PadButton::South),
+            cancel: key(Key::Escape) || pad(PadButton::East),
+        };
+        let p = self.nav_held;
+        self.nav = crate::game_ui::UiNav {
+            up: held.up && !p.up,
+            down: held.down && !p.down,
+            left: held.left && !p.left,
+            right: held.right && !p.right,
+            submit: held.submit && !p.submit,
+            cancel: held.cancel && !p.cancel,
+        };
+        self.nav_held = held;
     }
 
     fn poll_gamepads(&mut self) {

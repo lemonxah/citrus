@@ -26,13 +26,14 @@ layout(set = 0, binding = 4) uniform SsrData {
     mat4 inv_view;
     vec4 camera_pos;   // xyz world camera
     vec4 ssr;          // x enabled, y intensity, z max view dist, w roughness cutoff
-    vec4 refl_center;  // xyz probe box centre, w probe intensity (0 = none)
+    vec4 refl_center;  // xyz probe CAPTURE position (re-vector anchor), w probe intensity (0 = none)
     vec4 refl_extents; // xyz half-extents, w box-projection enabled
     vec4 fog_color;    // xyz colour, w density (0 = no fog)
     vec4 fog_params;   // x height falloff, y height ref, z start distance, w _
     vec4 fog_light;    // xyz sun colour*intensity, w anisotropy g
     vec4 fog_sun;      // xyz dir to sun, w time
     vec4 screen;       // x width, y height, z _, w _
+    vec4 refl_box;     // xyz probe box CENTER (capture + box offset), w _
 } u;
 
 // Max roughness mip of the CURRENTLY bound cube, queried at runtime (correct for
@@ -258,18 +259,21 @@ void main() {
             vec3 Rw = reflect(-Vw, Nw);
             float probe_intensity = u.refl_center.w;
             if (probe_intensity > 0.0 && u.refl_extents.w > 0.5) {
-                vec3 bmin = u.refl_center.xyz - u.refl_extents.xyz;
-                vec3 bmax = u.refl_center.xyz + u.refl_extents.xyz;
+                vec3 bmin = u.refl_box.xyz - u.refl_extents.xyz;
+                vec3 bmax = u.refl_box.xyz + u.refl_extents.xyz;
                 // Only box-project surfaces inside the probe box (matches
                 // standard.frag; outside, the box proxy mis-places the reflection).
-                bool inside = all(greaterThanEqual(worldPos, bmin))
-                           && all(lessThanEqual(worldPos, bmax));
+                // Flush-surface tolerance + backward-hit clamp match standard.frag.
+                vec3 eps = u.refl_extents.xyz * 0.02 + 0.02;
+                bool inside = all(greaterThanEqual(worldPos, bmin - eps))
+                           && all(lessThanEqual(worldPos, bmax + eps));
                 if (inside) {
                     vec3 invR = 1.0 / Rw;
                     vec3 t1 = (bmax - worldPos) * invR;
                     vec3 t2 = (bmin - worldPos) * invR;
                     vec3 tmax = max(t1, t2);
-                    Rw = (worldPos + Rw * min(min(tmax.x, tmax.y), tmax.z)) - u.refl_center.xyz;
+                    float dist = max(min(min(tmax.x, tmax.y), tmax.z), 0.0);
+                    Rw = (worldPos + Rw * dist) - u.refl_center.xyz;
                 }
             }
             float env_scale = probe_intensity > 0.0 ? probe_intensity : 1.0;
@@ -279,7 +283,10 @@ void main() {
                 float rough_fade = 1.0 - smoothstep(u.ssr.w * 0.5, u.ssr.w, roughness);
                 float graze_fade = smoothstep(0.15, 0.45, NdotV);
                 float w = clamp(ssr.a * rough_fade * graze_fade * u.ssr.y, 0.0, 1.0);
-                outc = base + reflectivity * w * (ssr.rgb - env);
+                vec3 refl = base + reflectivity * w * (ssr.rgb - env);
+                // A non-finite sample (e.g. from a freshly recreated target)
+                // must not reach the frame.
+                if (!any(isnan(refl)) && !any(isinf(refl))) outc = refl;
             }
         }
     }

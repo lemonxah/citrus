@@ -14,12 +14,29 @@ use glam::{Mat4, Quat, Vec3};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+mod audio_mixer;
+mod spatial_audio;
+mod gameplay;
 mod ik;
 mod input;
+mod localization;
 mod models;
+mod savegame;
+mod ui;
 mod vr;
 pub use ik::{
     IkTargets, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik, solve_two_bone,
+};
+pub use audio_mixer::AudioMixer;
+pub use spatial_audio::{
+    AcousticMaterial, AcousticPreset, AudioProbeVolume, OutputLayout, RayTracerKind, ReflectionMode, SpatialAudioSettings,
+};
+pub use localization::Localization;
+pub use savegame::{SaveGame, SaveValue};
+pub use gameplay::{AnyBox, ComponentLookup, Deferred, NavQuery, PhysicsQuery, RayFilter, RayHit, ScreenInfo};
+pub use ui::{
+    UiAction, UiAlign, UiButton, UiButtonState, UiCanvas, UiFillDirection, UiImage, UiPanel, UiPauseMenu,
+    UiProgressBar, UiRect, UiRenderMode, UiScaleMode, UiSlider, UiText, UiTextField, UiToggle,
 };
 pub use vr::{Ray, VrRig, pointer_ray, ray_plane};
 pub use input::{
@@ -139,6 +156,12 @@ impl ObjectRef {
     }
 }
 
+impl From<ObjectId> for ObjectRef {
+    fn from(id: ObjectId) -> Self {
+        ObjectRef(Some(id))
+    }
+}
+
 // ------------------------------------------------------------------ transform
 
 /// A decomposed transform (translation / rotation / scale). The gameplay-side
@@ -190,11 +213,20 @@ impl Transform {
 /// engine applies these after the update pass finishes (so the scene isn't
 /// mutated mid-iteration). The first slice of the in-game API; grow the enum as
 /// more world control is exposed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ComponentCommand {
     /// Switch to another scene (level change, menu -> game). Path is
     /// project-relative, e.g. "scenes/level2.scene". Replaces the current scene.
     LoadScene(String),
+    /// Start loading a scene in the background; a later `LoadScene` /
+    /// `LoadSceneAdditive` of it switches instantly once ready.
+    PreloadScene(String),
+    /// Add another scene's objects to the current one (streaming rooms).
+    LoadSceneAdditive(String),
+    /// Remove the objects an additive load brought in.
+    UnloadScene(String),
+    /// Carry an object (and its children) into the next scene on `LoadScene`.
+    KeepOnSceneChange(ObjectId, bool),
     /// Make this camera object the active render camera (2A).
     SetActiveCamera(ObjectId),
     /// Write another object's LOCAL transform (each field optional). Lets a pawn
@@ -220,6 +252,69 @@ pub enum ComponentCommand {
     SetShadowResolution(u32),
     /// Send a networked text message (None target = broadcast / public).
     NetMessage { to: Option<u64>, text: String },
+    /// Instantiate a `.prefab` (project-relative path). The first root gets
+    /// `root_id` so the caller can reference it immediately.
+    SpawnPrefab {
+        path: String,
+        root_id: ObjectId,
+        translation: Vec3,
+        rotation: Quat,
+    },
+    /// Clone an existing object (and its children) as a new root object.
+    Instantiate {
+        original: ObjectId,
+        new_id: ObjectId,
+        translation: Vec3,
+        rotation: Quat,
+    },
+    /// Remove an object and its children from the scene.
+    Destroy(ObjectId),
+    /// Enable / disable an object (disabled objects don't update, render or collide).
+    SetActive(ObjectId, bool),
+    /// Run `f` against the first component of type `type_id` on object `id`.
+    Modify {
+        id: ObjectId,
+        type_id: std::any::TypeId,
+        f: Deferred,
+    },
+    /// Broadcast a gameplay event, readable by every component next frame.
+    Emit(AnyBox),
+    AddForce { id: ObjectId, force: Vec3 },
+    AddImpulse { id: ObjectId, impulse: Vec3 },
+    AddTorque { id: ObjectId, torque: Vec3 },
+    SetVelocity { id: ObjectId, linear: Vec3 },
+    /// Re-bake every NavMesh Surface (after the level geometry changed).
+    RebakeNavMesh,
+    /// Change a joint's motor at runtime (deg/s or m/s; max force).
+    SetJointMotor { id: ObjectId, speed: f32, max_force: f32 },
+    /// Move a [`CharacterController`] by `delta`, sliding along obstacles.
+    MoveCharacter { id: ObjectId, delta: Vec3 },
+    /// Fire-and-forget sound. `position: None` plays it non-spatially.
+    PlaySound {
+        clip: String,
+        position: Option<Vec3>,
+        volume: f32,
+    },
+    /// (Re)start the [`AudioSource`] on an object.
+    PlayAudio(ObjectId),
+    StopAudio(ObjectId),
+    /// Set a persistent save value (see [`SaveGame`]).
+    SaveSet { key: String, value: SaveValue },
+    SaveRemove(String),
+    /// Write the save data to a slot file.
+    SaveWrite(String),
+    /// Replace the save data with a slot file's contents (next pass).
+    SaveLoad(String),
+    /// Switch the localization language.
+    SetLanguage(String),
+    SetBusVolume { bus: String, volume: f32 },
+    SetBusMuted { bus: String, muted: bool },
+    /// Lock + hide the OS cursor (mouse-look) or release it.
+    SetCursorLocked(bool),
+    /// Scale game time (0 = paused, 1 = normal). Affects `dt` and physics.
+    SetTimeScale(f32),
+    /// Exit the game (stops Play mode in the editor).
+    Quit,
 }
 
 /// Read-only networking view handed to components each frame. Filled by the
@@ -250,7 +345,10 @@ impl NetView {
 /// Per-frame update context handed to components in Play mode. Transform
 /// fields are the owning object's local TRS.
 pub struct ComponentCtx<'a> {
+    /// Frame delta in seconds, scaled by the time scale (fixed step in `fixed_update`).
     pub dt: f32,
+    /// Frame delta ignoring the time scale (UI, pause menus).
+    pub unscaled_dt: f32,
     /// Seconds since engine start.
     pub time: f32,
     pub translation: &'a mut Vec3,
@@ -281,6 +379,26 @@ pub struct ComponentCtx<'a> {
     /// Spawn points this frame as `(object index, tag)`, from objects carrying a
     /// [`SpawnPoint`] component. Resolve a transform via `spawn_point(tag)`.
     pub spawn_points: &'a [(usize, String)],
+    /// Id -> index map for `object_ids` (fast reference resolution).
+    pub id_index: &'a HashMap<ObjectId, usize>,
+    /// Whether each object is active (enabled with all parents enabled).
+    pub active: &'a [bool],
+    /// Other components in the scene, for [`ComponentCtx::get`].
+    pub lookup: &'a dyn ComponentLookup,
+    /// Physics queries (raycasts, velocities). `None` outside Play mode.
+    pub physics: Option<&'a dyn PhysicsQuery>,
+    /// Navmesh path queries. `None` outside Play mode or before the bake.
+    pub nav: Option<&'a dyn NavQuery>,
+    /// Events emitted last frame via [`ComponentCtx::emit`].
+    pub events: &'a [AnyBox],
+    /// Current time scale.
+    pub time_scale: f32,
+    /// Game view size, pointer, camera and UI clicks.
+    pub screen: &'a ScreenInfo,
+    /// Persistent save data (key-value), see `ctx.save_value`.
+    pub save: &'a SaveGame,
+    /// Localized string tables (`localization/*.loc`).
+    pub strings: &'a Localization,
 }
 
 impl ComponentCtx<'_> {
@@ -347,7 +465,7 @@ impl ComponentCtx<'_> {
 
     /// Resolve a stable id to its current index.
     pub fn index_of(&self, id: ObjectId) -> Option<usize> {
-        self.object_ids.iter().position(|i| *i == id)
+        self.id_index.get(&id).copied()
     }
 
     /// Resolve an [`ObjectRef`] to its index (None if unset or gone).
@@ -482,12 +600,19 @@ impl ComponentCtx<'_> {
 /// UI and viewport gizmos are separate traits in `citrus-editor`.
 pub trait Component: 'static {
     fn type_name(&self) -> &'static str;
-    /// Called once when Play mode starts.
+    /// Called once, the first frame the object is active in Play mode.
     fn start(&mut self, ctx: &mut ComponentCtx);
     /// Per-frame behaviour (Play mode only).
     fn update(&mut self, ctx: &mut ComponentCtx);
     /// Runs after every component finished `update` this frame.
     fn late_update(&mut self, ctx: &mut ComponentCtx);
+    /// Runs once per fixed physics step, before the step.
+    fn fixed_update(&mut self, ctx: &mut ComponentCtx);
+    fn on_collision_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
+    fn on_collision_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
+    fn on_trigger_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
+    fn on_trigger_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId);
+    fn on_animation_event(&mut self, ctx: &mut ComponentCtx, name: &str);
     /// Serialize to RON.
     fn save(&self) -> String;
     /// Downcasting for engine + editor systems that read typed component data.
@@ -501,12 +626,25 @@ pub trait Component: 'static {
 /// `citrus-editor`'s `Inspect` trait, not here.
 pub trait TypedComponent: Serialize + DeserializeOwned + Default + 'static {
     const NAME: &'static str;
-    /// Called once when Play mode starts.
+    /// Called once, the first frame the object is active in Play mode
+    /// (Play start, or later for spawned / re-enabled objects).
     fn start(&mut self, _ctx: &mut ComponentCtx) {}
     /// Called every frame while playing.
     fn update(&mut self, _ctx: &mut ComponentCtx) {}
     /// Called every frame after all components ran `update`.
     fn late_update(&mut self, _ctx: &mut ComponentCtx) {}
+    /// Called once per fixed physics step (60 Hz), before the step. Apply
+    /// forces here; `ctx.dt` is the fixed step.
+    fn fixed_update(&mut self, _ctx: &mut ComponentCtx) {}
+    /// A solid collider on this object started touching `other`.
+    fn on_collision_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    /// A solid collider on this object stopped touching `other`.
+    fn on_collision_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    /// `other` entered a trigger on this object (or this object entered `other`'s trigger).
+    fn on_trigger_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    fn on_trigger_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    /// An `Animator` on this object passed an animation event marker.
+    fn on_animation_event(&mut self, _ctx: &mut ComponentCtx, _name: &str) {}
 }
 
 impl<T: TypedComponent> Component for T {
@@ -521,6 +659,24 @@ impl<T: TypedComponent> Component for T {
     }
     fn late_update(&mut self, ctx: &mut ComponentCtx) {
         TypedComponent::late_update(self, ctx)
+    }
+    fn fixed_update(&mut self, ctx: &mut ComponentCtx) {
+        TypedComponent::fixed_update(self, ctx)
+    }
+    fn on_collision_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
+        TypedComponent::on_collision_enter(self, ctx, other)
+    }
+    fn on_collision_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
+        TypedComponent::on_collision_exit(self, ctx, other)
+    }
+    fn on_trigger_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
+        TypedComponent::on_trigger_enter(self, ctx, other)
+    }
+    fn on_trigger_exit(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
+        TypedComponent::on_trigger_exit(self, ctx, other)
+    }
+    fn on_animation_event(&mut self, ctx: &mut ComponentCtx, name: &str) {
+        TypedComponent::on_animation_event(self, ctx, name)
     }
     fn save(&self) -> String {
         ron::to_string(self).unwrap_or_default()
@@ -555,8 +711,11 @@ impl ComponentRegistry {
         registry.register::<FluxVoxelLight>();
         registry.register::<FluxVolume>();
         registry.register::<ReflectionProbe>();
+        registry.register::<PlanarReflection>();
         registry.register::<AudioSource>();
         registry.register::<AudioListener>();
+        registry.register::<AcousticMaterial>();
+        registry.register::<AudioProbeVolume>();
         registry.register::<VolumeComponent>();
         registry.register::<BoxCollider>();
         registry.register::<SphereCollider>();
@@ -565,9 +724,27 @@ impl ComponentRegistry {
         registry.register::<Bob>();
         registry.register::<LodComponent>();
         registry.register::<RigidBody>();
+        registry.register::<CharacterController>();
+        registry.register::<PhysicsJoint>();
+        registry.register::<NavMeshSurface>();
+        registry.register::<NavAgent>();
+        registry.register::<ParticleEmitter>();
+        registry.register::<ScenePortal>();
         registry.register::<Pawn>();
         registry.register::<SpawnPoint>();
         registry.register::<Sync>();
+        registry.register::<Animator>();
+        registry.register::<UiCanvas>();
+        registry.register::<UiRect>();
+        registry.register::<UiPanel>();
+        registry.register::<UiImage>();
+        registry.register::<UiText>();
+        registry.register::<UiButton>();
+        registry.register::<UiToggle>();
+        registry.register::<UiSlider>();
+        registry.register::<UiTextField>();
+        registry.register::<UiProgressBar>();
+        registry.register::<UiPauseMenu>();
         registry
     }
 
@@ -1004,7 +1181,11 @@ impl LodComponent {
         if self.cull_distance > 0.0 && distance > self.cull_distance {
             return None;
         }
-        self.levels.iter().position(|l| distance <= l.max_distance)
+        // Past the last level: keep the coarsest one (culling is cull_distance's job).
+        self.levels
+            .iter()
+            .position(|l| distance <= l.max_distance)
+            .or(self.levels.len().checked_sub(1))
     }
 }
 
@@ -1199,6 +1380,20 @@ pub enum ReflectionProbeMode {
 pub struct ReflectionProbe {
     /// Full box influence size in local meters (centered on the object).
     pub size: [f32; 3],
+    /// Box-center offset from the object position (world-axis meters, Unity's
+    /// box offset). Decouples WHERE the cube is captured from (the object
+    /// position — put it at eye height so interior objects reflect right) from
+    /// WHERE the box sits (aligned to the room's walls/floor/ceiling).
+    #[serde(default)]
+    pub box_offset: [f32; 3],
+    /// Keep the box FIXED IN WORLD SPACE while the object moves: `box_offset`
+    /// auto-compensates each frame, so dragging the probe repositions only the
+    /// capture point inside the room-aligned box. Off = box follows the object.
+    #[serde(default)]
+    pub lock_box: bool,
+    /// Transient: last frame's world position, for `lock_box` compensation.
+    #[serde(skip)]
+    pub last_world_pos: Option<[f32; 3]>,
     /// Captured cubemap face resolution (per side): 32 … 8192.
     pub resolution: u32,
     /// Realtime (live capture) vs Baked (loaded from a `.reflprobe` sidecar).
@@ -1232,6 +1427,9 @@ impl Default for ReflectionProbe {
     fn default() -> Self {
         Self {
             size: [10.0, 6.0, 10.0],
+            box_offset: [0.0; 3],
+            lock_box: false,
+            last_world_pos: None,
             resolution: 256,
             intensity: 1.0,
             box_projection: true,
@@ -1245,6 +1443,29 @@ impl Default for ReflectionProbe {
 
 impl TypedComponent for ReflectionProbe {
     const NAME: &'static str = "Reflection Probe";
+}
+
+/// A true mirror for a flat surface (floor, wall mirror): the scene is
+/// re-rendered every frame from the camera reflected about the object's world
+/// +Y plane and composited with per-pixel parallax — exact reflections that a
+/// reflection probe (single capture point) cannot produce for mid-room
+/// geometry. Each active surface costs a mirrored scene pass; at most
+/// `MAX_PLANAR` (4) render per frame.
+#[derive(Serialize, Deserialize)]
+pub struct PlanarReflection {
+    /// Roughness above which the planar reflection has fully faded back to the
+    /// reflection probe/env cube (the mirror render is sharp-only).
+    pub max_roughness: f32,
+}
+
+impl Default for PlanarReflection {
+    fn default() -> Self {
+        Self { max_roughness: 0.35 }
+    }
+}
+
+impl TypedComponent for PlanarReflection {
+    const NAME: &'static str = "Planar Reflection";
 }
 
 /// How a spatial audio source quietens with distance.
@@ -1277,6 +1498,53 @@ pub struct AudioSource {
     pub min_distance: f32,
     pub max_distance: f32,
     pub rolloff: AudioRolloff,
+    /// Mixer bus (project Audio Mixer) this source plays through.
+    #[serde(default = "default_bus")]
+    pub bus: String,
+    /// Spatial: render through the listener's HRTF (binaural) rather than
+    /// plain stereo panning. Needs the `steam-audio` engine feature.
+    #[serde(default = "default_true")]
+    pub hrtf: bool,
+    /// Spatial: high frequencies fade with distance.
+    #[serde(default = "default_true")]
+    pub air_absorption: bool,
+    /// Spatial: scene geometry between source and listener muffles it.
+    #[serde(default = "default_true")]
+    pub occlusion: bool,
+    /// 0 = omnidirectional, 0.5 = cardioid, 1 = dipole along the object's
+    /// forward (-Z) axis.
+    #[serde(default)]
+    pub directivity: f32,
+    /// How narrow the directivity lobe is (higher = tighter beam).
+    #[serde(default = "default_one")]
+    pub directivity_sharpness: f32,
+    /// Spatial: simulate this source's own reflections (reverb that depends
+    /// on where it is). Off = the listener-centric reverb, if enabled.
+    #[serde(default)]
+    pub reflections: bool,
+    /// Spatial: sound bends around corners using baked pathing probes.
+    #[serde(default)]
+    pub pathing: bool,
+    /// The clip is an ambisonic recording of this order (1..=3, ACN / N3D);
+    /// 0 = a regular mono / stereo clip. Ambisonic clips rotate with the
+    /// listener instead of being placed at the object.
+    #[serde(default)]
+    pub ambisonic_order: u8,
+    /// Spatial: encode to ambisonics and decode, instead of direct HRTF.
+    #[serde(default)]
+    pub spatialize_via_ambisonics: bool,
+}
+
+fn default_bus() -> String {
+    "sfx".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_one() -> f32 {
+    1.0
 }
 
 impl Default for AudioSource {
@@ -1291,6 +1559,16 @@ impl Default for AudioSource {
             min_distance: 1.0,
             max_distance: 20.0,
             rolloff: AudioRolloff::Logarithmic,
+            bus: default_bus(),
+            hrtf: true,
+            air_absorption: true,
+            occlusion: true,
+            directivity: 0.0,
+            directivity_sharpness: 1.0,
+            reflections: false,
+            pathing: false,
+            ambisonic_order: 0,
+            spatialize_via_ambisonics: false,
         }
     }
 }
@@ -1471,6 +1749,641 @@ impl TypedComponent for RigidBody {
     const NAME: &'static str = "Rigid Body";
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum JointKind {
+    /// Welds the two bodies together.
+    Fixed,
+    /// Rotation about one axis (doors, wheels, levers).
+    Hinge,
+    /// Free rotation about the anchor (ragdoll shoulders, chains).
+    Ball,
+    /// Translation along one axis (pistons, drawers).
+    Slider,
+    /// Pulls the anchors toward `rest_length` (soft connection).
+    Spring,
+    /// Keeps the anchors within `rest_length` (cables, tethers).
+    Rope,
+}
+
+impl JointKind {
+    pub const ALL: [JointKind; 6] = [Self::Fixed, Self::Hinge, Self::Ball, Self::Slider, Self::Spring, Self::Rope];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fixed => "Fixed",
+            Self::Hinge => "Hinge",
+            Self::Ball => "Ball",
+            Self::Slider => "Slider",
+            Self::Spring => "Spring",
+            Self::Rope => "Rope",
+        }
+    }
+}
+
+/// Connects this object's rigid body to another body (or to its start point
+/// in the world when `connected` is unset).
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhysicsJoint {
+    pub kind: JointKind,
+    pub connected: ObjectRef,
+    /// Anchor in this object's local space.
+    pub anchor: [f32; 3],
+    /// Hinge / slider axis in this object's local space.
+    pub axis: [f32; 3],
+    /// Hinge: degrees; slider: meters.
+    pub limits_enabled: bool,
+    pub limits: [f32; 2],
+    /// Hinge / slider motor (deg/s or m/s).
+    pub motor_enabled: bool,
+    pub motor_speed: f32,
+    pub motor_max_force: f32,
+    /// Spring / rope length (0 = the distance at start).
+    pub rest_length: f32,
+    pub stiffness: f32,
+    pub damping: f32,
+    /// Let the two connected bodies collide with each other.
+    pub collide_connected: bool,
+}
+
+impl Default for PhysicsJoint {
+    fn default() -> Self {
+        Self {
+            kind: JointKind::Hinge,
+            connected: ObjectRef::NONE,
+            anchor: [0.0; 3],
+            axis: [0.0, 1.0, 0.0],
+            limits_enabled: false,
+            limits: [-90.0, 90.0],
+            motor_enabled: false,
+            motor_speed: 90.0,
+            motor_max_force: 100.0,
+            rest_length: 0.0,
+            stiffness: 50.0,
+            damping: 2.0,
+            collide_connected: false,
+        }
+    }
+}
+
+impl TypedComponent for PhysicsJoint {
+    const NAME: &'static str = "Joint";
+}
+
+/// Emits camera-facing particles (smoke, sparks, magic, dust).
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParticleEmitter {
+    /// Particles per second while playing.
+    pub rate: f32,
+    /// Particles emitted at once when the emitter starts.
+    pub burst: u32,
+    /// Seconds each particle lives [min, max].
+    pub lifetime: [f32; 2],
+    /// Initial speed [min, max] along the emit direction.
+    pub speed: [f32; 2],
+    /// Emit direction in local space and cone half-angle (degrees).
+    pub direction: [f32; 3],
+    pub cone_angle: f32,
+    /// Spawn inside a sphere of this radius.
+    pub shape_radius: f32,
+    /// Multiplier on world gravity (negative floats upward).
+    pub gravity: f32,
+    pub drag: f32,
+    pub size: [f32; 2],
+    pub color_start: [f32; 4],
+    pub color_end: [f32; 4],
+    /// Project-relative texture (empty = soft round dot).
+    pub texture: String,
+    pub max_particles: u32,
+    pub looping: bool,
+    /// Seconds a non-looping emitter emits for.
+    pub duration: f32,
+    pub play_on_start: bool,
+    /// Particles stay where they were emitted (else they follow the object).
+    pub world_space: bool,
+    #[serde(skip)]
+    pub control: ParticleControl,
+}
+
+/// Gameplay requests to a running emitter (consumed by the engine).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParticleControl {
+    pub play: bool,
+    pub stop: bool,
+    pub clear: bool,
+    pub emit: u32,
+    /// Live particle count (filled in by the engine).
+    pub alive: u32,
+    pub playing: bool,
+}
+
+impl Default for ParticleEmitter {
+    fn default() -> Self {
+        Self {
+            rate: 20.0,
+            burst: 0,
+            lifetime: [1.0, 2.0],
+            speed: [1.0, 2.0],
+            direction: [0.0, 1.0, 0.0],
+            cone_angle: 20.0,
+            shape_radius: 0.05,
+            gravity: 0.0,
+            drag: 0.0,
+            size: [0.2, 0.05],
+            color_start: [1.0, 0.8, 0.4, 1.0],
+            color_end: [1.0, 0.2, 0.05, 0.0],
+            texture: String::new(),
+            max_particles: 500,
+            looping: true,
+            duration: 2.0,
+            play_on_start: true,
+            world_space: true,
+            control: ParticleControl::default(),
+        }
+    }
+}
+
+impl TypedComponent for ParticleEmitter {
+    const NAME: &'static str = "Particle Emitter";
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum PortalMode {
+    /// Replace the current scene (level change).
+    Switch,
+    /// Stream the scene in alongside the current one.
+    Additive,
+    /// Stream a previously added scene back out.
+    Unload,
+}
+
+impl PortalMode {
+    pub const ALL: [PortalMode; 3] = [Self::Switch, Self::Additive, Self::Unload];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Switch => "Switch scene",
+            Self::Additive => "Load additive",
+            Self::Unload => "Unload",
+        }
+    }
+}
+
+/// Seamless scene transition: preloads `scene` in the background when the
+/// activator comes within `preload_distance`, then switches / streams it when
+/// the activator enters this object's trigger collider (add a Box/Sphere
+/// Collider with "Is trigger"). Build the transition (a fall, a corridor, a
+/// crack in the wall) so the activator spends the preload time inside it.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScenePortal {
+    pub scene: String,
+    pub mode: PortalMode,
+    /// Object that activates the portal (unset = any object with a Pawn).
+    pub activator: ObjectRef,
+    /// Start preloading within this distance (0 = as soon as play starts).
+    pub preload_distance: f32,
+    /// Carry the activator into the new scene (Switch mode). It respawns at a
+    /// matching SpawnPoint if its Pawn has a spawn tag.
+    pub keep_activator: bool,
+    /// Fire once, then disable.
+    pub one_shot: bool,
+    #[serde(skip)]
+    preloaded: bool,
+    #[serde(skip)]
+    fired: bool,
+}
+
+impl Default for ScenePortal {
+    fn default() -> Self {
+        Self {
+            scene: String::new(),
+            mode: PortalMode::Switch,
+            activator: ObjectRef::NONE,
+            preload_distance: 30.0,
+            keep_activator: true,
+            one_shot: true,
+            preloaded: false,
+            fired: false,
+        }
+    }
+}
+
+impl ScenePortal {
+    fn activator_index(&self, ctx: &ComponentCtx) -> Option<usize> {
+        match self.activator.id() {
+            Some(_) => ctx.resolve(self.activator),
+            None => (0..ctx.object_ids.len()).find(|&i| {
+                ctx.active.get(i).copied().unwrap_or(false)
+                    && ctx.lookup.component(i, std::any::TypeId::of::<Pawn>()).is_some()
+            }),
+        }
+    }
+}
+
+impl TypedComponent for ScenePortal {
+    const NAME: &'static str = "Scene Portal";
+
+    fn update(&mut self, ctx: &mut ComponentCtx) {
+        if self.preloaded || self.scene.is_empty() || self.mode == PortalMode::Unload {
+            return;
+        }
+        let near = self.preload_distance <= 0.0
+            || self.activator_index(ctx).and_then(|i| ctx.object_position(i)).is_some_and(|p| {
+                p.distance(ctx.self_transform().translation) <= self.preload_distance
+            });
+        if near {
+            ctx.preload_scene(self.scene.clone());
+            self.preloaded = true;
+        }
+    }
+
+    fn on_trigger_enter(&mut self, ctx: &mut ComponentCtx, other: ObjectId) {
+        if self.scene.is_empty() || (self.one_shot && self.fired) {
+            return;
+        }
+        let Some(act) = self.activator_index(ctx) else {
+            return;
+        };
+        if ctx.object_ids.get(act) != Some(&other) {
+            return;
+        }
+        self.fired = true;
+        match self.mode {
+            PortalMode::Switch => {
+                if self.keep_activator {
+                    ctx.keep_on_scene_change(other, true);
+                }
+                ctx.load_scene(self.scene.clone());
+            }
+            PortalMode::Additive => ctx.load_scene_additive(self.scene.clone()),
+            PortalMode::Unload => ctx.unload_scene(self.scene.clone()),
+        }
+    }
+}
+
+/// Bakes a walkable navigation grid from the physics colliders inside its box
+/// (centered on the object) when play starts. Agents path over it.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct NavMeshSurface {
+    /// Box size in meters (world axes, centered on the object).
+    pub size: [f32; 3],
+    pub cell_size: f32,
+    pub agent_radius: f32,
+    pub agent_height: f32,
+    /// Steepest walkable slope in degrees.
+    pub max_slope: f32,
+    /// Tallest step an agent can climb between cells.
+    pub step_height: f32,
+    /// Layers whose colliders count as ground / obstacles.
+    pub layer_mask: u32,
+    /// Editor: overlay the baked walkable cells in the viewport.
+    #[serde(skip)]
+    pub show_preview: bool,
+    /// Editor: re-bake the preview.
+    #[serde(skip)]
+    pub rebake_preview: bool,
+}
+
+impl Default for NavMeshSurface {
+    fn default() -> Self {
+        Self {
+            size: [40.0, 10.0, 40.0],
+            cell_size: 0.25,
+            agent_radius: 0.35,
+            agent_height: 1.8,
+            max_slope: 45.0,
+            step_height: 0.4,
+            layer_mask: u32::MAX,
+            show_preview: false,
+            rebake_preview: false,
+        }
+    }
+}
+
+impl TypedComponent for NavMeshSurface {
+    const NAME: &'static str = "NavMesh Surface";
+}
+
+/// Walks the object along navmesh paths. Set a destination with
+/// `ctx.set_destination(agent, point)`; moves through a CharacterController
+/// when the object has one.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct NavAgent {
+    pub speed: f32,
+    /// Turn rate in degrees per second (0 = don't rotate).
+    pub turn_speed: f32,
+    /// Stop when this close to the destination.
+    pub stopping_distance: f32,
+    #[serde(skip)]
+    pub state: NavAgentState,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NavAgentState {
+    pub destination: Option<Vec3>,
+    /// Destination changed; the engine re-plans next update.
+    pub replan: bool,
+    pub path: Vec<Vec3>,
+    pub next: usize,
+    /// No path exists to the destination.
+    pub unreachable: bool,
+    pub velocity: Vec3,
+}
+
+impl Default for NavAgent {
+    fn default() -> Self {
+        Self {
+            speed: 3.5,
+            turn_speed: 540.0,
+            stopping_distance: 0.1,
+            state: NavAgentState::default(),
+        }
+    }
+}
+
+impl NavAgent {
+    pub fn set_destination(&mut self, target: Vec3) {
+        self.state.destination = Some(target);
+        self.state.replan = true;
+        self.state.unreachable = false;
+    }
+
+    pub fn stop(&mut self) {
+        self.state.destination = None;
+        self.state.path.clear();
+        self.state.velocity = Vec3::ZERO;
+    }
+
+    /// Has a destination and reached it (or can't reach it).
+    pub fn arrived(&self) -> bool {
+        self.state.destination.is_none() || self.state.unreachable
+    }
+
+    /// Distance left along the current path.
+    pub fn remaining_distance(&self, from: Vec3) -> f32 {
+        let s = &self.state;
+        if s.next >= s.path.len() {
+            return 0.0;
+        }
+        let mut d = from.distance(s.path[s.next]);
+        for w in s.path[s.next..].windows(2) {
+            d += w[0].distance(w[1]);
+        }
+        d
+    }
+}
+
+impl TypedComponent for NavAgent {
+    const NAME: &'static str = "Nav Agent";
+}
+
+/// Kinematic capsule that walks: moved with `ctx.move_character(delta)`, it
+/// slides along walls, climbs steps and slopes, and reports `ctx.is_grounded()`.
+/// Gravity is up to the caller (a [`Pawn`] on the same object applies it).
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct CharacterController {
+    pub radius: f32,
+    /// Total capsule height, including both caps.
+    pub height: f32,
+    /// Capsule center relative to the object origin (default puts the feet at the origin).
+    pub center: [f32; 3],
+    /// Tallest step climbed automatically (0 disables autostep).
+    pub step_height: f32,
+    /// Steepest walkable slope in degrees.
+    pub max_slope: f32,
+    /// Keep the character glued to the ground when walking down slopes/steps (meters).
+    pub snap_to_ground: f32,
+}
+
+impl Default for CharacterController {
+    fn default() -> Self {
+        Self {
+            radius: 0.35,
+            height: 1.8,
+            center: [0.0, 0.9, 0.0],
+            step_height: 0.3,
+            max_slope: 45.0,
+            snap_to_ground: 0.2,
+        }
+    }
+}
+
+impl TypedComponent for CharacterController {
+    const NAME: &'static str = "Character Controller";
+}
+
+/// Plays skeletal animation clips on this object's skinned meshes, with
+/// cross-fades. Each animated object gets its own pose, so spawned copies of a
+/// model animate independently. Drive it from gameplay with
+/// `ctx.play_animation(target, "Run", 0.2)`.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub struct Animator {
+    /// Clip or blend tree to play on start (empty = the model's first clip).
+    pub clip: String,
+    pub speed: f32,
+    pub looping: bool,
+    pub play_on_start: bool,
+    /// Named blend trees, played like clips (`play("Locomotion", 0.2)`), mixing
+    /// clips by float parameters (`set_float("Speed", v)`).
+    pub blend_trees: Vec<BlendTree>,
+    /// Named markers on clips; reaching one calls `on_animation_event` on the
+    /// object's components and emits an [`AnimationEvent`].
+    pub events: Vec<AnimEvent>,
+    /// Move the object by the root bone's horizontal motion (through its
+    /// CharacterController when present) instead of letting the clip slide.
+    pub root_motion: bool,
+    /// Skin on the GPU (compute). Off = CPU skinning.
+    pub gpu_skinning: bool,
+    #[serde(skip)]
+    pub state: AnimatorState,
+}
+
+/// Mixes clips by one (1D) or two (2D) float parameters.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct BlendTree {
+    pub name: String,
+    pub parameter: String,
+    /// Second parameter; empty = 1D tree.
+    pub parameter_y: String,
+    pub motions: Vec<BlendMotion>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct BlendMotion {
+    pub clip: String,
+    /// Parameter value(s) where this clip has full weight (y unused in 1D).
+    pub position: [f32; 2],
+}
+
+impl BlendTree {
+    pub fn is_2d(&self) -> bool {
+        !self.parameter_y.is_empty()
+    }
+
+    /// Per-motion weights (sum 1) for the parameter value `p`.
+    pub fn weights(&self, p: [f32; 2]) -> Vec<f32> {
+        let n = self.motions.len();
+        let mut w = vec![0.0; n];
+        if n == 0 {
+            return w;
+        }
+        if n == 1 {
+            w[0] = 1.0;
+            return w;
+        }
+        if !self.is_2d() {
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| self.motions[a].position[0].total_cmp(&self.motions[b].position[0]));
+            let x = p[0];
+            let first = order[0];
+            let last = order[n - 1];
+            if x <= self.motions[first].position[0] {
+                w[first] = 1.0;
+            } else if x >= self.motions[last].position[0] {
+                w[last] = 1.0;
+            } else {
+                for pair in order.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    let (xa, xb) = (self.motions[a].position[0], self.motions[b].position[0]);
+                    if x >= xa && x <= xb {
+                        let t = if xb - xa > 1e-6 { (x - xa) / (xb - xa) } else { 0.0 };
+                        w[a] = 1.0 - t;
+                        w[b] = t;
+                        break;
+                    }
+                }
+            }
+            return w;
+        }
+        // 2D: inverse-distance weighting (exact hit = that motion only).
+        for (i, m) in self.motions.iter().enumerate() {
+            let d = ((m.position[0] - p[0]).powi(2) + (m.position[1] - p[1]).powi(2)).sqrt();
+            if d < 1e-4 {
+                w.iter_mut().for_each(|v| *v = 0.0);
+                w[i] = 1.0;
+                return w;
+            }
+            w[i] = 1.0 / (d * d);
+        }
+        let sum: f32 = w.iter().sum();
+        w.iter_mut().for_each(|v| *v /= sum);
+        w
+    }
+}
+
+/// A named marker at `time` seconds into `clip`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct AnimEvent {
+    pub clip: String,
+    pub time: f32,
+    pub name: String,
+}
+
+/// Broadcast when an animation event fires (readable via `ctx.events`).
+#[derive(Clone, Debug)]
+pub struct AnimationEvent {
+    pub object: ObjectId,
+    pub name: String,
+}
+
+/// Runtime playback state of an [`Animator`] (not saved).
+#[derive(Clone, Default, Debug)]
+pub struct AnimatorState {
+    pub current: Option<String>,
+    /// Seconds into the current clip.
+    pub time: f32,
+    /// Clip being faded out and its time.
+    pub previous: Option<(String, f32)>,
+    pub fade_elapsed: f32,
+    pub fade_duration: f32,
+    pub playing: bool,
+    pub started: bool,
+    /// Length of the current clip (filled in by the engine).
+    pub duration: f32,
+    /// Clip names available on this object's model (filled in by the engine).
+    pub clips: Vec<String>,
+    /// Blend-tree parameters.
+    pub params: HashMap<String, f32>,
+    /// Events fired since the engine last delivered them.
+    pub fired: Vec<String>,
+    /// World-space root motion since it was last applied.
+    pub root_delta: Vec3,
+    /// Root position (skeleton space) last frame, for root-motion deltas.
+    pub last_root: Option<Vec3>,
+}
+
+impl Default for Animator {
+    fn default() -> Self {
+        Self {
+            clip: String::new(),
+            speed: 1.0,
+            looping: true,
+            play_on_start: true,
+            blend_trees: Vec::new(),
+            events: Vec::new(),
+            root_motion: false,
+            gpu_skinning: true,
+            state: AnimatorState::default(),
+        }
+    }
+}
+
+impl Animator {
+    /// Switch to `clip`, cross-fading over `fade` seconds. A no-op when that
+    /// clip is already playing.
+    pub fn play(&mut self, clip: &str, fade: f32) {
+        let s = &mut self.state;
+        s.started = true;
+        if s.playing && s.current.as_deref() == Some(clip) {
+            return;
+        }
+        s.previous = if fade > 0.0 {
+            s.current.take().map(|c| (c, s.time))
+        } else {
+            None
+        };
+        s.fade_elapsed = 0.0;
+        s.fade_duration = fade.max(0.0);
+        s.current = Some(clip.to_owned());
+        s.time = 0.0;
+        s.playing = true;
+    }
+
+    /// Set a blend-tree parameter.
+    pub fn set_float(&mut self, name: &str, value: f32) {
+        self.state.params.insert(name.to_owned(), value);
+    }
+
+    pub fn get_float(&self, name: &str) -> f32 {
+        self.state.params.get(name).copied().unwrap_or(0.0)
+    }
+
+    /// Freeze on the current frame.
+    pub fn stop(&mut self) {
+        self.state.playing = false;
+    }
+
+    pub fn is_playing(&self, clip: &str) -> bool {
+        self.state.playing && self.state.current.as_deref() == Some(clip)
+    }
+
+    /// A non-looping clip reached its end.
+    pub fn finished(&self) -> bool {
+        !self.looping && self.state.duration > 0.0 && self.state.time >= self.state.duration
+    }
+}
+
+impl TypedComponent for Animator {
+    const NAME: &'static str = "Animator";
+}
+
 // -------------------------------------------------- pawns & controllers (2A/2B)
 
 /// How a [`Pawn`] reads input and places its camera.
@@ -1505,8 +2418,9 @@ impl ControlMode {
 
 /// A controllable entity (pawn + player-controller combined). When `possessed`,
 /// it reads the action snapshot, moves itself, drives + activates its camera, and
-/// (FP/TP) writes the child camera's pitch / spring-arm. Movement is transform-
-/// based on a flat floor for now; RigidBody-driven movement is a follow-up.
+/// (FP/TP) writes the child camera's pitch / spring-arm. With a
+/// [`CharacterController`] on the same object it walks through the physics world
+/// (walls, steps, slopes); without one it moves on a flat floor at its start height.
 #[derive(Serialize, Deserialize)]
 pub struct Pawn {
     pub mode: ControlMode,
@@ -1606,6 +2520,9 @@ impl TypedComponent for Pawn {
         }
         if self.possessed {
             ctx.set_active_camera(self.camera);
+            if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
+                ctx.set_cursor_locked(true);
+            }
         }
         *ctx.rotation = Quat::from_rotation_y(self.yaw.to_radians());
         self.place_camera(ctx);
@@ -1661,8 +2578,15 @@ impl TypedComponent for Pawn {
         self.vel.x = horizontal.x;
         self.vel.z = horizontal.z;
 
-        if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
-            // Gravity + jump on a flat floor.
+        let walking = matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson);
+        let physical = ctx.physics.is_some() && ctx.get_self::<CharacterController>().is_some();
+        if physical {
+            self.grounded = ctx.is_grounded();
+            if self.grounded && self.vel.y < 0.0 {
+                self.vel.y = 0.0;
+            }
+        }
+        if walking {
             if self.grounded && ctx.input.pressed("Jump") {
                 self.vel.y = self.jump_power;
                 self.grounded = false;
@@ -1672,15 +2596,17 @@ impl TypedComponent for Pawn {
             self.vel.y = 0.0;
         }
 
-        pos += self.vel * dt;
-        if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson)
-            && pos.y <= self.floor_y
-        {
-            pos.y = self.floor_y;
-            self.vel.y = 0.0;
-            self.grounded = true;
+        if physical {
+            ctx.move_character(self.vel * dt);
+        } else {
+            pos += self.vel * dt;
+            if walking && pos.y <= self.floor_y {
+                pos.y = self.floor_y;
+                self.vel.y = 0.0;
+                self.grounded = true;
+            }
+            *ctx.translation = pos;
         }
-        *ctx.translation = pos;
 
         if !matches!(self.mode, ControlMode::Strategy) {
             *ctx.rotation = Quat::from_rotation_y(self.yaw.to_radians());
@@ -1832,5 +2758,41 @@ mod layer_tests {
         assert_eq!(s.collision.len(), NUM_LAYERS);
         assert_eq!(s.names[0], "Default");
         assert!(s.collide(10, 20)); // filled with full-collision default
+    }
+}
+
+#[cfg(test)]
+mod blend_tree_tests {
+    use super::*;
+
+    fn tree(ys: &str, motions: &[(&str, [f32; 2])]) -> BlendTree {
+        BlendTree {
+            name: "t".into(),
+            parameter: "x".into(),
+            parameter_y: ys.into(),
+            motions: motions
+                .iter()
+                .map(|(c, p)| BlendMotion { clip: (*c).into(), position: *p })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn one_d_blends_neighbours_and_clamps() {
+        let t = tree("", &[("Run", [6.0, 0.0]), ("Idle", [0.0, 0.0]), ("Walk", [2.0, 0.0])]);
+        assert_eq!(t.weights([1.0, 0.0]), vec![0.0, 0.5, 0.5]);
+        assert_eq!(t.weights([4.0, 0.0]), vec![0.5, 0.0, 0.5]);
+        assert_eq!(t.weights([-3.0, 0.0]), vec![0.0, 1.0, 0.0]);
+        assert_eq!(t.weights([9.0, 0.0]), vec![1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn two_d_weights_normalize_and_snap() {
+        let t = tree("y", &[("F", [0.0, 1.0]), ("B", [0.0, -1.0]), ("L", [-1.0, 0.0]), ("R", [1.0, 0.0])]);
+        let w = t.weights([0.0, 1.0]);
+        assert_eq!(w, vec![1.0, 0.0, 0.0, 0.0]);
+        let w = t.weights([0.5, 0.5]);
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        assert!(w[0] > w[1] && w[3] > w[2]);
     }
 }

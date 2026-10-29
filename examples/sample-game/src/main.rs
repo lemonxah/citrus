@@ -24,6 +24,7 @@ fn main() -> Result<()> {
         title: "Sample Game".into(),
         width: 1280.0,
         height: 720.0,
+        ..Default::default()
     };
 
     citrus_engine::run_game(config, |registry| {

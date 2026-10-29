@@ -40,6 +40,10 @@ fn main() {
         // Hardware ray-query screen-probe gather (RT-core GI backend; selected when
         // the device exposes ray-query, SDF screen_gi.comp is the fallback).
         "screen_gi_rt.comp",
+        // GPU skinning for Animator-driven meshes.
+        "skin.comp",
+        // Built-in unlit material (world-space UI, particles).
+        "unlit.frag",
     ] {
         let src = format!("shaders/{name}");
         let dst = Path::new(&out_dir).join(format!("{name}.spv"));

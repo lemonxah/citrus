@@ -11,6 +11,38 @@ use citrus_assets::{ShaderPropKind, ShaderSource};
 use citrus_core::{ShaderPropKindUi, ShaderPropUi, ShaderUiInfo};
 use citrus_render::{Renderer, ShaderId};
 
+/// A shader parsed + compiled on a worker thread (or the error).
+pub type PrecompiledShader = Result<(ShaderSource, Vec<u8>), String>;
+
+/// Compile every custom shader a scene's materials reference (worker side).
+pub fn precompile_scene_shaders(file: &citrus_assets::SceneFile, project_root: &Path) -> Vec<(String, PrecompiledShader)> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |name: &str| {
+        if name.ends_with(".frag") && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    };
+    for entry in &file.entries {
+        for m in std::iter::once(&entry.material).chain(entry.extra_materials.iter()) {
+            match m {
+                citrus_assets::MaterialRef::Inline { shader, .. } => add(shader),
+                citrus_assets::MaterialRef::File(path) => {
+                    if let Ok(mf) = citrus_assets::load_material_file(project_root.join(path)) {
+                        add(&mf.shader);
+                    }
+                }
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|rel| {
+            let compiled = citrus_assets::load_shader_file(project_root.join(&rel)).map_err(|e| format!("{e:#}"));
+            (rel, compiled)
+        })
+        .collect()
+}
+
 pub struct ShaderEntry {
     /// Parsed source (None when the file couldn't be read/parsed/compiled).
     pub source: Option<ShaderSource>,
@@ -51,6 +83,40 @@ impl ShaderLibrary {
             self.entries.insert(rel.to_owned(), entry);
         }
         &self.entries[rel]
+    }
+
+    /// Install a shader compiled off the main thread (scene loader worker), so
+    /// `resolve` finds it without running `glslc` on the main thread.
+    pub fn preload(&mut self, renderer: &mut Renderer, project_root: &Path, rel: &str, compiled: PrecompiledShader) {
+        if self.entries.contains_key(rel) {
+            return;
+        }
+        let mtime = std::fs::metadata(project_root.join(rel)).and_then(|m| m.modified()).ok();
+        let result = compiled.and_then(|(source, spirv)| {
+            renderer
+                .register_shader(&spirv)
+                .map(|id| (source, id))
+                .map_err(|e| format!("{e:#}"))
+        });
+        let entry = match result {
+            Ok((source, id)) => ShaderEntry {
+                ui: ui_from_source(&source),
+                source: Some(source),
+                id: Some(id),
+                mtime,
+            },
+            Err(e) => ShaderEntry {
+                source: None,
+                ui: ShaderUiInfo {
+                    display_name: rel.to_owned(),
+                    props: Vec::new(),
+                    error: Some(e),
+                },
+                id: None,
+                mtime,
+            },
+        };
+        self.entries.insert(rel.to_owned(), entry);
     }
 
     /// Already-loaded shader (no compile side effects); used on save paths.

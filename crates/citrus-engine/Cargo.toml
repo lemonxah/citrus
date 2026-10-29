@@ -8,10 +8,12 @@ license.workspace = true
 # `editor` (on by default) pulls in the egui editor shell. A built game depends
 # on citrus-engine with `default-features = false`, so it links the runtime only
 # — no citrus-editor, egui_dock, gizmos, or LSP.
-default = ["editor"]
+default = ["editor", "steam-audio"]
+# Steam Audio spatialization (HRTF, air absorption, directivity, occlusion).
+# Off: spatial sources fall back to distance-attenuated volume.
+steam-audio = ["dep:audionimbus"]
 editor = [
     "dep:citrus-editor",
-    "dep:egui",
     "dep:egui-winit",
     "dep:transform-gizmo-egui",
     "dep:egui_dock",
@@ -32,6 +34,7 @@ winit.workspace = true
 # Always-on (runtime needs them): plugin loading, audio, logging.
 libloading.workspace = true
 rodio.workspace = true
+audionimbus = { workspace = true, optional = true }
 glam.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
@@ -41,7 +44,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # Editor-only (optional; enabled by the `editor` feature).
 citrus-editor = { workspace = true, optional = true }
-egui = { workspace = true, optional = true }
+# Always on: game UI draws through the renderer's egui pass (egui links via
+# citrus-render in every build anyway).
+egui = { workspace = true }
 egui-winit = { workspace = true, optional = true }
 transform-gizmo-egui = { workspace = true, optional = true }
 egui_dock = { workspace = true, optional = true }

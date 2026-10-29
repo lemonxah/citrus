@@ -8,8 +8,12 @@
 //! The full world/avatar editor (gizmo toolbox, VRM tooling) keeps growing
 //! here through M5.
 
+mod audio_ui;
 mod code_editor;
 mod components;
+pub mod icons;
+pub mod theme;
+pub mod widgets;
 mod vim;
 mod file_browser;
 mod inspector;
@@ -26,15 +30,17 @@ pub use components::{
     ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoEdit,
     GizmoSpec, Inspect, InspectCtx, components_ui,
 };
+pub use audio_ui::{AudioSettingsResponse, audio_settings_ui};
 pub use file_browser::{FileBrowser, FileBrowserResponse};
 /// Re-export the icon font so the engine's editor UI can use the same glyphs
 /// (no emojis) the file browser does.
 pub use egui_phosphor;
 
-/// Register the Phosphor icon font with egui so the file browser (and any UI)
-/// can render its icon glyphs. Call once at startup.
+/// Install the editor fonts: IBM Plex Sans / Mono first, egui's defaults
+/// behind them, and the Phosphor icon font. Call once at startup.
 pub fn install_icon_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    theme::install_fonts(&mut fonts);
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 }
@@ -47,4 +53,4 @@ pub use inspector::{
     CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse, ObjectHeaderResponse,
     ObjectInfoModel, TransformModel,
 };
-pub use scene_panel::{SceneObjectRow, ScenePanel, ScenePanelResponse, SpawnKind};
+pub use scene_panel::{SceneObjectRow, ScenePanel, ScenePanelResponse, SpawnKind, UiPreset};

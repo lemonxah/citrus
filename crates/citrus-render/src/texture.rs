@@ -15,6 +15,90 @@ pub(crate) struct GpuTexture {
 }
 
 impl GpuTexture {
+    /// A color render target that is also sampled (world-space UI). Left in
+    /// SHADER_READ_ONLY_OPTIMAL, cleared to transparent.
+    pub fn render_target(
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        pool: vk::CommandPool,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+    ) -> Result<Self> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST,
+            )
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name: "ui target",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        one_time_submit(device, pool, queue, |cb| unsafe {
+            let to_dst = vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]));
+            device.cmd_clear_color_image(
+                cb,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: [0.0; 4] },
+                &[range],
+            );
+            let to_read = vk::ImageMemoryBarrier2::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                .subresource_range(range);
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&[to_read]));
+        })?;
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(range),
+                None,
+            )?
+        };
+        Ok(Self {
+            image,
+            view,
+            allocation: Some(allocation),
+        })
+    }
+
     pub fn upload(
         device: &ash::Device,
         allocator: &mut Allocator,

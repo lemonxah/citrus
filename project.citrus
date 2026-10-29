@@ -296,4 +296,33 @@
         ],
         active: 0,
     ),
+    audio_mixer: (
+        buses: {
+            "music": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+            "master": (
+                volume: 1.0,
+                muted: false,
+                parent: None,
+            ),
+            "ui": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+            "voice": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+            "sfx": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+        },
+    ),
 )

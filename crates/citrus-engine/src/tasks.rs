@@ -24,6 +24,8 @@ pub enum TaskKind {
     LoadScene,
     Bake,
     FocusReimport,
+    /// Steam Audio reverb / pathing bake.
+    AudioBake,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,8 @@ pub enum TaskProgress {
         flux_voxel_volumes: u32,
         phase: BakePhase,
     },
+    /// A plain 0..1 fraction with a phase label.
+    Fraction { done: f32, label: String },
 }
 
 impl TaskProgress {
@@ -60,6 +64,7 @@ impl TaskProgress {
                 lightmap_total,
                 ..
             } => Some(*lightmap_done as f32 / (*lightmap_total).max(1) as f32),
+            TaskProgress::Fraction { done, .. } => Some(done.clamp(0.0, 1.0)),
         }
     }
 
@@ -67,6 +72,7 @@ impl TaskProgress {
     pub fn detail(&self) -> String {
         match self {
             TaskProgress::Indeterminate => "working…".into(),
+            TaskProgress::Fraction { done, label } => format!("{label} {:.0}%", done.clamp(0.0, 1.0) * 100.0),
             TaskProgress::Bake {
                 lights,
                 bounces,
@@ -104,21 +110,14 @@ pub enum TaskPayload {
     /// A scene file + its models, parsed off-thread. `prepared` holds GPU
     /// resources already uploaded on the loader thread (when a transfer queue is
     /// available), to be installed on the main thread; None means upload on main.
-    Scene {
-        path: PathBuf,
-        file: Box<citrus_assets::SceneFile>,
-        models: std::collections::HashMap<String, citrus_assets::Scene>,
-        prepared: Option<std::collections::HashMap<String, citrus_render::PreparedScene>>,
-        /// Material textures decoded + uploaded on the loader thread, paired with
-        /// the (abs path, srgb) keys to seed the file cache. None on the
-        /// single-queue fallback (decoded on the main thread instead).
-        material_textures: Option<(Vec<(PathBuf, bool)>, citrus_render::PreparedScene)>,
-    },
+    Scene(Box<crate::scene_loader::LoadedSceneData>),
     /// A focus-scan result: the changed asset (if any) to re-import.
     FocusChanges {
         scene_path: Option<PathBuf>,
         label: String,
     },
+    /// A Steam Audio bake for `scene_path` (already written as its sidecar).
+    AudioBake { scene_path: PathBuf, bytes: Vec<u8> },
 }
 
 pub struct TaskResult {

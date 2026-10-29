@@ -4,12 +4,13 @@
 
 use std::path::PathBuf;
 
-use egui::{DragValue, Frame, RichText, Ui};
+use egui::{Frame, RichText, Ui};
 
 use citrus_core::{Component, ComponentRegistry, MaterialModel, ObjectId, ShaderUiInfo};
 
 use crate::components::{EditorComponents, components_ui};
 use crate::sections::material_editor_ui;
+use egui_phosphor::regular as ph;
 
 #[derive(Clone, PartialEq)]
 pub struct TransformModel {
@@ -128,53 +129,81 @@ impl InspectorPanel {
         }
     }
 
-    /// Pinned object header: a single flex row
-    /// `[enabled] [name (grows)] [static] [lock]`. The name field flexes to fill;
-    /// static + lock stay pinned right. Drawn above the scroll body so it never
-    /// moves. Returns what changed.
+    /// Pinned object header (spec §8.1): type tile, borderless name with the
+    /// type line under it, Active + lock on the right; then Layer and Static.
+    #[allow(clippy::too_many_arguments)]
     pub fn object_header(
         &mut self,
         ui: &mut Ui,
+        kind: crate::theme::ObjectKind,
+        type_line: &str,
         name: &mut String,
         enabled: &mut bool,
         static_geometry: &mut bool,
+        layer: &mut u8,
+        layer_names: &[String],
     ) -> ObjectHeaderResponse {
+        use crate::{icons::Icon, theme, widgets};
         let mut r = ObjectHeaderResponse::default();
         ui.horizontal(|ui| {
-            if ui
-                .checkbox(enabled, "")
-                .on_hover_text("Enable / disable (skips rendering and lighting)")
-                .changed()
-            {
-                r.object_changed = true;
-            }
-            // Right side first (right_to_left): lock, then Static; the name field
-            // then fills the remaining width on the left.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let icon = if self.locked { "🔒" } else { "🔓" };
+            widgets::type_tile(ui, kind, 32.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let w = (ui.available_width() - 110.0).max(60.0);
                 if ui
-                    .selectable_label(self.locked, icon)
-                    .on_hover_text("Lock the Inspector to the current selection")
+                    .add(
+                        egui::TextEdit::singleline(name)
+                            .frame(false)
+                            .font(theme::semibold(theme::SIZE_TITLE))
+                            .text_color(theme::TEXT_STRONG)
+                            .desired_width(w),
+                    )
+                    .changed()
+                {
+                    r.object_changed = true;
+                }
+                ui.label(RichText::new(type_line).size(theme::SIZE_META).color(theme::TEXT_MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if widgets::icon_button(ui, if self.locked { Icon::Lock } else { Icon::LockOpen }, "Lock the Inspector to the current selection", self.locked)
                     .clicked()
                 {
                     self.locked = !self.locked;
                     r.lock_changed = true;
                 }
                 if ui
-                    .checkbox(static_geometry, "Static")
-                    .on_hover_text("Non-moving: included in the lighting bake (lightmapped + occluder)")
-                    .changed()
-                {
-                    r.object_changed = true;
-                }
-                if ui
-                    .add(egui::TextEdit::singleline(name).desired_width(ui.available_width()))
+                    .checkbox(enabled, RichText::new("Active").color(theme::TEXT_SECONDARY))
+                    .on_hover_text("Enable / disable (skips updates, rendering and lighting)")
                     .changed()
                 {
                     r.object_changed = true;
                 }
             });
         });
+        ui.add_space(6.0);
+        ui.columns(2, |cols| {
+            cols[0].label(RichText::new("Layer").size(theme::SIZE_META).color(theme::TEXT_MUTED));
+            let current = layer_names.get(*layer as usize).cloned().unwrap_or_else(|| format!("Layer {layer}"));
+            egui::ComboBox::from_id_salt("citrus-object-layer")
+                .width(cols[0].available_width())
+                .selected_text(current)
+                .show_ui(&mut cols[0], |ui| {
+                    for (l, n) in layer_names.iter().enumerate() {
+                        if ui.selectable_value(layer, l as u8, n).changed() {
+                            r.object_changed = true;
+                        }
+                    }
+                });
+            cols[1].label(RichText::new("Static").size(theme::SIZE_META).color(theme::TEXT_MUTED));
+            if cols[1]
+                .checkbox(static_geometry, "")
+                .on_hover_text("Non-moving: included in the lighting bake (lightmapped + occluder)")
+                .changed()
+            {
+                r.object_changed = true;
+            }
+        });
+        ui.add_space(4.0);
         r
     }
 
@@ -183,7 +212,7 @@ impl InspectorPanel {
     pub fn lock_header(&mut self, ui: &mut Ui) -> bool {
         let mut changed = false;
         ui.horizontal(|ui| {
-            let icon = if self.locked { "🔒" } else { "🔓" };
+            let icon = if self.locked { ph::LOCK } else { ph::LOCK_OPEN };
             if ui
                 .selectable_label(self.locked, icon)
                 .on_hover_text("Lock the Inspector to the current selection")
@@ -249,7 +278,7 @@ impl InspectorPanel {
                 ui.label(RichText::new(path).small().weak());
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(dirty, egui::Button::new("💾 Save"))
+                        .add_enabled(dirty, egui::Button::new(format!("{} Save", ph::FLOPPY_DISK)))
                         .clicked()
                     {
                         response.save_material = true;
@@ -308,24 +337,31 @@ impl InspectorPanel {
     ) {
         // The object name / enabled / static row is drawn as the pinned header
         // (see `object_header`), so the body starts at Transform.
-        ui.label(RichText::new("Transform").strong());
+        crate::widgets::divider(ui);
+        let mut reset = false;
+        let (open, _) = crate::widgets::section_header(ui, ui.make_persistent_id("citrus-transform"), None, "Transform", None, |ui| {
+            reset = crate::widgets::icon_button(ui, crate::icons::Icon::Reset, "Reset transform", false).clicked();
+        });
         let t = &mut info.transform;
-        egui::Grid::new("transform-grid")
-            .num_columns(4)
-            .spacing([10.0, 4.0])
-            .show(ui, |ui| {
-                response.object_changed |= transform_row(ui, "Location", &mut t.translation, 0.02);
-                response.object_changed |= transform_row(ui, "Rotation", &mut t.rotation_deg, 0.5);
-                response.object_changed |= transform_row(ui, "Scale", &mut t.scale, 0.01);
+        if reset {
+            t.translation = [0.0; 3];
+            t.rotation_deg = [0.0; 3];
+            t.scale = [1.0; 3];
+            response.object_changed = true;
+        }
+        if open {
+            egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 }).show(ui, |ui| {
+                response.object_changed |= transform_row(ui, "Position", &mut t.translation, 0.02, 2);
+                response.object_changed |= transform_row(ui, "Rotation", &mut t.rotation_deg, 0.5, 1);
+                response.object_changed |= transform_row(ui, "Scale", &mut t.scale, 0.01, 2);
             });
+        }
 
         if let Some(material) = material {
             self.material_ui(ui, info, material, shader_info, shaders, response);
         }
 
         // Components (Unity-style: list + Add Component at the bottom).
-        ui.separator();
-        ui.label(RichText::new("Components").strong());
         let comp = components_ui(ui, components, registry, editor_components, objects, layer_names);
         response.object_changed |= comp.changed;
         response.add_component = comp.add;
@@ -419,24 +455,9 @@ impl InspectorPanel {
     }
 }
 
-/// One grid row: `Label   X [....]  Y [....]  Z [....]`. All rows align
-/// because the surrounding Grid sizes columns uniformly.
-fn transform_row(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64) -> bool {
-    let mut changed = false;
-    ui.label(label);
-    for (axis, value) in ["X", "Y", "Z"].iter().zip(values.iter_mut()) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(*axis).weak());
-            changed |= ui
-                .add_sized(
-                    [60.0, 18.0],
-                    DragValue::new(value).speed(speed).max_decimals(3),
-                )
-                .changed();
-        });
-    }
-    ui.end_row();
-    changed
+/// `Label  [X ....] [Y ....] [Z ....]` with axis tiles (scrub on the tile).
+fn transform_row(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64, decimals: usize) -> bool {
+    crate::widgets::property_row_w(ui, label, 64.0, |ui| crate::widgets::vec3_field(ui, values, decimals, speed))
 }
 
 fn human_size(bytes: u64) -> String {

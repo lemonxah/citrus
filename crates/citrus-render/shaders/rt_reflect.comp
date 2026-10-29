@@ -34,10 +34,11 @@ layout(set = 0, binding = 8, scalar) uniform RtData {
     mat4 inv_proj;
     mat4 inv_view;
     vec4 camera_pos;
-    vec4 refl_center;  // xyz box centre, w probe intensity (0 = none)
+    vec4 refl_center;  // xyz probe CAPTURE position (re-vector anchor), w probe intensity (0 = none)
     vec4 refl_extents; // xyz half-extents, w box-projection enabled
     vec4 params;       // x roughness cutoff, y intensity, z light count, w env IBL intensity (skybox gate)
     vec4 screen;       // x width, y height, z _, w _
+    vec4 refl_box;     // xyz probe box CENTER (capture + box offset), w _
 } u;
 
 const float PI = 3.14159265359;
@@ -97,13 +98,14 @@ vec3 direct_light(vec3 p, vec3 n) {
 vec3 sample_env(vec3 worldPos, vec3 R, float roughness) {
     float intensity = u.refl_center.w;
     if (intensity > 0.0 && u.refl_extents.w > 0.5) {
-        vec3 bmin = u.refl_center.xyz - u.refl_extents.xyz;
-        vec3 bmax = u.refl_center.xyz + u.refl_extents.xyz;
+        vec3 bmin = u.refl_box.xyz - u.refl_extents.xyz;
+        vec3 bmax = u.refl_box.xyz + u.refl_extents.xyz;
         vec3 invR = 1.0 / R;
         vec3 t1 = (bmax - worldPos) * invR;
         vec3 t2 = (bmin - worldPos) * invR;
         vec3 tmax = max(t1, t2);
-        R = (worldPos + R * min(min(tmax.x, tmax.y), tmax.z)) - u.refl_center.xyz;
+        float dist = max(min(min(tmax.x, tmax.y), tmax.z), 0.0);
+        R = (worldPos + R * dist) - u.refl_center.xyz;
     }
     // No probe zone → fall back to the skybox cube scaled by the env IBL
     // intensity (params.w), which is 0 when the skybox is disabled. This keeps

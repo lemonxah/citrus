@@ -118,7 +118,16 @@ impl PluginHost {
         registry: &mut ComponentRegistry,
         editor: &mut EditorComponents,
     ) -> Result<Vec<String>> {
-        let mut loaded = Vec::new();
+        let names = Self::build_all(project_root)?;
+        self.load_built(project_root, &names, registry, editor)?;
+        Ok(names)
+    }
+
+    /// Run `cargo build` for every plugin crate. Touches no editor state, so it
+    /// can run on a worker; [`Self::load_built`] registers the results.
+    #[cfg(feature = "editor")]
+    pub fn build_all(project_root: &Path) -> Result<Vec<String>> {
+        let mut built = Vec::new();
         for (_dir, name) in discover(project_root) {
             tracing::info!("building component plugin {name}…");
             // `--features editor`: the editor needs each plugin's inspector +
@@ -137,11 +146,25 @@ impl PluginHost {
             if stderr.contains("warning:") {
                 tracing::warn!("plugin {name} built with warnings:\n{}", stderr.trim());
             }
-            self.load(project_root, &name, registry, editor)
-                .with_context(|| format!("loading plugin {name}"))?;
-            loaded.push(name);
+            built.push(name);
         }
-        Ok(loaded)
+        Ok(built)
+    }
+
+    /// Load + register plugins already built by [`Self::build_all`].
+    #[cfg(feature = "editor")]
+    pub fn load_built(
+        &mut self,
+        project_root: &Path,
+        names: &[String],
+        registry: &mut ComponentRegistry,
+        editor: &mut EditorComponents,
+    ) -> Result<()> {
+        for name in names {
+            self.load(project_root, name, registry, editor)
+                .with_context(|| format!("loading plugin {name}"))?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "editor")]

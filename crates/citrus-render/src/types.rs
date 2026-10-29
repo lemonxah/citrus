@@ -433,6 +433,7 @@ pub struct LightInstance {
     pub baked: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct DrawCmd {
     pub mesh: MeshHandle,
     pub material: MaterialHandle,
@@ -453,6 +454,13 @@ pub struct DrawCmd {
     /// preview — its native baked size, or the would-be size from bake settings
     /// for an un-baked static object. 0 = not lightmapped.
     pub lightmap_size: u32,
+    /// Marked static in the scene. A BAKED reflection-probe capture draws only
+    /// static geometry (Unity semantics); dynamic objects stay out of the cube.
+    pub static_geometry: bool,
+    /// Index into `FrameInput::planar` when this draw IS a planar-reflective
+    /// surface (it samples its mirrored render and is excluded from its own
+    /// planar pass), or -1.
+    pub planar_index: i32,
 }
 
 pub struct EguiDraw {
@@ -648,7 +656,36 @@ pub struct FrameInput<'a> {
     /// volume in the reflection direction for emissive/voxel-light bounce (VXGI-style
     /// glossy approximation). Off = reflection cube only.
     pub voxel_specular: bool,
+    /// Active planar-reflection surfaces (floors, mirrors). Each gets a mirrored
+    /// scene render from the main camera into the planar RT array; surfaces whose
+    /// `DrawCmd.planar_index` matches sample their layer instead of the probe.
+    /// At most `MAX_PLANAR` are rendered; extras fall back to the probe.
+    pub planar: &'a [PlanarSurface],
     pub egui: Option<EguiDraw>,
+    /// World-space UI canvases to paint into their targets before the scene
+    /// pass samples them.
+    pub world_ui: Vec<WorldUiDraw>,
+}
+
+/// One world-space UI canvas frame: egui output for a target made by
+/// `Renderer::create_ui_target`. Each target must be fed by its own egui
+/// context (its texture deltas are applied to that target's renderer only).
+pub struct WorldUiDraw {
+    pub target: TextureHandle,
+    pub extent: [u32; 2],
+    pub draw: EguiDraw,
+}
+
+/// One planar-reflection surface: the world plane the scene is mirrored about.
+#[derive(Clone, Copy, Debug)]
+pub struct PlanarSurface {
+    /// A point on the plane (the owning object's world position).
+    pub point: [f32; 3],
+    /// Unit plane normal (the owning object's world +Y).
+    pub normal: [f32; 3],
+    /// Roughness above which the planar reflection has fully faded to the
+    /// probe/env fallback (sharp mirrors ~0.2-0.4).
+    pub max_roughness: f32,
 }
 
 /// Exponential distance + height fog parameters.
@@ -668,13 +705,20 @@ pub struct FogParams {
 /// A placed reflection-probe zone in world space, for box-projected reflections.
 #[derive(Clone, Copy, Debug)]
 pub struct ReflectionProbeBox {
+    /// Box center (world) = probe position + box offset. The parallax proxy.
     pub center: [f32; 3],
+    /// Capture position (world) = the probe object's position: where the cube
+    /// is rendered from and the anchor for the parallax re-vector.
+    pub capture: [f32; 3],
     pub half_extents: [f32; 3],
     pub intensity: f32,
     /// Box-projected parallax (Unity-style) vs. infinite/distant sampling.
     pub box_projection: bool,
     /// Captured cubemap face resolution for this probe.
     pub resolution: u32,
+    /// Realtime mode: the engine keeps re-capturing the cube continuously so
+    /// dynamic lighting tracks in reflections; Baked loads a sidecar once.
+    pub realtime: bool,
 }
 
 /// Resolved per-frame post-processing parameters (the blended profile flattened

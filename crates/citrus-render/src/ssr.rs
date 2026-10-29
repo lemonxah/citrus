@@ -46,6 +46,9 @@ pub(crate) struct SsrUniforms {
     /// xyz = direction TO the sun (world), w = time (animates the fog noise).
     pub fog_sun: [f32; 4],
     pub screen: [f32; 4],
+    /// xyz = probe box CENTER (world; capture pos + box offset), w unused.
+    /// `refl_center` above is the CAPTURE position (parallax re-vector anchor).
+    pub refl_box: [f32; 4],
 }
 
 /// Per-render-target SSR resources.

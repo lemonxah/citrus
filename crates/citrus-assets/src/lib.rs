@@ -49,10 +49,10 @@ pub use scene_file::{
     ProbeFallback, RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile,
     VoxelGridMode, WorldEnvironment, load_scene_file, save_scene_file,
 };
-pub use tex_cache::load_texture_bc;
+pub use tex_cache::{load_texture_bc, texture_mean, texture_mean_linear};
 pub use shader_file::{
     SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,
-    ShaderSource, compile_shader, load_shader_file, parse_shader_source,
+    ShaderSource, compile_shader, load_shader_file, parse_shader_source, precompile_shader_file,
 };
 
 use std::path::{Path, PathBuf};
