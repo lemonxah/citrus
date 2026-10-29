@@ -650,6 +650,9 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   viewport and the game path now resolve against the scene pass's own stored depth. Also: the
   viewport target is recreated at frame start and tracks its own GI freshness, and screen GI /
   SSR reject non-finite history.
+- [done] Viewport resize crash (SIGSEGV in egui_ash_renderer::cmd_draw): a replaced viewport target freed its
+  egui descriptor set while the frame being drawn (built before the resize) still referenced its texture id.
+  Replaced targets are now retired for FRAMES_IN_FLIGHT + 1 frames, then unregistered from egui and freed.
 - [done] UI canvas billboard (window icon, own filter entry) and the "Game UI overlay" toggle
   moved from the menu bar into the billboard widgets menu, under Orientation cross.
 - [done] Menu bar: hovering another top-level menu while one is open switches to it (egui's

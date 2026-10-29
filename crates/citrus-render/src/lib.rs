@@ -2567,6 +2567,11 @@ pub struct Renderer {
     /// `None` for the game runtime (renders straight to the swapchain).
     #[allow(dead_code)] // read by the RTT render branch (stage 2, in progress)
     viewport_target: Option<ViewportTarget>,
+    /// Replaced viewport targets kept alive until no frame can still draw
+    /// them: this frame's egui list was built against the old texture id, and
+    /// freeing its descriptor set before the draw is recorded (and the GPU is
+    /// done with it) segfaults in the driver. Countdown in rendered frames.
+    retired_viewport_targets: Vec<(ViewportTarget, usize)>,
     /// Baked light-probe SH (set-0 binding 2). A 1-probe zero buffer until a
     /// bake is loaded, so the binding is always valid.
     probe_buffer: Buffer,
@@ -3283,6 +3288,7 @@ impl Renderer {
             unlit_shader: None,
             camera_preview: None,
             viewport_target: None,
+            retired_viewport_targets: Vec::new(),
             probe_buffer,
             probe_count: 1, // default buffer holds one probe
             probe_volumes: Vec::new(),
@@ -5361,6 +5367,7 @@ impl Renderer {
         if self.needs_resize || self.swapchain_size != (size.width, size.height) {
             self.recreate_swapchain()?;
         }
+        self.free_retired_viewport_targets(false);
 
         // Editor RTT: (re)create the offscreen viewport target at the requested
         // dock-rect size, before anything this frame reads its history. None (game) leaves it absent → renders to swapchain.
@@ -5376,8 +5383,9 @@ impl Renderer {
                     let _ = self.ctx.device.device_wait_idle();
                 }
                 let mut alloc = allocator.lock().unwrap();
-                if let Some(mut old) = self.viewport_target.take() {
-                    old.destroy(&self.ctx.device, &mut alloc);
+                tracing::debug!(vw, vh, "viewport target resized");
+                if let Some(old) = self.viewport_target.take() {
+                    self.retired_viewport_targets.push((old, FRAMES_IN_FLIGHT + 1));
                 }
                 if let Some(mut old) = self.viewport_ssr.take() {
                     old.destroy(&self.ctx.device, &mut alloc);
@@ -7471,6 +7479,33 @@ impl Renderer {
     }
 
     /// egui texture for the editor viewport's offscreen render (RTT), if active.
+    /// Count down retired viewport targets (one step per rendered frame) and
+    /// free the expired ones; `all` frees everything (shutdown, after idle).
+    fn free_retired_viewport_targets(&mut self, all: bool) {
+        if self.retired_viewport_targets.is_empty() {
+            return;
+        }
+        for (_, frames) in &mut self.retired_viewport_targets {
+            *frames = frames.saturating_sub(1);
+        }
+        let Some(allocator) = self.allocator.clone() else {
+            return;
+        };
+        let mut alloc = allocator.lock().unwrap();
+        let mut i = 0;
+        while i < self.retired_viewport_targets.len() {
+            if all || self.retired_viewport_targets[i].1 == 0 {
+                let (mut t, _) = self.retired_viewport_targets.swap_remove(i);
+                if let Some(egui) = self.egui.as_mut() {
+                    egui.remove_user_texture(t.texture_id);
+                }
+                t.destroy(&self.ctx.device, &mut alloc);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     pub fn viewport_texture(&self) -> Option<(egui::TextureId, [f32; 2])> {
         self.viewport_target.as_ref().map(|t| {
             (t.texture_id, [t.extent.width as f32, t.extent.height as f32])
@@ -8474,6 +8509,9 @@ impl Drop for Renderer {
                 preview.destroy(device, &mut alloc);
             }
             if let Some(mut vt) = self.viewport_target.take() {
+                vt.destroy(device, &mut alloc);
+            }
+            for (mut vt, _) in self.retired_viewport_targets.drain(..) {
                 vt.destroy(device, &mut alloc);
             }
             if let Some(mut t) = self.viewport_ssr.take() {
