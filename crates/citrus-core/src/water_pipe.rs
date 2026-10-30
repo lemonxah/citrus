@@ -34,6 +34,23 @@ pub const MAX_SIM_SUBSTEPS: u32 = 16;
 const COURANT: f32 = 0.5;
 /// Water-dragging rate (1/s) at `sim_momentum` 1.
 const MOMENTUM_RATE: f32 = 1.5;
+/// Eddy viscosity rate (1/s) at Chop smoothing 1.
+const EDDY_RATE: f32 = 2.0;
+/// Most of a cell's velocity difference to its neighbours viscosity evens
+/// out in one substep (keeps the explicit diffusion stable).
+const VISCOUS_STEP_MAX: f32 = 0.2;
+
+/// Bed friction per unit kinematic viscosity (1/(m^2)): 3 / (h min(h, delta))
+/// over water `h` deep, where delta = sqrt(2 nu / omega) is the oscillating
+/// boundary layer of the waves the grid carries (about eight cells long):
+/// laminar sheet flow when the layer fills the depth, a thin Stokes layer
+/// at the bed when it doesn't.
+pub fn bed_friction(h: f32, cell: f32, gravity: f32, viscosity: f32) -> f32 {
+    let k = std::f32::consts::PI / (4.0 * cell.max(1e-3));
+    let omega = (gravity * k * (k * h).min(10.0).tanh()).max(1e-4).sqrt();
+    let delta = (2.0 * viscosity / omega).sqrt();
+    3.0 / (h * h.min(delta).max(1e-3))
+}
 /// Rate (1/s) the level eases back to rest, so sources and outflow balance.
 const LEVEL_RETURN: f32 = 0.02;
 /// A push's dent (m) and added water (m/s) per m/s of push.
@@ -393,6 +410,9 @@ pub struct PipeParams {
     /// Kinematic viscosity (m^2/s): flow over the bed loses 3 nu / h^2 per
     /// second (laminar sheet flow).
     pub viscosity: f32,
+    /// Eddy viscosity as a rate (1/s): nu_eddy = eddy * cell^2, so it acts
+    /// on what the grid resolves (the shortest waves most).
+    pub eddy: f32,
 }
 
 impl PipeParams {
@@ -405,6 +425,7 @@ impl PipeParams {
             wave_depth: water.sim_wave_depth.max(0.05),
             displacement: water.sim_displacement.max(0.0),
             viscosity: water.kinematic_viscosity(),
+            eddy: water.sim_chop_smoothing.max(0.0) * EDDY_RATE,
         }
     }
 
@@ -628,12 +649,36 @@ impl PipeSim {
                 f[d] = (f[d] + dt * p.gravity * face * (head - hn)).max(0.0);
                 if p.viscosity > 0.0 {
                     let h = (0.5 * (hs + nh)).max(0.02);
-                    f[d] *= (-3.0 * p.viscosity / (h * h) * dt).exp();
+                    f[d] *= (-p.viscosity * bed_friction(h, cell, p.gravity, p.viscosity) * dt).exp();
                 }
             }
             let c = self.couple[self.win(w)];
+            let mut dq = Vec2::ZERO;
             if c[1] > 0.0 && p.momentum > 0.0 {
-                let dq = (Vec2::new(c[2], c[3]) - self.vel[s]) * (c[1] * (p.momentum * dt).min(1.0) * cell * hs.clamp(0.01, p.wave_depth));
+                dq += (Vec2::new(c[2], c[3]) - self.vel[s]) * (c[1] * (p.momentum * dt).min(1.0) * cell * hs.clamp(0.01, p.wave_depth));
+            }
+            if p.viscosity > 0.0 || p.eddy > 0.0 {
+                // Viscous shallow water: momentum spreads to the neighbours
+                // (nu laplacian u). Walls hold the water still (no slip);
+                // past the window it carries on as it is.
+                let u = self.vel[s];
+                let around: Vec2 = DIRS
+                    .iter()
+                    .map(|o| {
+                        let nb = w + *o;
+                        if !self.inside(nb) {
+                            u
+                        } else if self.solid(nb) {
+                            Vec2::ZERO
+                        } else {
+                            self.vel[self.store(nb)]
+                        }
+                    })
+                    .sum();
+                let rate = (p.viscosity * dt / (cell * cell) + p.eddy * dt).min(VISCOUS_STEP_MAX);
+                dq += (around - 4.0 * u) * (rate * cell * hs.clamp(0.01, p.wave_depth));
+            }
+            if dq != Vec2::ZERO {
                 if dq.x > 0.0 {
                     if !self.solid(w + DIRS[1]) {
                         f[1] += dq.x;
@@ -824,15 +869,16 @@ impl PipeSim {
             let at = |nb: IVec2| if self.inside(nb) && !self.solid(nb) { self.eta(nb) } else { e };
             let mut g = Vec2::new(at(w + DIRS[1]) - at(w + DIRS[0]), at(w + DIRS[3]) - at(w + DIRS[2])) / (2.0 * cell);
             let mut u = if self.solid(w) { Vec2::ZERO } else { self.vel[self.store(w)] };
-            if let Some((_, l)) = &self.ewave
+            if let Some((ep, l)) = &self.ewave
                 && !self.solid(w)
             {
+                let m = ep.mix;
                 let c = l.state[self.store(w)];
                 let at = |nb: IVec2| if self.inside(nb) && !self.solid(nb) { l.state[self.store(nb)] } else { c };
                 let (x0, x1, z0, z1) = (at(w + DIRS[0]), at(w + DIRS[1]), at(w + DIRS[2]), at(w + DIRS[3]));
-                e += c[0];
-                g += Vec2::new(x1[0] - x0[0], z1[0] - z0[0]) / (2.0 * cell);
-                u += Vec2::new(x1[1] - x0[1], z1[1] - z0[1]).clamp_length_max(MAX_ORBITAL * 2.0 * cell) / (2.0 * cell);
+                e += c[0] * m;
+                g += Vec2::new(x1[0] - x0[0], z1[0] - z0[0]) * m / (2.0 * cell);
+                u += Vec2::new(x1[1] - x0[1], z1[1] - z0[1]).clamp_length_max(MAX_ORBITAL * 2.0 * cell) * m / (2.0 * cell);
             }
             // Inside a body's footprint there is no free surface (see
             // water_sim.comp): drawn flattened, the readback keeps it.
@@ -1103,6 +1149,148 @@ mod tests {
         let (tuned, _) = checker(0.06, 6.0);
         assert!(smooth < raw * 0.5 && smooth_all < raw_all, "smoothing: {smooth} vs {raw} (energy {smooth_all} vs {raw_all})");
         assert!(tuned < raw * 0.25, "smoothing and fine damping: {tuned} vs {raw}");
+    }
+
+    /// Surface energy (heights squared, summed over the simulation and the
+    /// dispersive layer) left `secs` after a push into a fluid of `preset`.
+    fn ringing(preset: &str, secs: f32) -> f32 {
+        let (mut water, field) = tank(128, 16.0, 1.5);
+        crate::FLUID_PRESETS.iter().find(|f| f.name == preset).unwrap().apply(&mut water);
+        let p = PipeParams::for_water(&water);
+        let mut sim = PipeSim::new(&field);
+        sim.set_ewave(EwaveParams::for_water(&water, sim.window, 1.5));
+        let push = WaterDisplacer::from_push(&WaterPush { at: Vec2::ZERO, radius: 0.6, strength: 6.0 });
+        let steps = (secs * 90.0) as usize;
+        for k in 0..steps {
+            let list = if k < 3 { vec![push] } else { Vec::new() };
+            sim.step(1.0 / 90.0, &p, &list);
+        }
+        let (tex, _) = sim.output();
+        tex.iter().map(|t| t[0] * t[0]).sum()
+    }
+
+    #[test]
+    fn the_ripple_mix_scales_the_dispersive_layer_and_zero_turns_it_off() {
+        let (mut water, _) = tank(64, 8.0, 2.0);
+        let window = choose_window(&water, Vec2::ZERO, None);
+        water.sim_ripple_mix = 0.0;
+        assert!(EwaveParams::for_water(&water, window, 2.0).is_none(), "off at 0");
+        let surface = |mix: f32| {
+            let (mut water, field) = tank(64, 8.0, 2.0);
+            water.sim_ripple_mix = mix;
+            let p = PipeParams::for_water(&water);
+            let mut plain = PipeSim::new(&field);
+            let mut sim = PipeSim::new(&field);
+            sim.set_ewave(EwaveParams::for_water(&water, sim.window, 2.0));
+            let push = WaterDisplacer::from_push(&WaterPush { at: Vec2::ZERO, radius: 0.5, strength: 6.0 });
+            for k in 0..60 {
+                let list = if k == 0 { vec![push] } else { Vec::new() };
+                plain.step(1.0 / 90.0, &p, &list);
+                sim.step(1.0 / 90.0, &p, &list);
+            }
+            let (a, _) = plain.output();
+            let (b, _) = sim.output();
+            a.iter().zip(&b).map(|(x, y)| (y[0] - x[0]).abs()).sum::<f32>()
+        };
+        let (full, half) = (surface(1.0), surface(0.5));
+        assert!(full > 1e-3 && (half / full - 0.5).abs() < 0.05, "half the ripples show: {half} vs {full}");
+    }
+
+    /// Grid-scale roughness of the simulation (not the dispersive layer)
+    /// `secs` after bodies churned it, at `smoothing`.
+    fn chop(smoothing: f32, secs: f32) -> (f32, f32) {
+        let (mut water, field) = tank(96, 12.0, 1.0);
+        water.sim_chop_smoothing = smoothing;
+        water.sim_dispersion = 0.0;
+        let p = PipeParams::for_water(&water);
+        let mut sim = PipeSim::new(&field);
+        let mut x = -3.0;
+        for k in 0..(secs * 90.0) as usize {
+            let list: Vec<WaterDisplacer> = if k < 90 {
+                x += 2.0 / 90.0;
+                vec![WaterDisplacer { center: Vec2::new(x, 0.0), half: Vec2::splat(0.4), axis: Vec2::X, thickness: 0.3, round: false, velocity: Vec2::new(2.0, 0.0), rate: 0.0, momentum: 1.0, impulse: false }]
+            } else {
+                Vec::new()
+            };
+            sim.step(1.0 / 90.0, &p, &list);
+        }
+        let n = sim.window.n as i32;
+        let h = |x: i32, z: i32| sim.height(x.clamp(0, n - 1), z.clamp(0, n - 1));
+        let (mut rough, mut all) = (0.0f32, 0.0f32);
+        for z in 0..n {
+            for x in 0..n {
+                let r = h(x, z) - 0.25 * (h(x + 1, z) + h(x - 1, z) + h(x, z + 1) + h(x, z - 1));
+                rough += r * r;
+                all += h(x, z) * h(x, z);
+            }
+        }
+        (rough, all)
+    }
+
+    #[test]
+    fn chop_smoothing_drains_short_waves_more_than_long_ones() {
+        let (raw_rough, raw_all) = chop(0.0, 3.0);
+        let (smooth_rough, smooth_all) = chop(0.6, 3.0);
+        assert!(smooth_rough < raw_rough * 0.5, "short chop drained: {smooth_rough} vs {raw_rough}");
+        // Long swells (the bulk of the energy) are kept far better.
+        assert!(smooth_rough / smooth_all < raw_rough / raw_all, "the short share falls");
+    }
+
+    /// `ringing` on the user's pool: 25 cm cells, 1.1 m deep.
+    fn pool_ringing(preset: &str, scale: f32, secs: f32) -> f32 {
+        let mut water = Water { size: [10.8, 10.4], depth: 1.1, waves: Vec::new(), ripple_resolution: 128, ripple_area: 32.0, ..Default::default() };
+        crate::FLUID_PRESETS.iter().find(|f| f.name == preset).unwrap().apply(&mut water);
+        water.fluid_scale = scale;
+        let window = choose_window(&water, Vec2::ZERO, None);
+        let field = SimField::build(&water, window, None);
+        let p = PipeParams::for_water(&water);
+        let mut sim = PipeSim::new(&field);
+        sim.set_ewave(EwaveParams::for_water(&water, window, 1.1));
+        let push = WaterDisplacer::from_push(&WaterPush { at: Vec2::ZERO, radius: 0.6, strength: 6.0 });
+        for k in 0..(secs * 90.0) as usize {
+            let list = if k < 3 { vec![push] } else { Vec::new() };
+            sim.step(1.0 / 90.0, &p, &list);
+        }
+        let (tex, _) = sim.output();
+        tex.iter().map(|t| t[0] * t[0]).sum()
+    }
+
+    #[test]
+    fn honey_staged_at_jar_scale_is_thick_in_a_pool() {
+        let water = pool_ringing("Water", 1.0, 2.0);
+        let honey = pool_ringing("Honey", 1.0, 2.0);
+        let staged = pool_ringing("Honey", 50.0, 2.0);
+        assert!(staged < water * 0.1 && staged < honey * 0.2, "1:50 honey settles like a jar's: {staged} vs honey {honey}, water {water}");
+    }
+
+    #[test]
+    fn thick_fluids_keep_only_long_waves() {
+        let water = Water::default();
+        let mut honey = Water::default();
+        crate::FLUID_PRESETS.iter().find(|f| f.name == "Honey").unwrap().apply(&mut honey);
+        let k = |l: f32| std::f32::consts::TAU / l;
+        for l in [0.05, 0.5, 8.0] {
+            assert!(water.wave_share(k(l)) > 0.9, "water keeps {l} m waves");
+        }
+        assert!(honey.wave_share(k(0.15)) == 0.0, "no fine detail on honey");
+        assert!(honey.wave_share(k(8.0)) > 0.5, "long waves survive even honey");
+        honey.fluid_scale = 50.0;
+        assert!(honey.wave_share(k(8.0)) < 0.05, "staged as a jar: none");
+    }
+
+    #[test]
+    fn thick_fluids_do_not_splash() {
+        let mut w = Water::default();
+        assert!(w.splashiness() > 0.99, "water splashes freely: {}", w.splashiness());
+        crate::FLUID_PRESETS.iter().find(|f| f.name == "Honey").unwrap().apply(&mut w);
+        assert!(w.splashiness() < 0.15, "honey hardly: {}", w.splashiness());
+    }
+
+    #[test]
+    fn thicker_fluids_settle_faster() {
+        let (water, honey, mud) = (ringing("Water", 3.0), ringing("Honey", 3.0), ringing("Mud", 3.0));
+        assert!(honey < water * 0.5, "honey settles: {honey} vs water {water}");
+        assert!(mud < honey * 0.7, "mud settles faster still: {mud} vs honey {honey}");
     }
 
     #[test]

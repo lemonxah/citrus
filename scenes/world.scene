@@ -2093,7 +2093,7 @@
                 shape: Cube,
             ),
             enabled: true,
-            static_geometry: false,
+            static_geometry: true,
             lightmap_scale: 1.0,
             layer: 0,
             material: File("@2e85e1f1-f852-4fd6-b375-a5ff2270ef6a"),
@@ -2124,8 +2124,8 @@
                     data: "(convex:false,follow_shape:false,detail:Medium,is_trigger:false,layer:0,material:\"\")",
                 ),
             ],
-            translation: (2.113267, 0.7065568, 1.2988039),
-            rotation: (0.0046145343, 0.0039127744, 0.011311529, 0.99991775),
+            translation: (1.799609, 0.67151093, 0.2937842),
+            rotation: (0.004614536, 0.0039127762, 0.011311534, 0.99991775),
             scale: (1.0, 0.99999946, 1.0),
         ),
         (
@@ -2253,10 +2253,10 @@
             components: [
                 (
                     kind: "Water",
-                    data: "(body:Pool,shape:[],smooth_shape:false,river:[(position:(3.6622202,-0.39639577,-4.199863),width:3.3485477,depth:1.5,speed:1.5),(position:(1.4394225,-0.6912973,2.7614236),width:3.27863,depth:1.5,speed:1.5),(position:(-4.227695,-0.6912973,7.377278),width:4.0,depth:1.5,speed:1.5),(position:(-7.7714944,-0.6912973,6.857213),width:4.0,depth:1.5,speed:1.5),(position:(-14.117946,-0.69129825,2.1684492),width:4.0,depth:1.5,speed:1.5),(position:(-17.35487,-0.69129825,-3.0192783),width:4.0,depth:1.5,speed:1.5),(position:(-16.65861,-0.69129825,-10.297556),width:4.0,depth:1.5,speed:1.5),(position:(-13.91925,-0.69129825,-13.931743),width:4.0,depth:1.5,speed:1.5),(position:(-4.682494,-0.69129825,-8.89535),width:4.0,depth:1.5,speed:1.5),(position:(-2.2433233,-0.6912973,-5.762282),width:4.0,depth:1.5,speed:1.5)],size:(10.836876,10.383941),depth:1.1,waves:[],density:1000.0,drag:1.0,angular_drag:1.0,current:(0.0,0.0,0.0),resolution:100,look:(shallow_color:(0.13379933,0.7318764,0.88139546),deep_color:(0.005744281,0.08015803,0.13515949),absorption_depth:5.0,clarity:0.93,roughness:0.03,ripple_strength:0.15,ripple_scale:1.0,foam_width:0.35,crest_foam:0.3,refraction:0.03,foam:0.0),wind_response:0.0,interactive:true,ripple_area:32.0,ripple_resolution:128,ripple_damping:0.35,gpu_sim:true,sim_wave_depth:3.0,sim_displacement:1.0,sim_momentum:1.0,sim_dispersion:1.0,underwater:(enabled:true,sound:\"\",volume:0.8,muffle:0.85,fog_density:1.0,distortion:1.0,blur:2.5,caustics:0.6),steam:0.0,project_caustics:true,projection_strength:1.0)",
+                    data: "(body:Pool,shape:[],smooth_shape:false,river:[(position:(3.6622202,-0.39639577,-4.199863),width:3.3485477,depth:1.5,speed:1.5),(position:(1.4394225,-0.6912973,2.7614236),width:3.27863,depth:1.5,speed:1.5),(position:(-4.227695,-0.6912973,7.377278),width:4.0,depth:1.5,speed:1.5),(position:(-7.7714944,-0.6912973,6.857213),width:4.0,depth:1.5,speed:1.5),(position:(-14.117946,-0.69129825,2.1684492),width:4.0,depth:1.5,speed:1.5),(position:(-17.35487,-0.69129825,-3.0192783),width:4.0,depth:1.5,speed:1.5),(position:(-16.65861,-0.69129825,-10.297556),width:4.0,depth:1.5,speed:1.5),(position:(-13.91925,-0.69129825,-13.931743),width:4.0,depth:1.5,speed:1.5),(position:(-4.682494,-0.69129825,-8.89535),width:4.0,depth:1.5,speed:1.5),(position:(-2.2433233,-0.6912973,-5.762282),width:4.0,depth:1.5,speed:1.5)],size:(10.836876,10.383941),depth:1.1,waves:[],density:1000.0,viscosity:0.001,fluid_scale:1.0,drag:1.0,angular_drag:1.0,current:(0.0,0.0,0.0),resolution:200,look:(shallow_color:(0.10000002,0.4500001,0.48),deep_color:(0.009999997,0.070000045,0.12),absorption_depth:4.0,clarity:0.7,roughness:0.06,ripple_strength:0.35,ripple_scale:1.0,foam_width:0.35,crest_foam:0.3,refraction:1.0,foam:1.0,foam_on:false),wind_response:0.0,interactive:true,ripple_area:32.0,ripple_resolution:128,ripple_damping:0.8,gpu_sim:true,sim_wave_depth:1.0,sim_displacement:0.7,sim_momentum:0.43,sim_dispersion:1.0,sim_ripple_mix:0.45,sim_chop_smoothing:1.0,sim_wake_ripples:0.2,sim_ripple_smoothing:0.06,sim_fine_damping:6.0,underwater:(enabled:true,sound:\"\",volume:0.8,muffle:0.85,fog_density:1.0,distortion:1.0,blur:2.5,caustics:0.6),steam:0.0,project_caustics:true,projection_strength:6.63)",
                 ),
             ],
-            translation: (0.3765085, 0.96728975, -0.43110496),
+            translation: (0.14938048, 0.96728975, -0.08742359),
             rotation: (-0.0, -0.0, -0.0, 1.0),
             scale: (1.0, 1.0, 1.0),
         ),
@@ -2282,9 +2282,9 @@
                     data: "(kind:Dynamic,mass:1.0,restitution:0.0,friction:0.5,gravity_scale:1.0,material:\"@5e460bda-b128-473f-b13b-66943095f5fc\")",
                 ),
             ],
-            translation: (2.7953422, 0.49892205, 2.4079356),
-            rotation: (-0.0003670912, -0.00000614899, 1.0, 0.0000038924504),
-            scale: (0.99998784, 0.99998784, 1.0000001),
+            translation: (1.9743756, 0.49892205, 3.00146),
+            rotation: (-0.0003670912, -0.00000614899, 1.0, 0.0000038924486),
+            scale: (0.9999888, 0.9999888, 1.0000001),
         ),
         (
             id: "f8fc137c-36cc-4ced-b90a-4a1fac4f000c",
@@ -2497,9 +2497,9 @@
         ],
     ),
     editor_camera: Some((
-        position: (4.578171, 7.9715214, 0.96772575),
-        yaw: 3.2728765,
-        pitch: -1.1543499,
+        position: (3.953493, 5.6378436, 2.4313421),
+        yaw: -2.6941547,
+        pitch: -1.0036302,
     )),
     collapsed: [
         "7ee09aa3-ad5e-4f83-9c52-25c96fb49b54",

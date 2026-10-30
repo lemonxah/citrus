@@ -981,7 +981,7 @@ impl PhysicsWorld {
                 forces.push((up * lift * sub + drag, *p));
                 drag_k += water.angular_drag * sub / n;
                 // Stokes rotational drag, pi mu D^3, for thick fluids.
-                spin_visc += std::f32::consts::PI * water.viscosity.max(0.0) * diameter.powi(3) * sub / n;
+                spin_visc += std::f32::consts::PI * water.effective_viscosity() * diameter.powi(3) * sub / n;
                 ang_k += sub / n;
             }
             let frac = submerged / n;

@@ -144,7 +144,7 @@ impl WaterRenderer {
                 continue;
             };
             body.ripple = self.ripples(renderer, material, water, id.raw() as u64, local_cam, dt);
-            body.ripple[3] = water.look.foam.max(0.0);
+            body.ripple[3] = if water.look.foam_on { water.look.foam.max(0.0) } else { 0.0 };
             alive.push(id);
             renderer.set_material_water_slot(material, self.bodies.len() as u32);
             self.bodies.push(body);
@@ -256,6 +256,7 @@ impl WaterRenderer {
             body_gain: e.body_gain,
             smoothing: e.smoothing,
             grid_damping: e.grid_damping,
+            mix: e.mix,
         });
         let depth = field.max_depth.min(params.wave_depth) + max_height;
         let dt = dt.clamp(0.0, 0.05).min(citrus_core::max_sim_dt(window.cell, depth, max_speed));
@@ -285,6 +286,7 @@ impl WaterRenderer {
             wave_depth: params.wave_depth,
             displace: params.displacement,
             viscosity: params.viscosity,
+            eddy: params.eddy,
             ewave,
             field_version: field.version,
             field_origin: field.window.origin.to_array(),
@@ -669,7 +671,10 @@ pub fn pack_water(water: &Water) -> GpuWater {
     let l = &water.look;
     body.shallow = [l.shallow_color[0], l.shallow_color[1], l.shallow_color[2], l.absorption_depth.max(0.01)];
     body.deep = [l.deep_color[0], l.deep_color[1], l.deep_color[2], l.clarity.clamp(0.0, 1.0)];
-    body.look0 = [l.roughness, l.ripple_strength, l.ripple_scale, l.foam_width];
+    // The shader's scrolling detail is about 15 cm waves (at scale 1):
+    // thick fluids (and oil, a little) calm it.
+    let detail_k = std::f32::consts::TAU * l.ripple_scale.max(0.01) / 0.15;
+    body.look0 = [l.roughness, l.ripple_strength * water.wave_share(detail_k), l.ripple_scale, l.foam_width];
     body.look1 = [l.crest_foam, l.refraction, n as f32, amp_sum];
     body
 }

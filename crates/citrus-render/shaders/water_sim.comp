@@ -70,7 +70,9 @@ layout(push_constant) uniform Push {
     uint closed;
     float wave_depth;
     float displace;
-    uint ew_on;
+    // Eddy viscosity rate (1/s; water_pipe.rs PipeParams::eddy). The
+    // dispersive layer runs when ew_mix > 0.
+    float eddy;
     float ew_gain;
     float ew_depth;
     float ew_damping;
@@ -84,9 +86,13 @@ layout(push_constant) uniform Push {
     float ew_grid_damping;
     // Kinematic viscosity (m^2/s).
     float viscosity;
+    // Share of the dispersive layer that shows (0..1).
+    float ew_mix;
 } pc;
 
 const float MAX_SPEED = 8.0;
+// Most of a cell's velocity difference viscosity evens out per substep.
+const float VISCOUS_STEP_MAX = 0.2;
 // Mirrors citrus_core::water_ewave.
 const float EW_SURFACE_TENSION = 7.3e-5;
 const float EW_MAX_SOURCE = 0.25;
@@ -245,14 +251,33 @@ void flux_cell(ivec2 w) {
         float face = clamp(0.5 * (hs + nh), 0.0, pc.wave_depth);
         f[d] = max(f[d] + pc.dt * pc.gravity * face * (hd - hn), 0.0);
         if (pc.viscosity > 0.0) {
-            // Laminar sheet flow loses 3 nu / h^2 over the bed (water_pipe.rs).
+            // Bed friction (water_pipe.rs bed_friction).
             float hv = max(0.5 * (hs + nh), 0.02);
-            f[d] *= exp(-3.0 * pc.viscosity / (hv * hv) * pc.dt);
+            float kb = PI / (4.0 * max(pc.cell, 1e-3));
+            float om = sqrt(max(pc.gravity * kb * tanh(min(kb * hv, 10.0)), 1e-4));
+            float delta = sqrt(2.0 * pc.viscosity / om);
+            f[d] *= exp(-pc.viscosity * 3.0 / (hv * max(min(hv, delta), 1e-3)) * pc.dt);
         }
     }
     vec4 c = couple[win(w)];
+    vec2 dq = vec2(0.0);
     if (c.y > 0.0 && pc.momentum > 0.0) {
-        vec2 dq = (c.zw - vel[s]) * (c.y * min(pc.momentum * pc.dt, 1.0) * pc.cell * clamp(hs, 0.01, pc.wave_depth));
+        dq += (c.zw - vel[s]) * (c.y * min(pc.momentum * pc.dt, 1.0) * pc.cell * clamp(hs, 0.01, pc.wave_depth));
+    }
+    if (pc.viscosity > 0.0 || pc.eddy > 0.0) {
+        // Viscous shallow water: momentum spreads to the neighbours (nu
+        // laplacian u); walls hold the water still, past the window it
+        // carries on (water_pipe.rs).
+        vec2 u = vel[s];
+        vec2 around = vec2(0.0);
+        for (int d = 0; d < 4; d++) {
+            ivec2 nb = w + DIRS[d];
+            around += !inside(nb) ? u : (solid(nb) ? vec2(0.0) : vel[store(nb)]);
+        }
+        float rate = min(pc.viscosity * pc.dt / (pc.cell * pc.cell) + pc.eddy * pc.dt, VISCOUS_STEP_MAX);
+        dq += (around - 4.0 * u) * (rate * pc.cell * clamp(hs, 0.01, pc.wave_depth));
+    }
+    if (dq != vec2(0.0)) {
         if (dq.x > 0.0) {
             if (!solid(w + DIRS[1])) f.y += dq.x;
         } else if (!solid(w + DIRS[0])) {
@@ -446,15 +471,16 @@ void output_cell(ivec2 w) {
     // Further surface layers add their height to `e`, their slope to `g`
     // and their surface velocity to `u` here, before both the ripple
     // texture and the readback are written; the dispersive layer does.
-    if (pc.ew_on != 0u && !solid(w)) {
+    if (pc.ew_mix > 0.0 && !solid(w)) {
         vec2 c = ew[store(w)];
         vec2 x0 = ew_or(w + DIRS[0], c);
         vec2 x1 = ew_or(w + DIRS[1], c);
         vec2 z0 = ew_or(w + DIRS[2], c);
         vec2 z1 = ew_or(w + DIRS[3], c);
-        e += c.x;
-        g += vec2(x1.x - x0.x, z1.x - z0.x) / (2.0 * pc.cell);
-        vec2 orb = vec2(x1.y - x0.y, z1.y - z0.y) / (2.0 * pc.cell);
+        float m = pc.ew_mix;
+        e += c.x * m;
+        g += vec2(x1.x - x0.x, z1.x - z0.x) * m / (2.0 * pc.cell);
+        vec2 orb = vec2(x1.y - x0.y, z1.y - z0.y) * m / (2.0 * pc.cell);
         float os = length(orb);
         u += os > EW_MAX_ORBITAL ? orb * (EW_MAX_ORBITAL / os) : orb;
     }

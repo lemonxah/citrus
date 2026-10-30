@@ -299,22 +299,7 @@
     ),
     audio_mixer: (
         buses: {
-            "ui": (
-                volume: 1.0,
-                muted: false,
-                parent: Some("master"),
-            ),
             "sfx": (
-                volume: 1.0,
-                muted: false,
-                parent: Some("master"),
-            ),
-            "master": (
-                volume: 1.0,
-                muted: false,
-                parent: None,
-            ),
-            "voice": (
                 volume: 1.0,
                 muted: false,
                 parent: Some("master"),
@@ -323,6 +308,21 @@
                 volume: 1.0,
                 muted: false,
                 parent: Some("master"),
+            ),
+            "ui": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+            "voice": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+            "master": (
+                volume: 1.0,
+                muted: false,
+                parent: None,
             ),
         },
     ),

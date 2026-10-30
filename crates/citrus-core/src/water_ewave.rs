@@ -100,6 +100,8 @@ pub struct EwaveParams {
     pub smoothing: f32,
     /// Kinematic viscosity (m^2/s): each mode also decays at 2 nu k^2.
     pub viscosity: f32,
+    /// Share of the layer that shows on the surface (0..1).
+    pub mix: f32,
 }
 
 impl EwaveParams {
@@ -114,7 +116,8 @@ impl EwaveParams {
     /// is off or the window can't run it.
     pub fn for_water(water: &Water, window: SimWindow, depth: f32) -> Option<Self> {
         let strength = water.sim_dispersion.max(0.0);
-        if strength <= 0.0 || !ewave_supported(window.n) {
+        let mix = water.sim_ripple_mix.clamp(0.0, 1.0);
+        if strength <= 0.0 || mix <= 0.0 || !ewave_supported(window.n) {
             return None;
         }
         // Past the window's size every mode is deep already.
@@ -132,12 +135,13 @@ impl EwaveParams {
             body_gain: water.sim_wake_ripples.max(0.0),
             smoothing: water.sim_ripple_smoothing.max(0.0),
             viscosity: water.kinematic_viscosity(),
+            mix,
         })
     }
 
     /// Undamped, unsourced: for checking the scheme.
     pub fn free(depth: f32) -> Self {
-        Self { gravity: GRAVITY, depth, gain: 1.0, damping: 0.0, grid_damping: 0.0, split: 0.0, current: Vec2::ZERO, body_gain: 1.0, smoothing: 0.0, viscosity: 0.0 }
+        Self { gravity: GRAVITY, depth, gain: 1.0, damping: 0.0, grid_damping: 0.0, split: 0.0, current: Vec2::ZERO, body_gain: 1.0, smoothing: 0.0, viscosity: 0.0, mix: 1.0 }
     }
 }
 

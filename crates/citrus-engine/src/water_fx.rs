@@ -383,8 +383,10 @@ impl WaterFx {
             let s = w.look.shallow_color;
             [0.55 + s[0] * 0.3, 0.6 + s[1] * 0.3, 0.62 + s[2] * 0.3]
         });
+        // Thick fluids swallow impacts without throwing droplets.
+        let splashiness = |p: Vec3| refs.iter().find(|(m, w)| w.height_at(*m, p + Vec3::Y * 2.0, t).is_some()).map_or(1.0, |(_, w)| w.splashiness());
         for s in &splashes {
-            self.sim.splash(s, tint, 1.0);
+            self.sim.splash(s, tint, splashiness(s.at));
         }
         for (k, w) in wakes.iter().enumerate() {
             self.sim.wake(0x5EED_0000 + k as u64, w, tint, dt);
@@ -398,7 +400,9 @@ impl WaterFx {
             for c in &o.components {
                 if let Some(f) = c.as_any().downcast_ref::<Waterfall>() {
                     let plunge = f.plunge(world[i], |p| catch_height(scene, &refs, p, t));
-                    self.sim.pour(o.id.raw() as u64, f, world[i], plunge.y, dt);
+                    let sp = splashiness(plunge);
+                    let poured = Waterfall { splash: f.splash * sp, mist: f.mist * sp, ..f.clone() };
+                    self.sim.pour(o.id.raw() as u64, &poured, world[i], plunge.y, dt);
                     falls.push((o.id, f.clone(), world[i], plunge.y));
                 }
             }

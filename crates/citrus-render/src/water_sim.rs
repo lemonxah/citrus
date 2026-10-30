@@ -71,6 +71,8 @@ pub struct WaterSimEwave {
     pub smoothing: f32,
     /// Damping (1/s) of the grid's finest waves.
     pub grid_damping: f32,
+    /// Share of the layer that shows (0..1).
+    pub mix: f32,
 }
 
 /// One water body's simulation input for a frame.
@@ -103,6 +105,8 @@ pub struct WaterSimBody {
     pub displace: f32,
     /// Kinematic viscosity (m^2/s).
     pub viscosity: f32,
+    /// Eddy viscosity rate (1/s; nu_eddy = eddy * cell^2).
+    pub eddy: f32,
     /// The dispersive layer, when it runs (`n` a power of two).
     pub ewave: Option<WaterSimEwave>,
     /// Per-cell rest depth, base flow x/z and kind for the window at
@@ -147,7 +151,7 @@ struct Push {
     closed: u32,
     wave_depth: f32,
     displace: f32,
-    ew_on: u32,
+    eddy: f32,
     ew_gain: f32,
     ew_depth: f32,
     ew_damping: f32,
@@ -157,7 +161,7 @@ struct Push {
     ew_follow: f32,
     ew_grid_damping: f32,
     viscosity: f32,
-    _pad: f32,
+    ew_mix: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<Push>() == 128);
@@ -517,7 +521,7 @@ impl GpuWaterSim {
         let pipeline_layout = self.pipeline_layout;
         let bodies = &mut self.bodies;
         let dispatch = |b: &Body, q: &WaterSimBody, mode: u32, prev: [i32; 2], dt: f32| {
-            let ew = q.ewave.unwrap_or(WaterSimEwave { gain: 0.0, depth: 1.0, damping: 0.0, split: 0.0, current: [0.0; 2], body_gain: 0.0, smoothing: 0.0, grid_damping: 0.0 });
+            let ew = q.ewave.unwrap_or(WaterSimEwave { gain: 0.0, depth: 1.0, damping: 0.0, split: 0.0, current: [0.0; 2], body_gain: 0.0, smoothing: 0.0, grid_damping: 0.0, mix: 0.0 });
             let push = Push {
                 origin: q.origin,
                 prev,
@@ -536,7 +540,7 @@ impl GpuWaterSim {
                 closed: q.closed as u32,
                 wave_depth: q.wave_depth,
                 displace: q.displace,
-                ew_on: q.ewave.is_some() as u32,
+                eddy: q.eddy,
                 ew_gain: ew.gain,
                 ew_depth: ew.depth,
                 ew_damping: ew.damping,
@@ -546,7 +550,7 @@ impl GpuWaterSim {
                 ew_follow: if ew.smoothing <= 1e-4 { 1.0 } else { 1.0 - (-dt.max(0.0) / ew.smoothing).exp() },
                 ew_grid_damping: ew.grid_damping,
                 viscosity: q.viscosity,
-                _pad: 0.0,
+                ew_mix: ew.mix,
             };
             let groups = q.n.div_ceil(8);
             unsafe {

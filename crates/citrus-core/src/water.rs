@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::TypedComponent;
 
+/// Wind's growth rate on a wave as a share of its angular frequency.
+const WAVE_GROWTH: f32 = 0.03;
 const GRAVITY: f32 = 9.81;
 
 /// One Gerstner wave.
@@ -54,8 +56,15 @@ pub struct WaterLook {
     /// How strongly the surface bends the view of what's underneath
     /// (1 = water's real refraction, 0 = none).
     pub refraction: f32,
-    /// All foam (contact, crests, whitewater) as a multiplier; 0 turns it off.
+    /// All foam (contact, crests, whitewater) as a multiplier.
     pub foam: f32,
+    /// Foam drawn at all (keeps `foam` for when it's turned back on).
+    #[serde(default = "default_true")]
+    pub foam_on: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for WaterLook {
@@ -72,6 +81,7 @@ impl Default for WaterLook {
             crest_foam: 0.3,
             refraction: 1.0,
             foam: 1.0,
+            foam_on: true,
         }
     }
 }
@@ -161,6 +171,10 @@ pub struct Water {
     /// where their density settles them), how fast waves die, how sluggishly
     /// it flows.
     pub viscosity: f32,
+    /// Stage the fluid as a 1:N scale model: it moves like the same fluid
+    /// N times smaller (a jar of honey in a pool-sized scene). By Froude
+    /// similarity that is viscosity times N^1.5. 1 = real size.
+    pub fluid_scale: f32,
     /// Linear drag on submerged bodies (1/s).
     pub drag: f32,
     /// Angular drag on submerged bodies (1/s).
@@ -193,6 +207,13 @@ pub struct Water {
     /// Strength of the dispersive wave layer over the simulation (wave
     /// trains, Kelvin wakes, chop; 0 = off). Runs weaker over shallow water.
     pub sim_dispersion: f32,
+    /// How much of the dispersive ripple layer shows (0 = off, 1 = all of
+    /// it); scales the ripples already there too, not only new ones.
+    pub sim_ripple_mix: f32,
+    /// Eddy viscosity on the simulation's short chop (0 = none, 1 = strong):
+    /// turbulence drains short waves far faster than long swells, so chop
+    /// from bodies and impacts dies out instead of bouncing round a pool.
+    pub sim_chop_smoothing: f32,
     /// How strongly bodies moving through start dispersive waves (their
     /// wake); drops and splashes are not scaled by it.
     pub sim_wake_ripples: f32,
@@ -306,7 +327,7 @@ const fn fluid(name: &'static str, density: f32, viscosity: f32, shallow: [f32; 
 
 /// Fluid templates. Look: absorption, clarity, roughness, ripples, foam,
 /// refraction, steam.
-pub const FLUID_PRESETS: [FluidPreset; 8] = [
+pub const FLUID_PRESETS: [FluidPreset; 9] = [
     fluid("Water", 1000.0, 0.001, [0.10, 0.45, 0.48], [0.01, 0.07, 0.12], [4.0, 0.7, 0.06, 0.35, 1.0, 1.0, 0.0]),
     fluid("Sea water", 1025.0, 0.00108, [0.06, 0.40, 0.44], [0.0, 0.05, 0.12], [6.0, 0.6, 0.07, 0.4, 1.0, 1.0, 0.0]),
     fluid("Hot spring", 1005.0, 0.0005, [0.35, 0.75, 0.80], [0.05, 0.35, 0.45], [5.0, 0.85, 0.04, 0.2, 0.3, 1.0, 1.0]),
@@ -314,6 +335,7 @@ pub const FLUID_PRESETS: [FluidPreset; 8] = [
     fluid("Oil", 900.0, 0.1, [0.25, 0.20, 0.08], [0.03, 0.025, 0.01], [0.4, 0.2, 0.03, 0.15, 0.0, 1.4, 0.0]),
     fluid("Syrup", 1330.0, 2.5, [0.65, 0.32, 0.08], [0.25, 0.08, 0.01], [0.5, 0.45, 0.02, 0.05, 0.0, 1.4, 0.0]),
     fluid("Honey", 1420.0, 10.0, [0.95, 0.60, 0.12], [0.55, 0.25, 0.02], [0.35, 0.55, 0.015, 0.03, 0.0, 1.5, 0.0]),
+    fluid("Cold honey", 1430.0, 100.0, [0.90, 0.52, 0.10], [0.50, 0.20, 0.02], [0.3, 0.45, 0.02, 0.0, 0.0, 1.5, 0.0]),
     fluid("Mud", 1700.0, 50.0, [0.32, 0.24, 0.16], [0.18, 0.13, 0.08], [0.05, 0.0, 0.35, 0.05, 0.0, 0.0, 0.0]),
 ];
 
@@ -489,6 +511,7 @@ impl Default for Water {
             ],
             density: 1000.0,
             viscosity: 0.001,
+            fluid_scale: 1.0,
             drag: 1.0,
             angular_drag: 1.0,
             current: [0.0; 3],
@@ -501,9 +524,11 @@ impl Default for Water {
             ripple_damping: 0.35,
             gpu_sim: true,
             sim_wave_depth: 3.0,
-            sim_displacement: 1.0,
+            sim_displacement: 0.5,
             sim_momentum: 1.0,
             sim_dispersion: 1.0,
+            sim_ripple_mix: 1.0,
+            sim_chop_smoothing: 0.3,
             sim_wake_ripples: 0.2,
             sim_ripple_smoothing: 0.06,
             sim_fine_damping: 6.0,
@@ -567,6 +592,7 @@ impl Water {
             .map(|(dir, wavelength, amp, steep, speed)| {
                 let k = std::f32::consts::TAU / wavelength.max(0.05);
                 let omega = (GRAVITY * k * (k * depth).tanh()).sqrt() * speed;
+                let amp = amp * self.wave_share(k);
                 // Steepness is shared out so the summed crests never loop over.
                 let qa = (steep.clamp(0.0, 1.0) / (k * n.max(1) as f32)).min(amp.max(0.0));
                 ResolvedWave { dir, k, omega, qa, amplitude: amp.max(0.0) }
@@ -624,9 +650,42 @@ impl Water {
         self.column(xz).is_some()
     }
 
-    /// Kinematic viscosity (m^2/s): dynamic viscosity over density.
+    /// How readily the fluid splashes (0..1): 1 / (1 + 3 Oh), Oh the
+    /// Ohnesorge number mu / sqrt(rho sigma L) at a 10 cm splash. Water
+    /// splashes freely; honey and mud swallow an impact without throwing
+    /// droplets.
+    pub fn splashiness(&self) -> f32 {
+        let oh = self.effective_viscosity() / (self.density.max(1.0) * 0.072 * 0.1).sqrt();
+        1.0 / (1.0 + 3.0 * oh)
+    }
+
+    /// Dynamic viscosity (Pa s) the fluid acts with: `viscosity` scaled
+    /// by `fluid_scale`^1.5.
+    pub fn effective_viscosity(&self) -> f32 {
+        self.viscosity.max(0.0) * self.fluid_scale.max(1.0).powf(1.5)
+    }
+
+    /// Kinematic viscosity (m^2/s) the fluid acts with.
     pub fn kinematic_viscosity(&self) -> f32 {
-        self.viscosity.max(0.0) / self.density.max(1.0)
+        self.effective_viscosity() / self.density.max(1.0)
+    }
+
+    /// Share of a wave of wave number `k` (rad/m) the fluid keeps (0..1): a
+    /// wave lives only where wind feeds it (growth about 3% of its angular
+    /// frequency, Miles' order for a strong wind) faster than viscosity
+    /// drains it (2 nu k^2 in the body, plus the bed's boundary layer).
+    /// 1 for water at every size; thick fluids keep only long waves.
+    pub fn wave_share(&self, k: f32) -> f32 {
+        let nu = self.kinematic_viscosity();
+        if nu <= 0.0 {
+            return 1.0;
+        }
+        let depth = self.depth.max(0.05);
+        let kh = (k * depth).min(10.0);
+        let omega = ((GRAVITY * k + 7.3e-5 * k * k * k) * kh.tanh()).max(1e-6).sqrt();
+        let bulk = 2.0 * nu * k * k;
+        let bed = k * (nu * omega * 0.5).sqrt() / (2.0 * kh).sinh().max(1e-3);
+        (1.0 - (bulk + bed) / (WAVE_GROWTH * omega)).clamp(0.0, 1.0)
     }
 
     /// Make this a pool: still, clear, pool-blue water with no waves, wind

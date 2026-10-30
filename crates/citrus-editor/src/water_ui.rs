@@ -136,7 +136,22 @@ fn simulation_ui(ui: &mut Ui, w: &mut Water, c: &mut bool) {
             0.0..=4.0,
             c,
         );
-        if w.sim_dispersion > 0.0 {
+        widgets::property_row(ui, "Chop smoothing", |ui| {
+            *c |= ui
+                .add(egui::Slider::new(&mut w.sim_chop_smoothing, 0.0..=1.0))
+                .on_hover_text(
+                    "Drains the short choppy waves bodies and impacts leave, the way turbulence does in real water, while long swells and wakes carry on. \
+                     0 = they bounce round until Damping wears them down",
+                )
+                .changed();
+        });
+        widgets::property_row(ui, "Ripples", |ui| {
+            *c |= ui
+                .add(egui::Slider::new(&mut w.sim_ripple_mix, 0.0..=1.0))
+                .on_hover_text("How much of the fine dispersive ripples show: 0 turns them off (the water still sloshes and makes its wake), 1 shows all of them")
+                .changed();
+        });
+        if w.sim_dispersion > 0.0 && w.sim_ripple_mix > 0.0 {
             drag_tip(
                 ui,
                 "Wake ripples",
@@ -290,13 +305,26 @@ impl Inspect for Water {
         drag(ui, "Density (kg/m3)", &mut self.density, 1.0, 1.0..=20_000.0, &mut c);
         widgets::property_row(ui, "Viscosity (Pa s)", |ui| {
             c |= ui
-                .add(egui::Slider::new(&mut self.viscosity, 0.0001..=1000.0).logarithmic(true).max_decimals(4))
+                .add(egui::Slider::new(&mut self.viscosity, 0.0001..=100_000.0).logarithmic(true).max_decimals(4))
                 .on_hover_text(
                     "How thick the fluid is: water 0.001, oil ~0.1, honey ~10. Thicker fluid drags bodies harder (they sink or rise slowly to where their density \
                      settles them), damps waves (only long slow ones survive) and flows sluggishly. What floats is set by Density alone.",
                 )
                 .changed();
         });
+        widgets::property_row(ui, "Fluid scale (1:N)", |ui| {
+            c |= ui
+                .add(egui::Slider::new(&mut self.fluid_scale, 1.0..=200.0).logarithmic(true).max_decimals(1))
+                .on_hover_text(
+                    "Stage the fluid as a scale model: it moves like the same fluid N times smaller. Honey's thickness shows at jar size; \
+                     in a pool-sized scene it still makes slow waves, as real honey would. 1:50 or so makes a pool of honey move like a jar of it. \
+                     (Froude similarity: viscosity x N^1.5.) 1 = real size.",
+                )
+                .changed();
+        });
+        if self.fluid_scale > 1.0 {
+            note(ui, &format!("Acts with {:.3} Pa s.", self.effective_viscosity()));
+        }
         drag(ui, "Drag", &mut self.drag, 0.01, 0.0..=50.0, &mut c);
         drag(ui, "Angular drag", &mut self.angular_drag, 0.01, 0.0..=50.0, &mut c);
         widgets::property_row(ui, "Current (m/s)", |ui| c |= widgets::vec3_field(ui, &mut self.current, 2, 0.01));
@@ -310,11 +338,16 @@ impl Inspect for Water {
         drag(ui, "Absorption depth", &mut l.absorption_depth, 0.05, 0.05..=200.0, &mut c);
         drag(ui, "Clarity", &mut l.clarity, 0.005, 0.0..=1.0, &mut c);
         drag(ui, "Roughness", &mut l.roughness, 0.002, 0.0..=1.0, &mut c);
-        drag(ui, "Ripples", &mut l.ripple_strength, 0.005, 0.0..=2.0, &mut c);
-        drag(ui, "Ripple scale", &mut l.ripple_scale, 0.01, 0.05..=20.0, &mut c);
+        drag(ui, "Surface detail", &mut l.ripple_strength, 0.005, 0.0..=2.0, &mut c);
+        drag(ui, "Detail scale", &mut l.ripple_scale, 0.01, 0.05..=20.0, &mut c);
         drag(ui, "Shore foam (m)", &mut l.foam_width, 0.005, 0.0..=5.0, &mut c);
         drag(ui, "Crest foam", &mut l.crest_foam, 0.005, 0.0..=1.0, &mut c);
-        drag(ui, "Foam", &mut l.foam, 0.01, 0.0..=2.0, &mut c);
+        widgets::property_row(ui, "Foam", |ui| {
+            c |= ui.checkbox(&mut l.foam_on, "").on_hover_text("Shore, crest, plunge and whitewater foam on this water").changed();
+        });
+        if l.foam_on {
+            drag(ui, "Foam amount", &mut l.foam, 0.01, 0.0..=2.0, &mut c);
+        }
         drag(ui, "Refraction", &mut l.refraction, 0.01, 0.0..=2.0, &mut c);
 
         widgets::eyebrow(ui, "Underwater");

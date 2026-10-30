@@ -2259,6 +2259,22 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   strength). Editor drags smooth the body's speed (0.1 s) and cap it at 4 m/s.
 - [done] Bodies in the water block the dispersive ripples (by draft, full past 8 cm), so ripples
   reflect off a floating couch or boat instead of running underneath; long waves still pass under.
+- [done] Fluid scale (1:N, Physics): stage the fluid as a scale model, moving like the same fluid
+  N times smaller (Froude similarity: viscosity x N^1.5), since honey's thickness shows at jar
+  size and a pool-sized grid (25 cm cells) can't show it at real size; at 1:20 a splash in a
+  honey pool dies ~3000x faster than in water. Viscosity now also reaches the analytic waves and
+  the shader's surface detail: each keeps the share wind can feed faster than viscosity (body and
+  bed boundary layer) drains it, so water keeps every wave, oil calms the fine detail, honey keeps
+  only long waves. Viscosity slider to 100 000 Pa s.
+- [done] Chop smoothing (Simulation, 0..1, default 0.3): eddy viscosity on the simulation itself
+  (nu_eddy = rate x cell^2), so the short chop bodies and impacts leave drains while long swells
+  and wakes carry on; the Ripples slider only covers the dispersive layer. Thick fluids don't
+  splash: spray and waterfall spray/mist scale by 1 / (1 + 3 Oh) (Ohnesorge number at 10 cm), so
+  honey and mud swallow impacts. Cold honey preset (100 Pa s). Look > Ripples renamed Surface
+  detail (the shader's scrolling detail, not the simulation). Displacement defaults to 0.5.
+- [done] Foam on/off per water (Look > Foam, with Foam amount when on; the amount is kept while
+  off). Ripples slider (Simulation, 0..1): how much of the dispersive ripple layer shows, scaling
+  the ripples already there too; 0 turns the layer off (the water still sloshes and wakes).
 - [done] Wake vs ripples: a body's push on the dispersive layer is spread over Ripple smoothing
   (default 0.06 s; it moved once a frame and kicked grid-sized ripples all round it at frame
   rate), the blocking under it follows the same smoothed footprint (so what it pushes in ahead and
@@ -2268,7 +2284,9 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 - [done] Fluid viscosity (Pa s) and templates: Water, Sea water, Hot spring (steams), Swamp, Oil,
   Syrup, Honey, Mud set density, viscosity and the look (colour, clarity, roughness, ripples, foam,
   refraction) as a starting point. Viscosity damps waves at 2 nu k^2 (thick fluids keep only long,
-  slow waves), slows flow over the bed (3 nu / h^2), and drags bodies by the sphere drag curve
+  slow waves), spreads momentum through the flow (viscous shallow water, nu laplacian u, walls
+  no-slip), brakes it at the bed (laminar sheet flow, or the waves' thin Stokes boundary layer in
+  deeper water), and drags bodies by the sphere drag curve
   (Stokes drag in thick fluids, form drag in thin), with Stokes rotational drag; what floats is
   set by density alone.
 - [done] Water and colliders: every static object (its colliders, or its render mesh without any)
