@@ -114,6 +114,9 @@ pub struct MaterialFeatures {
     pub emission: bool,
     pub alpha_mode: AlphaMode,
     pub double_sided: bool,
+    /// Water surface shading (engine-generated water grids).
+    #[serde(default)]
+    pub water: bool,
 }
 
 /// Continuously editable material parameters; delivered to the shader as
@@ -252,6 +255,8 @@ pub struct MaterialFx {
     pub orm_invert: [f32; 4],
     /// Parallax occlusion mapping: x = displacement scale (0 = off). yzw unused.
     pub parallax: [f32; 4],
+    /// x = water body slot in the frame UBO (water materials). yzw unused.
+    pub water: [f32; 4],
 }
 
 impl MaterialFx {
@@ -315,7 +320,54 @@ impl MaterialFx {
                 if p.screen_reflections { 1.0 } else { 0.0 },
                 0.0,
             ],
+            water: [0.0; 4],
         }
+    }
+}
+
+/// Water bodies the frame UBO holds (a water material picks one by slot).
+pub const MAX_WATER_BODIES: usize = 4;
+/// Churned foam spots per water body (waterfall plunges, whirlpools).
+pub const MAX_WATER_FOAM: usize = 4;
+/// Waves summed per water body.
+pub const MAX_WATER_WAVES: usize = 8;
+
+/// One water surface's waves and look, as the standard shader's water path
+/// reads them (std140, `GpuWater` in standard_common.glsl).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct GpuWater {
+    /// Per wave: xy direction (local XZ), z wave number, w angular speed.
+    pub wave_a: [[f32; 4]; MAX_WATER_WAVES],
+    /// Per wave: x horizontal amplitude (Q*A), y amplitude, z the normal's
+    /// y slope term, w unused.
+    pub wave_b: [[f32; 4]; MAX_WATER_WAVES],
+    /// rgb shallow colour, w absorption depth.
+    pub shallow: [f32; 4],
+    /// rgb deep colour, w clarity.
+    pub deep: [f32; 4],
+    /// x roughness, y ripple strength, z ripple scale, w foam width.
+    pub look0: [f32; 4],
+    /// x crest foam, y refraction, z wave count, w summed amplitude.
+    pub look1: [f32; 4],
+    /// Interactive ripple window: xy centre (local XZ), z width (0 = none).
+    /// The field is the water material's slot-15 texture (r height, gb its
+    /// local XZ gradient).
+    pub ripple: [f32; 4],
+    /// World to the body's local space (caustics on what lies under it).
+    pub to_local: [[f32; 4]; 4],
+    /// x, y half extents in local XZ (0 = endless), z rest surface (local
+    /// y), w caustic strength (0 = none).
+    pub bounds: [f32; 4],
+    /// Churned spots: xy centre (local XZ), z radius, w foam amount.
+    pub foam: [[f32; 4]; MAX_WATER_FOAM],
+    /// x: lights under the surface throw caustics out of it (pools).
+    pub extra: [f32; 4],
+}
+
+impl Default for GpuWater {
+    fn default() -> Self {
+        Self::zeroed()
     }
 }
 
@@ -328,6 +380,16 @@ pub struct MaterialHandle(pub(crate) usize);
 /// A registered custom fragment shader (compiled SPIR-V).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShaderId(pub(crate) usize);
+
+/// Fallback bound to an unassigned custom-shader texture property.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CustomTextureDefault {
+    #[default]
+    White,
+    Black,
+    Normal,
+    Gray,
+}
 
 #[derive(Default)]
 pub struct MaterialDesc {
@@ -355,6 +417,7 @@ pub struct MaterialDesc {
     pub error: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct CameraData {
     pub view: Mat4,
     pub proj: Mat4,
@@ -461,6 +524,9 @@ pub struct DrawCmd {
     /// surface (it samples its mirrored render and is excluded from its own
     /// planar pass), or -1.
     pub planar_index: i32,
+    /// Hidden by baked occlusion culling from the culling camera's cell: skipped
+    /// in the main camera pass, still drawn into shadows / probes / captures.
+    pub occluded: bool,
 }
 
 pub struct EguiDraw {
@@ -555,6 +621,9 @@ pub struct ProbeSh {
     /// Chebyshev visibility test (DDGI-style) — smooth occlusion instead of a
     /// hard threshold. Zero = no data (the test falls back to single-moment).
     pub dist2: [f32; 4],
+    /// World offset of the probe from its grid position (FluxVoxel relocation
+    /// moves probes out of geometry); the visibility test uses the moved spot.
+    pub offset: [f32; 3],
 }
 
 /// Result of a bake: a lightmap per instance (same order) and SH per probe.
@@ -570,6 +639,8 @@ pub struct BakeOutput {
 pub struct RenderStats {
     /// Total scene draw calls this frame (excluding egui).
     pub draw_calls: u32,
+    /// Draw calls that drew more than one object (GPU instancing).
+    pub instanced_draws: u32,
     /// Opaque + cutout draws.
     pub opaque_draws: u32,
     /// Extra draws caused by transparency (alpha-blended, sorted pass).
@@ -598,6 +669,10 @@ pub struct RenderStats {
     pub gpu_post_ms: f32,
     pub gpu_egui_ms: f32,
     pub gpu_cam_preview_ms: f32,
+    /// Flux trace sub-passes (ms): screen-probe gather, denoise, integrate.
+    pub gpu_gi_gather_ms: f32,
+    pub gpu_gi_denoise_ms: f32,
+    pub gpu_gi_integrate_ms: f32,
 }
 
 pub struct FrameInput<'a> {
@@ -613,6 +688,10 @@ pub struct FrameInput<'a> {
     /// renders the scene without lightmaps, so it needs the analytic lights or
     /// it captures dark. Empty → fall back to `lights`.
     pub capture_lights: &'a [LightInstance],
+    /// FluxVoxel: moving emitters as point lights (colour already includes the
+    /// GI gain), shaded per pixel with the grid's injection kernel as indirect
+    /// light instead of being injected into the probe grid.
+    pub voxel_emitters: &'a [BakeLight],
     /// When set, the scene is also rendered from this camera into the offscreen
     /// preview target (the editor's Camera tab). `None` skips that pass.
     pub camera_preview: Option<CameraData>,
@@ -625,6 +704,12 @@ pub struct FrameInput<'a> {
     pub shadow_distance: f32,
     /// Seconds since app start; drives animated shader effects.
     pub time: f32,
+    /// Water clock (s): the play clock while playing, so the rendered waves
+    /// match the ones floating bodies ride.
+    pub water_time: f32,
+    /// Water bodies this frame, indexed by the water materials' slots (at
+    /// most `MAX_WATER_BODIES` are used).
+    pub water: &'a [GpuWater],
     pub draws: &'a [DrawCmd],
     /// Debug: render objects as a lightmap-UV checkerboard (cell size tracks
     /// each object's lightmap resolution) instead of their material.
@@ -645,11 +730,18 @@ pub struct FrameInput<'a> {
     /// Resolved post-processing parameters (from the camera's blended Volume
     /// profiles). Per-pixel effects applied in the surface shaders.
     pub postfx: PostFx,
+    /// Post-processing for the camera preview (resolved at the preview camera).
+    pub preview_postfx: PostFx,
     /// Active reflection-probe zone (the placed `ReflectionProbe` whose box
     /// contains the camera, or the nearest). Drives box-projected parallax +
     /// intensity for the environment reflection. `None` = treat the env cube as
     /// distant/infinite (no parallax, intensity 1).
     pub reflection_probe: Option<ReflectionProbeBox>,
+    /// Second probe (slot 1, binding 9), blended per pixel with `reflection_probe`.
+    pub reflection_probe_b: Option<ReflectionProbeBox>,
+    /// Which slot wins where both probe boxes cover a pixel (higher importance,
+    /// then the smaller box). Outside both boxes slot 0 is used.
+    pub reflection_primary: u8,
     /// Distance + height exponential fog (atmospheric depth). `None` = no fog.
     pub fog: Option<FogParams>,
     /// FluxVoxel specular-from-volume: metallic/rough surfaces sample the probe
@@ -661,6 +753,9 @@ pub struct FrameInput<'a> {
     /// `DrawCmd.planar_index` matches sample their layer instead of the probe.
     /// At most `MAX_PLANAR` are rendered; extras fall back to the probe.
     pub planar: &'a [PlanarSurface],
+    /// Cameras rendering into textures this frame (CCTV / TV screens), recorded
+    /// before the main pass. Their targets come from `Renderer::camera_target`.
+    pub camera_targets: &'a [CameraTargetView],
     pub egui: Option<EguiDraw>,
     /// World-space UI canvases to paint into their targets before the scene
     /// pass samples them.
@@ -674,6 +769,16 @@ pub struct WorldUiDraw {
     pub target: TextureHandle,
     pub extent: [u32; 2],
     pub draw: EguiDraw,
+}
+
+/// A camera rendering into its texture target this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct CameraTargetView {
+    /// The camera object's id (as passed to `Renderer::camera_target`).
+    pub id: u128,
+    pub camera: CameraData,
+    /// Wanted texture size; the target is resized when it changes.
+    pub size: [u32; 2],
 }
 
 /// One planar-reflection surface: the world plane the scene is mirrored about.
@@ -719,6 +824,20 @@ pub struct ReflectionProbeBox {
     /// Realtime mode: the engine keeps re-capturing the cube continuously so
     /// dynamic lighting tracks in reflections; Baked loads a sidecar once.
     pub realtime: bool,
+    /// The probe object's id (which cube belongs in which slot).
+    pub id: u128,
+    /// Thickness of the shell just inside the box faces over which this probe
+    /// fades in when blended with a second probe.
+    pub blend_distance: f32,
+    /// Overlap priority: where two probe boxes overlap, the higher importance
+    /// (then the smaller box) wins.
+    pub importance: i32,
+    /// Realtime refreshes per second (0 = every frame).
+    pub update_hz: f32,
+    /// Realtime capture one face per frame instead of all six at once.
+    pub time_slicing: bool,
+    /// Realtime capture draws non-static objects too.
+    pub include_dynamic: bool,
 }
 
 /// Resolved per-frame post-processing parameters (the blended profile flattened
@@ -747,6 +866,40 @@ pub struct PostFx {
     pub bloom_radius: f32,
     pub ca_enabled: bool,
     pub ca_intensity: f32,
+    /// The camera is in (or at the surface of) a water body.
+    pub underwater: Option<UnderwaterFx>,
+}
+
+/// Underwater look for a camera inside a water body's column.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnderwaterFx {
+    /// World height of the water surface over the camera. Pixels whose near
+    /// plane point is below it are under water (a clean waterline when the
+    /// near plane straddles the surface).
+    pub surface: f32,
+    /// Water colour looking up toward the surface and down into the deep
+    /// (linear, unlit: the renderer lights them by the sun + ambient).
+    pub shallow_color: [f32; 3],
+    pub deep_color: [f32; 3],
+    /// Extinction per metre of view distance through the water.
+    pub density: f32,
+    /// Extinction per metre of depth for light coming down from the surface.
+    pub light_falloff: f32,
+    /// Screen wobble strength (0 = none).
+    pub distortion: f32,
+    /// Blur radius below the waterline (px at 1080p; 0 = none).
+    pub blur: f32,
+    /// Caustic light pattern strength (0 = none).
+    pub caustics: f32,
+    /// The water body's waves and transform, so the waterline, the fog's
+    /// surface cut and the depth darkening follow the moving surface.
+    pub water_to_world: glam::Mat4,
+    pub body: GpuWater,
+    /// Rest surface height in the water's local space at the camera (a
+    /// river's follows its course).
+    pub rest_surface: f32,
+    /// The water clock the waves animate with.
+    pub clock: f32,
 }
 
 impl Default for PostFx {
@@ -770,6 +923,7 @@ impl Default for PostFx {
             bloom_radius: 0.5,
             ca_enabled: false,
             ca_intensity: 0.3,
+            underwater: None,
         }
     }
 }

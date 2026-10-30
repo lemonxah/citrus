@@ -1,15 +1,18 @@
 //! Humanoid full-body IK: map an imported skeleton's bones to humanoid roles by
-//! name, then pose them from VR `TrackerTargets` (head/hands/waist/feet) using
-//! the two-bone (limbs) + direct (hips/head) solvers. Produces per-joint local
-//! transforms ready for `Skeleton::palette` → linear-blend skinning.
+//! name, then pose them from `TrackerTargets` (head, hands, hips, feet, chest,
+//! elbows, knees). The solve follows the usual VR full-body layout: the pelvis
+//! comes from the hip tracker or is estimated under the head, the spine bends
+//! and twists toward the head (and chest), shoulders turn toward reaching
+//! hands, arms and legs are two-bone chains with elbow / knee bend goals, end
+//! bones take the tracker rotation, and without foot trackers the feet stay
+//! planted and step on their own.
 //!
 //! Bone matching covers the common naming schemes (Mixamo `LeftArm`/`LeftForeArm`,
-//! VRM/Unity `leftUpperArm`/`leftLowerArm`). The retarget math is a first cut: it
-//! aligns each limb's bones to the solved world directions; exact wrist/ankle
-//! roll wants per-rig tuning against a real avatar.
+//! VRM/Unity `leftUpperArm`/`leftLowerArm`); an Avatar Descriptor bone map
+//! overrides it.
 
 use citrus_assets::Skeleton;
-use citrus_core::{solve_two_bone, TrackerCalibration, TrackerTargets};
+use citrus_core::{TRACKER_SLOTS, TrackerCalibration, TrackerTargets, solve_two_bone};
 use glam::{Mat4, Quat, Vec3};
 
 /// Humanoid bone indices into a `Skeleton::joints`, by role. `None` when the
@@ -30,6 +33,12 @@ pub struct HumanoidRig {
     pub r_upper_leg: Option<usize>,
     pub r_lower_leg: Option<usize>,
     pub r_foot: Option<usize>,
+    pub chest: Option<usize>,
+    pub neck: Option<usize>,
+    pub l_eye: Option<usize>,
+    pub r_eye: Option<usize>,
+    pub l_shoulder: Option<usize>,
+    pub r_shoulder: Option<usize>,
 }
 
 impl HumanoidRig {
@@ -80,114 +89,425 @@ impl HumanoidRig {
             r_upper_leg: upper_leg("right"),
             r_lower_leg: lower_leg("right"),
             r_foot: find(&["right", "foot"], &["toe"]),
+            chest: find(&["upperchest"], &[]).or_else(|| find(&["chest"], &[])).or_else(|| find(&["spine2"], &[])),
+            neck: find(&["neck"], &[]),
+            l_eye: find(&["left", "eye"], &["brow", "lid", "lash"])
+                .or_else(|| find(&["eye_l"], &["brow", "lid", "lash"]))
+                .or_else(|| find(&["eye.l"], &["brow", "lid", "lash"])),
+            r_eye: find(&["right", "eye"], &["brow", "lid", "lash"])
+                .or_else(|| find(&["eye_r"], &["brow", "lid", "lash"]))
+                .or_else(|| find(&["eye.r"], &["brow", "lid", "lash"])),
+            l_shoulder: find(&["left", "shoulder"], &[]).or_else(|| find(&["left", "clavicle"], &[])),
+            r_shoulder: find(&["right", "shoulder"], &[]).or_else(|| find(&["right", "clavicle"], &[])),
         }
+        .with_shoulder_parents(skel)
+    }
+
+    /// Unnamed shoulders: an upper arm's parent that isn't part of the spine.
+    fn with_shoulder_parents(mut self, skel: &Skeleton) -> Self {
+        let spine = spine_chain(skel, &self);
+        for (shoulder, upper) in [(&mut self.l_shoulder, self.l_upper_arm), (&mut self.r_shoulder, self.r_upper_arm)] {
+            if shoulder.is_none()
+                && let Some(p) = upper.and_then(|u| skel.joints[u].parent)
+                && !spine.contains(&p)
+                && Some(p) != self.hips
+            {
+                *shoulder = Some(p);
+            }
+        }
+        self
+    }
+
+    /// [`Self::map`] with explicit role -> joint-name overrides (an avatar
+    /// descriptor's `bone_map`). Unknown roles / joints are returned as errors.
+    pub fn map_with_overrides(skel: &Skeleton, overrides: &[(String, String)]) -> (Self, Vec<String>) {
+        let mut rig = Self::map(skel);
+        let mut problems = Vec::new();
+        for (role, joint) in overrides {
+            let Some(index) = skel.joints.iter().position(|j| j.name == *joint) else {
+                problems.push(format!("bone map: no joint named {joint:?} (role {role})"));
+                continue;
+            };
+            let slot = match role.as_str() {
+                "hips" => &mut rig.hips,
+                "head" => &mut rig.head,
+                "left_upper_arm" => &mut rig.l_upper_arm,
+                "left_lower_arm" => &mut rig.l_lower_arm,
+                "left_hand" => &mut rig.l_hand,
+                "right_upper_arm" => &mut rig.r_upper_arm,
+                "right_lower_arm" => &mut rig.r_lower_arm,
+                "right_hand" => &mut rig.r_hand,
+                "left_upper_leg" => &mut rig.l_upper_leg,
+                "left_lower_leg" => &mut rig.l_lower_leg,
+                "left_foot" => &mut rig.l_foot,
+                "right_upper_leg" => &mut rig.r_upper_leg,
+                "right_lower_leg" => &mut rig.r_lower_leg,
+                "right_foot" => &mut rig.r_foot,
+                "chest" => &mut rig.chest,
+                "neck" => &mut rig.neck,
+                "left_eye" => &mut rig.l_eye,
+                "right_eye" => &mut rig.r_eye,
+                "left_shoulder" => &mut rig.l_shoulder,
+                "right_shoulder" => &mut rig.r_shoulder,
+                _ => {
+                    problems.push(format!("bone map: unknown humanoid role {role:?}"));
+                    continue;
+                }
+            };
+            *slot = Some(index);
+        }
+        (rig, problems)
     }
 
     /// Enough of a humanoid to drive full-body IK (hips + head + at least one arm).
     pub fn is_humanoid(&self) -> bool {
         self.hips.is_some() && self.head.is_some()
     }
-
-    fn arms(&self) -> [(Option<usize>, Option<usize>, Option<usize>); 2] {
-        [
-            (self.l_upper_arm, self.l_lower_arm, self.l_hand),
-            (self.r_upper_arm, self.r_lower_arm, self.r_hand),
-        ]
-    }
-    fn legs(&self) -> [(Option<usize>, Option<usize>, Option<usize>); 2] {
-        [
-            (self.l_upper_leg, self.l_lower_leg, self.l_foot),
-            (self.r_upper_leg, self.r_lower_leg, self.r_foot),
-        ]
-    }
 }
 
-/// Forward-resolve world matrices from per-joint local transforms (order-robust).
 fn world_matrices(skel: &Skeleton, locals: &[Mat4]) -> Vec<Mat4> {
-    let n = skel.joints.len();
-    let mut world = vec![Mat4::IDENTITY; n];
-    let mut done = vec![false; n];
-    let mut remaining = n;
-    while remaining > 0 {
-        let mut progressed = false;
-        for i in 0..n {
-            if done[i] {
-                continue;
-            }
-            let ready = match skel.joints[i].parent {
-                None => true,
-                Some(p) => done[p],
-            };
-            if ready {
-                let l = locals.get(i).copied().unwrap_or(Mat4::IDENTITY);
-                world[i] = match skel.joints[i].parent {
-                    Some(p) => world[p] * l,
-                    None => l,
-                };
-                done[i] = true;
-                remaining -= 1;
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    world
+    skel.world_matrices(locals)
 }
 
-/// Pose the skeleton from VR tracker targets, returning per-joint local
-/// transforms (feed into `Skeleton::palette`). Falls back to the rest pose for
-/// any chain whose tracker or bones are missing.
+/// Joints strictly between the hips and the head, hips side first.
+pub fn spine_chain(skel: &Skeleton, rig: &HumanoidRig) -> Vec<usize> {
+    let (Some(hips), Some(head)) = (rig.hips, rig.head) else { return Vec::new() };
+    let mut chain = Vec::new();
+    let mut j = skel.joints[head].parent;
+    while let Some(p) = j {
+        if p == hips {
+            chain.reverse();
+            return chain;
+        }
+        chain.push(p);
+        j = skel.joints[p].parent;
+    }
+    Vec::new()
+}
+
+fn pos(m: &Mat4) -> Vec3 {
+    m.w_axis.truncate()
+}
+
+/// The avatar's facing in its own space (horizontal), from the rest pose: the
+/// left-to-right hip (or shoulder) line crossed with up.
+pub fn rest_forward(skel: &Skeleton, rig: &HumanoidRig) -> Vec3 {
+    let rest = world_matrices(skel, &skel.rest_locals());
+    let pairs = [(rig.l_upper_leg, rig.r_upper_leg), (rig.l_upper_arm, rig.r_upper_arm), (rig.l_hand, rig.r_hand)];
+    for (l, r) in pairs {
+        if let (Some(l), Some(r)) = (l, r) {
+            let f = (pos(&rest[l]) - pos(&rest[r])).cross(Vec3::Y);
+            let f = Vec3::new(f.x, 0.0, f.z);
+            if f.length_squared() > 1e-8 {
+                return f.normalize();
+            }
+        }
+    }
+    Vec3::Z
+}
+
+/// The rotation about +Y that `q` applies to the horizontal direction `fwd`.
+fn yaw_of(q: Quat, fwd: Vec3) -> Quat {
+    let f = q * fwd;
+    let f = Vec3::new(f.x, 0.0, f.z);
+    if f.length_squared() < 1e-6 {
+        return Quat::IDENTITY;
+    }
+    let a = fwd.z.atan2(fwd.x) - f.z.atan2(f.x);
+    Quat::from_rotation_y(a)
+}
+
+/// Full-body IK tuning.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyIkSettings {
+    /// 0..1 mix of the IK result over the incoming pose.
+    pub weight: f32,
+    /// Share of the head's yaw (relative to the hips) the spine takes.
+    pub spine_twist: f32,
+    /// 0..1: how far shoulders turn toward reaching hands.
+    pub shoulder_rotation: f32,
+    /// Keep feet planted and step procedurally when there are no foot trackers.
+    pub plant_feet: bool,
+    /// A planted foot steps once it is this far from where it belongs.
+    pub step_distance: f32,
+    /// Or once the body has turned this much away from it (radians).
+    pub step_angle: f32,
+    pub step_time: f32,
+    pub step_height: f32,
+}
+
+impl Default for BodyIkSettings {
+    fn default() -> Self {
+        Self {
+            weight: 1.0,
+            spine_twist: 0.5,
+            shoulder_rotation: 0.5,
+            plant_feet: true,
+            step_distance: 0.25,
+            step_angle: 0.8,
+            step_time: 0.22,
+            step_height: 0.08,
+        }
+    }
+}
+
+/// A procedurally planted foot (world space).
+#[derive(Clone, Copy, Debug)]
+struct Footing {
+    pos: Vec3,
+    rot: Quat,
+    from: Vec3,
+    from_rot: Quat,
+    /// Step progress 0..1; 1 = planted.
+    t: f32,
+}
+
+/// Per-avatar state the solver carries between frames (planted feet).
+#[derive(Clone, Debug, Default)]
+pub struct BodyIkState {
+    feet: [Option<Footing>; 2],
+}
+
+/// Rotate joint `j` by the world-space `delta` about its own position.
+fn rotate_joint(skel: &Skeleton, locals: &mut [Mat4], j: usize, delta: Quat) {
+    let world = world_matrices(skel, locals);
+    apply_world_delta(skel, &world, locals, j, delta);
+}
+
+/// Give joint `j` the world rotation `rot`, keeping its position.
+fn set_joint_rotation(skel: &Skeleton, locals: &mut [Mat4], j: usize, rot: Quat) {
+    let world = world_matrices(skel, locals);
+    let parent = skel.joints[j].parent.map(|p| world_rot(&world, p)).unwrap_or(Quat::IDENTITY);
+    set_world_rot(locals, j, parent, rot.normalize());
+}
+
+/// Rotate `chain` (root first) so `end` moves toward `target`, spreading the
+/// turn evenly over the joints.
+fn bend_chain(skel: &Skeleton, locals: &mut [Mat4], chain: &[usize], end: usize, target: Vec3) {
+    let Some(&first) = chain.first() else { return };
+    let world = world_matrices(skel, locals);
+    let base = pos(&world[first]);
+    let (a, b) = (pos(&world[end]) - base, target - base);
+    if a.length_squared() < 1e-8 || b.length_squared() < 1e-8 {
+        return;
+    }
+    let step = Quat::IDENTITY.slerp(Quat::from_rotation_arc(a.normalize(), b.normalize()), 1.0 / chain.len() as f32);
+    for &j in chain {
+        rotate_joint(skel, locals, j, step);
+    }
+}
+
+/// Two-bone solve of `a -> b -> c` toward `target`, bending toward `pole`.
+fn solve_limb(skel: &Skeleton, locals: &mut [Mat4], (a, b, c): (usize, usize, usize), target: Vec3, pole: Vec3) {
+    let world = world_matrices(skel, locals);
+    let sol = solve_two_bone(pos(&world[a]), pos(&world[b]), pos(&world[c]), target, pole);
+    apply_two_bone(skel, &world, locals, a, b, &sol);
+}
+
+/// Pose `locals` (the incoming animated or rest pose, in/out) from `targets`,
+/// given in the skeleton's own space. `world` is the avatar's world matrix
+/// (planted feet are held in world space) and `dt` the frame time.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_body(
+    skel: &Skeleton,
+    rig: &HumanoidRig,
+    locals: &mut [Mat4],
+    targets: &TrackerTargets,
+    settings: &BodyIkSettings,
+    state: &mut BodyIkState,
+    world: Mat4,
+    dt: f32,
+) {
+    let n = skel.joints.len();
+    if locals.len() < n || !rig.is_humanoid() || !targets.any() {
+        return;
+    }
+    let base_locals: Vec<Mat4> = locals.to_vec();
+    let base = world_matrices(skel, locals);
+    let rest = world_matrices(skel, &skel.rest_locals());
+    let fwd_rest = rest_forward(skel, rig);
+    let (hips, head) = (rig.hips.unwrap_or(0), rig.head.unwrap_or(0));
+    let spine = spine_chain(skel, rig);
+
+    // Pelvis: the hip tracker, else under the head turned by the head's yaw.
+    let hips_pose = targets.hips.or_else(|| {
+        let (hp, hr) = targets.head?;
+        let yaw = yaw_of(hr * world_rot(&base, head).inverse(), fwd_rest);
+        let offset = pos(&base[hips]) - pos(&base[head]);
+        Some((hp + yaw * offset, yaw * world_rot(&base, hips)))
+    });
+    if let Some((p, r)) = hips_pose {
+        let parent = skel.joints[hips].parent.map(|pj| base[pj]).unwrap_or(Mat4::IDENTITY);
+        let (scale, _, _) = base[hips].to_scale_rotation_translation();
+        locals[hips] = parent.inverse() * Mat4::from_scale_rotation_translation(scale, r.normalize(), p);
+    }
+    let hips_yaw = yaw_of(world_rot(&world_matrices(skel, locals), hips) * world_rot(&rest, hips).inverse(), fwd_rest);
+
+    // Spine: bend toward the chest and head, twist with the head's yaw.
+    if !spine.is_empty() {
+        let chest_at = rig.chest.and_then(|c| spine.iter().position(|&j| j == c));
+        if let (Some((cp, cr)), Some(k)) = (targets.chest, chest_at) {
+            bend_chain(skel, locals, &spine[..k], spine[k], cp);
+            set_joint_rotation(skel, locals, spine[k], cr);
+            if let Some((hp, _)) = targets.head {
+                bend_chain(skel, locals, &spine[k + 1..], head, hp);
+            }
+        } else if let Some((hp, _)) = targets.head {
+            bend_chain(skel, locals, &spine, head, hp);
+        }
+        if let Some((_, hr)) = targets.head
+            && settings.spine_twist > 0.0
+        {
+            let rel = yaw_of(hr * world_rot(&base, head).inverse(), fwd_rest) * hips_yaw.inverse();
+            let step = Quat::IDENTITY.slerp(rel, settings.spine_twist.clamp(0.0, 1.0) / spine.len() as f32);
+            for &j in &spine {
+                if targets.chest.is_some() && Some(j) == rig.chest {
+                    continue;
+                }
+                rotate_joint(skel, locals, j, step);
+            }
+        }
+    }
+    if let Some((_, hr)) = targets.head {
+        set_joint_rotation(skel, locals, head, hr);
+    }
+
+    // Body frame for bend goals: the chest's turn from rest, else the hips'.
+    let w = world_matrices(skel, locals);
+    let torso = rig.chest.or(spine.last().copied()).unwrap_or(hips);
+    let body = world_rot(&w, torso) * world_rot(&rest, torso).inverse();
+    let fwd = (body * fwd_rest).normalize_or(fwd_rest);
+    let up = (body * Vec3::Y).normalize_or(Vec3::Y);
+    let left = up.cross(fwd).normalize_or(Vec3::X);
+
+    // Arms.
+    let arms = [
+        (rig.l_shoulder, rig.l_upper_arm, rig.l_lower_arm, rig.l_hand, targets.left_hand, targets.left_elbow, left),
+        (rig.r_shoulder, rig.r_upper_arm, rig.r_lower_arm, rig.r_hand, targets.right_hand, targets.right_elbow, -left),
+    ];
+    for (shoulder, ua, la, ha, hand, elbow, out) in arms {
+        let (Some(a), Some(b), Some(c), Some((tp, tr))) = (ua, la, ha, hand) else { continue };
+        if let Some(sh) = shoulder
+            && settings.shoulder_rotation > 0.0
+        {
+            let w = world_matrices(skel, locals);
+            let origin = pos(&w[sh]);
+            let (cur, want) = (pos(&w[a]) - origin, tp - origin);
+            if cur.length_squared() > 1e-8 && want.length_squared() > 1e-8 {
+                let full = Quat::from_rotation_arc(cur.normalize(), want.normalize());
+                let (axis, angle) = full.to_axis_angle();
+                let angle = (angle * settings.shoulder_rotation.clamp(0.0, 1.0) * 0.35).min(0.5);
+                rotate_joint(skel, locals, sh, Quat::from_axis_angle(axis, angle));
+            }
+        }
+        let w = world_matrices(skel, locals);
+        let pole = match elbow {
+            Some((ep, _)) => ep,
+            None => pos(&w[b]) + (-fwd * 0.4 - up * 0.6 + out * 0.3),
+        };
+        solve_limb(skel, locals, (a, b, c), tp, pole);
+        set_joint_rotation(skel, locals, c, tr);
+    }
+
+    // Legs: foot trackers, else planted feet that step.
+    let legs = [
+        (rig.l_upper_leg, rig.l_lower_leg, rig.l_foot, targets.left_foot, targets.left_knee, left),
+        (rig.r_upper_leg, rig.r_lower_leg, rig.r_foot, targets.right_foot, targets.right_knee, -left),
+    ];
+    let inv_world = world.inverse();
+    let (_, world_r, _) = world.to_scale_rotation_translation();
+    let w = world_matrices(skel, locals);
+    let hips_now = pos(&w[hips]);
+    let stepping = state.feet.iter().flatten().any(|f| f.t < 1.0);
+    let mut started = stepping;
+    for (side, (ul, ll, fl, foot, knee, out)) in legs.into_iter().enumerate() {
+        let (Some(a), Some(b), Some(c)) = (ul, ll, fl) else { continue };
+        let target = match foot {
+            Some(t) => {
+                state.feet[side] = None;
+                Some(t)
+            }
+            None if settings.plant_feet && (targets.head.is_some() || targets.hips.is_some()) => {
+                let offset = pos(&base[c]) - pos(&base[hips]);
+                let ideal = hips_now + hips_yaw * Vec3::new(offset.x, 0.0, offset.z);
+                let ideal = Vec3::new(ideal.x, pos(&base[c]).y, ideal.z);
+                let ideal_rot = hips_yaw * world_rot(&base, c);
+                let (ideal_w, ideal_wr) = (world.transform_point3(ideal), (world_r * ideal_rot).normalize());
+                let f = state.feet[side].get_or_insert(Footing {
+                    pos: ideal_w,
+                    rot: ideal_wr,
+                    from: ideal_w,
+                    from_rot: ideal_wr,
+                    t: 1.0,
+                });
+                if f.t >= 1.0 {
+                    let far = (f.pos - ideal_w).length() > settings.step_distance;
+                    let turned = f.rot.angle_between(ideal_wr) > settings.step_angle;
+                    if (far || turned) && !started {
+                        started = true;
+                        *f = Footing { pos: ideal_w, rot: ideal_wr, from: f.pos, from_rot: f.rot, t: 0.0 };
+                    }
+                } else {
+                    f.pos = ideal_w;
+                    f.rot = ideal_wr;
+                }
+                let (p, r) = if f.t < 1.0 {
+                    f.t = (f.t + dt / settings.step_time.max(0.01)).min(1.0);
+                    let e = f.t * f.t * (3.0 - 2.0 * f.t);
+                    let lift = (f.t * std::f32::consts::PI).sin() * settings.step_height;
+                    (f.from.lerp(f.pos, e) + Vec3::Y * lift, f.from_rot.slerp(f.rot, e))
+                } else {
+                    (f.pos, f.rot)
+                };
+                Some((inv_world.transform_point3(p), (world_r.inverse() * r).normalize()))
+            }
+            None => None,
+        };
+        let Some((tp, tr)) = target else { continue };
+        let w = world_matrices(skel, locals);
+        let pole = match knee {
+            Some((kp, _)) => kp,
+            None => pos(&w[b]) + fwd * 0.5 + out * 0.1,
+        };
+        solve_limb(skel, locals, (a, b, c), tp, pole);
+        set_joint_rotation(skel, locals, c, tr);
+    }
+
+    let weight = settings.weight.clamp(0.0, 1.0);
+    if weight < 1.0 {
+        for (l, b) in locals.iter_mut().zip(&base_locals) {
+            let (s0, r0, t0) = b.to_scale_rotation_translation();
+            let (s1, r1, t1) = l.to_scale_rotation_translation();
+            *l = Mat4::from_scale_rotation_translation(s0.lerp(s1, weight), r0.slerp(r1, weight), t0.lerp(t1, weight));
+        }
+    }
+}
+
+/// Turn the eye bones by a gaze (x right, y up, -1..1) of up to `max` (yaw,
+/// pitch) radians, in the head's frame.
+pub fn apply_eye_gaze(skel: &Skeleton, rig: &HumanoidRig, locals: &mut [Mat4], left: glam::Vec2, right: glam::Vec2, max: glam::Vec2) {
+    let Some(head) = rig.head else { return };
+    let rest = world_matrices(skel, &skel.rest_locals());
+    let w = world_matrices(skel, locals);
+    let turn = world_rot(&w, head) * world_rot(&rest, head).inverse();
+    let fwd = turn * rest_forward(skel, rig);
+    let up = turn * Vec3::Y;
+    let side = fwd.cross(up).normalize_or(Vec3::NEG_X);
+    for (eye, g) in [(rig.l_eye, left), (rig.r_eye, right)] {
+        let Some(e) = eye else { continue };
+        let g = g.clamp(glam::Vec2::splat(-1.0), glam::Vec2::ONE);
+        let delta = Quat::from_axis_angle(side, g.y * max.y) * Quat::from_axis_angle(up, -g.x * max.x);
+        rotate_joint(skel, locals, e, delta);
+    }
+}
+
+/// Pose the skeleton from tracker targets in its own space, starting from the
+/// rest pose, without foot planting. Returns per-joint locals.
 pub fn pose_from_trackers(skel: &Skeleton, targets: &TrackerTargets) -> Vec<Mat4> {
     let rig = HumanoidRig::map(skel);
     let mut locals = skel.rest_locals();
-
-    // Hips: drive the root directly from the waist tracker (fall back to head).
-    if let (Some(hips), Some((pos, rot))) = (rig.hips, targets.hips.or(targets.head)) {
-        locals[hips] = Mat4::from_rotation_translation(rot, pos);
-    }
-    // Head: orient the head bone toward the head tracker's rotation.
-    if let (Some(head), Some((_, rot))) = (rig.head, targets.head) {
-        let (s, _, t) = locals[head].to_scale_rotation_translation();
-        locals[head] = Mat4::from_scale_rotation_translation(s, rot, t);
-    }
-
-    // Limbs: two-bone IK toward each end-effector tracker.
-    let world = world_matrices(skel, &locals);
-    let apply_limb = |a: usize, b: usize, c: usize, target: Vec3, locals: &mut [Mat4]| {
-        let root = world[a].w_axis.truncate();
-        let mid = world[b].w_axis.truncate();
-        let end = world[c].w_axis.truncate();
-        // Pole hint: bend roughly away from the root→end midline, toward -Z.
-        let pole = mid + Vec3::new(0.0, 0.0, -1.0);
-        let sol = solve_two_bone(root, mid, end, target, pole);
-        // Compose the solved world deltas into the bones' local rotations.
-        for (joint, delta) in [(a, sol.root_rotation), (b, sol.mid_rotation)] {
-            let parent_w = match skel.joints[joint].parent {
-                Some(p) => world[p],
-                None => Mat4::IDENTITY,
-            };
-            let (s, r, t) = locals[joint].to_scale_rotation_translation();
-            let (_, pr, _) = parent_w.to_scale_rotation_translation();
-            // delta is in world space; bring it into the parent's frame.
-            let local_delta = pr.inverse() * delta * pr;
-            locals[joint] = Mat4::from_scale_rotation_translation(s, local_delta * r, t);
-        }
-    };
-
-    let arm_targets = [targets.left_hand, targets.right_hand];
-    for (i, (ua, la, ha)) in rig.arms().iter().enumerate() {
-        if let (Some(a), Some(b), Some(c), Some((tp, _))) = (*ua, *la, *ha, arm_targets[i]) {
-            apply_limb(a, b, c, tp, &mut locals);
-        }
-    }
-    let leg_targets = [targets.left_foot, targets.right_foot];
-    for (i, (ul, ll, fl)) in rig.legs().iter().enumerate() {
-        if let (Some(a), Some(b), Some(c), Some((tp, _))) = (*ul, *ll, *fl, leg_targets[i]) {
-            apply_limb(a, b, c, tp, &mut locals);
-        }
-    }
+    let settings = BodyIkSettings { plant_feet: false, ..Default::default() };
+    solve_body(skel, &rig, &mut locals, targets, &settings, &mut BodyIkState::default(), Mat4::IDENTITY, 0.0);
     locals
 }
 
@@ -342,76 +662,107 @@ pub fn apply_foot_ik(
     }
 }
 
-/// Raw world poses of whichever full-body trackers are present this frame (head,
-/// hands, hips, feet). Source-agnostic: SteamVR/SlimeVR, a mocap stream, etc.
+/// Raw tracker poses in slot order (see `TrackerTargets::slots`), any source.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct TrackerPoses {
-    pub head: Option<Mat4>,
-    pub left_hand: Option<Mat4>,
-    pub right_hand: Option<Mat4>,
-    pub hips: Option<Mat4>,
-    pub left_foot: Option<Mat4>,
-    pub right_foot: Option<Mat4>,
+pub struct TrackerPoses(pub [Option<Mat4>; TRACKER_SLOTS]);
+
+impl TrackerPoses {
+    pub fn from_targets(t: &TrackerTargets) -> Self {
+        Self(t.slots().map(|p| p.map(|(pos, rot)| Mat4::from_rotation_translation(rot, pos))))
+    }
 }
 
-/// Per-role calibration offsets captured at the T-pose alignment step.
+/// Per-slot calibration offsets from a tracker to the bone it drives.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BodyCalibration {
-    pub head: Option<TrackerCalibration>,
-    pub left_hand: Option<TrackerCalibration>,
-    pub right_hand: Option<TrackerCalibration>,
-    pub hips: Option<TrackerCalibration>,
-    pub left_foot: Option<TrackerCalibration>,
-    pub right_foot: Option<TrackerCalibration>,
+pub struct BodyCalibration(pub [Option<TrackerCalibration>; TRACKER_SLOTS]);
+
+/// The bone each tracker slot drives (elbow and knee trackers drive the lower
+/// arm / leg joint, i.e. the elbow and knee).
+fn slot_bones(rig: &HumanoidRig) -> [Option<usize>; TRACKER_SLOTS] {
+    [
+        rig.head,
+        rig.l_hand,
+        rig.r_hand,
+        rig.hips,
+        rig.l_foot,
+        rig.r_foot,
+        rig.chest,
+        rig.l_lower_arm,
+        rig.r_lower_arm,
+        rig.l_lower_leg,
+        rig.r_lower_leg,
+    ]
 }
 
-/// Capture full-body calibration: the avatar is shown in its rest/T-pose and the
-/// player stands in the matching T-pose; for each assigned tracker we store the
-/// rigid offset from the raw tracker pose to its bone's world pose. Confirm this
-/// once, then drive the avatar with [`targets_from_calibrated`] every frame.
-///
-/// Assumes the skeleton's rest pose is (close to) a T-pose, which is the norm for
-/// imported humanoid rigs; if not, pose the avatar into a T-pose first and pass
-/// those locals via a skeleton whose rest matches.
+/// Capture full-body calibration while the player holds the avatar's rest
+/// pose (a T-pose for imported humanoids). The avatar is lined up under the
+/// player's head, turned to face where the head faces, then each tracker's
+/// offset to its bone is stored. After this, [`targets_from_calibrated`] turns
+/// live tracker poses into bone targets in the trackers' space.
 pub fn calibrate_tpose(skel: &Skeleton, raw: &TrackerPoses) -> BodyCalibration {
-    let locals = skel.rest_locals();
-    let world = world_matrices(skel, &locals);
     let rig = HumanoidRig::map(skel);
-    let cap = |bone: Option<usize>, t: Option<Mat4>| match (bone, t) {
-        (Some(b), Some(tp)) => Some(TrackerCalibration::capture(tp, world[b])),
-        _ => None,
+    let world = world_matrices(skel, &skel.rest_locals());
+    let align = match (raw.0[0], rig.head) {
+        (Some(hmd), Some(head)) => {
+            let (_, hr, hp) = hmd.to_scale_rotation_translation();
+            let look = hr * Vec3::NEG_Z;
+            let yaw = yaw_of(Quat::from_rotation_arc(rest_forward(skel, &rig), Vec3::new(look.x, 0.0, look.z).normalize_or(Vec3::NEG_Z)), rest_forward(skel, &rig));
+            let head_at = yaw * pos(&world[head]);
+            Mat4::from_rotation_translation(yaw, Vec3::new(hp.x - head_at.x, 0.0, hp.z - head_at.z))
+        }
+        _ => Mat4::IDENTITY,
     };
-    BodyCalibration {
-        head: cap(rig.head, raw.head),
-        left_hand: cap(rig.l_hand, raw.left_hand),
-        right_hand: cap(rig.r_hand, raw.right_hand),
-        hips: cap(rig.hips, raw.hips),
-        left_foot: cap(rig.l_foot, raw.left_foot),
-        right_foot: cap(rig.r_foot, raw.right_foot),
+    let bones = slot_bones(&rig);
+    let mut out = BodyCalibration::default();
+    for ((slot, bone), t) in out.0.iter_mut().zip(bones).zip(raw.0) {
+        if let (Some(b), Some(t)) = (bone, t) {
+            *slot = Some(TrackerCalibration::capture(t, align * world[b]));
+        }
     }
+    out
 }
 
-/// Turn live tracker poses into IK end-effector targets using a captured
-/// [`BodyCalibration`]; feed the result straight into [`pose_from_trackers`].
-pub fn targets_from_calibrated(cal: &BodyCalibration, raw: &TrackerPoses) -> TrackerTargets {
-    let conv = |c: Option<TrackerCalibration>, t: Option<Mat4>| -> Option<(Vec3, Quat)> {
-        match (c, t) {
-            (Some(c), Some(tp)) => {
-                let m = c.apply(tp);
-                let (_, r, p) = m.to_scale_rotation_translation();
-                Some((p, r))
+/// Calibration used before the player calibrates: the offsets an ideal player
+/// would produce in the rest pose (headset at the eyes looking forward,
+/// controllers and trackers aligned with the body), so head and hand rotations
+/// already map sensibly onto the bones.
+pub fn default_calibration(skel: &Skeleton) -> BodyCalibration {
+    let rig = HumanoidRig::map(skel);
+    let world = world_matrices(skel, &skel.rest_locals());
+    let fwd = rest_forward(skel, &rig);
+    let facing = Quat::from_rotation_y((-fwd.x).atan2(-fwd.z));
+    let bones = slot_bones(&rig);
+    let mut raw = TrackerPoses::default();
+    for (k, (slot, bone)) in raw.0.iter_mut().zip(bones).enumerate() {
+        if let Some(b) = bone {
+            let mut p = pos(&world[b]);
+            if k == 0 {
+                p += fwd * 0.08 + Vec3::Y * 0.07;
             }
-            _ => None,
+            *slot = Some(Mat4::from_rotation_translation(facing, p));
         }
-    };
-    TrackerTargets {
-        head: conv(cal.head, raw.head),
-        left_hand: conv(cal.left_hand, raw.left_hand),
-        right_hand: conv(cal.right_hand, raw.right_hand),
-        hips: conv(cal.hips, raw.hips),
-        left_foot: conv(cal.left_foot, raw.left_foot),
-        right_foot: conv(cal.right_foot, raw.right_foot),
     }
+    let mut out = BodyCalibration::default();
+    for ((slot, bone), t) in out.0.iter_mut().zip(bones).zip(raw.0) {
+        if let (Some(b), Some(t)) = (bone, t) {
+            *slot = Some(TrackerCalibration::capture(t, world[b]));
+        }
+    }
+    out
+}
+
+/// Turn live tracker poses into bone targets using a [`BodyCalibration`].
+/// Slots without a calibration pass through unchanged.
+pub fn targets_from_calibrated(cal: &BodyCalibration, raw: &TrackerPoses) -> TrackerTargets {
+    let mut out = [None; TRACKER_SLOTS];
+    for ((slot, t), c) in out.iter_mut().zip(raw.0).zip(cal.0) {
+        *slot = t.map(|t| {
+            let m = c.map(|c| c.apply(t)).unwrap_or(t);
+            let (_, r, p) = m.to_scale_rotation_translation();
+            (p, r.normalize())
+        });
+    }
+    TrackerTargets::from_slots(out)
 }
 
 #[cfg(test)]
@@ -445,25 +796,135 @@ mod tests {
             ],
         };
         // Trackers sit slightly off the bones at the calibration (T-)pose.
-        let raw = TrackerPoses {
-            hips: Some(Mat4::from_translation(Vec3::new(0.02, 1.0, 0.0))),
-            left_hand: Some(Mat4::from_translation(Vec3::new(0.5, 0.03, 0.0))),
-            ..Default::default()
-        };
+        let mut raw = TrackerPoses::default();
+        raw.0[3] = Some(Mat4::from_translation(Vec3::new(0.02, 1.0, 0.0)));
+        raw.0[1] = Some(Mat4::from_translation(Vec3::new(0.5, 0.03, 0.0)));
         let cal = calibrate_tpose(&skel, &raw);
         // At the calibration pose the targets recover the bone world positions.
         let t = targets_from_calibrated(&cal, &raw);
         assert!((t.hips.unwrap().0 - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-3);
         assert!((t.left_hand.unwrap().0 - Vec3::new(0.5, 1.0, 0.0)).length() < 1e-3);
         // Moving the hand tracker moves its target by the same world delta.
-        let moved = TrackerPoses {
-            left_hand: Some(
-                Mat4::from_translation(Vec3::new(0.0, 0.0, 0.2)) * raw.left_hand.unwrap(),
-            ),
-            ..raw
-        };
+        let mut moved = raw;
+        moved.0[1] = Some(Mat4::from_translation(Vec3::new(0.0, 0.0, 0.2)) * raw.0[1].unwrap());
         let t2 = targets_from_calibrated(&cal, &moved);
         assert!((t2.left_hand.unwrap().0 - Vec3::new(0.5, 1.0, 0.2)).length() < 1e-3);
+    }
+
+    /// A T-pose humanoid facing +Z, hips at 1 m, head at 1.65 m.
+    fn tpose() -> Skeleton {
+        let mut joints = vec![
+            joint_at("Hips", None, Vec3::new(0.0, 1.0, 0.0)),
+            joint_at("Spine", Some(0), Vec3::new(0.0, 0.15, 0.0)),
+            joint_at("Chest", Some(1), Vec3::new(0.0, 0.2, 0.0)),
+            joint_at("Neck", Some(2), Vec3::new(0.0, 0.2, 0.0)),
+            joint_at("Head", Some(3), Vec3::new(0.0, 0.1, 0.0)),
+        ];
+        for (side, x) in [("Left", 1.0f32), ("Right", -1.0)] {
+            let base = joints.len();
+            joints.push(joint_at(&format!("{side}Shoulder"), Some(2), Vec3::new(0.05 * x, 0.15, 0.0)));
+            joints.push(joint_at(&format!("{side}UpperArm"), Some(base), Vec3::new(0.1 * x, 0.0, 0.0)));
+            joints.push(joint_at(&format!("{side}LowerArm"), Some(base + 1), Vec3::new(0.25 * x, 0.0, 0.0)));
+            joints.push(joint_at(&format!("{side}Hand"), Some(base + 2), Vec3::new(0.25 * x, 0.0, 0.0)));
+            joints.push(joint_at(&format!("{side}UpperLeg"), Some(0), Vec3::new(0.1 * x, -0.05, 0.0)));
+            joints.push(joint_at(&format!("{side}LowerLeg"), Some(base + 4), Vec3::new(0.0, -0.45, 0.0)));
+            joints.push(joint_at(&format!("{side}Foot"), Some(base + 5), Vec3::new(0.0, -0.42, 0.0)));
+        }
+        Skeleton { joints }
+    }
+
+    fn at(skel: &Skeleton, locals: &[Mat4], name: &str) -> Vec3 {
+        let i = skel.joints.iter().position(|j| j.name == name).unwrap();
+        world_matrices(skel, locals)[i].w_axis.truncate()
+    }
+
+    #[test]
+    fn maps_the_full_rig() {
+        let skel = tpose();
+        let rig = HumanoidRig::map(&skel);
+        assert_eq!((rig.chest, rig.neck, rig.l_shoulder, rig.r_shoulder), (Some(2), Some(3), Some(5), Some(12)));
+        assert_eq!(spine_chain(&skel, &rig), vec![1, 2, 3]);
+        assert!((rest_forward(&skel, &rig) - Vec3::Z).length() < 1e-5);
+    }
+
+    #[test]
+    fn three_point_tracking_reaches_head_and_hands_and_crouches_on_planted_feet() {
+        let skel = tpose();
+        let rig = HumanoidRig::map(&skel);
+        let targets = TrackerTargets {
+            head: Some((Vec3::new(0.0, 1.55, 0.05), Quat::IDENTITY)),
+            left_hand: Some((Vec3::new(0.3, 1.2, 0.3), Quat::IDENTITY)),
+            right_hand: Some((Vec3::new(-0.3, 1.2, 0.3), Quat::IDENTITY)),
+            ..Default::default()
+        };
+        let mut locals = skel.rest_locals();
+        let mut state = BodyIkState::default();
+        solve_body(&skel, &rig, &mut locals, &targets, &BodyIkSettings::default(), &mut state, Mat4::IDENTITY, 1.0 / 60.0);
+        assert!((at(&skel, &locals, "Head") - Vec3::new(0.0, 1.55, 0.05)).length() < 0.02);
+        assert!((at(&skel, &locals, "LeftHand") - Vec3::new(0.3, 1.2, 0.3)).length() < 0.02);
+        assert!((at(&skel, &locals, "RightHand") - Vec3::new(-0.3, 1.2, 0.3)).length() < 0.02);
+        // Elbows hang below the shoulder-hand line.
+        let (sh, el, ha) = (at(&skel, &locals, "LeftUpperArm"), at(&skel, &locals, "LeftLowerArm"), at(&skel, &locals, "LeftHand"));
+        assert!(el.y < (sh.y + ha.y) * 0.5, "elbow {el}");
+        // The hips dropped 10 cm with the head; feet stay on the floor and knees bend forward.
+        let foot = at(&skel, &locals, "LeftFoot");
+        assert!((foot.y - 0.08).abs() < 0.02, "foot {foot}");
+        let knee = at(&skel, &locals, "LeftLowerLeg");
+        assert!(knee.z > foot.z + 0.02, "knee {knee} foot {foot}");
+    }
+
+    #[test]
+    fn foot_and_hip_trackers_drive_the_legs_and_knee_trackers_aim_them() {
+        let skel = tpose();
+        let rig = HumanoidRig::map(&skel);
+        let targets = TrackerTargets {
+            head: Some((Vec3::new(0.0, 1.62, 0.0), Quat::IDENTITY)),
+            hips: Some((Vec3::new(0.0, 0.95, 0.0), Quat::IDENTITY)),
+            left_foot: Some((Vec3::new(0.15, 0.1, 0.25), Quat::IDENTITY)),
+            right_foot: Some((Vec3::new(-0.15, 0.1, -0.1), Quat::IDENTITY)),
+            left_knee: Some((Vec3::new(0.5, 0.5, 0.2), Quat::IDENTITY)),
+            ..Default::default()
+        };
+        let mut locals = skel.rest_locals();
+        solve_body(&skel, &rig, &mut locals, &targets, &BodyIkSettings::default(), &mut BodyIkState::default(), Mat4::IDENTITY, 0.0);
+        assert!((at(&skel, &locals, "Hips") - Vec3::new(0.0, 0.95, 0.0)).length() < 1e-3);
+        assert!((at(&skel, &locals, "LeftFoot") - Vec3::new(0.15, 0.1, 0.25)).length() < 0.02);
+        assert!((at(&skel, &locals, "RightFoot") - Vec3::new(-0.15, 0.1, -0.1)).length() < 0.02);
+        assert!(at(&skel, &locals, "LeftLowerLeg").x > 0.2, "left knee splays toward its tracker");
+    }
+
+    #[test]
+    fn planted_feet_hold_then_step_after_the_body() {
+        let skel = tpose();
+        let rig = HumanoidRig::map(&skel);
+        let settings = BodyIkSettings::default();
+        let mut state = BodyIkState::default();
+        let head = |x: f32| TrackerTargets { head: Some((Vec3::new(x, 1.62, 0.0), Quat::IDENTITY)), ..Default::default() };
+        let mut locals = skel.rest_locals();
+        solve_body(&skel, &rig, &mut locals, &head(0.0), &settings, &mut state, Mat4::IDENTITY, 1.0 / 60.0);
+        let start = at(&skel, &locals, "LeftFoot");
+        let mut locals = skel.rest_locals();
+        solve_body(&skel, &rig, &mut locals, &head(0.1), &settings, &mut state, Mat4::IDENTITY, 1.0 / 60.0);
+        assert!((at(&skel, &locals, "LeftFoot") - start).length() < 0.02, "a small lean keeps the foot planted");
+        for _ in 0..90 {
+            locals = skel.rest_locals();
+            solve_body(&skel, &rig, &mut locals, &head(0.6), &settings, &mut state, Mat4::IDENTITY, 1.0 / 60.0);
+        }
+        let foot = at(&skel, &locals, "LeftFoot");
+        assert!((foot.x - 0.7).abs() < 0.05 && (foot.y - 0.08).abs() < 0.02, "the foot stepped under the body: {foot}");
+    }
+
+    #[test]
+    fn default_calibration_maps_an_ideal_headset_onto_the_head_bone() {
+        let skel = tpose();
+        let cal = default_calibration(&skel);
+        let facing = Quat::from_rotation_y(std::f32::consts::PI);
+        let mut raw = TrackerPoses::default();
+        raw.0[0] = Some(Mat4::from_rotation_translation(facing, Vec3::new(0.0, 1.72, 0.08)));
+        let t = targets_from_calibrated(&cal, &raw);
+        let (p, r) = t.head.unwrap();
+        assert!((p - Vec3::new(0.0, 1.65, 0.0)).length() < 1e-3, "{p}");
+        assert!(r.angle_between(Quat::IDENTITY) < 1e-3);
     }
 
     #[test]

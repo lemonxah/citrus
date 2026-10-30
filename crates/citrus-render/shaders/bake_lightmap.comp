@@ -20,6 +20,10 @@ struct Vertex {
     vec4 color;
     vec4 tangent;
     vec2 uv1;
+    // Skinning lanes: unused here, but part of the 104-byte engine Vertex, so the
+    // array stride matches (without them every fetch past vertex 0 was wrong).
+    uvec4 joints;
+    vec4 weights;
 };
 layout(buffer_reference, scalar) readonly buffer Vertices { Vertex v[]; };
 layout(buffer_reference, scalar) readonly buffer Indices { uint i[]; };

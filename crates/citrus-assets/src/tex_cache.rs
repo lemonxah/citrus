@@ -63,7 +63,7 @@ fn cache_path(src: &Path, srgb: bool) -> Option<PathBuf> {
 fn encode_texture(data: &citrus_render::TextureData) -> CompressedTexture {
     // BC needs multiple-of-4 dims and device support; otherwise keep raw (still
     // cached so the source decode isn't repeated).
-    let mult4 = data.width % 4 == 0 && data.height % 4 == 0 && data.width >= 4 && data.height >= 4;
+    let mult4 = data.width.is_multiple_of(4) && data.height.is_multiple_of(4) && data.width >= 4 && data.height >= 4;
     let mult4 = mult4 && citrus_render::bc_supported();
     if data.hdr {
         if mult4 {
@@ -104,7 +104,7 @@ fn encode_bc7(data: &citrus_render::TextureData, format: TexFormat) -> Compresse
     // usually albedo) have no real alpha. Only pay for alpha when a texel is
     // actually non-opaque. Ultra-fast tier: this is a one-time encode and the
     // quality is still good for material maps.
-    let has_alpha = data.pixels.chunks_exact(4).any(|p| p[3] != 255);
+    let has_alpha = data.pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
     let settings = if has_alpha {
         intel_tex_2::bc7::alpha_ultra_fast_settings()
     } else {
@@ -381,7 +381,7 @@ pub fn texture_mean_linear(data: &citrus_render::TextureData) -> [f32; 3] {
     }
     let mut acc = [0.0f64; 3];
     let mut n = 0u64;
-    for px in data.pixels.chunks_exact(4) {
+    for px in data.pixels.as_chunks::<4>().0 {
         for c in 0..3 {
             let s = px[c] as f32 / 255.0;
             acc[c] += if data.srgb { srgb_to_linear(s) } else { s } as f64;
@@ -404,6 +404,104 @@ fn srgb_to_linear(c: f32) -> f32 {
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// The import-cache blob for a texture (encoding it first when stale), with
+/// the source mtime/size fields zeroed so it can travel inside a content
+/// package and be re-bound to the extracted file by [`seed_texture_cache`].
+pub fn texture_cache_blob(path: impl AsRef<Path>, srgb: bool) -> Result<Vec<u8>> {
+    let path = path.as_ref();
+    let tex = load_texture_bc(path, srgb)?;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(MAGIC);
+    buf.push(format_byte(tex.format));
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(&tex.width.to_le_bytes());
+    buf.extend_from_slice(&tex.height.to_le_bytes());
+    buf.extend_from_slice(&(tex.mips.len() as u32).to_le_bytes());
+    for mip in &tex.mips {
+        buf.extend_from_slice(&(mip.len() as u32).to_le_bytes());
+        buf.extend_from_slice(mip);
+    }
+    Ok(buf)
+}
+
+/// Install a packaged cache blob for `path` (already on disk) so the next
+/// `load_texture_bc` skips the decode + encode. The blob is fully validated
+/// (format, dimensions, per-mip byte counts) since it may come from untrusted
+/// content; BC blobs are skipped on devices without BC support. Returns the
+/// texture's GPU byte size when installed, None when skipped.
+pub fn seed_texture_cache(path: impl AsRef<Path>, srgb: bool, blob: &[u8], max_dim: u32) -> Result<Option<u64>> {
+    let path = path.as_ref();
+    if blob.len() < 9 + 16 || &blob[..8] != MAGIC {
+        anyhow::bail!("not a texture cache blob");
+    }
+    let tex = parse_blob(blob).context("malformed texture cache blob")?;
+    validate_compressed(&tex, max_dim)?;
+    let is_bc = matches!(tex.format, TexFormat::Bc7Srgb | TexFormat::Bc7Unorm | TexFormat::Bc6h);
+    if is_bc && !citrus_render::bc_supported() {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(path).with_context(|| format!("seeding cache for {}", path.display()))?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cache = cache_path(path, srgb).context("texture has no parent directory")?;
+    write_cache(&cache, &tex, mtime, meta.len())?;
+    Ok(Some(tex.mips.iter().map(|m| m.len() as u64).sum()))
+}
+
+fn parse_blob(bytes: &[u8]) -> Option<CompressedTexture> {
+    let mut p = 8usize;
+    let take = |p: &mut usize, n: usize| -> Option<&[u8]> {
+        let s = bytes.get(*p..p.checked_add(n)?)?;
+        *p += n;
+        Some(s)
+    };
+    let format = byte_format(take(&mut p, 1)?[0])?;
+    take(&mut p, 16)?;
+    let u32_at = |p: &mut usize| -> Option<u32> { Some(u32::from_le_bytes(take(p, 4)?.try_into().ok()?)) };
+    let width = u32_at(&mut p)?;
+    let height = u32_at(&mut p)?;
+    let mip_count = u32_at(&mut p)? as usize;
+    if mip_count == 0 || mip_count > 16 {
+        return None;
+    }
+    let mut mips = Vec::with_capacity(mip_count);
+    for _ in 0..mip_count {
+        let len = u32_at(&mut p)? as usize;
+        mips.push(take(&mut p, len)?.to_vec());
+    }
+    (p == bytes.len()).then_some(CompressedTexture {
+        format,
+        width,
+        height,
+        mips,
+    })
+}
+
+/// Check a compressed texture's mip byte counts match its format and size, so
+/// a crafted cache can't make the GPU upload read past a buffer.
+pub fn validate_compressed(tex: &CompressedTexture, max_dim: u32) -> Result<()> {
+    if tex.width == 0 || tex.height == 0 || tex.width > max_dim || tex.height > max_dim {
+        anyhow::bail!("texture size {}x{} outside 1..={max_dim}", tex.width, tex.height);
+    }
+    for (i, mip) in tex.mips.iter().enumerate() {
+        let (w, h) = ((tex.width >> i).max(1) as usize, (tex.height >> i).max(1) as usize);
+        let expected = match tex.format {
+            TexFormat::Bc7Srgb | TexFormat::Bc7Unorm | TexFormat::Bc6h => w.div_ceil(4) * h.div_ceil(4) * 16,
+            TexFormat::RgbaSrgb | TexFormat::RgbaUnorm => w * h * 4,
+            TexFormat::RgbaF16 => w * h * 8,
+        };
+        if mip.len() != expected {
+            anyhow::bail!("mip {i} holds {} bytes, expected {expected}", mip.len());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

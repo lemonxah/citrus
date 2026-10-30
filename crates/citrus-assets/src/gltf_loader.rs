@@ -21,6 +21,8 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
         materials: Vec::new(),
         instances: Vec::new(),
         skeletons: Vec::new(),
+        morphs: Vec::new(),
+        springs: Default::default(),
         animations: Vec::new(),
     };
     // (image index, srgb) -> scene texture index. The same image can be
@@ -108,6 +110,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 emission: has_emission,
                 alpha_mode,
                 double_sided: material.double_sided(),
+                water: false,
             },
             albedo,
             normal,
@@ -208,6 +211,11 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
             // models). Only genuinely overlapping/tiled uv0 needs a generated set.
             let has_lightmap_uv =
                 real_uv1 || crate::lightmap_uv::uv0_is_lightmappable(&vertices, &indices);
+            let morphs = read_morphs(&reader, &mesh, &primitive, vertices.len());
+            if !morphs.is_empty() {
+                scene.morphs.resize(scene.meshes.len(), Vec::new());
+                scene.morphs.push(morphs);
+            }
             scene.meshes.push(MeshData { vertices, indices, has_lightmap_uv });
             let material = primitive.material().index().unwrap_or(default_material);
             primitive_map.insert(
@@ -323,6 +331,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
     if scene.instances.is_empty() {
         bail!("glTF scene produced no renderable instances");
     }
+    scene.springs = crate::vrm::read_springs(path);
     tracing::info!(
         meshes = scene.meshes.len(),
         materials = scene.materials.len(),
@@ -375,7 +384,7 @@ fn rgba8_from_gltf(data: &gltf::image::Data, srgb: bool) -> Result<citrus_render
         Format::R8G8B8A8 => data.pixels.clone(),
         Format::R8G8B8 => {
             let mut out = Vec::with_capacity(pixel_count * 4);
-            for chunk in data.pixels.chunks_exact(3) {
+            for chunk in data.pixels.as_chunks::<3>().0 {
                 out.extend_from_slice(chunk);
                 out.push(255);
             }
@@ -390,7 +399,7 @@ fn rgba8_from_gltf(data: &gltf::image::Data, srgb: bool) -> Result<citrus_render
         }
         Format::R8G8 => {
             let mut out = Vec::with_capacity(pixel_count * 4);
-            for chunk in data.pixels.chunks_exact(2) {
+            for chunk in data.pixels.as_chunks::<2>().0 {
                 out.extend_from_slice(&[chunk[0], chunk[1], 0, 255]);
             }
             out
@@ -405,3 +414,45 @@ fn rgba8_from_gltf(data: &gltf::image::Data, srgb: bool) -> Result<citrus_render
         hdr: false,
     })
 }
+
+/// Blendshape names from `extras.targetNames` (on the primitive, else the mesh,
+/// as exporters write them).
+fn target_names(mesh: &gltf::Mesh, primitive: &gltf::Primitive) -> Vec<String> {
+    let parse = |extras: &gltf::json::Extras| -> Option<Vec<String>> {
+        let raw = extras.as_ref()?;
+        let v: serde_json::Value = serde_json::from_str(raw.get()).ok()?;
+        let names = v.get("targetNames")?.as_array()?;
+        Some(names.iter().map(|n| n.as_str().unwrap_or_default().to_owned()).collect())
+    };
+    parse(primitive.extras()).or_else(|| parse(mesh.extras())).unwrap_or_default()
+}
+
+/// A primitive's morph targets, keeping only the vertices each one moves.
+fn read_morphs<'a, 's, F>(
+    reader: &gltf::mesh::Reader<'a, 's, F>,
+    mesh: &gltf::Mesh,
+    primitive: &gltf::Primitive,
+    vertex_count: usize,
+) -> Vec<crate::MorphTarget>
+where
+    F: Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]>,
+{
+    let names = target_names(mesh, primitive);
+    let mut out = Vec::new();
+    for (k, (positions, normals, _)) in reader.read_morph_targets().enumerate() {
+        let p: Vec<[f32; 3]> = positions.map(|it| it.collect()).unwrap_or_default();
+        let n: Vec<[f32; 3]> = normals.map(|it| it.collect()).unwrap_or_default();
+        let mut deltas = Vec::new();
+        for v in 0..vertex_count {
+            let dp = p.get(v).copied().unwrap_or_default();
+            let dn = n.get(v).copied().unwrap_or_default();
+            if dp.iter().chain(&dn).any(|x| x.abs() > 1e-7) {
+                deltas.push((v as u32, dp, dn));
+            }
+        }
+        let name = names.get(k).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| format!("Shape {k}"));
+        out.push(crate::MorphTarget { name, deltas });
+    }
+    out
+}
+

@@ -22,6 +22,7 @@ pub struct PassEnv<'a> {
     pub dt: f32,
     pub unscaled_dt: f32,
     pub time: f32,
+    pub water_time: f32,
     pub time_scale: f32,
     pub input: &'a citrus_core::InputState,
     pub net: &'a citrus_core::NetView,
@@ -44,13 +45,12 @@ struct PassLookup<'a> {
 
 impl citrus_core::ComponentLookup for PassLookup<'_> {
     fn component(&self, object: usize, type_id: std::any::TypeId) -> Option<&dyn Component> {
-        let matches = |c: &&Box<dyn Component>| c.as_any().type_id() == type_id;
-        let found = if object == self.self_index {
-            self.before.iter().chain(self.after.iter()).find(matches)
+        let matches = |c: &&dyn Component| c.as_any().type_id() == type_id;
+        if object == self.self_index {
+            self.before.iter().chain(self.after.iter()).map(|c| c.as_ref()).find(matches)
         } else {
-            self.objects.get(object)?.components.iter().find(matches)
-        };
-        found.map(|c| c.as_ref())
+            self.objects.get(object)?.components.iter().map(|c| c.as_ref()).find(matches)
+        }
     }
 }
 
@@ -186,6 +186,65 @@ struct SkinnedMesh {
     mesh_index: usize,
     base_vertices: Vec<citrus_render::Vertex>,
     skeleton: usize,
+    /// Bind-space AABB of the vertices each joint influences, for posed
+    /// culling bounds (`posed_bounds`).
+    joint_boxes: Vec<(u32, Vec3, Vec3)>,
+    /// Blendshapes, driven by Face Tracking / Blend Shapes.
+    morphs: Vec<citrus_assets::MorphTarget>,
+}
+
+impl SkinnedMesh {
+    fn new(mesh_index: usize, base_vertices: Vec<citrus_render::Vertex>, skeleton: usize) -> Self {
+        let mut boxes: HashMap<u32, (Vec3, Vec3)> = HashMap::new();
+        for v in &base_vertices {
+            let p = Vec3::from(v.position);
+            for (j, w) in v.joints.iter().zip(v.weights) {
+                if w > 0.0 {
+                    let b = boxes.entry(*j).or_insert((p, p));
+                    b.0 = b.0.min(p);
+                    b.1 = b.1.max(p);
+                }
+            }
+        }
+        let joint_boxes = boxes.into_iter().map(|(j, (lo, hi))| (j, lo, hi)).collect();
+        Self { mesh_index, base_vertices, skeleton, joint_boxes, morphs: Vec::new() }
+    }
+}
+
+/// The model template a LOD level draws: its own model, or a mesh generated
+/// from the object's model (`base`) at the level's triangle share. None =
+/// the base mesh.
+fn lod_template_key(level: &citrus_core::LodLevel, base: Option<&str>) -> Option<String> {
+    if !level.model.is_empty() {
+        return Some(level.model.clone());
+    }
+    let base = base?;
+    (level.keep > 0.0 && level.keep < 1.0).then(|| format!("{base}#lod{:.3}", level.keep))
+}
+
+/// Object-space AABB of a skinned mesh in the pose `palette`: each joint's
+/// bind-space vertex box moved by that joint's skinning matrix. A vertex
+/// blended between joints lies inside the union of its joints' boxes.
+fn posed_bounds(boxes: &[(u32, Vec3, Vec3)], palette: &[Mat4]) -> Option<(Vec3, Vec3)> {
+    let mut out: Option<(Vec3, Vec3)> = None;
+    for &(j, lo, hi) in boxes {
+        let Some(m) = palette.get(j as usize) else {
+            continue;
+        };
+        for k in 0..8 {
+            let c = Vec3::new(
+                if k & 1 == 0 { lo.x } else { hi.x },
+                if k & 2 == 0 { lo.y } else { hi.y },
+                if k & 4 == 0 { lo.z } else { hi.z },
+            );
+            let p = m.transform_point3(c);
+            out = Some(match out {
+                Some((a, b)) => (a.min(p), b.max(p)),
+                None => (p, p),
+            });
+        }
+    }
+    out
 }
 
 /// An object's own skinned vertex buffers, driven by its `Animator`.
@@ -195,6 +254,9 @@ struct AnimInstance {
     /// Skinned by the GPU compute pass (else CPU-written).
     gpu: bool,
 }
+
+/// Wire edges of a collider shape (local space), shared.
+pub type ColliderWire = std::sync::Arc<Vec<(Vec3, Vec3)>>;
 
 pub struct LoadedScene {
     /// Rebuilt every frame from renderable objects.
@@ -206,6 +268,12 @@ pub struct LoadedScene {
     skeletons: Vec<citrus_assets::Skeleton>,
     animations: Vec<citrus_assets::AnimationClip>,
     skinned_meshes: Vec<SkinnedMesh>,
+    /// Posed object-space bounds of skinned meshes, refreshed by
+    /// `update_skinning`: per Animator object (id, mesh), and per shared mesh.
+    pose_bounds: HashMap<(ObjectId, usize), (Vec3, Vec3)>,
+    /// When each render-texture camera last refreshed (its Update Rate).
+    camera_target_last: HashMap<ObjectId, std::time::Instant>,
+    shared_pose_bounds: HashMap<usize, (Vec3, Vec3)>,
     /// Skeleton index each entry of `animations` animates (parallel).
     clip_skeleton: Vec<usize>,
     /// Per-object skinned copies for objects with an `Animator`.
@@ -222,6 +290,16 @@ pub struct LoadedScene {
     /// Captured full-body tracker calibration (from a T-pose alignment). When set,
     /// raw tracker poses are remapped through it before driving IK.
     vr_calibration: Option<crate::humanoid::BodyCalibration>,
+    /// Planted-foot state of each object's Humanoid IK.
+    body_ik_state: HashMap<ObjectId, crate::humanoid::BodyIkState>,
+    /// This machine's face tracking this frame (headset or OSC).
+    local_face: Option<citrus_core::FaceFrame>,
+    /// Clock for cloth wind gusts (s).
+    cloth_time: f32,
+    /// Lip sync: the local mic's visemes, and remote players' by the object
+    /// their peer owns.
+    local_visemes: Option<citrus_core::VisemeFrame>,
+    remote_visemes: HashMap<ObjectId, citrus_core::VisemeFrame>,
     mesh_handles: Vec<MeshHandle>,
     mesh_infos: Vec<MeshInfo>,
     mesh_bounds: Vec<(Vec3, Vec3)>,
@@ -239,6 +317,9 @@ pub struct LoadedScene {
     /// Loaded `.postfx` profiles by project-relative path (Volume references).
     /// Cached on first use; reload the scene to pick up external edits.
     postfx_cache: std::collections::HashMap<String, citrus_assets::PostFxProfile>,
+    /// Volumes affecting the last `effective_postfx` camera: (object name,
+    /// weight, effects its profile overrides). Shown by the Environment tab.
+    pub postfx_overrides: Vec<(String, f32, Vec<&'static str>)>,
     primitive_meshes: HashMap<citrus_assets::PrimitiveShape, usize>,
     default_material: Option<usize>,
     /// model path -> base index of its meshes in the scene arrays
@@ -247,6 +328,9 @@ pub struct LoadedScene {
     /// Imported model path -> (first mesh index, template material per model
     /// mesh). Lets scene entries and runtime prefab spawns reuse uploaded models.
     model_templates: HashMap<String, (usize, Vec<usize>)>,
+    /// Each model's parts as imported (scene files store model instances as
+    /// their changes against these).
+    model_parts: HashMap<String, Vec<citrus_assets::ModelPart>>,
     /// Builtin test-scene meshes: (first mesh index, template materials).
     builtin_template: Option<(usize, Vec<usize>)>,
     material_file_cache: HashMap<PathBuf, usize>,
@@ -266,12 +350,39 @@ pub struct LoadedScene {
     pub baked: Option<BakedData>,
     /// Steam Audio bake (serialized probe batch, `<scene>.audiobake`).
     pub audio_bake: Option<std::sync::Arc<Vec<u8>>>,
+    /// Baked occlusion culling (`<scene>.occlusion`), if any.
+    pub occlusion: Option<crate::occlusion::OcclusionData>,
+    /// Position of the camera occlusion culling is evaluated from (set by the
+    /// host before `sync_draws`); None disables culling.
+    pub occlusion_camera: Option<Vec3>,
+    /// The editor's lightmap UV-checker preview is on (draws then carry each
+    /// object's lightmap resolution).
+    pub lightmap_preview: bool,
+    /// Per-frame world transforms / active flags from `sync_draws_multi`.
+    frame_cache_world: Vec<Mat4>,
+    frame_cache_active: Vec<bool>,
     /// Camera a possessed pawn activated this play session (2A). Overrides the
     /// default "smallest camera id" selection while set. Cleared on Stop.
     pub active_camera_override: Option<ObjectId>,
     /// Draws not tied to an object's render slots (world-UI quads, particles),
     /// refilled by the host every frame and appended by `sync_draws`.
     pub extra_draws: Vec<DrawCmd>,
+    /// Splashes and wakes from physics this frame, for the water effects.
+    pub water_splashes: Vec<citrus_core::WaterSplash>,
+    pub water_wakes: Vec<crate::water_fx::FxWake>,
+    /// Pushes from landing water (waterfalls) for Play's ripple step.
+    pub water_fx_pushes: Vec<(usize, citrus_core::WaterPush)>,
+    /// Water poured from containers, to draw this frame (Play).
+    pub water_pours: Vec<crate::water_carry::PourDrop>,
+    /// Poured water that hit something (point, velocity, litres): a few drops.
+    pub water_drips: Vec<(Vec3, Vec3, f32)>,
+    /// Wave Rider offsets this frame (object index -> world offset, tilt),
+    /// applied to what's drawn only: the synced transform stays the anchor.
+    pub ride_offsets: HashMap<usize, (Vec3, Quat)>,
+    /// Mesh Collider shapes built from render meshes (decomposition is slow).
+    pub collider_shapes: std::sync::Mutex<HashMap<crate::physics::ColliderShapeKey, std::sync::Arc<crate::physics::MeshColliderShape>>>,
+    /// Their wire edges for the editor gizmo.
+    pub collider_wires: std::sync::Mutex<HashMap<crate::physics::ColliderShapeKey, ColliderWire>>,
     /// Camera position for LOD selection (set by the host before `sync_draws`).
     pub lod_camera: Option<Vec3>,
     /// Current LOD level per object (hysteresis).
@@ -280,6 +391,8 @@ pub struct LoadedScene {
     lod_failed: std::collections::HashSet<String>,
     /// Scene file each additively loaded object came from (for unloading).
     pub object_origin: HashMap<ObjectId, String>,
+    /// Animator Controllers and `.anim` clips in use (loaded on demand).
+    pub anim_assets: crate::anim_graph::AnimAssets,
 }
 
 /// One probe volume's runtime metadata: where it sits and which SH range it
@@ -332,15 +445,24 @@ impl LoadedScene {
             skeletons: Vec::new(),
             animations: Vec::new(),
             skinned_meshes: Vec::new(),
+            pose_bounds: HashMap::new(),
+            camera_target_last: HashMap::new(),
+            shared_pose_bounds: HashMap::new(),
             clip_skeleton: Vec::new(),
             anim_instances: HashMap::new(),
             anim_time: 0.0,
             ik_targets: None,
             foot_ik: None,
             vr_calibration: None,
+            body_ik_state: HashMap::new(),
+            local_face: None,
+            cloth_time: 0.0,
+            local_visemes: None,
+            remote_visemes: HashMap::new(),
             mesh_geometry: Vec::new(),
             mesh_sdf: Vec::new(),
             postfx_cache: std::collections::HashMap::new(),
+            postfx_overrides: Vec::new(),
             mesh_handles: Vec::new(),
             mesh_infos: Vec::new(),
             mesh_bounds: Vec::new(),
@@ -349,12 +471,22 @@ impl LoadedScene {
             default_material: None,
             model_mesh_base: HashMap::new(),
             model_templates: HashMap::new(),
+            model_parts: HashMap::new(),
             builtin_template: None,
             extra_draws: Vec::new(),
+            water_splashes: Vec::new(),
+            water_wakes: Vec::new(),
+            water_fx_pushes: Vec::new(),
+            water_pours: Vec::new(),
+            water_drips: Vec::new(),
+            ride_offsets: HashMap::new(),
+            collider_shapes: Default::default(),
+            collider_wires: Default::default(),
             lod_camera: None,
             lod_state: HashMap::new(),
             lod_failed: Default::default(),
             object_origin: HashMap::new(),
+            anim_assets: Default::default(),
             material_file_cache: HashMap::new(),
             texture_file_cache: HashMap::new(),
             skybox: None,
@@ -363,6 +495,11 @@ impl LoadedScene {
             visible_layers: citrus_core::all_layers_mask(),
             baked: None,
             audio_bake: None,
+            occlusion: None,
+            occlusion_camera: None,
+            lightmap_preview: false,
+            frame_cache_world: Vec::new(),
+            frame_cache_active: Vec::new(),
             active_camera_override: None,
         }
     }
@@ -434,12 +571,27 @@ impl LoadedScene {
         let mut state = vec![0u8; n];
         let mut out = vec![Mat4::IDENTITY; n];
         for i in 0..n {
-            self.resolve_world(i, &mut state, &mut out);
+            self.resolve_world(i, &mut state, &mut out, None);
         }
         out
     }
 
-    fn resolve_world(&self, i: usize, state: &mut [u8], out: &mut [Mat4]) -> Mat4 {
+    /// [`Self::world_transforms`] with the Wave Rider offsets applied (and
+    /// carried to children): where things are drawn.
+    pub fn render_world_transforms(&self) -> Vec<Mat4> {
+        if self.ride_offsets.is_empty() {
+            return self.world_transforms();
+        }
+        let n = self.objects.len();
+        let mut state = vec![0u8; n];
+        let mut out = vec![Mat4::IDENTITY; n];
+        for i in 0..n {
+            self.resolve_world(i, &mut state, &mut out, Some(&self.ride_offsets));
+        }
+        out
+    }
+
+    fn resolve_world(&self, i: usize, state: &mut [u8], out: &mut [Mat4], offsets: Option<&HashMap<usize, (Vec3, Quat)>>) -> Mat4 {
         if state[i] == 2 {
             return out[i];
         }
@@ -450,10 +602,17 @@ impl LoadedScene {
         // In-progress parent (cycle) or root/dangling parent → treat local as world.
         let world = match self.objects[i].parent {
             Some(p) if p < out.len() && p != i && state[p] != 1 => {
-                let pw = self.resolve_world(p, state, out);
+                let pw = self.resolve_world(p, state, out, offsets);
                 pw * local
             }
             _ => local,
+        };
+        let world = match offsets.and_then(|o| o.get(&i)) {
+            Some(&(off, tilt)) => {
+                let pos = world.w_axis.truncate();
+                Mat4::from_translation(pos + off) * Mat4::from_quat(tilt) * Mat4::from_translation(-pos) * world
+            }
+            None => world,
         };
         state[i] = 2;
         out[i] = world;
@@ -481,6 +640,55 @@ impl LoadedScene {
     }
 
     /// Re-parent `child`, preserving its world transform. Rejects cycles.
+    /// Put `members` under a new Empty named "Group" at their centre (under
+    /// their shared parent, if they have one), keeping their world
+    /// transforms. Members inside another member's subtree stay where they
+    /// are. Returns the group's index.
+    pub fn group_into_empty(&mut self, members: &[usize]) -> Option<usize> {
+        let mut picked: Vec<usize> = members.iter().copied().filter(|&m| m < self.objects.len()).collect();
+        picked.sort_unstable();
+        picked.dedup();
+        let is_under = |scene: &Self, mut i: usize, set: &[usize]| {
+            while let Some(p) = scene.objects[i].parent {
+                if set.contains(&p) {
+                    return true;
+                }
+                i = p;
+            }
+            false
+        };
+        let tops: Vec<usize> = picked.iter().copied().filter(|&m| !is_under(self, m, &picked)).collect();
+        if tops.is_empty() {
+            return None;
+        }
+        let parent = self.objects[tops[0]].parent.filter(|p| tops.iter().all(|&m| self.objects[m].parent == Some(*p)));
+        let centre = tops.iter().map(|&m| self.world_transform(m).w_axis.truncate()).sum::<Vec3>() / tops.len() as f32;
+        let parent_world = parent.map_or(Mat4::IDENTITY, |p| self.world_transform(p));
+        let ids: Vec<ObjectId> = tops.iter().map(|&m| self.objects[m].id).collect();
+        let group_id = ObjectId::new();
+        self.objects.push(SceneObject {
+            id: group_id,
+            name: "Group".into(),
+            render: None,
+            extra_render: Vec::new(),
+            source: ObjectSource::Empty,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            layer: 0,
+            parent,
+            translation: parent_world.inverse().transform_point3(centre),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            components: Vec::new(),
+        });
+        for id in ids {
+            let (Some(child), Some(group)) = (self.index_of(id), self.index_of(group_id)) else { continue };
+            self.reorder_object(child, Some(group), None);
+        }
+        self.index_of(group_id)
+    }
+
     pub fn set_parent(&mut self, child: usize, parent: Option<usize>) {
         if let Some(p) = parent {
             if p == child || p >= self.objects.len() {
@@ -743,7 +951,7 @@ impl LoadedScene {
         self.clip_skeleton
             .extend(std::iter::repeat_n(skel_base, scene.animations.len()));
         let has_skeleton = !scene.skeletons.is_empty();
-        for mesh in &scene.meshes {
+        for (mesh_i, mesh) in scene.meshes.iter().enumerate() {
             // A mesh is skinned if any vertex carries skin weights and the model
             // brought a skeleton. Skinned meshes get a host-visible buffer + a
             // CPU-skinning record so they animate each frame.
@@ -751,11 +959,9 @@ impl LoadedScene {
             if skinned {
                 let handle = renderer.upload_mesh_skinned(mesh)?;
                 self.mesh_handles.push(handle);
-                self.skinned_meshes.push(SkinnedMesh {
-                    mesh_index: self.mesh_handles.len() - 1,
-                    base_vertices: mesh.vertices.clone(),
-                    skeleton: skel_base,
-                });
+                let mut sm = SkinnedMesh::new(self.mesh_handles.len() - 1, mesh.vertices.clone(), skel_base);
+                sm.morphs = scene.morphs.get(mesh_i).cloned().unwrap_or_default();
+                self.skinned_meshes.push(sm);
             } else {
                 self.mesh_handles.push(renderer.upload_mesh(mesh)?);
             }
@@ -825,6 +1031,9 @@ impl LoadedScene {
         // Group all of the model's objects under a single root (named after the
         // file), so an imported model is one entry in the Scene tree you can move
         // as a unit, and the loaders' per-material mesh split stays tidy.
+        if let Some(p) = source_path {
+            self.model_parts.entry(p.to_string_lossy().into_owned()).or_insert_with(|| citrus_assets::ModelPart::of(scene));
+        }
         let root_index = self.objects.len();
         let root_name = source_path
             .and_then(|p| p.file_stem())
@@ -847,6 +1056,7 @@ impl LoadedScene {
             components: Vec::new(),
         });
 
+        let first_new = self.objects.len();
         for instance in &scene.instances {
             let Some(&slot0) = instance.slots.first() else {
                 continue;
@@ -890,6 +1100,7 @@ impl LoadedScene {
                 components: Vec::new(),
             });
         }
+        self.attach_springs(first_new, &scene.springs);
         Ok(())
     }
 
@@ -919,11 +1130,9 @@ impl LoadedScene {
         for (i, mesh) in scene.meshes.iter().enumerate() {
             self.mesh_handles.push(mesh_handles[i]);
             if skinned.get(i).copied().unwrap_or(false) {
-                self.skinned_meshes.push(SkinnedMesh {
-                    mesh_index: self.mesh_handles.len() - 1,
-                    base_vertices: mesh.vertices.clone(),
-                    skeleton: skel_base,
-                });
+                let mut sm = SkinnedMesh::new(self.mesh_handles.len() - 1, mesh.vertices.clone(), skel_base);
+                sm.morphs = scene.morphs.get(i).cloned().unwrap_or_default();
+                self.skinned_meshes.push(sm);
             }
             self.mesh_geometry.push((
                 mesh.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
@@ -986,6 +1195,9 @@ impl LoadedScene {
             });
         }
 
+        if let Some(p) = source_path {
+            self.model_parts.entry(p.to_string_lossy().into_owned()).or_insert_with(|| citrus_assets::ModelPart::of(scene));
+        }
         let root_index = self.objects.len();
         let root_name = source_path
             .and_then(|p| p.file_stem())
@@ -1007,6 +1219,7 @@ impl LoadedScene {
             scale: Vec3::ONE,
             components: Vec::new(),
         });
+        let first_new = self.objects.len();
         for instance in &scene.instances {
             let Some(&slot0) = instance.slots.first() else {
                 continue;
@@ -1049,6 +1262,7 @@ impl LoadedScene {
                 components: Vec::new(),
             });
         }
+        self.attach_springs(first_new, &scene.springs);
         Ok(())
     }
 
@@ -1118,9 +1332,20 @@ impl LoadedScene {
         project_root: &Path,
     ) -> Result<usize> {
         let file = citrus_assets::load_material_file(path)?;
+        let camera_sizes: HashMap<ObjectId, [u32; 2]> = [&file.textures.albedo, &file.textures.emission]
+            .into_iter()
+            .flatten()
+            .filter_map(|p| camera_texture_id(p))
+            .map(|id| (id, self.camera_texture_size(id)))
+            .collect();
         let mut load_tex = |slot: &Option<PathBuf>, srgb: bool| -> Result<Option<TextureHandle>> {
             let Some(rel) = slot else { return Ok(None) };
-            let abs = project_root.join(rel);
+            // `camera:<object id>`: a render-texture camera's live target.
+            if let Some(id) = camera_texture_id(rel) {
+                let size = camera_sizes.get(&id).copied().unwrap_or([512, 512]);
+                return renderer.camera_target(id.raw(), size[0], size[1]).map(Some);
+            }
+            let abs = citrus_core::asset_ref::resolve_rel_path(project_root, rel);
             if let Some(&handle) = self.texture_file_cache.get(&(abs.clone(), srgb)) {
                 return Ok(Some(handle));
             }
@@ -1274,7 +1499,7 @@ impl LoadedScene {
     /// Disk-cached by citrus-assets (warmed by the scene loader's worker), so
     /// this never decodes on the main thread after the first load.
     fn texture_mean(project_root: &Path, rel: Option<&PathBuf>, srgb: bool) -> [f32; 3] {
-        rel.map_or([1.0; 3], |rel| citrus_assets::texture_mean(project_root.join(rel), srgb))
+        rel.map_or([1.0; 3], |rel| citrus_assets::texture_mean(citrus_core::asset_ref::resolve_rel_path(project_root, rel), srgb))
     }
 
     /// Push one material's inspector model into the renderer, resolving its
@@ -1325,6 +1550,7 @@ impl LoadedScene {
         let albedo_path = self.materials[index].model.textures.albedo.clone();
         let orm_path = self.materials[index].model.textures.orm.clone();
         let albedo_mean = Self::texture_mean(project_root, albedo_path.as_ref(), true);
+        renderer.set_material_albedo_mean(handle, albedo_mean);
         // ORM .b = metalness.
         let orm_metallic_mean = Self::texture_mean(project_root, orm_path.as_ref(), false)[2];
         let bc = self.materials[index].model.base_color;
@@ -1389,33 +1615,58 @@ impl LoadedScene {
 
         if m.shader == "standard" {
             renderer.set_material_shader(handle, None);
+            renderer.set_material_outline(handle, None);
             renderer.set_material_error(handle, false);
             return;
         }
         let shader = m.shader.clone();
         let shader_entry = shaders.resolve(renderer, project_root, &shader);
-        match shader_entry.id {
-            Some(id) => {
-                let defaults = shader_entry.defaults();
-                let model = &mut self.materials[index].model;
-                if model.custom_values.len() != defaults.len() {
-                    model.custom_values = defaults;
-                }
-                // 15 prop floats into the first lanes; the 16th (d3.w) is the
-                // engine-set baked-lightmap layer, so don't overwrite it here.
-                let mut data = [0.0f32; 16];
-                let n = model.custom_values.len().min(15);
-                data[..n].copy_from_slice(&model.custom_values[..n]);
-                renderer.set_material_shader(handle, Some(id));
-                renderer.set_material_custom_data(handle, data);
-                renderer.set_material_error(handle, false);
-            }
-            // Broken/missing shader → error swirl.
-            None => renderer.set_material_error(handle, true),
+        let (Some(_), Some(source)) = (shader_entry.id, shader_entry.source.clone()) else {
+            // Broken/missing shader: error swirl.
+            renderer.set_material_error(handle, true);
+            return;
+        };
+        {
+            let model = &mut self.materials[index].model;
+            shader_entry.fit_values(&mut model.custom_values);
+            shader_entry.sync_textures(&mut model.textures);
         }
+        let values = self.materials[index].model.custom_values.clone();
+        // v1 push lanes (the 16th, d3.w, is the engine-set lightmap layer).
+        renderer.set_material_custom_data(handle, source.push_data(&values));
+        // v2: std140 material block + texture properties (set 2).
+        if source.ubo_size > 0 {
+            renderer.set_material_custom_block(handle, &source.uniform_bytes(&values));
+        }
+        let tex_paths = self.materials[index].model.textures.shader.clone();
+        let mut slots = Vec::new();
+        for prop in source.textures() {
+            let citrus_assets::ShaderPropKind::Texture { default, srgb, .. } = prop.kind else {
+                continue;
+            };
+            let path = tex_paths.iter().find(|(n, _)| *n == prop.name).and_then(|(_, p)| p.clone());
+            let tex = path.and_then(|rel| match self.load_texture_cached(renderer, project_root, &rel, srgb) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::error!("loading texture {}: {e:#}", rel.display());
+                    None
+                }
+            });
+            slots.push((tex, crate::shaders::texture_default(default)));
+        }
+        let keywords = source.keywords(&values);
+        let id = shaders.variant(renderer, project_root, &shader, &keywords);
+        renderer.set_material_shader(handle, id);
+        if !slots.is_empty() {
+            renderer.set_material_custom_textures(handle, &slots);
+        }
+        renderer.set_material_custom_keywords(handle, keywords);
+        renderer.set_material_outline(handle, custom_outline(&source, &values));
+        renderer.set_material_error(handle, id.is_none());
     }
 
-    /// Load a project-relative texture, caching by (absolute path, srgb).
+    /// Load a project-relative texture, caching by (absolute path, srgb). A
+    /// `camera:<object id>` path is that render-texture camera's live target.
     fn load_texture_cached(
         &mut self,
         renderer: &mut Renderer,
@@ -1423,7 +1674,11 @@ impl LoadedScene {
         rel: &Path,
         srgb: bool,
     ) -> Result<TextureHandle> {
-        let abs = project_root.join(rel);
+        if let Some(id) = camera_texture_id(rel) {
+            let size = self.camera_texture_size(id);
+            return renderer.camera_target(id.raw(), size[0], size[1]);
+        }
+        let abs = citrus_core::asset_ref::resolve_rel_path(project_root, rel);
         if let Some(&handle) = self.texture_file_cache.get(&(abs.clone(), srgb)) {
             return Ok(handle);
         }
@@ -1494,8 +1749,12 @@ impl LoadedScene {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         let mut add = |paths: &citrus_core::MaterialTexturePaths| {
-            for (rel, srgb) in slots(paths).into_iter().filter_map(|(p, s)| p.map(|p| (p, s))) {
-                let abs = project_root.join(&rel);
+            for (rel, srgb) in slots(paths)
+                .into_iter()
+                .filter_map(|(p, s)| p.map(|p| (p, s)))
+                .filter(|(p, _)| camera_texture_id(p).is_none())
+            {
+                let abs = citrus_core::asset_ref::resolve_rel_path(project_root, &rel);
                 if seen.insert((abs.clone(), srgb)) {
                     out.push((abs, srgb));
                 }
@@ -1506,7 +1765,7 @@ impl LoadedScene {
             for mref in refs {
                 match mref {
                     MaterialRef::File(path) => {
-                        let abs = project_root.join(path);
+                        let abs = citrus_core::asset_ref::resolve_path(project_root, path);
                         if let Ok(mf) = citrus_assets::load_material_file(&abs) {
                             add(&tex_paths_from_file(&mf.textures));
                         }
@@ -1514,6 +1773,7 @@ impl LoadedScene {
                     MaterialRef::Inline { textures, .. } => {
                         add(&tex_paths_from_file(textures));
                     }
+                    MaterialRef::Model => {}
                 }
             }
         }
@@ -1538,6 +1798,10 @@ impl LoadedScene {
     ) {
         for index in 0..self.materials.len() {
             if changed.contains(&self.materials[index].model.shader) {
+                let shader = self.materials[index].model.shader.clone();
+                if let Some(entry) = shaders.get(&shader) {
+                    entry.remap_after_reload(&mut self.materials[index].model.custom_values);
+                }
                 self.apply_material(renderer, shaders, project_root, index);
             }
         }
@@ -1599,6 +1863,19 @@ impl LoadedScene {
         changed
     }
 
+    /// Headset play space of the first active `VR Player` (its world position
+    /// and yaw), so stereo rendering follows the game's locomotion.
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub fn vr_player_rig(&self) -> Option<citrus_core::VrRig> {
+        let active = self.active_flags();
+        let i = (0..self.objects.len()).find(|&i| {
+            active[i] && self.objects[i].components.iter().any(|c| c.as_any().is::<citrus_core::VrPlayer>())
+        })?;
+        let (_, rot, origin) = self.world_transform(i).to_scale_rotation_translation();
+        let f = rot * Vec3::NEG_Z;
+        Some(citrus_core::VrRig { origin, yaw: (-f.x).atan2(-f.z), scale: 1.0 })
+    }
+
     /// Object index of the "main" camera: the one with the smallest camera id.
     /// Run [`ensure_camera_ids`](Self::ensure_camera_ids) first so every camera
     /// has an id.
@@ -1618,6 +1895,7 @@ impl LoadedScene {
                 .components
                 .iter()
                 .find_map(|c| c.as_any().downcast_ref::<CameraComponent>())
+                && !cam.render_texture
                 && best.is_none_or(|(_, id)| cam.id < id)
             {
                 best = Some((i, cam.id));
@@ -1645,6 +1923,53 @@ impl LoadedScene {
             })
             .map(|c| c.culling_mask)
             .unwrap_or(citrus_core::all_layers_mask())
+    }
+
+    /// Render-texture size of the camera with object id `id` (default 512²).
+    fn camera_texture_size(&self, id: ObjectId) -> [u32; 2] {
+        self.index_of(id)
+            .and_then(|i| self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::CameraComponent>()))
+            .map_or([512, 512], |c| c.texture_size)
+    }
+
+    /// Every active render-texture camera whose target exists, with its view
+    /// for this frame (recorded before the main pass).
+    pub fn camera_target_views(&mut self) -> Vec<citrus_render::CameraTargetView> {
+        use citrus_core::CameraComponent;
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.frame_active(i) {
+                continue;
+            }
+            let Some(cam) = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<CameraComponent>()) else {
+                continue;
+            };
+            if !cam.render_texture {
+                continue;
+            }
+            // Update Rate: hold the last picture until the next refresh is due.
+            let id = self.objects[i].id;
+            if cam.update_hz > 0.0
+                && self.camera_target_last.get(&id).is_some_and(|t| now.duration_since(*t).as_secs_f32() < 1.0 / cam.update_hz)
+            {
+                continue;
+            }
+            self.camera_target_last.insert(id, now);
+            due.push(i);
+        }
+        due.into_iter()
+            .filter_map(|i| {
+                let cam = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<CameraComponent>())?;
+                let aspect = cam.texture_size[0].max(1) as f32 / cam.texture_size[1].max(1) as f32;
+                let (view, proj, position) = self.camera_view_proj_for(i, aspect)?;
+                Some(citrus_render::CameraTargetView {
+                    id: self.objects[i].id.raw(),
+                    camera: citrus_render::CameraData { view, proj, position },
+                    size: cam.texture_size,
+                })
+            })
+            .collect()
     }
 
     /// View/proj/position for the camera on object `i` (None if it has no
@@ -1724,6 +2049,7 @@ impl LoadedScene {
                         dt: env.dt,
                         unscaled_dt: env.unscaled_dt,
                         time: env.time,
+                        water_time: env.water_time,
                         translation: &mut translation,
                         rotation: &mut rotation,
                         scale: &mut scale,
@@ -1833,12 +2159,169 @@ impl LoadedScene {
         owners: &[(ObjectId, u64)],
     ) -> std::collections::HashMap<u64, Vec3> {
         let mut m = std::collections::HashMap::new();
+        let mut from_avatar = std::collections::HashSet::new();
         for (id, peer) in owners {
-            if let Some(i) = self.objects.iter().position(|o| o.id == *id) {
-                m.insert(*peer, self.world_transform(i).w_axis.truncate());
+            let Some(i) = self.objects.iter().position(|o| o.id == *id) else { continue };
+            // A Network Avatar speaks from its head (else its replicated head target).
+            let head = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::NetworkAvatar>())
+                .and_then(|av| {
+                    av.head
+                        .id()
+                        .and_then(|h| self.index_of(h))
+                        .map(|h| self.world_transform(h).w_axis.truncate())
+                        .or(av.targets.head.map(|(p, _)| p))
+                });
+            match head {
+                Some(p) => {
+                    m.insert(*peer, p);
+                    from_avatar.insert(*peer);
+                }
+                None if !from_avatar.contains(peer) => {
+                    m.insert(*peer, self.world_transform(i).w_axis.truncate());
+                }
+                None => {}
             }
         }
         m
+    }
+
+    /// Give the first skinned object added from a model its VRM spring bones:
+    /// Bone Cloth per chain and the colliders they use.
+    fn attach_springs(&mut self, first_new: usize, springs: &citrus_assets::vrm::SpringImport) {
+        if springs.is_empty() {
+            return;
+        }
+        let Some(i) = (first_new..self.objects.len()).find(|&i| self.has_skinned_mesh(i)) else { return };
+        let comps = &mut self.objects[i].components;
+        if !springs.colliders.is_empty() {
+            comps.push(Box::new(citrus_core::ClothColliders { colliders: springs.colliders.clone(), ..Default::default() }));
+        }
+        for chain in &springs.chains {
+            comps.push(Box::new(citrus_core::BoneCloth {
+                roots: chain.roots.clone(),
+                stiffness: [chain.stiffness, chain.stiffness],
+                damping: chain.damping,
+                gravity: chain.gravity,
+                radius: [chain.radius, chain.radius],
+                colliders: chain.colliders.clone(),
+                ..Default::default()
+            }));
+        }
+        tracing::info!("imported {} VRM spring chains and {} colliders", springs.chains.len(), springs.colliders.len());
+    }
+
+    /// Place every Wave Rider on the water at water clock `t`: fills each
+    /// rider's state and the draw-only offsets. With `drift`, steep waves and
+    /// current move the anchors of riders `owns` says this client controls
+    /// (in play; the owner's motion then replicates like any transform).
+    pub fn update_wave_riders(&mut self, t: f32, dt: f32, drift: bool, owns: &dyn Fn(ObjectId) -> bool) {
+        self.ride_offsets.clear();
+        let has_riders = self.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<citrus_core::WaveRider>()));
+        if !has_riders {
+            return;
+        }
+        let world = self.world_transforms();
+        let active = self.active_flags();
+        let waters: Vec<(Mat4, citrus_core::Water)> = (0..self.objects.len())
+            .filter(|&i| active[i])
+            .filter_map(|i| {
+                self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::Water>()).map(|w| (world[i], w.clone()))
+            })
+            .collect();
+        let mut moves = Vec::new();
+        for (i, o) in self.objects.iter_mut().enumerate() {
+            if !active[i] {
+                continue;
+            }
+            let Some(rider) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::WaveRider>()) else { continue };
+            let anchor = world[i].w_axis.truncate();
+            let state = waters.iter().find_map(|(m, w)| rider.ride(w, *m, anchor, t)).unwrap_or_default();
+            rider.state = state;
+            if state.in_water {
+                self.ride_offsets.insert(i, (state.offset, state.tilt));
+                if drift && state.on_surface && state.drift.length_squared() > 1e-8 && owns(o.id) {
+                    moves.push((i, state.drift * dt));
+                }
+            }
+        }
+        for (i, delta) in moves {
+            let local = match self.objects[i].parent {
+                Some(p) if p < world.len() => world[p].inverse().transform_vector3(delta),
+                _ => delta,
+            };
+            self.objects[i].translation += local;
+        }
+    }
+
+    /// Advance the wind clock and let every Water body feel the Wind Zones
+    /// at its centre (call once per frame, before `update_skinning`).
+    pub fn update_water_wind(&mut self, dt: f32) {
+        self.cloth_time += dt;
+        let t = self.cloth_time;
+        let has_water = self.objects.iter().any(|o| o.components.iter().any(|c| c.as_any().is::<citrus_core::Water>()));
+        if !has_water {
+            return;
+        }
+        let world = self.world_transforms();
+        let active = self.active_flags();
+        let winds: Vec<citrus_core::WindSample> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| active[*i])
+            .filter_map(|(i, o)| {
+                o.components
+                    .iter()
+                    .find_map(|c| c.as_any().downcast_ref::<citrus_core::ClothWind>())
+                    .map(|w| citrus_core::WindSample::new(w, world[i]))
+            })
+            .collect();
+        for (i, o) in self.objects.iter_mut().enumerate() {
+            let Some(water) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Water>()) else {
+                continue;
+            };
+            let centre = world[i].w_axis.truncate();
+            let w: Vec3 = winds.iter().map(|z| z.at(centre, t)).sum();
+            let local = world[i].inverse().transform_vector3(w);
+            water.feel_wind(glam::Vec2::new(local.x, local.z), dt);
+        }
+    }
+
+    /// [`Self::to_scene_file`] with model instances stored as their changes
+    /// (what the editor writes to disk).
+    pub fn to_compact_scene_file(&self, project_root: &Path, shaders: &ShaderLibrary) -> SceneFile {
+        let mut file = self.to_scene_file(project_root, shaders);
+        file.compact_models(&|p| self.model_parts.get(p).cloned());
+        file
+    }
+
+    /// The scene's Voice Chat settings (None = voice off).
+    pub fn voice_settings(&self) -> Option<citrus_core::VoiceChat> {
+        self.objects
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.is_active(*i))
+            .find_map(|(_, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::VoiceChat>()).cloned())
+    }
+
+    /// Lip sync input for this frame: the local mic's visemes and each remote
+    /// peer's (by peer id; matched to their Network Avatars through `owners`).
+    pub fn set_visemes(
+        &mut self,
+        local: Option<citrus_core::VisemeFrame>,
+        peers: &std::collections::HashMap<u64, citrus_core::VisemeFrame>,
+        owners: &[(ObjectId, u64)],
+    ) {
+        self.local_visemes = local;
+        self.remote_visemes.clear();
+        for (id, peer) in owners {
+            if let Some(v) = peers.get(peer) {
+                self.remote_visemes.insert(*id, *v);
+            }
+        }
     }
 
     /// Apply `ComponentCommand::SetLocalTransform`: write another object's local
@@ -1863,40 +2346,34 @@ impl LoadedScene {
         }
     }
 
-    /// Replicate networked objects (2G): for each object with a [`Sync`]
-    /// component, the local owner broadcasts its transform; everyone else applies
-    /// the latest received transform (snapped or smoothed).
+    /// Replicate networked objects (2G): `NetworkObject` / `Sync` transforms,
+    /// variables, animator parameters and avatar poses (see `net_sync`).
     pub fn network_sync(&mut self, session: &mut crate::net::NetSession, dt: f32) {
-        use citrus_core::Sync as SyncComp;
-        for object in &mut self.objects {
-            let Some(smoothing) = object
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<SyncComp>())
-                .map(|s| s.smoothing)
-            else {
-                continue;
-            };
-            let id = object.id;
-            if session.owns(id) {
-                session.send_transform(id, object.translation, object.rotation, object.scale);
-            } else if let Some(rt) = session.remote_transform(id) {
-                if smoothing > 0.0 {
-                    let a = (smoothing * dt).clamp(0.0, 1.0);
-                    object.translation = object.translation.lerp(rt.translation, a);
-                    object.rotation = object.rotation.slerp(rt.rotation, a);
-                    object.scale = object.scale.lerp(rt.scale, a);
-                } else {
-                    object.translation = rt.translation;
-                    object.rotation = rt.rotation;
-                    object.scale = rt.scale;
-                }
-            }
-        }
+        crate::net_sync::sync(self, session, dt);
     }
 
     /// True if the object and all of its ancestors are enabled (a disabled
     /// parent hides its whole subtree).
+    /// World transform from this frame's cache (filled by `sync_draws_multi`),
+    /// falling back to a parent walk. For the per-frame readers that run after
+    /// it (lights, post volumes, probes, audio).
+    pub fn frame_world(&self, index: usize) -> Mat4 {
+        if self.frame_cache_world.len() == self.objects.len() {
+            self.frame_cache_world[index]
+        } else {
+            self.world_transform(index)
+        }
+    }
+
+    /// `is_active` from this frame's cache (see [`frame_world`]).
+    pub fn frame_active(&self, index: usize) -> bool {
+        if self.frame_cache_active.len() == self.objects.len() {
+            self.frame_cache_active[index]
+        } else {
+            self.is_active(index)
+        }
+    }
+
     pub fn is_active(&self, index: usize) -> bool {
         let mut i = index;
         let mut guard = 0;
@@ -1926,7 +2403,14 @@ impl LoadedScene {
         // (previously dropped on the assumption the voxel grid covered them, which
         // broke once the auto-grid became mutually exclusive with placed volumes),
         // so realtime lights work everywhere a voxel volume may not cover.
-        self.gather_lights_impl(self.baked.is_some())
+        self.gather_lights_impl(self.lightmaps_in_use())
+    }
+
+    /// Whether the bake's lightmaps light static surfaces. Realtime GI no
+    /// longer replaces them: with a bake loaded, Flux / FluxRT run in mixed mode
+    /// and add only what the bake can't hold (moving emitters, realtime lights).
+    pub fn lightmaps_in_use(&self) -> bool {
+        self.baked.is_some()
     }
 
     /// All scene lights, **including Baked/Mixed even when a bake exists** — for
@@ -1946,7 +2430,7 @@ impl LoadedScene {
         use citrus_core::{LightComponent, LightKind, LightMode};
         let mut lights = Vec::new();
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
                 continue;
             }
             let Some(light) = self.objects[i]
@@ -1963,7 +2447,7 @@ impl LoadedScene {
             // surfaces don't double-count while dynamic objects still get lit. They
             // don't cast realtime shadows (kept out of the shadow atlas).
             let is_baked = drop_baked && light.mode != LightMode::Realtime;
-            let world = self.world_transform(i);
+            let world = self.frame_world(i);
             let (_, rotation, position) = world.to_scale_rotation_translation();
             // Forward (-Z) is the light's travel direction.
             let direction = rotation * Vec3::NEG_Z;
@@ -2042,6 +2526,7 @@ impl LoadedScene {
                     // Baked sidecars carry no visibility moments, so disabled.
                     dist: [0.0; 4],
                     dist2: [0.0; 4],
+                    offset: [0.0; 3],
                 })
                 .collect();
         }
@@ -2333,7 +2818,7 @@ impl LoadedScene {
         //
         // A `FluxVoxelLight` component is a dedicated volume-only light.
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
                 continue;
             }
             let Some(f) = self.objects[i]
@@ -2343,7 +2828,7 @@ impl LoadedScene {
             else {
                 continue;
             };
-            let pos = self.world_transform(i).w_axis.truncate();
+            let pos = self.frame_world(i).w_axis.truncate();
             let light = citrus_render::BakeLight {
                 kind: citrus_render::LightKind::Point,
                 position: pos,
@@ -2360,13 +2845,32 @@ impl LoadedScene {
             };
             out.push((light, self.objects[i].static_geometry));
         }
+        // Static emitters join the cached, propagated grid; moving ones are
+        // shaded per pixel instead (`flux_voxel_dynamic_emitters`), since a
+        // probe grid shows its cells under an orb's sharp falloff.
+        out.extend(self.emitter_voxel_lights(true).into_iter().map(|l| (l, true)));
+        out
+    }
+
+    /// Moving emissive objects as FluxVoxel point lights, for the forward pass
+    /// to evaluate per pixel with the grid's injection kernel.
+    pub fn flux_voxel_dynamic_emitters(&self) -> Vec<citrus_render::BakeLight> {
+        self.emitter_voxel_lights(false)
+    }
+
+    /// Emissive objects (static or moving) as additive FluxVoxel lights.
+    fn emitter_voxel_lights(&self, static_geometry: bool) -> Vec<citrus_render::BakeLight> {
+        let mut out = Vec::new();
         // Emissive objects act as additive FluxVoxel lights: their emission
         // (colour × intensity × emission-map mean) becomes a movable point light
         // with distance falloff, so the voxel GI is lit FROM them like any other
         // FluxVoxel light (instead of not at all). Brighter emission reaches
         // further. Dynamic (non-static) emitters track their movement per frame.
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
+                continue;
+            }
+            if self.objects[i].static_geometry != static_geometry {
                 continue;
             }
             let Some(render) = self.objects[i].render else {
@@ -2385,10 +2889,11 @@ impl LoadedScene {
             // clearly-visible VIEW-INDEPENDENT diffuse pool (the look the user wants).
             // Tunable; raise if emitters should throw more light, lower for subtler.
             const EMISSIVE_GI_GAIN: f32 = 8.0;
+            let gain = EMISSIVE_GI_GAIN * self.environment.realtime_gi.emissive_boost.max(0.0);
             let total_flux = [
-                m.emission_color[0] * m.emission_intensity * mean[0] * EMISSIVE_GI_GAIN,
-                m.emission_color[1] * m.emission_intensity * mean[1] * EMISSIVE_GI_GAIN,
-                m.emission_color[2] * m.emission_intensity * mean[2] * EMISSIVE_GI_GAIN,
+                m.emission_color[0] * m.emission_intensity * mean[0] * gain,
+                m.emission_color[1] * m.emission_intensity * mean[1] * gain,
+                m.emission_color[2] * m.emission_intensity * mean[2] * gain,
             ];
             let lum = 0.2126 * total_flux[0] + 0.7152 * total_flux[1] + 0.0722 * total_flux[2];
             if lum <= 1e-3 {
@@ -2399,7 +2904,7 @@ impl LoadedScene {
             // visor) scatters K points along its longest axis so it lights its
             // surroundings over its whole extent, not just the object centre. Energy
             // is split across the points so the total emitted flux is preserved.
-            let world = self.world_transform(i);
+            let world = self.frame_world(i);
             let (lmin, lmax) = self.mesh_bounds[render.mesh];
             let lcenter = (lmin + lmax) * 0.5;
             let extent = (lmax - lmin).abs();
@@ -2446,7 +2951,7 @@ impl LoadedScene {
                     spot_outer_deg: 0.0,
                     radius: 0.0,
                 };
-                out.push((light, self.objects[i].static_geometry));
+                out.push(light);
             }
         }
         out
@@ -2592,8 +3097,12 @@ impl LoadedScene {
             // scene centre when there's no camera (bake / gizmo path).
             VoxelGridMode::CameraClipmap => {
                 let extent = gi.voxel_clipmap_extent.clamp(2.0, 256.0);
+                // Scroll in steps of about a quarter of the extent (whole probes,
+                // so the grid stays aligned): each step rebuilds the static base,
+                // and the camera stays well inside the cube between steps.
+                let step = spacing * (extent * 0.25 / spacing).round().max(1.0);
                 let center = view_pos
-                    .map(|p| (p / spacing).round() * spacing)
+                    .map(|p| (p / step).round() * step)
                     .or_else(|| self.flux_voxel_static_bounds().map(|(lo, hi)| (lo + hi) * 0.5))
                     .unwrap_or(Vec3::ZERO);
                 let size = Vec3::splat(extent * 2.0);
@@ -2948,11 +3457,23 @@ impl LoadedScene {
     ) -> (Vec<crate::sw_gi::SdfInstance>, f32) {
         // Resolve each gather instance to its local mesh index by its handle
         // (an object may contribute several slots, each a different mesh).
-        let mesh_index = |handle: citrus_render::MeshHandle| -> Option<usize> {
-            self.mesh_handles.iter().position(|&h| h == handle)
-        };
-        for inst in &gather.instances {
-            let Some(mi) = mesh_index(inst.mesh) else { continue };
+        // MeshHandle is Eq but not Hash, so resolve each instance once up front;
+        // consecutive instances usually share a mesh, so a last-hit cache skips
+        // most of the linear scans.
+        let mut last: Option<(citrus_render::MeshHandle, Option<usize>)> = None;
+        let inst_mesh: Vec<Option<usize>> = gather
+            .instances
+            .iter()
+            .map(|inst| match last {
+                Some((h, mi)) if h == inst.mesh => mi,
+                _ => {
+                    let mi = self.mesh_handles.iter().position(|&h| h == inst.mesh);
+                    last = Some((inst.mesh, mi));
+                    mi
+                }
+            })
+            .collect();
+        for &mi in inst_mesh.iter().flatten() {
             if self.mesh_sdf[mi].is_none() {
                 let (pos, idx) = &self.mesh_geometry[mi];
                 self.mesh_sdf[mi] =
@@ -2961,7 +3482,7 @@ impl LoadedScene {
         }
         let mut insts = Vec::with_capacity(gather.instances.len());
         for (k, instance) in gather.instances.iter().enumerate() {
-            let Some(mi) = mesh_index(instance.mesh) else {
+            let Some(mi) = inst_mesh[k] else {
                 continue;
             };
             let Some(sdf) = self.mesh_sdf[mi].as_ref() else {
@@ -3008,6 +3529,15 @@ impl LoadedScene {
         self.ik_targets = targets;
     }
 
+    /// This machine's face tracking for this frame (None = not tracking).
+    pub fn set_local_face(&mut self, face: Option<citrus_core::FaceFrame>) {
+        self.local_face = face;
+    }
+
+    pub fn local_face(&self) -> Option<&citrus_core::FaceFrame> {
+        self.local_face.as_ref()
+    }
+
     /// Enable/disable terrain foot IK for humanoid avatars (applied on top of the
     /// animated/IK pose so feet plant on uneven ground). `None` disables it.
     pub fn set_foot_ik(&mut self, params: Option<crate::humanoid::FootIkParams>) {
@@ -3019,12 +3549,24 @@ impl LoadedScene {
         self.foot_ik.is_some()
     }
 
-    /// The first humanoid skeleton in the scene (the avatar driven by full-body
-    /// tracking), if any.
+    /// The skeleton full-body tracking drives: the model of the local
+    /// player's Humanoid IK object, else the first humanoid in the scene.
     fn first_humanoid(&self) -> Option<&citrus_assets::Skeleton> {
-        self.skeletons
-            .iter()
-            .find(|s| crate::humanoid::HumanoidRig::map(s).is_humanoid())
+        let local = self.objects.iter().find_map(|o| {
+            let ik = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::HumanoidIk>())?;
+            let remote = o
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::NetworkAvatar>())
+                .is_some_and(|a| a.remote);
+            if remote || matches!(ik.source, citrus_core::IkSource::Network | citrus_core::IkSource::Objects) {
+                return None;
+            }
+            let mesh = o.render_slots().map(|r| r.mesh).find(|m| self.skinned_meshes.iter().any(|sm| sm.mesh_index == *m))?;
+            let sm = self.skinned_meshes.iter().find(|sm| sm.mesh_index == mesh)?;
+            self.skeletons.get(sm.skeleton)
+        });
+        local.or_else(|| self.skeletons.iter().find(|s| crate::humanoid::HumanoidRig::map(s).is_humanoid()))
     }
 
     /// Capture a full-body tracker calibration: the player holds a T-pose matching
@@ -3036,7 +3578,7 @@ impl LoadedScene {
         let Some(skel) = self.first_humanoid() else {
             return false;
         };
-        let poses = tracker_poses_from_targets(raw);
+        let poses = crate::humanoid::TrackerPoses::from_targets(raw);
         self.vr_calibration = Some(crate::humanoid::calibrate_tpose(skel, &poses));
         true
     }
@@ -3058,12 +3600,86 @@ impl LoadedScene {
         &self,
         raw: &citrus_core::TrackerTargets,
     ) -> citrus_core::TrackerTargets {
-        match &self.vr_calibration {
-            Some(cal) => {
-                crate::humanoid::targets_from_calibrated(cal, &tracker_poses_from_targets(raw))
+        let cal = match &self.vr_calibration {
+            Some(cal) => *cal,
+            None => match self.first_humanoid() {
+                Some(skel) => crate::humanoid::default_calibration(skel),
+                None => return *raw,
+            },
+        };
+        crate::humanoid::targets_from_calibrated(&cal, &crate::humanoid::TrackerPoses::from_targets(raw))
+    }
+
+    /// The local player's tracker targets (as set by `set_ik_targets`) in
+    /// world space: tracking space sits on the scene's VR Player rig, or the
+    /// world origin without one.
+    pub fn local_tracking_world(&self) -> Option<citrus_core::TrackerTargets> {
+        let t = self.ik_targets.filter(|t| t.any())?;
+        let root = self
+            .objects
+            .iter()
+            .position(|o| o.components.iter().any(|c| c.as_any().is::<citrus_core::VrPlayer>()))
+            .map(|i| self.world_transform(i))
+            .unwrap_or(Mat4::IDENTITY);
+        Some(t.transformed(root))
+    }
+
+    /// World-space targets for each active object's Humanoid IK, with its
+    /// solver settings.
+    pub(crate) fn humanoid_ik_inputs(
+        &self,
+        active: &[bool],
+        world: &[Mat4],
+    ) -> HashMap<usize, (citrus_core::TrackerTargets, crate::humanoid::BodyIkSettings)> {
+        use citrus_core::{HumanoidIk, IkSource, NetworkAvatar};
+        let mut out = HashMap::new();
+        let stage = self.ik_targets.filter(|t| t.any());
+        let default_root = self
+            .objects
+            .iter()
+            .position(|o| o.components.iter().any(|c| c.as_any().is::<citrus_core::VrPlayer>()));
+        for (i, o) in self.objects.iter().enumerate() {
+            if !active.get(i).copied().unwrap_or(false) {
+                continue;
             }
-            None => *raw,
+            let Some(ik) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<HumanoidIk>()) else { continue };
+            let net = o.components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkAvatar>());
+            let local = || {
+                let root = ik.tracking_root.id().and_then(|id| self.index_of(id)).or(default_root);
+                stage.map(|t| t.transformed(root.map(|r| world[r]).unwrap_or(Mat4::IDENTITY)))
+            };
+            let targets = match ik.source {
+                IkSource::Auto => match net {
+                    Some(av) if av.remote => Some(av.targets),
+                    _ => local(),
+                },
+                IkSource::LocalTrackers => local(),
+                IkSource::Network => net.map(|av| av.targets),
+                IkSource::Objects => {
+                    let mut slots = [None; citrus_core::TRACKER_SLOTS];
+                    for (k, r) in ik.objects.iter().enumerate().take(citrus_core::TRACKER_SLOTS) {
+                        if let Some(j) = r.id().and_then(|id| self.index_of(id)) {
+                            let (_, rot, pos) = world[j].to_scale_rotation_translation();
+                            slots[k] = Some((pos, rot));
+                        }
+                    }
+                    Some(citrus_core::TrackerTargets::from_slots(slots))
+                }
+            };
+            let Some(targets) = targets.filter(|t| t.any()) else { continue };
+            let settings = crate::humanoid::BodyIkSettings {
+                weight: ik.weight,
+                spine_twist: ik.spine_twist,
+                shoulder_rotation: ik.shoulder_rotation,
+                plant_feet: ik.plant_feet,
+                step_distance: ik.step_distance,
+                step_angle: ik.step_angle.to_radians(),
+                step_time: ik.step_time,
+                step_height: ik.step_height,
+            };
+            out.insert(i, (targets.transformed(world[i].inverse()), settings));
         }
+        out
     }
 
     /// Approximate ground height + up-ish normal under a world point, from a
@@ -3115,6 +3731,38 @@ impl LoadedScene {
         // those need the shared (whole-scene) pose.
         let mut shared_users: std::collections::HashSet<usize> = Default::default();
         let mut alive: std::collections::HashSet<ObjectId> = Default::default();
+        // Bone cloth: collider shapes other objects' cloth can list, and per
+        // shared mesh the object whose cloth poses it.
+        let any_cloth = self.objects.iter().any(|o| crate::cloth::has_cloth(&o.components));
+        let cloth_shapes = if any_cloth {
+            crate::cloth::shapes_by_object(
+                self.objects
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| active[*i])
+                    .map(|(i, o)| (o.id, o.components.as_slice(), world[i])),
+            )
+        } else {
+            HashMap::new()
+        };
+        let mut cloth_owner: HashMap<usize, usize> = HashMap::new();
+        let cloth_time = self.cloth_time;
+        let winds: Vec<citrus_core::WindSample> = if any_cloth {
+            self.objects
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| active[*i])
+                .filter_map(|(i, o)| {
+                    o.components
+                        .iter()
+                        .find_map(|c| c.as_any().downcast_ref::<citrus_core::ClothWind>())
+                        .map(|w| citrus_core::WindSample::new(w, world[i]))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ik_inputs = self.humanoid_ik_inputs(&active, &world);
 
         for i in 0..self.objects.len() {
             if !active[i] {
@@ -3129,25 +3777,124 @@ impl LoadedScene {
                 continue;
             }
             let id = self.objects[i].id;
-            let Some(animator) = self.objects[i]
-                .components
-                .iter_mut()
-                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>())
-            else {
+            let components = &self.objects[i].components;
+            let has_ik = components.iter().any(|c| c.as_any().is::<citrus_core::HumanoidIk>());
+            let has_face = components.iter().any(|c| {
+                c.as_any().is::<citrus_core::FaceTracking>()
+                    || c.as_any().is::<citrus_core::BlendShapes>()
+                    || c.as_any().is::<citrus_core::LipSync>()
+            });
+            if !has_ik
+                && !has_face
+                && !crate::cloth::has_mesh_cloth(components)
+                && !components.iter().any(|c| c.as_any().is::<citrus_core::Animator>())
+            {
+                if any_cloth && crate::cloth::has_cloth(components) {
+                    for &m in &skinned_slots {
+                        cloth_owner.entry(m).or_insert(i);
+                    }
+                }
                 shared_users.extend(skinned_slots);
                 continue;
-            };
+            }
             alive.insert(id);
             let skeleton = self.skinned_meshes[skinned_by_mesh[&skinned_slots[0]]].skeleton;
             let Some(skel) = self.skeletons.get(skeleton) else {
                 continue;
             };
-            let clips: Vec<usize> = (0..self.animations.len())
-                .filter(|&c| self.clip_skeleton.get(c) == Some(&skeleton))
-                .collect();
-            let (locals, root_local) = advance_animator(animator, skel, &self.animations, &clips, dt);
-            animator.state.root_delta = world[i].transform_vector3(root_local);
-            let gpu = animator.gpu_skinning;
+            let animator = self.objects[i]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>());
+            let (mut locals, gpu) = match animator {
+                Some(animator) => {
+                    let clips: Vec<usize> = (0..self.animations.len())
+                        .filter(|&c| self.clip_skeleton.get(c) == Some(&skeleton))
+                        .collect();
+                    let (locals, root_local) = if crate::anim_graph::wants_graph(animator) {
+                        let ctrl = self.anim_assets.prepare(animator);
+                        let rig = self.anim_assets.skeleton_rig(skeleton, skel);
+                        if animator.state.clips.len() != clips.len() {
+                            animator.state.clips = clips.iter().map(|&c| self.animations[c].name.clone()).collect();
+                        }
+                        let set = crate::anim_graph::ClipSet {
+                            imported: &self.animations,
+                            indices: &clips,
+                            assets: &self.anim_assets.clips,
+                        };
+                        let out = crate::anim_graph::advance(animator, ctrl.as_deref(), &rig, &set, dt);
+                        (out.pose.to_locals(), out.root_delta)
+                    } else {
+                        advance_animator(animator, skel, &self.animations, &clips, dt)
+                    };
+                    animator.state.root_delta = world[i].transform_vector3(root_local);
+                    (locals, animator.gpu_skinning)
+                }
+                None => (skel.rest_locals(), true),
+            };
+            // Morphed and cloth vertices are written by the CPU skinning path.
+            let has_mesh_cloth = any_cloth && crate::cloth::has_mesh_cloth(&self.objects[i].components);
+            let gpu = gpu && !has_face && !has_mesh_cloth;
+            if has_ik {
+                let descriptor = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
+                    self.objects[k].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::AvatarDescriptor>())
+                });
+                let rig = match descriptor {
+                    Some(desc) if !desc.bone_map.is_empty() => crate::humanoid::HumanoidRig::map_with_overrides(skel, &desc.bone_map).0,
+                    _ => crate::humanoid::HumanoidRig::map(skel),
+                };
+                let input = ik_inputs.get(&i);
+                if let Some((targets, settings)) = input {
+                    let state = self.body_ik_state.entry(id).or_default();
+                    crate::humanoid::solve_body(skel, &rig, &mut locals, targets, settings, state, world[i], dt);
+                }
+                if let Some(ik) = self.objects[i]
+                    .components
+                    .iter_mut()
+                    .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::HumanoidIk>())
+                {
+                    ik.runtime.humanoid = rig.is_humanoid();
+                    ik.runtime.targets = input.map(|(t, _)| *t).unwrap_or_default();
+                }
+            }
+            let morph_weights: Vec<Vec<f32>> = if has_face {
+                let avatar = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
+                    self.objects[k]
+                        .components
+                        .iter()
+                        .find_map(|c| c.as_any().downcast_ref::<citrus_core::NetworkAvatar>())
+                        .map(|av| (self.objects[k].id, av.remote, av.face.clone()))
+                });
+                let net_face = avatar.as_ref().map(|(_, remote, face)| (*remote, face.clone()));
+                let visemes = match &avatar {
+                    Some((id, true, _)) => self.remote_visemes.get(id).copied(),
+                    _ => self.local_visemes,
+                };
+                let morphs: Vec<&[citrus_assets::MorphTarget]> =
+                    skinned_slots.iter().map(|m| self.skinned_meshes[skinned_by_mesh[m]].morphs.as_slice()).collect();
+                let out = crate::face_drive::drive(
+                    &mut self.objects[i].components,
+                    &morphs,
+                    self.local_face.as_ref(),
+                    net_face,
+                    visemes.as_ref(),
+                    dt,
+                );
+                if let Some((left, right, max)) = out.eyes {
+                    let rig = crate::humanoid::HumanoidRig::map(skel);
+                    crate::humanoid::apply_eye_gaze(skel, &rig, &mut locals, left, right, max);
+                }
+                out.weights
+            } else {
+                Vec::new()
+            };
+            if any_cloth {
+                let verts: Vec<&[citrus_render::Vertex]> = skinned_slots
+                    .iter()
+                    .map(|m| self.skinned_meshes[skinned_by_mesh[m]].base_vertices.as_slice())
+                    .collect();
+                crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, cloth_time, dt);
+            }
             let palette = skel.palette(&locals);
 
             if self.anim_instances.get(&id).is_none_or(|inst| inst.gpu != gpu) {
@@ -3171,16 +3918,45 @@ impl LoadedScene {
                 }
                 self.anim_instances.insert(id, AnimInstance { slots, gpu });
             }
-            for &(m, handle) in &self.anim_instances[&id].slots {
+            for &(m, _) in &self.anim_instances[&id].slots {
+                let sm = &self.skinned_meshes[skinned_by_mesh[&m]];
+                if let Some(b) = posed_bounds(&sm.joint_boxes, &palette) {
+                    self.pose_bounds.insert((id, m), b);
+                }
+            }
+            for (k, &(m, handle)) in self.anim_instances[&id].slots.iter().enumerate() {
                 if gpu {
                     renderer.skin_mesh_gpu(handle, &palette);
                 } else {
                     let sm = &self.skinned_meshes[skinned_by_mesh[&m]];
-                    renderer.update_mesh_vertices(handle, &skin_vertices(&sm.base_vertices, &palette));
+                    let weights = morph_weights.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    let mut skinned = match crate::face_drive::morphed(&sm.base_vertices, &sm.morphs, weights) {
+                        Some(v) => skin_vertices(&v, &palette),
+                        None => skin_vertices(&sm.base_vertices, &palette),
+                    };
+                    let slot = if has_mesh_cloth { self.objects[i].render_slots().position(|r| r.mesh == m) } else { None };
+                    if let Some(slot) = slot {
+                        crate::cloth::step_mesh(
+                            &mut self.objects[i].components,
+                            slot,
+                            skel,
+                            &sm.base_vertices,
+                            &mut skinned,
+                            &self.mesh_geometry[m].1,
+                            world[i],
+                            &cloth_shapes,
+                            &winds,
+                            cloth_time,
+                            dt,
+                        );
+                    }
+                    renderer.update_mesh_vertices(handle, &skinned);
                 }
             }
         }
         self.anim_instances.retain(|id, _| alive.contains(id));
+        self.body_ik_state.retain(|id, _| alive.contains(id));
+        self.pose_bounds.retain(|(id, _), _| alive.contains(id));
 
         // Shared path (objects without an Animator): IK targets pose humanoid
         // avatars when present; otherwise the skeleton's first clip loops.
@@ -3195,12 +3971,19 @@ impl LoadedScene {
                     || t.right_foot.is_some()
             })
             .unwrap_or(false);
-        if !ik_active && self.animations.is_empty() {
+        if !ik_active && self.animations.is_empty() && cloth_owner.is_empty() {
             return;
         }
         self.anim_time += dt;
+        // Cloth-posed locals per owner object, so every mesh of one model
+        // shares a single simulation step this frame.
+        let mut cloth_posed: HashMap<usize, Vec<Mat4>> = HashMap::new();
         for sm in &self.skinned_meshes {
             if !shared_users.contains(&sm.mesh_index) {
+                continue;
+            }
+            let owner = cloth_owner.get(&sm.mesh_index).copied();
+            if !ik_active && self.animations.is_empty() && owner.is_none() {
                 continue;
             }
             let Some(skel) = self.skeletons.get(sm.skeleton) else {
@@ -3223,20 +4006,72 @@ impl LoadedScene {
             // Terrain foot IK: plant the feet on the ground under them. The ground
             // sampler caps hits at the foot height + max_lift so the avatar never
             // grounds on its own AABB.
-            if let Some(params) = self.foot_ik {
-                if crate::humanoid::HumanoidRig::map(skel).is_humanoid() {
+            if let Some(params) = self.foot_ik
+                && crate::humanoid::HumanoidRig::map(skel).is_humanoid() {
                     let max_lift = params.max_lift;
                     crate::humanoid::apply_foot_ik(skel, &mut locals, &params, |p| {
                         self.ground_height(p.x, p.z, p.y + max_lift)
                     });
                 }
+            if let Some(o) = owner {
+                if let Some(posed) = cloth_posed.get(&o) {
+                    locals.clone_from(posed);
+                } else {
+                    let verts: Vec<&[citrus_render::Vertex]> = self
+                        .skinned_meshes
+                        .iter()
+                        .filter(|m| cloth_owner.get(&m.mesh_index) == Some(&o) && m.skeleton == sm.skeleton)
+                        .map(|m| m.base_vertices.as_slice())
+                        .collect();
+                    crate::cloth::step(&mut self.objects[o].components, skel, &verts, &mut locals, world[o], &cloth_shapes, &winds, cloth_time, dt);
+                    cloth_posed.insert(o, locals.clone());
+                }
             }
             let palette = skel.palette(&locals);
+            if let Some(b) = posed_bounds(&sm.joint_boxes, &palette) {
+                self.shared_pose_bounds.insert(sm.mesh_index, b);
+            }
             renderer.update_mesh_vertices(
                 self.mesh_handles[sm.mesh_index],
                 &skin_vertices(&sm.base_vertices, &palette),
             );
         }
+    }
+
+    /// Whether an object draws a skinned mesh carrying blendshapes.
+    pub fn has_blendshapes(&self, i: usize) -> bool {
+        self.objects.get(i).is_some_and(|o| {
+            o.render_slots().any(|r| self.skinned_meshes.iter().any(|sm| sm.mesh_index == r.mesh && !sm.morphs.is_empty()))
+        })
+    }
+
+    /// Whether an object draws a skinned (rigged) mesh, i.e. its Animator
+    /// drives bones rather than object transforms.
+    pub fn has_skinned_mesh(&self, i: usize) -> bool {
+        self.objects
+            .get(i)
+            .is_some_and(|o| o.render_slots().any(|r| self.skinned_meshes.iter().any(|sm| sm.mesh_index == r.mesh)))
+    }
+
+    /// Bone names and rest transforms of an object's skinned mesh (empty when
+    /// it has none).
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub fn skeleton_rest_pose(&self, i: usize) -> Vec<(String, crate::anim_graph::Trs)> {
+        let Some(o) = self.objects.get(i) else {
+            return Vec::new();
+        };
+        o.render_slots()
+            .find_map(|r| self.skinned_meshes.iter().find(|sm| sm.mesh_index == r.mesh))
+            .and_then(|sm| self.skeletons.get(sm.skeleton))
+            .map(|sk| {
+                sk.joints
+                    .iter()
+                    .map(|j| {
+                        (j.name.clone(), crate::anim_graph::Trs { t: j.rest_translation, r: j.rest_rotation, s: j.rest_scale })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// GPU mesh to draw for an object's render slot: its Animator copy when it
@@ -3293,38 +4128,40 @@ impl LoadedScene {
         out
     }
 
-    /// Whether the scene has any active reflection probe set to **Baked** mode
-    /// (loads its `.reflprobe` sidecar). `false` when there's no probe or every
-    /// probe is Realtime (always re-captured live, so engine/capture fixes take
-    /// effect without a manual re-bake of a stale sidecar).
-    pub fn has_baked_reflection_probe(&self) -> bool {
-        use citrus_core::{ReflectionProbe, ReflectionProbeMode};
-        self.objects.iter().enumerate().any(|(i, o)| {
-            self.is_active(i)
-                && o.components.iter().any(|c| {
-                    c.as_any()
-                        .downcast_ref::<ReflectionProbe>()
-                        .is_some_and(|p| p.mode == ReflectionProbeMode::Baked)
-                })
-        })
-    }
-
     /// The reflection-probe zone covering `camera_pos` (or the nearest), as a
     /// world-space box for box-projected reflections. `None` when the scene has
     /// no `ReflectionProbe` — the env cube is then sampled as distant/infinite.
-    pub fn active_reflection_probe(
-        &self,
-        camera_pos: Vec3,
-    ) -> Option<citrus_render::ReflectionProbeBox> {
+    /// Every active reflection probe as (object id, capture point, resolution),
+    /// for baking each probe's cube.
+    pub fn reflection_probe_captures(&self) -> Vec<(u128, Vec3, u32)> {
+        use citrus_core::ReflectionProbe;
+        (0..self.objects.len())
+            .filter(|&i| self.is_active(i))
+            .filter_map(|i| {
+                let probe = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<ReflectionProbe>())?;
+                let capture = self.world_transform(i).w_axis.truncate() + Vec3::from(probe.capture_offset);
+                Some((self.objects[i].id.raw(), capture, probe.resolution))
+            })
+            .collect()
+    }
+
+    pub fn active_reflection_probe(&self, camera_pos: Vec3) -> Option<citrus_render::ReflectionProbeBox> {
+        self.active_reflection_probes(camera_pos)[0]
+    }
+
+    /// The two highest-priority reflection probes for `camera_pos`, best first
+    /// (see [`active_reflection_probe`](Self::active_reflection_probe) for the
+    /// ranking). The second one is blended per pixel with the first.
+    pub fn active_reflection_probes(&self, camera_pos: Vec3) -> [Option<citrus_render::ReflectionProbeBox>; 2] {
         use citrus_core::ReflectionProbe;
         // Unreal-style priority: among probes whose box CONTAINS the point, the
         // highest Importance wins, tie-broken by the smallest box (a small specific
         // probe overrides a large surrounding one). When no probe contains the
         // point, the nearest box is used. Rank key (higher = better):
         // (contains, importance, -box_volume, -outside_distance).
-        let mut best: Option<((bool, i32, f32, f32), citrus_render::ReflectionProbeBox)> = None;
+        let mut ranked: Vec<((bool, i32, f32, f32), citrus_render::ReflectionProbeBox)> = Vec::new();
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
                 continue;
             }
             let Some(probe) = self.objects[i]
@@ -3334,40 +4171,44 @@ impl LoadedScene {
             else {
                 continue;
             };
-            let capture = self.world_transform(i).w_axis.truncate();
-            // The box (parallax proxy) can be offset from the capture point so
-            // the capture sits at eye height while the box hugs the room.
-            let center = capture + Vec3::from(probe.box_offset);
+            let origin = self.frame_world(i).w_axis.truncate();
+            // Box (parallax proxy) and capture point are both offsets from the
+            // object, so the capture can sit anywhere inside the room box.
+            let center = origin + Vec3::from(probe.box_offset);
+            let capture = origin + Vec3::from(probe.capture_offset);
             let half = Vec3::from(probe.size) * 0.5 * self.objects[i].scale;
             let d = (camera_pos - center).abs() - half;
             let outside = d.max(Vec3::ZERO).length();
             let contains = d.max_element() <= 0.0;
             let volume = (half.x * half.y * half.z).max(1e-4);
             let key = (contains, probe.importance, -volume, -outside);
-            let candidate = citrus_render::ReflectionProbeBox {
-                center: center.to_array(),
-                capture: capture.to_array(),
-                half_extents: half.to_array(),
-                intensity: probe.intensity.max(0.0),
-                box_projection: probe.box_projection,
-                resolution: probe.resolution,
-                realtime: probe.mode == citrus_core::ReflectionProbeMode::Realtime,
-            };
-            let better = match &best {
-                None => true,
-                Some((bk, _)) => {
-                    // Lexicographic compare; f32 lanes via partial_cmp.
-                    (key.0, key.1).cmp(&(bk.0, bk.1)) == std::cmp::Ordering::Greater
-                        || ((key.0, key.1) == (bk.0, bk.1)
-                            && (key.2, key.3).partial_cmp(&(bk.2, bk.3))
-                                == Some(std::cmp::Ordering::Greater))
-                }
-            };
-            if better {
-                best = Some((key, candidate));
-            }
+            ranked.push((
+                key,
+                citrus_render::ReflectionProbeBox {
+                    center: center.to_array(),
+                    capture: capture.to_array(),
+                    half_extents: half.to_array(),
+                    intensity: probe.intensity.max(0.0),
+                    box_projection: probe.box_projection,
+                    resolution: probe.resolution,
+                    realtime: probe.mode == citrus_core::ReflectionProbeMode::Realtime,
+                    id: self.objects[i].id.raw(),
+                    blend_distance: probe.blend_distance.max(0.0) * self.objects[i].scale.max_element(),
+                    importance: probe.importance,
+                    update_hz: probe.update_hz.max(0.0),
+                    time_slicing: probe.time_slicing,
+                    include_dynamic: probe.include_dynamic,
+                },
+            ));
         }
-        best.map(|(_, p)| p)
+        // Best first: lexicographic on (contains, importance), then the f32 lanes.
+        ranked.sort_by(|(a, _), (b, _)| {
+            (b.0, b.1)
+                .cmp(&(a.0, a.1))
+                .then_with(|| (b.2, b.3).partial_cmp(&(a.2, a.3)).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let mut it = ranked.into_iter().map(|(_, p)| p);
+        [it.next(), it.next()]
     }
 
     /// Whether object `i` counts as a planar-reflection surface this frame:
@@ -3376,7 +4217,7 @@ impl LoadedScene {
     /// (per-frame list) so indices line up.
     fn planar_surface_eligible(&self, i: usize) -> bool {
         self.objects[i].render.is_some()
-            && self.is_active(i)
+            && self.frame_active(i)
             && self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) != 0
             && self.objects[i]
                 .components
@@ -3434,8 +4275,9 @@ impl LoadedScene {
 
         // (priority, weighted profile) for each contributing volume.
         let mut stack: Vec<(f32, citrus_assets::PostFxProfile, f32)> = Vec::new();
+        let mut overrides = Vec::new();
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
                 continue;
             }
             let Some(vol) = self.objects[i]
@@ -3452,10 +4294,13 @@ impl LoadedScene {
             let weight = if vol.global {
                 vol.weight
             } else {
-                let center = self.world_transform(i).w_axis.truncate();
+                // The box lives in the object's local space (rotated + scaled with
+                // it, as drawn in the editor); the fade distance is in world units.
+                let world = self.frame_world(i);
                 let half = Vec3::from(vol.half_extents).abs();
-                let d = (camera_pos - center).abs() - half;
-                let outside = d.max(Vec3::ZERO).length();
+                let local = world.inverse().transform_point3(camera_pos);
+                let closest = world.transform_point3(local.clamp(-half, half));
+                let outside = (camera_pos - closest).length();
                 if outside <= 0.0 {
                     vol.weight
                 } else if outside < vol.blend_distance.max(1e-3) {
@@ -3469,22 +4314,31 @@ impl LoadedScene {
             }
             // Load + cache the profile.
             if !self.postfx_cache.contains_key(&vol.profile) {
-                let path = project_root.join(&vol.profile);
+                let path = citrus_core::asset_ref::resolve_path(project_root, &vol.profile);
                 let profile = citrus_assets::load_postfx(&path).unwrap_or_default();
                 self.postfx_cache.insert(vol.profile.clone(), profile);
             }
             let profile = self.postfx_cache[&vol.profile];
             stack.push((vol.priority, profile, weight.clamp(0.0, 1.0)));
+            let effects: Vec<&'static str> = [
+                (profile.tonemap.enabled, "tonemap"),
+                (profile.bloom.enabled, "bloom"),
+                (profile.color_grading.enabled, "color grading"),
+                (profile.vignette.enabled, "vignette"),
+                (profile.chromatic_aberration.enabled, "chromatic aberration"),
+            ]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+            overrides.push((self.objects[i].name.clone(), weight.clamp(0.0, 1.0), effects));
         }
+        self.postfx_overrides = overrides;
 
         stack.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // The scene's global postfx is the always-present base ("global volume");
-        // local volumes blend on top by priority. Prepended at weight 1.0 so it
-        // fully replaces the neutral default before any volume contributes.
-        let mut blend: Vec<(citrus_assets::PostFxProfile, f32)> =
-            vec![(self.environment.postfx, 1.0)];
-        blend.extend(stack.into_iter().map(|(_, p, w)| (p, w)));
-        let p = citrus_assets::blend_profiles(&blend);
+        // The scene's global postfx is the always-present base; volumes blend on
+        // top by priority, overriding only the effects they enable.
+        let blend: Vec<(citrus_assets::PostFxProfile, f32)> = stack.into_iter().map(|(_, p, w)| (p, w)).collect();
+        let p = citrus_assets::blend_over(self.environment.postfx, &blend);
 
         let tonemap = match p.tonemap.mode {
             citrus_assets::TonemapMode::None => 0,
@@ -3510,6 +4364,7 @@ impl LoadedScene {
             bloom_radius: p.bloom.radius,
             ca_enabled: p.chromatic_aberration.enabled,
             ca_intensity: p.chromatic_aberration.intensity,
+            underwater: None,
         }
     }
 
@@ -3533,7 +4388,7 @@ impl LoadedScene {
         use citrus_core::AudioSource;
         let mut cues = Vec::new();
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
                 continue;
             }
             if let Some(src) = self.objects[i]
@@ -3541,7 +4396,7 @@ impl LoadedScene {
                 .iter()
                 .find_map(|c| c.as_any().downcast_ref::<AudioSource>())
             {
-                let pos = self.world_transform(i).w_axis.truncate();
+                let pos = self.frame_world(i).w_axis.truncate();
                 cues.push(crate::audio::AudioCue::from_source(self.objects[i].id, src, pos));
             }
         }
@@ -3552,7 +4407,7 @@ impl LoadedScene {
     pub fn audio_listener(&self) -> Option<Vec3> {
         use citrus_core::AudioListener;
         for i in 0..self.objects.len() {
-            if !self.is_active(i) {
+            if !self.frame_active(i) {
                 continue;
             }
             if self.objects[i]
@@ -3560,7 +4415,7 @@ impl LoadedScene {
                 .iter()
                 .any(|c| c.as_any().downcast_ref::<AudioListener>().is_some())
             {
-                return Some(self.world_transform(i).w_axis.truncate());
+                return Some(self.frame_world(i).w_axis.truncate());
             }
         }
         None
@@ -3579,13 +4434,14 @@ impl LoadedScene {
     pub fn sync_draws_multi(&mut self, selected: &[usize], highlight: f32) {
         self.draws.clear();
         // One O(n) memoized pass instead of re-walking each parent chain per object.
-        let world = self.world_transforms();
+        let world = self.render_world_transforms();
+        self.frame_cache_active = (0..self.objects.len()).map(|i| self.is_active(i)).collect();
         // Locked reflection-probe boxes stay fixed in world space: compensate
         // box_offset by however far the object moved since last frame, so
         // dragging the probe repositions only the capture point inside the box.
-        for i in 0..self.objects.len() {
-            let pos = world[i].w_axis.truncate();
-            let Some(probe) = self.objects[i]
+        for (object, w) in self.objects.iter_mut().zip(world.iter()) {
+            let pos = w.w_axis.truncate();
+            let Some(probe) = object
                 .components
                 .iter_mut()
                 .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::ReflectionProbe>())
@@ -3606,16 +4462,20 @@ impl LoadedScene {
         // PlanarReflection component its layer index, in the SAME order (and
         // with the same visibility filter) as `planar_surfaces()` builds the
         // per-frame list, so DrawCmd.planar_index matches FrameInput.planar.
+        let occ_cell = match (&self.occlusion, self.occlusion_camera) {
+            (Some(o), Some(cam)) => o.cell_of(cam),
+            _ => None,
+        };
         let mut planar_idx = vec![-1i32; self.objects.len()];
         let mut planar_n = 0i32;
-        for i in 0..self.objects.len() {
+        for (i, slot) in planar_idx.iter_mut().enumerate() {
             if planar_n >= citrus_render::MAX_PLANAR as i32 {
                 break;
             }
             if !self.planar_surface_eligible(i) {
                 continue;
             }
-            planar_idx[i] = planar_n;
+            *slot = planar_n;
             planar_n += 1;
         }
         for i in 0..self.objects.len() {
@@ -3644,37 +4504,51 @@ impl LoadedScene {
             let has_lm_uv = self.objects[i]
                 .render
                 .is_some_and(|r| self.mesh_has_lightmap_uv.get(r.mesh).copied().unwrap_or(false));
-            let lightmap_size = if self.objects[i].static_geometry && has_lm_uv {
+            // Only the UV-checker preview reads it (it decomposes the matrix).
+            let lightmap_size = if self.lightmap_preview && self.objects[i].static_geometry && has_lm_uv {
                 self.lightmap_size_for_world(i, world[i])
             } else {
                 0
             };
             let transform = world[i];
             let highlight = if selected.contains(&i) { highlight } else { 0.0 };
+            let occluded = self.objects[i].static_geometry
+                && match (occ_cell, &self.occlusion) {
+                    (Some(c), Some(o)) => !o.visible(c, self.objects[i].id),
+                    _ => false,
+                };
             let Ok(lod) = self.lod_level(i, transform.w_axis.truncate()) else {
                 continue;
             };
             // One draw per material slot (slot 0 + extras), all at this transform.
-            for (k, mut render) in self.objects[i].render_slots().collect::<Vec<_>>().into_iter().enumerate() {
+            for (k, mut render) in self.objects[i].render_slots().enumerate() {
                 if let Some((base, count)) = lod {
                     render.mesh = base + k.min(count - 1);
                 }
-                let (mn, mx) = self.mesh_aabb(render.mesh);
+                let id = self.objects[i].id;
+                let (mn, mx) = self
+                    .pose_bounds
+                    .get(&(id, render.mesh))
+                    .or_else(|| self.shared_pose_bounds.get(&render.mesh))
+                    .copied()
+                    .unwrap_or_else(|| self.mesh_aabb(render.mesh));
                 self.draws.push(DrawCmd {
                     mesh: self.draw_mesh(self.objects[i].id, render.mesh),
                     material: self.materials[render.material].handle,
                     transform,
                     highlight,
-                    mesh_center: self.mesh_center_local(render.mesh),
+                    mesh_center: (mn + mx) * 0.5,
                     bound_radius: ((mx - mn) * 0.5).length(),
                     lightmap_layer,
                     lightmap_size,
                     static_geometry: self.objects[i].static_geometry,
                     planar_index: planar_idx[i],
+                    occluded,
                 });
             }
         }
         self.draws.extend(self.extra_draws.iter().copied());
+        self.frame_cache_world = world;
     }
 
     /// Delete an object and its whole subtree, remapping the surviving
@@ -3851,6 +4725,12 @@ impl LoadedScene {
     }
 
     pub fn pick(&self, origin: Vec3, dir: Vec3) -> Option<usize> {
+        self.pick_hit(origin, dir).map(|(i, _)| i)
+    }
+
+    /// The closest object the ray hits and its world distance (mesh-precise,
+    /// like `pick`).
+    pub fn pick_hit(&self, origin: Vec3, dir: Vec3) -> Option<(usize, f32)> {
         let mut best: Option<(usize, f32)> = None;
         for (i, object) in self.objects.iter().enumerate() {
             if object.render.is_none() {
@@ -3892,7 +4772,7 @@ impl LoadedScene {
                 }
             }
         }
-        best.map(|(i, _)| i)
+        best
     }
 
     /// Build the serialized `MaterialRef` for one material index (File if it
@@ -3905,7 +4785,8 @@ impl LoadedScene {
     ) -> MaterialRef {
         let entry = &self.materials[material_index];
         match &entry.file {
-            Some(path) => MaterialRef::File(relative_to(path, project_root)),
+            Some(path) => MaterialRef::File(citrus_core::asset_ref::reference(project_root, &relative_to(path, project_root))),
+            None if entry.model == entry.default => MaterialRef::Model,
             None => {
                 let (params, features) = material_from_model(&entry.model);
                 let custom = shaders
@@ -3970,6 +4851,8 @@ impl LoadedScene {
                     translation: object.translation.to_array(),
                     rotation: object.rotation.to_array(),
                     scale: object.scale.to_array(),
+                    model: None,
+                    model_part: None,
                 }
             })
             .collect();
@@ -4040,8 +4923,9 @@ impl LoadedScene {
         default_material: usize,
     ) -> usize {
         match mref {
+            MaterialRef::Model => default_material,
             MaterialRef::File(path) => {
-                let abs = project_root.join(path);
+                let abs = citrus_core::asset_ref::resolve_path(project_root, path);
                 self.material_from_file(renderer, shaders, &abs, project_root)
             }
             MaterialRef::Inline {
@@ -4075,26 +4959,37 @@ impl LoadedScene {
 
     /// Load any LOD-level models not uploaded yet (cheap when all are loaded).
     pub fn prepare_lods(&mut self, renderer: &mut Renderer, project_root: &Path) {
-        let mut wanted = Vec::new();
+        // (template key, model to load, triangle share to keep when generated)
+        let mut wanted: Vec<(String, String, Option<f32>)> = Vec::new();
         for o in &self.objects {
-            if let Some(lod) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::LodComponent>()) {
-                for level in &lod.levels {
-                    if !level.model.is_empty()
-                        && !self.model_templates.contains_key(&level.model)
-                        && !self.lod_failed.contains(&level.model)
-                        && !wanted.contains(&level.model)
-                    {
-                        wanted.push(level.model.clone());
-                    }
+            let Some(lod) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::LodComponent>()) else { continue };
+            let base = match &o.source {
+                ObjectSource::Model { path, .. } => Some(path.as_str()),
+                _ => None,
+            };
+            for level in &lod.levels {
+                let Some(key) = lod_template_key(level, base) else { continue };
+                if !self.model_templates.contains_key(&key) && !self.lod_failed.contains(&key) && !wanted.iter().any(|w| w.0 == key) {
+                    let generated = level.model.is_empty();
+                    let source = if generated { base.unwrap_or_default().to_owned() } else { level.model.clone() };
+                    wanted.push((key, source, generated.then_some(level.keep)));
                 }
             }
         }
-        for path in wanted {
-            let result = citrus_assets::load_model_with_meta(project_root.join(&path))
-                .and_then(|asset| self.install_model_template(renderer, &path, &asset, None));
+        for (key, source, keep) in wanted {
+            let result = citrus_assets::load_model_with_meta(project_root.join(&source)).and_then(|mut asset| {
+                if let Some(keep) = keep {
+                    for mesh in &mut asset.meshes {
+                        *mesh = citrus_assets::simplify::simplify(mesh, keep);
+                    }
+                    // Blendshapes index the original vertices.
+                    asset.morphs.clear();
+                }
+                self.install_model_template(renderer, &key, &asset, None)
+            });
             if let Err(e) = result {
-                tracing::warn!("LOD model {path}: {e:#}");
-                self.lod_failed.insert(path);
+                tracing::warn!("LOD model {key}: {e:#}");
+                self.lod_failed.insert(key);
             }
         }
     }
@@ -4121,11 +5016,12 @@ impl LoadedScene {
         let Some(level) = level else {
             return Err(());
         };
-        let model = &lod.levels[level].model;
-        Ok(self
-            .model_templates
-            .get(model)
-            .map(|(base, mats)| (*base, mats.len().max(1))))
+        let base = match &self.objects[i].source {
+            ObjectSource::Model { path, .. } => Some(path.as_str()),
+            _ => None,
+        };
+        let Some(key) = lod_template_key(&lod.levels[level], base) else { return Ok(None) };
+        Ok(self.model_templates.get(&key).map(|(base, mats)| (*base, mats.len().max(1))))
     }
 
     /// Upload the builtin test-scene meshes once and remember their templates.
@@ -4160,6 +5056,7 @@ impl LoadedScene {
         if self.model_templates.contains_key(path) {
             return Ok(());
         }
+        self.model_parts.insert(path.to_owned(), citrus_assets::ModelPart::of(asset));
         let mesh_base = self.mesh_handles.len();
         let object_start = self.objects.len();
         match prepared {
@@ -4193,6 +5090,7 @@ impl LoadedScene {
         registry: &ComponentRegistry,
         entries: &[SceneEntry],
     ) -> Result<usize> {
+        self.anim_assets.set_root(project_root);
         let base = self.objects.len();
         for entry in entries {
             // (mesh, template material) for every render slot of this source.
@@ -4348,7 +5246,7 @@ impl LoadedScene {
         for entry in entries {
             match &entry.source {
                 ObjectSource::Model { path, .. } if !self.model_templates.contains_key(path) => {
-                    let asset = citrus_assets::load_model_with_meta(&project_root.join(path))
+                    let asset = citrus_assets::load_model_with_meta(project_root.join(path))
                         .with_context(|| format!("importing {path}"))?;
                     self.install_model_template(renderer, path, &asset, None)?;
                 }
@@ -4384,16 +5282,10 @@ impl LoadedScene {
         project_root: &Path,
     ) -> Result<HashMap<String, citrus_assets::Scene>> {
         let mut models = HashMap::new();
-        for entry in &file.entries {
-            if let ObjectSource::Model { path, .. } = &entry.source {
-                if models.contains_key(path) {
-                    continue;
-                }
-                let abs = project_root.join(path);
-                let asset = citrus_assets::load_model_with_meta(&abs)
-                    .with_context(|| format!("importing {path} for scene"))?;
-                models.insert(path.clone(), asset);
-            }
+        for path in file.model_paths() {
+            let abs = project_root.join(&path);
+            let asset = citrus_assets::load_model_with_meta(&abs).with_context(|| format!("importing {path} for scene"))?;
+            models.insert(path, asset);
         }
         Ok(models)
     }
@@ -4438,6 +5330,9 @@ impl LoadedScene {
         material_textures: Option<(Vec<(PathBuf, bool)>, citrus_render::PreparedScene)>,
         mut progress: impl FnMut(&str),
     ) -> Result<Self> {
+        let mut expanded = file.clone();
+        expanded.expand_models(&|p| models.get(p).map(citrus_assets::ModelPart::of));
+        let file = &expanded;
         let mut scene = Self::empty();
         scene.skybox = file.skybox.clone();
         scene.environment = file.environment.clone();
@@ -4809,6 +5704,26 @@ fn texture_slot_order(
     ]
 }
 
+/// The camera object id in a `camera:<object id>` texture path.
+fn camera_texture_id(path: &Path) -> Option<ObjectId> {
+    path.to_str()?.strip_prefix("camera:")?.trim().parse().ok()
+}
+
+/// Convention: a custom shader with an `OUTLINE` toggle plus `outline_color`
+/// and `outline_width` properties gets the engine's inverted-hull outline.
+fn custom_outline(source: &citrus_assets::ShaderSource, values: &[f32]) -> Option<([f32; 4], f32)> {
+    let on = source.prop("OUTLINE")?;
+    let color = source.prop("outline_color")?;
+    let width = source.prop("outline_width")?;
+    let v = |at: usize| values.get(at).copied().unwrap_or(0.0);
+    if v(on.offset) == 0.0 || v(width.offset) <= 0.0 {
+        return None;
+    }
+    let c = color.offset;
+    let alpha = if color.kind.size() == 4 { v(c + 3) } else { 1.0 };
+    Some(([v(c), v(c + 1), v(c + 2), alpha], v(width.offset)))
+}
+
 pub fn tex_paths_from_file(
     t: &citrus_assets::MaterialTextures,
 ) -> citrus_core::MaterialTexturePaths {
@@ -4825,6 +5740,7 @@ pub fn tex_paths_from_file(
         roughness: t.roughness.clone(),
         metallic: t.metallic.clone(),
         displacement: t.displacement.clone(),
+        shader: t.shader.iter().map(|(n, p)| (n.clone(), Some(p.clone()))).collect(),
     }
 }
 
@@ -4845,6 +5761,11 @@ pub fn tex_file_from_paths(
         roughness: t.roughness.clone(),
         metallic: t.metallic.clone(),
         displacement: t.displacement.clone(),
+        shader: t
+            .shader
+            .iter()
+            .filter_map(|(n, p)| p.clone().map(|p| (n.clone(), p)))
+            .collect(),
     }
 }
 
@@ -4913,6 +5834,7 @@ pub fn features_from_model(m: &MaterialModel) -> MaterialFeatures {
             AlphaModeModel::Blend => AlphaMode::Blend,
         },
         double_sided: m.double_sided,
+        water: false,
     }
 }
 
@@ -4921,20 +5843,6 @@ pub fn relative_to(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
-}
-
-/// Convert per-role `(position, rotation)` tracker targets into the `Mat4`-based
-/// `TrackerPoses` the calibration math takes.
-fn tracker_poses_from_targets(t: &citrus_core::TrackerTargets) -> crate::humanoid::TrackerPoses {
-    let m = |p: Option<(Vec3, glam::Quat)>| p.map(|(pos, rot)| Mat4::from_rotation_translation(rot, pos));
-    crate::humanoid::TrackerPoses {
-        head: m(t.head),
-        left_hand: m(t.left_hand),
-        right_hand: m(t.right_hand),
-        hips: m(t.hips),
-        left_foot: m(t.left_foot),
-        right_foot: m(t.right_foot),
-    }
 }
 
 /// Strip a trailing `(N)` (N = digits) from a duplicate name so re-duplicating
@@ -5003,7 +5911,7 @@ fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 /// the actual SURFACE, not the loose AABB.
 fn ray_mesh(origin: Vec3, dir: Vec3, pos: &[Vec3], idx: &[u32]) -> Option<f32> {
     let mut best = f32::INFINITY;
-    for tri in idx.chunks_exact(3) {
+    for tri in idx.as_chunks::<3>().0 {
         let (Some(&a), Some(&b), Some(&c)) = (
             pos.get(tri[0] as usize),
             pos.get(tri[1] as usize),
@@ -5011,11 +5919,10 @@ fn ray_mesh(origin: Vec3, dir: Vec3, pos: &[Vec3], idx: &[u32]) -> Option<f32> {
         ) else {
             continue;
         };
-        if let Some(t) = ray_triangle(origin, dir, a, b, c) {
-            if t < best {
+        if let Some(t) = ray_triangle(origin, dir, a, b, c)
+            && t < best {
                 best = t;
             }
-        }
     }
     best.is_finite().then_some(best)
 }
@@ -5048,6 +5955,54 @@ fn ray_triangle(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_texture_paths_name_a_camera_and_never_the_main_view() {
+        let id = ObjectId::new();
+        assert_eq!(camera_texture_id(Path::new(&format!("camera:{id}"))), Some(id));
+        assert_eq!(camera_texture_id(Path::new("textures/tv.png")), None);
+        let mut scene = LoadedScene::empty();
+        for (cam_id, rtt) in [(1u32, true), (2, false)] {
+            scene.objects.push(SceneObject {
+                id: ObjectId::new(),
+                name: String::new(),
+                render: None,
+                extra_render: Vec::new(),
+                source: citrus_assets::ObjectSource::Camera,
+                enabled: true,
+                static_geometry: false,
+                lightmap_scale: 1.0,
+                layer: 0,
+                parent: None,
+                translation: Vec3::ZERO,
+                rotation: glam::Quat::IDENTITY,
+                scale: Vec3::ONE,
+                components: vec![Box::new(citrus_core::CameraComponent { id: cam_id, render_texture: rtt, ..Default::default() })],
+            });
+        }
+        assert_eq!(scene.main_camera(), Some(1), "the render-texture camera (lower id) is skipped");
+    }
+
+    #[test]
+    fn posed_bounds_follow_the_joints() {
+        let vert = |p: [f32; 3], j: u32| citrus_render::Vertex {
+            position: p,
+            joints: [j, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        // An "arm": two vertices on joint 0 at the origin, two on joint 1 at x = 1.
+        let sm = SkinnedMesh::new(
+            0,
+            vec![vert([0.0, 0.0, 0.0], 0), vert([0.0, 1.0, 0.0], 0), vert([1.0, 0.0, 0.0], 1), vert([1.0, 1.0, 0.0], 1)],
+            0,
+        );
+        let rest = posed_bounds(&sm.joint_boxes, &[Mat4::IDENTITY, Mat4::IDENTITY]).unwrap();
+        assert_eq!(rest, (Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0)));
+        // Joint 1 swings 5 m out: the bind-pose box would miss it entirely.
+        let posed = posed_bounds(&sm.joint_boxes, &[Mat4::IDENTITY, Mat4::from_translation(Vec3::X * 5.0)]).unwrap();
+        assert_eq!(posed, (Vec3::ZERO, Vec3::new(6.0, 1.0, 0.0)));
+    }
 
     #[test]
     fn cluster_aabbs_merges_down_to_cap() {
@@ -5281,8 +6236,8 @@ mod lod_tests {
             scale: Vec3::ONE,
             components: vec![Box::new(LodComponent {
                 levels: vec![
-                    LodLevel { max_distance: 10.0, model: String::new() },
-                    LodLevel { max_distance: 20.0, model: String::new() },
+                    LodLevel { keep: 0.0, max_distance: 10.0, model: String::new() },
+                    LodLevel { keep: 0.0, max_distance: 20.0, model: String::new() },
                 ],
                 cull_distance: 30.0,
             })],
@@ -5311,3 +6266,73 @@ mod lod_tests {
         assert_eq!(level_at(&mut s, 40.0), None);
     }
 }
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    fn obj(scene: &mut LoadedScene, name: &str, parent: Option<usize>, t: Vec3) -> usize {
+        scene.objects.push(SceneObject {
+            id: ObjectId::new(),
+            name: name.into(),
+            render: None,
+            extra_render: Vec::new(),
+            source: ObjectSource::Empty,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            layer: 0,
+            parent,
+            translation: t,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            components: Vec::new(),
+        });
+        scene.objects.len() - 1
+    }
+
+    #[test]
+    fn grouping_keeps_world_positions_and_the_shared_parent() {
+        let mut s = LoadedScene::empty();
+        let room = obj(&mut s, "Room", None, Vec3::new(10.0, 0.0, 0.0));
+        let a = obj(&mut s, "A", Some(room), Vec3::new(1.0, 0.0, 0.0));
+        let b = obj(&mut s, "B", Some(room), Vec3::new(3.0, 0.0, 0.0));
+        let a_child = obj(&mut s, "A child", Some(a), Vec3::new(0.0, 1.0, 0.0));
+        let ids: Vec<ObjectId> = [a, b, a_child].iter().map(|&i| s.objects[i].id).collect();
+        let world_before: Vec<Vec3> = [a, b, a_child].iter().map(|&i| s.world_transform(i).w_axis.truncate()).collect();
+        let g = s.group_into_empty(&[a, b, a_child]).unwrap();
+        assert_eq!(s.objects[g].name, "Group");
+        assert_eq!(s.objects[g].parent, s.index_of(s.objects[room].id), "under the shared parent");
+        assert!((s.world_transform(g).w_axis.truncate() - Vec3::new(12.0, 0.0, 0.0)).length() < 1e-4, "at their centre");
+        for (id, before) in ids.iter().zip(world_before) {
+            let i = s.index_of(*id).unwrap();
+            assert!((s.world_transform(i).w_axis.truncate() - before).length() < 1e-4, "world position kept");
+        }
+        let a_now = s.index_of(ids[0]).unwrap();
+        assert_eq!(s.objects[a_now].parent, Some(g));
+        assert_eq!(s.objects[s.index_of(ids[2]).unwrap()].parent, Some(a_now), "a member's own child stays with it");
+        for (i, o) in s.objects.iter().enumerate() {
+            assert!(o.parent.is_none_or(|p| p < i), "parents stay ahead of children");
+        }
+    }
+    #[test]
+    fn root_objects_and_mixed_parents_all_move_under_the_new_group() {
+        let mut s = LoadedScene::empty();
+        let lights: Vec<usize> = (0..5).map(|k| obj(&mut s, "light", None, Vec3::new(k as f32, 2.0, 0.0))).collect();
+        let room = obj(&mut s, "Room", None, Vec3::new(0.0, 0.0, 5.0));
+        let lamp = obj(&mut s, "Lamp", Some(room), Vec3::new(1.0, 0.0, 0.0));
+        let mut members = lights.clone();
+        members.push(lamp);
+        let ids: Vec<ObjectId> = members.iter().map(|&i| s.objects[i].id).collect();
+        let g = s.group_into_empty(&members).unwrap();
+        assert_eq!(s.objects[g].parent, None, "different parents: the group goes at the root");
+        for id in &ids {
+            assert_eq!(s.objects[s.index_of(*id).unwrap()].parent, Some(g), "every selected object is under the group");
+        }
+        assert_eq!(s.objects.iter().filter(|o| o.parent == Some(g)).count(), 6);
+        for (i, o) in s.objects.iter().enumerate() {
+            assert!(o.parent.is_none_or(|p| p < i));
+        }
+    }
+}
+

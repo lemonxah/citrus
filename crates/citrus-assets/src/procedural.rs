@@ -14,7 +14,55 @@ pub fn primitive_mesh(shape: PrimitiveShape) -> MeshData {
         PrimitiveShape::Sphere => uv_sphere(0.5, 48, 24),
         PrimitiveShape::Capsule => capsule(0.25, 1.0, 32, 8),
         PrimitiveShape::Plane => plane(2.0, 1.0),
+        PrimitiveShape::Bucket => bucket(),
     }
+}
+
+/// Wall and floor thickness of the Bucket primitive (unit size).
+pub const BUCKET_WALL: f32 = 0.04;
+pub const BUCKET_FLOOR: f32 = 0.05;
+
+/// Unit open-top box: outer faces, inner faces and the rim, each quad its
+/// own cell in a 4x4 lightmap atlas.
+fn bucket() -> MeshData {
+    let h = 0.5;
+    let i = h - BUCKET_WALL;
+    let f = -h + BUCKET_FLOOR;
+    let p = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+    let quads: [([Vec3; 4], Vec3); 14] = [
+        ([p(-h, -h, h), p(h, -h, h), p(h, h, h), p(-h, h, h)], Vec3::Z),
+        ([p(h, -h, -h), p(-h, -h, -h), p(-h, h, -h), p(h, h, -h)], Vec3::NEG_Z),
+        ([p(h, -h, h), p(h, -h, -h), p(h, h, -h), p(h, h, h)], Vec3::X),
+        ([p(-h, -h, -h), p(-h, -h, h), p(-h, h, h), p(-h, h, -h)], Vec3::NEG_X),
+        ([p(-h, -h, -h), p(h, -h, -h), p(h, -h, h), p(-h, -h, h)], Vec3::NEG_Y),
+        ([p(i, f, i), p(-i, f, i), p(-i, h, i), p(i, h, i)], Vec3::NEG_Z),
+        ([p(-i, f, -i), p(i, f, -i), p(i, h, -i), p(-i, h, -i)], Vec3::Z),
+        ([p(i, f, -i), p(i, f, i), p(i, h, i), p(i, h, -i)], Vec3::NEG_X),
+        ([p(-i, f, i), p(-i, f, -i), p(-i, h, -i), p(-i, h, i)], Vec3::X),
+        ([p(-i, f, i), p(i, f, i), p(i, f, -i), p(-i, f, -i)], Vec3::Y),
+        ([p(-h, h, h), p(h, h, h), p(i, h, i), p(-i, h, i)], Vec3::Y),
+        ([p(h, h, -h), p(-h, h, -h), p(-i, h, -i), p(i, h, -i)], Vec3::Y),
+        ([p(h, h, h), p(h, h, -h), p(i, h, -i), p(i, h, i)], Vec3::Y),
+        ([p(-h, h, -h), p(-h, h, h), p(-i, h, i), p(-i, h, -i)], Vec3::Y),
+    ];
+    const M: f32 = 0.06;
+    let mut vertices = Vec::with_capacity(56);
+    let mut indices = Vec::with_capacity(84);
+    for (q, (mut c, n)) in quads.into_iter().enumerate() {
+        if (c[1] - c[0]).cross(c[2] - c[0]).dot(n) < 0.0 {
+            c.swap(1, 3);
+        }
+        let base = vertices.len() as u32;
+        let (col, row) = ((q % 4) as f32, (q / 4) as f32);
+        let t = (c[1] - c[0]).normalize_or(Vec3::X);
+        for (k, pos) in c.into_iter().enumerate() {
+            let uv = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]][k];
+            let uv1 = [(col + M + uv[0] * (1.0 - 2.0 * M)) / 4.0, (row + M + uv[1] * (1.0 - 2.0 * M)) / 4.0];
+            vertices.push(Vertex { position: pos.to_array(), normal: n.to_array(), uv, uv1, tangent: [t.x, t.y, t.z, 1.0], ..Default::default() });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    MeshData { vertices, indices, has_lightmap_uv: true }
 }
 
 /// Build a `MeshData`, using the primary (clean, non-overlapping) UVs as the
@@ -213,6 +261,8 @@ pub fn test_scene() -> Scene {
         materials,
         instances,
         skeletons: Vec::new(),
+        morphs: Vec::new(),
+        springs: Default::default(),
         animations: Vec::new(),
     }
 }
@@ -363,4 +413,23 @@ fn uv_sphere(radius: f32, segments: u32, rings: u32) -> MeshData {
         }
     }
     mesh_with_lightmap(vertices, indices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bucket_is_open_on_top_and_wound_outward() {
+        let m = primitive_mesh(PrimitiveShape::Bucket);
+        assert_eq!(m.indices.len(), 14 * 6);
+        for t in m.indices.chunks(3) {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(m.vertices[i as usize].position));
+            let n = Vec3::from(m.vertices[t[0] as usize].normal);
+            assert!((b - a).cross(c - a).dot(n) > 0.0, "front faces follow the normals");
+        }
+        let inner = 0.5 - BUCKET_WALL;
+        let covers_mouth = m.vertices.iter().any(|v| v.position[1] > 0.49 && v.position[0].abs() < inner - 1e-3 && v.position[2].abs() < inner - 1e-3);
+        assert!(!covers_mouth, "nothing across the opening");
+    }
 }

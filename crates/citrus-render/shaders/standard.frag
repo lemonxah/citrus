@@ -7,63 +7,25 @@ layout(constant_id = 0) const bool FEAT_TOON = false;
 layout(constant_id = 1) const bool FEAT_NORMAL_MAP = false;
 layout(constant_id = 2) const bool FEAT_EMISSION = false;
 layout(constant_id = 3) const uint ALPHA_MODE = 0u; // 0 opaque, 1 cutout, 2 blend
+layout(constant_id = 4) const bool FEAT_WATER = false;
 
-const int MAX_LIGHTS = 128;
+#include "standard_common.glsl"
 
-struct Light {
-    vec4 pos_kind;   // xyz world position, w = kind (0 dir, 1 point, 2 spot)
-    vec4 dir_range;  // xyz travel direction (normalized), w = range
-    vec4 color;      // rgb color*intensity, w = cos(outer half-angle)
-    vec4 spot;       // x = cos(inner half-angle)
-};
-
-const int MAX_SHADOW_VIEWS = 12;
-const int MAX_PROBE_VOLUMES = 4;
-
-// One baked light-probe volume: world->local plus the grid layout (matches
-// GpuProbeVolume on the CPU).
-struct ProbeVolume {
-    mat4 world_to_local; // local box spans -size/2 .. +size/2
-    vec4 size_base;      // xyz = local box size, w = first probe index (sh_base)
-    vec4 counts;         // xyz = probe counts per axis
-};
-
-layout(set = 0, binding = 0) uniform FrameData {
-    mat4 view;
-    mat4 proj;
-    mat4 view_proj;
-    vec4 camera_pos;
-    vec4 light_dir;
-    vec4 light_color;
-    vec4 ambient;
-    vec4 misc; // x = time, y = light count, z = shadow spacing, w = probe-volume count
-    vec4 postfx0; // x tonemap mode, y exposure EV, z grade exposure, w contrast
-    vec4 postfx1; // x saturation, y temperature, z tint, w grading enabled
-    vec4 postfx2; // x vignette enabled, y intensity, z smoothness, w screen width
-    vec4 postfx3; // xyz vignette color, w screen height
-    vec4 cascade_splits; // far view-space distance of each directional cascade
-    Light lights[MAX_LIGHTS];
-    mat4 shadow_vp[MAX_SHADOW_VIEWS];
-    ProbeVolume probe_volumes[MAX_PROBE_VOLUMES];
-    vec4 debug; // x = lightmap-UV checker preview, y = gi debug, z = screen-GI active
-    mat4 inv_view;
-    mat4 inv_proj;
-    vec4 ssr; // x = enabled, y = intensity, z = max view-space dist, w = roughness cutoff
-    vec4 refl_center;  // xyz = probe CAPTURE position (re-vector anchor), w = intensity (0 = no zone)
-    vec4 refl_extents; // xyz = probe box half-extents, w = box-projection enabled
-    vec4 fog_color;    // xyz = fog colour, w = density (0 = no fog)
-    vec4 fog_params;   // x = height falloff, y = height ref, z = start distance
-    vec4 refl_box;     // xyz = probe box CENTER (capture + box offset), w unused
-} frame;
-
-// Bindings 5 (scene depth) and 6 (prev colour) feed the deferred SSR resolve
-// pass now, not this shader; they stay in the set-0 layout but go unused here.
+// Water: copies of the opaque scene (depth, HDR colour) taken before the
+// transparent draws; valid for this pass when frame.water.y > 0.5.
+layout(set = 0, binding = 5) uniform sampler2D u_opaque_depth;
+layout(set = 0, binding = 6) uniform sampler2D u_opaque_color;
 // Reflection probe: prefiltered environment cubemap (mirror at mip 0, rougher
 // toward higher mips). Sampled by reflection direction + roughness.
 layout(set = 0, binding = 7) uniform samplerCube u_env;
+// Second reflection probe, blended per pixel with u_env by box influence.
+layout(set = 0, binding = 9) uniform samplerCube u_env_b;
 // Planar reflections: per-plane mirrored scene renders, sampled at screen UV
 // by surfaces whose push constant carries a planar layer (pc.emission.w >= 1).
 layout(set = 0, binding = 8) uniform sampler2DArray u_planar;
+// Each water body's ripple field by body slot (r height, gb local XZ
+// gradient, with mips): the caustics on what lies under it.
+layout(set = 0, binding = 10) uniform sampler2D u_water_ripples[MAX_WATER_BODIES];
 // Max roughness mip = (mip count - 1) of the CURRENTLY bound cube, queried at
 // runtime so it's correct whether u_env is the 64px skybox cube (7 mips) or a
 // higher-res captured reflection-probe cube (e.g. 256px = 9 mips). A hardcoded
@@ -75,7 +37,7 @@ layout(set = 0, binding = 8) uniform sampler2DArray u_planar;
 layout(set = 0, binding = 1) uniform sampler2DArrayShadow u_shadow;
 
 // Baked probe SH-L1: 4 coefficients (RGB in .xyz) per probe.
-struct Probe { vec4 c[5]; }; // c[0..3]=radiance+dist SH, c[4]=dist² SH (Chebyshev)
+struct Probe { vec4 c[6]; }; // c[0..3]=radiance+dist SH, c[4]=dist² SH (Chebyshev)
 layout(set = 0, binding = 2) readonly buffer Probes { Probe probes[]; };
 
 // Baked lightmaps (static-object GI): one array layer per object, sampled by
@@ -118,6 +80,17 @@ vec3 screen_gi_upsample(vec2 suv, vec3 P, vec3 Nv) {
     const float STEP = 4.0;   // pixels between taps (≈17px-wide denoise)
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
+    // View rays through the taps: affine in NDC for a perspective inverse, so
+    // build the centre ray + per-tap steps once instead of an inv_proj multiply
+    // per tap (25 per fragment).
+    vec2 cndc = suv * 2.0 - 1.0;
+    cndc.y = -cndc.y;
+    vec4 f0 = frame.inv_proj * vec4(cndc, 1.0, 1.0);
+    vec4 fx = frame.inv_proj * vec4(cndc + vec2(2.0 * STEP * texel.x, 0.0), 1.0, 1.0);
+    vec4 fy = frame.inv_proj * vec4(cndc - vec2(0.0, 2.0 * STEP * texel.y), 1.0, 1.0);
+    vec3 r0 = f0.xyz / f0.w;
+    vec3 rx = fx.xyz / fx.w - r0;
+    vec3 ry = fy.xyz / fy.w - r0;
     for (int j = -R; j <= R; ++j) {
         for (int i = -R; i <= R; ++i) {
             vec2 off = vec2(i, j);
@@ -137,10 +110,7 @@ vec3 screen_gi_upsample(vec2 suv, vec3 P, vec3 Nv) {
             // -> raw ray noise on every angled surface) while a true depth edge,
             // far in both, is still rejected. Softer falloff (×5) widens the kept
             // set so high-intensity GI isn't left grainy on curvature.
-            vec2 ndc = uv * 2.0 - 1.0;
-            ndc.y = -ndc.y;
-            vec4 farp = frame.inv_proj * vec4(ndc, 1.0, 1.0);
-            vec3 dir = normalize(farp.xyz / farp.w);
+            vec3 dir = normalize(r0 + rx * off.x + ry * off.y);
             float denom = dot(Nv, dir);
             float pred = abs(denom) > 1e-4 ? length(dir * (dot(Nv, P) / denom)) : frag_dist;
             float inv_fd = 1.0 / max(frag_dist, 0.5);
@@ -215,7 +185,7 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
     vec3 t = volume_coords(v, world_pos);
     ivec3 cnt = ivec3(v.counts.xyz + 0.5);
     vec3 size = max(v.size_base.xyz, vec3(1e-4));
-    vec3 center = -v.world_to_local[3].xyz; // meta stores translate(-center)
+    vec3 center = -(transpose(mat3(v.world_to_local)) * v.world_to_local[3].xyz); // volume origin (rotation-aware)
     vec3 cell = size / max(vec3(cnt - 1), vec3(1.0));
     vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
     ivec3 g0 = ivec3(floor(g));
@@ -238,7 +208,7 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
         uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
         // Probe world position from its grid coords.
         vec3 gn = vec3(gc) / max(vec3(cnt - 1), vec3(1.0));
-        vec3 ppos = center + (gn - 0.5) * size;
+        vec3 ppos = center + transpose(mat3(v.world_to_local)) * ((gn - 0.5) * size) + probes[idx].c[5].xyz;
         vec3 to_frag = world_pos - ppos;
         float pd = length(to_frag);
         vec3 dir = pd > 1e-5 ? to_frag / pd : n;
@@ -280,22 +250,45 @@ vec3 sample_volume(ProbeVolume v, vec3 world_pos, vec3 n) {
 // ordered finest-first (cascades): the first that contains the point wins, but
 //   - near an INNER cascade's boundary we cross-fade into the next (coarser)
 //     cascade so the resolution change isn't a visible seam (coverage stays 1),
-//   - near the OUTERMOST cascade's boundary we instead drop coverage toward 0 so
-//     the GI fades smoothly into ambient rather than hard-stopping at the box.
+//   - the OUTERMOST cascade keeps full coverage everywhere inside its box and
+//     fades to ambient over one probe cell OUTSIDE it (DDGI). Fading inside the
+//     box starved the surfaces volumes are built for: a floor resting on the
+//     bottom face got ~2% of its GI, leaving only the probe dots visible.
+
+// How far a point (volume coords `t`) lies outside volume `v`, in probe cells.
+float volume_outside_cells(ProbeVolume v, vec3 t) {
+    vec3 cells = max(v.counts.xyz - 1.0, vec3(1.0));
+    vec3 out_g = max(max(-t, t - 1.0), vec3(0.0)) * cells;
+    return max(out_g.x, max(out_g.y, out_g.z));
+}
+
+// `world_pos` moved onto the nearest point of volume `v`'s box.
+vec3 volume_clamp(ProbeVolume v, vec3 world_pos) {
+    vec3 half_size = max(v.size_base.xyz, vec3(1e-4)) * 0.5;
+    vec3 local = clamp((v.world_to_local * vec4(world_pos, 1.0)).xyz, -half_size, half_size);
+    mat3 local_to_world = transpose(mat3(v.world_to_local));
+    return local_to_world * (local - v.world_to_local[3].xyz);
+}
+
 float sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
     int vcount = int(frame.misc.w + 0.5);
     for (int vi = 0; vi < vcount && vi < MAX_PROBE_VOLUMES; ++vi) {
         ProbeVolume v = frame.probe_volumes[vi];
         vec3 t = volume_coords(v, world_pos);
-        if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) {
+        bool has_next = (vi + 1 < vcount && vi + 1 < MAX_PROBE_VOLUMES);
+        float outside = volume_outside_cells(v, t);
+        if (outside > 0.0 && (has_next || outside >= 1.0)) {
             continue;
+        }
+        if (outside > 0.0) {
+            irradiance = sample_volume(v, volume_clamp(v, world_pos), n);
+            return 1.0 - smoothstep(0.0, 1.0, outside);
         }
         vec3 fine = sample_volume(v, world_pos, n);
         // Distance to the nearest box face in normalized units (0 at the face,
         // 0.5 at the center).
         vec3 edge = min(t, vec3(1.0) - t);
         float e = min(edge.x, min(edge.y, edge.z));
-        bool has_next = (vi + 1 < vcount && vi + 1 < MAX_PROBE_VOLUMES);
         if (has_next) {
             // Wide, smooth cross-fade into the coarser cascade hides the band.
             float inner = smoothstep(0.0, 0.22, e);
@@ -307,10 +300,8 @@ float sample_probes(vec3 world_pos, vec3 n, out vec3 irradiance) {
             irradiance = fine;
             return 1.0;
         }
-        // Outermost cascade: wide, gentle fade-to-ambient so GI melts into the
-        // ambient term over a broad ring instead of stopping at a visible line.
         irradiance = fine;
-        return smoothstep(0.0, 0.2, e);
+        return 1.0;
     }
     irradiance = vec3(0.0);
     return 0.0;
@@ -361,14 +352,22 @@ vec3 sample_irradiance_smooth(vec3 world_pos, vec3 n) {
     for (int vi = 0; vi < vcount && vi < MAX_PROBE_VOLUMES; ++vi) {
         ProbeVolume v = frame.probe_volumes[vi];
         vec3 t = volume_coords(v, world_pos);
-        if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) {
+        // Outermost volume: a one-cell margin outside the box (as sample_probes).
+        bool has_next = (vi + 1 < vcount && vi + 1 < MAX_PROBE_VOLUMES);
+        float outside = volume_outside_cells(v, t);
+        if (outside > 0.0 && (has_next || outside >= 1.0)) {
             continue;
         }
+        float fade = 1.0 - smoothstep(0.0, 1.0, outside);
         ivec3 cnt = ivec3(v.counts.xyz + 0.5);
         vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
         ivec3 g0 = ivec3(floor(g));
         vec3 f = g - vec3(g0);
-        f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0); // smootherstep (C2): blend voxel edges
+        // Plain trilinear: smoothstep-style weights flatten near each probe, so
+        // every probe owns a plateau and the field reads as a grid.
+        mat3 local_to_world = transpose(mat3(v.world_to_local));
+        vec3 center = -(local_to_world * v.world_to_local[3].xyz);
+        vec3 size = max(v.size_base.xyz, vec3(1e-4));
         vec3 sum = vec3(0.0);
         float wsum = 0.0;
         for (int i = 0; i < 8; ++i) {
@@ -376,11 +375,21 @@ vec3 sample_irradiance_smooth(vec3 world_pos, vec3 n) {
             ivec3 gc = clamp(g0 + off, ivec3(0), cnt - 1);
             vec3 tw = mix(vec3(1.0) - f, f, vec3(off));
             float w = tw.x * tw.y * tw.z;
+            // Backface weight (DDGI): a probe behind this surface (under a floor
+            // that sits just above the volume's bottom layer) sees only the
+            // back of it, so it must not darken the surface it can't see.
+            vec3 gn = vec3(gc) / max(vec3(cnt - 1), vec3(1.0));
+            vec3 to_probe = center + local_to_world * ((gn - 0.5) * size) - world_pos;
+            // A step across the surface plane, not an angle falloff: weighting
+            // front probes by angle changes non-linearly between probes and
+            // shows each one as a bump.
+            float facing = dot(to_probe, to_probe) > 1e-8 ? smoothstep(-0.15, 0.05, dot(normalize(to_probe), n)) : 1.0;
+            w *= facing + 1e-3;
             uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
             sum += w * sh_eval(idx, n);
             wsum += w;
         }
-        return wsum > 1e-5 ? max(sum / wsum, vec3(0.0)) : vec3(0.0);
+        return wsum > 1e-5 ? max(sum / wsum, vec3(0.0)) * fade : vec3(0.0);
     }
     return vec3(0.0);
 }
@@ -488,20 +497,6 @@ layout(set = 1, binding = 1) uniform sampler2D t_normal;
 layout(set = 1, binding = 2) uniform sampler2D t_orm; // R occlusion, G roughness, B metallic
 layout(set = 1, binding = 3) uniform sampler2D t_emission;
 
-// Extended per-material params (beyond the 128-byte push block).
-layout(set = 1, binding = 4) uniform MaterialFx {
-    vec4 rim;    // rgb rim colour, w rim power
-    vec4 toon;   // x rim strength, y ramp smoothness, z emission pulse, w _
-    vec4 scroll; // xy base UV scroll, zw emission UV scroll
-    vec4 matcap; // xyz matcap layer strengths, w _
-    vec4 matcap_blend; // xyz blend modes (0 add / 1 mul / 2 replace), w _
-    vec4 albedo_st;   // xy tiling (scale), zw offset
-    vec4 normal_st;
-    vec4 orm_st;
-    vec4 emission_st;
-    vec4 orm_invert;  // x ao, y roughness, z metallic: 1 = invert sampled value
-    vec4 parallax;    // x = displacement scale (0 = off)
-} fx;
 
 // Split AO / Roughness / Metallic maps. Each multiplies the matching packed-ORM
 // channel; the 1×1 default is white, so an unassigned slot is a no-op.
@@ -522,6 +517,8 @@ layout(set = 1, binding = 11) uniform sampler2D t_matcap2;
 layout(set = 1, binding = 12) uniform sampler2D t_matcap2_mask;
 
 layout(push_constant) uniform Push {
+    // The model matrix comes from the instance stream; column 0 here holds the
+    // 128-bit mask of lights that can reach this draw (uint bits).
     mat4 model;
     vec4 base_color;
     vec4 emission;
@@ -598,6 +595,9 @@ vec3 apply_postfx(vec3 color, vec2 fragcoord) {
     return color;
 }
 
+// Radius (m) every punctual light is treated as for specular highlights.
+const float LIGHT_SOURCE_RADIUS = 0.05;
+
 float d_ggx(float NdotH, float a) {
     float a2 = a * a;
     float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
@@ -672,6 +672,282 @@ vec2 parallax_uv(vec2 uv, vec3 vt, float scale) {
     float before = (1.0 - texture(t_displacement, prev).r) - (cur_d - layer_d);
     float w = after / (after - before);
     return mix(cur, prev, clamp(w, 0.0, 1.0));
+}
+
+// Box-projected parallax (Unity-style) for one reflection probe: reproject the
+// reflection ray onto the probe's box so flat surfaces line up with the
+// captured environment instead of treating it as infinitely distant.
+// Only surfaces INSIDE the box are projected: for a surface outside it the
+// ray-box hit lands on the wrong face, so the raw direction is used instead
+// (REFLECTION_PROBES_MATH.md 6.4). The box center may differ from the capture
+// point (Lagarde); the re-vector anchors on the capture position. A small
+// tolerance keeps surfaces flush with a box face (a mirror on the wall, the
+// floor) counted as inside.
+vec3 probe_dir(vec3 R, vec3 capture, vec3 center, vec3 extents, bool project) {
+    if (!project) return R;
+    vec3 bmin = center - extents;
+    vec3 bmax = center + extents;
+    vec3 eps = extents * 0.02 + 0.02;
+    bool inside = all(greaterThanEqual(v_world_pos, bmin - eps))
+               && all(lessThanEqual(v_world_pos, bmax + eps));
+    if (!inside) return R;
+    vec3 invR = 1.0 / R;
+    vec3 t1 = (bmax - v_world_pos) * invR;
+    vec3 t2 = (bmin - v_world_pos) * invR;
+    vec3 tmax = max(t1, t2);
+    // A fragment just outside the box (eps tolerance) can produce a negative
+    // exit distance; clamp so the hit never lands behind it.
+    float dist = max(min(min(tmax.x, tmax.y), tmax.z), 0.0);
+    return v_world_pos + R * dist - capture;
+}
+
+// Probe influence: 0 outside the box, ramping to 1 across the `blend` shell
+// just inside its faces (the Reflection Probe's blend distance).
+float probe_influence(vec3 p, vec3 center, vec3 extents, float blend) {
+    vec3 d = extents - abs(p - center);
+    float inner = min(d.x, min(d.y, d.z));
+    if (blend <= 1e-4) return inner >= 0.0 ? 1.0 : 0.0;
+    return clamp(inner / blend, 0.0, 1.0);
+}
+
+// Gradient noise with analytic derivatives: (value, d/dx, d/dy).
+vec2 water_hash(vec2 p) {
+    p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+    return fract(sin(p) * 43758.5453) * 2.0 - 1.0;
+}
+
+vec3 water_noised(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    vec2 ga = water_hash(i);
+    vec2 gb = water_hash(i + vec2(1.0, 0.0));
+    vec2 gc = water_hash(i + vec2(0.0, 1.0));
+    vec2 gd = water_hash(i + vec2(1.0, 1.0));
+    float va = dot(ga, f);
+    float vb = dot(gb, f - vec2(1.0, 0.0));
+    float vc = dot(gc, f - vec2(0.0, 1.0));
+    float vd = dot(gd, f - vec2(1.0, 1.0));
+    float k = va - vb - vc + vd;
+    float v = va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k;
+    vec2 d = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd)
+           + du * (u.yx * k + vec2(vb, vc) - va);
+    return vec3(v, d);
+}
+
+// Two drifting ripple layers, slopes only.
+vec2 water_ripple_slope(vec2 p, float t, float scale) {
+    vec2 p1 = p * scale * 0.9 + vec2(t * 0.05, t * 0.031);
+    vec2 p2 = p * scale * 2.3 + vec2(-t * 0.043, t * 0.067);
+    return water_noised(p1).yz * 0.6 + water_noised(p2).yz * 0.4;
+}
+
+// Ripples tilting the wave normal, carried along the world `flow` (m/s) by
+// two half-period-offset phases that cross-fade (a flow map), faded out
+// where a pixel covers more than a ripple (no sparkle in the distance).
+vec3 water_ripples(vec3 N, vec2 p, float t, float strength, float scale, vec2 flow) {
+    const float PERIOD = 2.0;
+    float ph0 = fract(t / PERIOD);
+    float ph1 = fract(t / PERIOD + 0.5);
+    float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
+    vec2 g0 = water_ripple_slope(p - flow * (ph0 * PERIOD), t, scale);
+    vec2 g1 = water_ripple_slope(p - flow * (ph1 * PERIOD) + vec2(0.37, 0.71), t, scale);
+    vec2 g = mix(g1, g0, w0);
+    float fade = 1.0 - smoothstep(0.35, 1.2, length(fwidth(p * scale * 2.3)));
+    return normalize(N - vec3(g.x, 0.0, g.y) * (strength * 0.25 * fade));
+}
+
+// Foam cells: the edges of a jittered cell grid (second-nearest minus nearest
+// feature distance), so foam reads as a lacy network of bubbles rather than
+// smooth noise. 1 on the bubble walls.
+float water_bubbles(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float f1 = 8.0;
+    float f2 = 8.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 g = vec2(x, y);
+            vec2 o = water_hash(i + g) * 0.5 + 0.5;
+            float d = length(g + o - f);
+            if (d < f1) {
+                f2 = f1;
+                f1 = d;
+            } else if (d < f2) {
+                f2 = d;
+            }
+        }
+    }
+    return 1.0 - smoothstep(0.0, 0.18, f2 - f1);
+}
+
+// Foam texture: two bubble scales carried along `flow` (m/s) by a flow map's
+// two cross-fading phases; `density` fills the cells in so thick foam reads
+// solid and thin foam stays lacy.
+float water_foam_pattern(vec2 p, float t, vec2 flow, float density) {
+    const float PERIOD = 3.0;
+    float ph0 = fract(t / PERIOD);
+    float ph1 = fract(t / PERIOD + 0.5);
+    float w0 = 1.0 - abs(1.0 - 2.0 * ph0);
+    vec2 a = p - flow * (ph0 * PERIOD);
+    vec2 b = p - flow * (ph1 * PERIOD) + vec2(3.7, 1.3);
+    float f0 = water_bubbles(a * 3.0) * 0.6 + water_bubbles(a * 7.0 + 1.7) * 0.4;
+    float f1 = water_bubbles(b * 3.0) * 0.6 + water_bubbles(b * 7.0 + 1.7) * 0.4;
+    return clamp(mix(mix(f1, f0, w0), 1.0, density * density), 0.0, 1.0);
+}
+
+// View-space distance to the opaque scene behind framebuffer pixel `frag`.
+float water_scene_dist(vec2 frag) {
+    ivec2 size = textureSize(u_opaque_depth, 0);
+    float d = texelFetch(u_opaque_depth, clamp(ivec2(frag), ivec2(0), size - 1), 0).r;
+    if (d >= 1.0) {
+        return 1e6;
+    }
+    vec2 suv = frag / vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
+    vec4 p = frame.inv_proj * vec4(suv.x * 2.0 - 1.0, 1.0 - suv.y * 2.0, d, 1.0);
+    return abs(p.w) > 1e-8 ? length(p.xyz / p.w) : 1e6;
+}
+
+// Slope (local XZ gradient) and, when `want_hess`, Hessian (xx, zz, xz) of
+// body `s`'s surface over its local point `xz`, band-limited to `foot`
+// metres: the Gerstner sum, the simulated field and the fine scrolling
+// ripples (world `wxz`), the same surface the water shader draws.
+void water_surface_slope(int s, vec2 xz, vec2 wxz, float foot, bool want_hess, out vec2 g, out vec3 h) {
+    g = vec2(0.0);
+    h = vec3(0.0);
+    float t = frame.water.x;
+    int n = min(int(frame.water_bodies[s].look1.z + 0.5), MAX_WATER_WAVES);
+    for (int i = 0; i < n; ++i) {
+        vec4 a = frame.water_bodies[s].wave_a[i];
+        float amp = frame.water_bodies[s].wave_b[i].y * water_band(a.z, foot);
+        float phase = a.z * dot(a.xy, xz) - a.w * t;
+        g += (amp * a.z * cos(phase)) * a.xy;
+        h -= (amp * a.z * a.z * sin(phase)) * vec3(a.x * a.x, a.y * a.y, a.x * a.y);
+    }
+    vec4 r = frame.water_bodies[s].ripple;
+    vec2 uv = water_ripple_uv(s, xz);
+    float fade = water_ripple_fade(uv);
+    if (fade > 0.0) {
+        float size = float(textureSize(u_water_ripples[s], 0).x);
+        float lod = water_ripple_lod(foot, r.z, size);
+        g += textureLod(u_water_ripples[s], uv, lod).gb * fade;
+        if (want_hess) {
+            // Central differences of the gradient a texel of that mip apart.
+            float e = exp2(floor(lod)) / size;
+            vec2 px = textureLod(u_water_ripples[s], uv + vec2(e, 0.0), lod).gb;
+            vec2 nx = textureLod(u_water_ripples[s], uv - vec2(e, 0.0), lod).gb;
+            vec2 pz = textureLod(u_water_ripples[s], uv + vec2(0.0, e), lod).gb;
+            vec2 nz = textureLod(u_water_ripples[s], uv - vec2(0.0, e), lod).gb;
+            h += fade * vec3(px.x - nx.x, pz.y - nz.y, 0.5 * (px.y - nx.y + pz.x - nz.x)) / (2.0 * e * r.z);
+        }
+    }
+    vec4 look0 = frame.water_bodies[s].look0;
+    float scale = max(look0.z, 0.01);
+    float k = look0.y * 0.25 * (1.0 - smoothstep(0.35, 1.2, foot * scale * 2.3));
+    if (k > 0.0) {
+        vec2 g0 = water_ripple_slope(wxz, t, scale);
+        g += g0 * k;
+        if (want_hess) {
+            float e = 0.05 / scale;
+            vec2 gx = water_ripple_slope(wxz + vec2(e, 0.0), t, scale);
+            vec2 gz = water_ripple_slope(wxz + vec2(0.0, e), t, scale);
+            h += (k / e) * vec3(gx.x - g0.x, gz.y - g0.y, 0.5 * (gx.y - g0.y + gz.x - g0.x));
+        }
+    }
+}
+
+// Caustic focusing through body `s`'s surface: light crossing it at local
+// `entry` bends by the slope there and lands `kappa` x slope further on, so a
+// receiver gets 1/det(I + kappa H) of it, read at the surface point whose
+// light lands here. Averaged over the receiver that keeps its brightness.
+float water_focus(int s, vec2 entry, vec2 to_world, float kappa, float foot) {
+    vec2 g;
+    vec3 h;
+    water_surface_slope(s, entry, entry + to_world, foot, false, g, h);
+    vec2 src = entry - kappa * g;
+    water_surface_slope(s, src, src + to_world, foot, true, g, h);
+    float det = (1.0 + kappa * h.x) * (1.0 + kappa * h.y) - kappa * kappa * h.z * h.z;
+    return min(inversesqrt(det * det + 0.01), 8.0);
+}
+
+// Light gain from caustics at world `p` for one light (1 = none). `travel`
+// is a directional light's direction of travel; a point/spot light is at
+// `light_pos` (`point`).
+//   Under a surface, lit from above: light refracted into the water focuses
+// where the surface curves, bent by (1 - 1/1.33) of the slope over the
+// slanted depth. Caustic strength (bounds.w) scales the focusing.
+//   Above a pool's surface (extra.x > 0), lit from a light under it: the
+// light leaves the water bent the other way, by (1.33 - 1) of the slope over
+// its path through the air, and throws the moving pattern on walls and
+// ceiling; extra.x scales that light (1 physical), and the Fresnel loss at
+// the surface takes the grazing rays.
+float water_caustic_gain(vec3 p, vec3 travel, vec3 light_pos, bool point) {
+    int n = min(int(frame.water.z + 0.5), MAX_WATER_BODIES);
+    float pix = length(fwidth(p));
+    for (int s = 0; s < n; ++s) {
+        vec4 b = frame.water_bodies[s].bounds;
+        mat4 to_local = frame.water_bodies[s].to_local;
+        vec3 l = (to_local * vec4(p, 1.0)).xyz;
+        vec3 lp = (to_local * vec4(light_pos, 1.0)).xyz;
+        vec2 to_world = p.xz - l.xz;
+        float depth = b.z - l.y;
+        bool inside = b.x <= 0.0 || (abs(l.x) <= b.x && abs(l.z) <= b.y);
+        if (depth > 0.005 && inside) {
+            if (b.w <= 0.0 || (point && lp.y < b.z)) {
+                return 1.0;
+            }
+            vec3 dir = point ? normalize(l - lp) : normalize(mat3(to_local) * travel);
+            vec3 tr = refract(dir, vec3(0.0, 1.0, 0.0), 1.0 / 1.33);
+            if (tr.y > -0.05) {
+                tr = vec3(0.0, -1.0, 0.0);
+            }
+            float slant = depth / -tr.y;
+            float kappa = b.w * slant * (1.0 - 1.0 / 1.33);
+            vec2 entry = l.xz - tr.xz * slant;
+            // Deeper floors see the pattern softer (lights have a size).
+            float foot = max(pix, 0.02 + 0.03 * depth);
+            return mix(1.0, water_focus(s, entry, to_world, kappa, foot), exp(-depth * 0.18));
+        }
+        float strength = frame.water_bodies[s].extra.x;
+        float under = b.z - lp.y;
+        if (!point || strength <= 0.0 || depth > 0.0 || under <= 0.005) {
+            continue;
+        }
+        if (b.x > 0.0 && (abs(lp.x) > b.x || abs(lp.z) > b.y)) {
+            continue;
+        }
+        // Where the bent ray leaves the water: 1.33 sin(water angle) = sin(air
+        // angle) along the line from the light to here.
+        float rise = -depth;
+        vec2 across = l.xz - lp.xz;
+        float reach = length(across);
+        float lo = 0.0;
+        float hi = reach;
+        for (int k = 0; k < 10; ++k) {
+            float r = 0.5 * (lo + hi);
+            float sw = r / sqrt(r * r + under * under);
+            float sa = (reach - r) / sqrt((reach - r) * (reach - r) + rise * rise);
+            if (1.33 * sw > sa) {
+                hi = r;
+            } else {
+                lo = r;
+            }
+        }
+        float r = 0.5 * (lo + hi);
+        vec2 entry = lp.xz + (reach > 1e-5 ? across / reach : vec2(0.0)) * r;
+        if (b.x > 0.0 && (abs(entry.x) > b.x || abs(entry.y) > b.y)) {
+            return 0.0;
+        }
+        float air = sqrt((reach - r) * (reach - r) + rise * rise);
+        float cos_air = rise / max(air, 1e-4);
+        float fresnel = 0.02 + 0.98 * pow(1.0 - clamp(cos_air, 0.0, 1.0), 5.0);
+        // A point source's spreading beam dilutes the focusing far away.
+        float kappa = 0.33 * air * (1.33 * under) / (1.33 * under + air);
+        float foot = max(pix * 0.5, 0.01 + 0.01 * air);
+        return strength * (1.0 - fresnel) * water_focus(s, entry, to_world, kappa, foot);
+    }
+    return 1.0;
 }
 
 void main() {
@@ -751,89 +1027,311 @@ void main() {
     float roughness = clamp(orm.g * rough_s * pc.params0.y, 0.045, 1.0);
     float metallic = clamp(orm.b * metal_s * pc.params0.x, 0.0, 1.0);
 
+    // Water: wave normal plus ripples, a body coloured by depth absorption,
+    // the opaque scene refracted through it, and shore + crest foam.
+    vec3 water_behind = vec3(0.0);
+    float water_see = 0.0;
+    float water_alpha = 1.0;
+    float water_foam = 0.0;
+    if (FEAT_WATER) {
+        int ws = clamp(int(fx.water.x + 0.5), 0, MAX_WATER_BODIES - 1);
+        vec4 shallow = frame.water_bodies[ws].shallow;
+        vec4 deep = frame.water_bodies[ws].deep;
+        vec4 look0 = frame.water_bodies[ws].look0;
+        vec4 look1 = frame.water_bodies[ws].look1;
+        float wt = frame.water.x;
+        // Directions from the water's local space to world (normals by the
+        // inverse transpose of local-to-world), and its rest "up".
+        mat3 to_world_n = transpose(mat3(frame.water_bodies[ws].to_local));
+        vec3 up = normalize(to_world_n * vec3(0.0, 1.0, 0.0));
+        // The full surface per pixel at its rest point (v_uv): the mesh only
+        // carries what its spacing can hold. Everything is band-limited to
+        // the pixel's footprint, and what is too fine to show roughens the
+        // highlight instead of sparkling.
+        vec2 rest = v_uv;
+        float foot = max(max(length(dFdx(rest)), length(dFdy(rest))), 1e-4);
+        float calm = 1.0 - v_color.b * v_color.b;
+        vec3 wd;
+        vec3 wn;
+        float crest_n;
+        float lost;
+        water_waves(ws, rest, wt, foot, wd, wn, crest_n, lost);
+        wn = normalize(mix(vec3(0.0, 1.0, 0.0), wn, calm));
+        // The simulated layer at the footprint's mip (r height, gb slope).
+        vec2 ruv = water_ripple_uv(ws, rest);
+        float rfade = water_ripple_fade(ruv) * calm;
+        vec4 rip = texture(t_displacement, ruv) * rfade;
+        vec3 nl = normalize(vec3(wn.x / max(wn.y, 0.05) - rip.g, 1.0, wn.z / max(wn.y, 0.05) - rip.b));
+        N = normalize(to_world_n * nl);
+        if (!gl_FrontFacing) {
+            N = -N;
+        }
+        // World-space flow (m/s), decoded by the vertex shader.
+        vec2 flow = v_color.rg;
+        N = water_ripples(N, v_world_pos.xz, wt, look0.y, max(look0.z, 0.01), flow);
+        float surface_h = wd.y * calm + rip.r;
+        roughness = clamp(look0.x, 0.02, 1.0);
+        metallic = 0.0;
+        ao = 1.0;
+        vec3 Vw = normalize(frame.camera_pos.xyz - v_world_pos);
+        float clarity = clamp(deep.w, 0.0, 1.0);
+        float shore = 0.0;
+        float contact_depth = 1e4;
+        float transmit = 0.35;
+        if (frame.water.y > 0.5) {
+            vec3 cam = frame.camera_pos.xyz;
+            vec3 I = -Vw;
+            vec2 screen = vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
+            float surf_dist = length((frame.view * vec4(v_world_pos, 1.0)).xyz);
+            float flat_path = max(water_scene_dist(gl_FragCoord.xy) - surf_dist, 0.0);
+            // Behind the surface: down from above, up from below.
+            vec3 into = gl_FrontFacing ? -up : up;
+            float thick = flat_path * max(dot(I, into), 0.0);
+            // Refraction: the view ray bent by Snell's law through the
+            // surface normal (look.refraction scales the bend, 1 physical),
+            // followed to the bottom: the thickness here first, then the
+            // depth re-read where the bent ray lands. A lookup that lands on
+            // something out of the water, off screen, or a ray reflected
+            // whole falls back to the straight view.
+            vec2 rp = gl_FragCoord.xy;
+            float path = flat_path;
+            vec3 T = refract(I, N, gl_FrontFacing ? 1.0 / 1.33 : 1.33);
+            float bend = max(look1.y, 0.0);
+            if (bend > 0.0 && dot(T, T) > 0.5 && thick > 1e-4) {
+                T = normalize(mix(I, T, bend));
+                float down = max(dot(T, into), 0.05);
+                float len = thick / down;
+                vec2 hit = rp;
+                float keep = 0.0;
+                for (int k = 0; k < 2; ++k) {
+                    vec4 c = frame.view_proj * vec4(v_world_pos + T * len, 1.0);
+                    if (c.w <= 1e-4) {
+                        keep = 0.0;
+                        break;
+                    }
+                    vec2 suv = vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+                    vec2 edge = min(suv, 1.0 - suv);
+                    keep = smoothstep(0.0, 0.04, min(edge.x, edge.y));
+                    if (keep <= 0.0) {
+                        break;
+                    }
+                    hit = suv * screen;
+                    float dq = water_scene_dist(hit);
+                    vec3 q = v_world_pos + T * len;
+                    vec3 behind_p = cam + normalize(q - cam) * min(dq, 1e4);
+                    float below = dot(behind_p - v_world_pos, into);
+                    if (below <= 0.0) {
+                        keep = 0.0;
+                        break;
+                    }
+                    len = below / down;
+                }
+                rp = mix(rp, hit, keep);
+                path = mix(flat_path, len, keep);
+            }
+            path = min(path, 1e4);
+            transmit = exp(-path * 3.0 / max(shallow.w, 0.01));
+            vec3 behind = texture(u_opaque_color, rp / vec2(textureSize(u_opaque_color, 0))).rgb;
+            water_behind = behind * mix(shallow.rgb, vec3(1.0), transmit);
+            water_see = transmit * clarity;
+            // Soft where the surface meets something: over a few pixels or
+            // the mesh's spacing, whichever is wider, so the waterline on a
+            // body never shows the triangles it cuts.
+            float contact = clamp(max(2.0 * foot, 0.1 * v_uv1.y), 0.03, 0.3);
+            water_alpha = smoothstep(0.0, contact, thick);
+            shore = 1.0 - smoothstep(0.0, max(look0.w, 1e-3), thick);
+            contact_depth = thick;
+        } else {
+            water_alpha = 1.0 - clarity * 0.4;
+        }
+        float height = clamp(surface_h / max(look1.w, 1e-4), -1.0, 1.0);
+        float crest = smoothstep(0.35, 0.95, crest_n * calm) * smoothstep(0.1, 0.7, height) * look1.x;
+        // Contact foam in two layers: dense against whatever the water
+        // touches, patchy lace further out, the band lapping in and out.
+        float lap = 0.85 + 0.15 * sin(wt * 1.3 + dot(v_world_pos.xz, vec2(0.7, 0.4)));
+        float fw = max(look0.w, 1e-3) * lap;
+        float dense = 1.0 - smoothstep(0.0, fw * 0.35, contact_depth);
+        float lace = 1.0 - smoothstep(fw * 0.35, fw, contact_depth);
+        // Whitewater where the simulated water runs fast for its depth
+        // (Froude number u / sqrt(g h) past ~0.8: plunge pools, hard wakes),
+        // not ordinary sloshing in shallow water.
+        float wave_speed = sqrt(9.81 * clamp(contact_depth, 0.1, 5.0));
+        float white = smoothstep(0.8, 1.6, rip.a / wave_speed);
+        // Churned water (waterfall plunges, whirlpools): thick in the middle,
+        // breaking into lace toward the edge, carried outward.
+        float churn = 0.0;
+        vec2 churn_flow = vec2(0.0);
+        for (int k = 0; k < MAX_WATER_FOAM; ++k) {
+            vec4 spot = frame.water_bodies[ws].foam[k];
+            if (spot.z <= 0.0) {
+                continue;
+            }
+            vec2 d = rest - spot.xy;
+            float r = length(d) / spot.z;
+            float c = spot.w * (1.0 - smoothstep(0.25, 1.0, r));
+            if (c > churn) {
+                churn = c;
+                vec2 out_dir = r > 1e-3 ? d / (r * spot.z) : vec2(0.0);
+                churn_flow = (transpose(mat3(frame.water_bodies[ws].to_local)) * vec3(out_dir.x, 0.0, out_dir.y)).xz * (0.5 + 0.5 * r);
+            }
+        }
+        churn = clamp(churn, 0.0, 1.0);
+        flow += churn_flow * churn;
+        float density = max(max(dense, churn * 0.9), max(white * 0.8, crest * 0.6));
+        float cover = max(max(max(dense, lace * 0.7), max(crest, white)), churn);
+        float bubbles = water_foam_pattern(v_world_pos.xz, wt, flow, density);
+        water_foam = clamp(cover * smoothstep(0.25, 0.75, bubbles * (0.6 + 0.4 * cover) + cover * 0.25), 0.0, 1.0);
+        // The body's Foam amount (ripple.w): 0 turns it all off.
+        water_foam *= clamp(frame.water_bodies[ws].ripple.w, 0.0, 2.0);
+        water_foam = min(water_foam, 1.0);
+        albedo = vec4(mix(mix(deep.rgb, shallow.rgb, transmit), vec3(0.92), water_foam), 1.0);
+        water_see *= 1.0 - water_foam;
+        roughness = mix(roughness, 0.6, water_foam);
+        // Specular anti-aliasing: the normal's spread over the pixel and the
+        // slope of the waves too fine to draw widen the lobe (GGX alpha^2 +
+        // 2 sigma^2), so small bright highlights don't flicker into specks.
+        vec3 dndx = dFdx(N);
+        vec3 dndy = dFdy(N);
+        float spread = 0.25 * (dot(dndx, dndx) + dot(dndy, dndy));
+        float a = roughness * roughness;
+        float a2 = clamp(a * a + min(2.0 * spread, 0.18) + 2.0 * lost * calm, 0.0, 1.0);
+        roughness = clamp(sqrt(sqrt(a2)), 0.02, 1.0);
+    }
+
     vec3 V = normalize(frame.camera_pos.xyz - v_world_pos);
     float NdotV = max(dot(N, V), 1e-4);
     vec3 f0 = mix(vec3(0.04), albedo.rgb, metallic);
     vec3 diffuse_color = albedo.rgb * (1.0 - metallic);
+    if (FEAT_WATER) {
+        // The see-through share comes from the refraction instead.
+        f0 = vec3(0.02);
+        diffuse_color *= 1.0 - water_see;
+    }
 
     // Accumulate every active scene light. The CPU guarantees at least one
     // (a directional fallback when the scene has no light objects).
     int light_count = int(frame.misc.y + 0.5);
+    // Surfaces under water catch caustic light (seen from above too), and
+    // lights under a pool throw it out onto what's above.
+    bool caustics = !FEAT_WATER && frame.water.z > 0.5;
     vec3 color = vec3(0.0);
     bool has_lightmap = pc.params1.w >= 0.0;
-    for (int i = 0; i < light_count && i < MAX_LIGHTS; ++i) {
-        Light light = frame.lights[i];
-        int kind = int(light.pos_kind.w + 0.5);
-        // Baked/Mixed light (flagged spot.y<0 & spot.w>0): its energy is already
-        // in the lightmap, so skip it for lightmapped (static) surfaces, but DO
-        // apply it to non-lightmapped objects (dynamic / added-after-bake) so they
-        // aren't black in a baked scene. Realtime lights are never skipped.
-        bool light_baked = light.spot.y < 0.0 && light.spot.w > 0.5;
-        if (light_baked && has_lightmap) {
-            continue;
-        }
-
-        // Direction to the light + distance-based attenuation.
-        vec3 L;
-        float attenuation = 1.0;
-        if (kind == 0) {
-            L = normalize(-light.dir_range.xyz);
-        } else {
-            vec3 to_light = light.pos_kind.xyz - v_world_pos;
-            float dist = length(to_light);
-            L = (dist > 1e-5) ? to_light / dist : N;
-            // Smooth inverse-square-ish falloff clamped to the range.
-            float range = max(light.dir_range.w, 1e-3);
-            float t = clamp(1.0 - dist / range, 0.0, 1.0);
-            attenuation = (t * t) / (1.0 + dist * dist);
-            if (kind == 2) {
-                // Spot cone: full inside the inner angle, smooth to the outer.
-                float cos_dir = dot(normalize(light.dir_range.xyz), -L);
-                float cos_outer = light.color.w;
-                float cos_inner = light.spot.x;
-                attenuation *= smoothstep(cos_outer, cos_inner, cos_dir);
+    uvec4 light_mask = floatBitsToUint(pc.model[0]);
+    vec3 voxel_emit = vec3(0.0); // FluxVoxel moving emitters (indirect, kind 3)
+    for (int w = 0; w < 4; ++w) {
+        uint bits = light_mask[w];
+        while (bits != 0u) {
+            int i = w * 32 + findLSB(bits);
+            bits &= bits - 1u;
+            if (i >= light_count || i >= MAX_LIGHTS) {
+                bits = 0u;
+                continue;
             }
+            Light light = frame.lights[i];
+            int kind = int(light.pos_kind.w + 0.5);
+            if (kind == 3) {
+                // The voxel grid's injection kernel per pixel: a probe grid
+                // shows its cells under an orb's sharp falloff.
+                vec3 d = light.pos_kind.xyz - v_world_pos;
+                float dist = length(d);
+                float f = clamp(1.0 - dist / max(light.dir_range.w, 1e-3), 0.0, 1.0);
+                vec3 Le = dist > 1e-4 ? d / dist : N;
+                voxel_emit += light.color.rgb * (f * f * max(0.11141 + 0.25465 * dot(N, Le), 0.0));
+                continue;
+            }
+            // Baked/Mixed light (flagged spot.y<0 & spot.w>0): its energy is already
+            // in the lightmap, so skip it for lightmapped (static) surfaces, but DO
+            // apply it to non-lightmapped objects (dynamic / added-after-bake) so they
+            // aren't black in a baked scene. Realtime lights are never skipped.
+            bool light_baked = light.spot.y < 0.0 && light.spot.w > 0.5;
+            bool baked_here = light_baked && has_lightmap;
+            if (baked_here && !caustics) {
+                continue;
+            }
+
+            // Direction to the light + distance-based attenuation.
+            vec3 L;
+            float attenuation = 1.0;
+            // Lights are small spheres, not points: their angular size widens
+            // the specular lobe (Karis 2013 sphere-light roughness), which keeps
+            // a mirror-smooth highlight finite instead of overflowing half floats.
+            float a_spec = roughness * roughness;
+            float a_light = a_spec + 0.00465;
+            if (kind == 0) {
+                L = normalize(-light.dir_range.xyz);
+            } else {
+                vec3 to_light = light.pos_kind.xyz - v_world_pos;
+                float dist = length(to_light);
+                a_light = min(a_spec + LIGHT_SOURCE_RADIUS / (2.0 * max(dist, 1e-3)), 1.0);
+                L = (dist > 1e-5) ? to_light / dist : N;
+                // Smooth inverse-square-ish falloff clamped to the range.
+                float range = max(light.dir_range.w, 1e-3);
+                float t = clamp(1.0 - dist / range, 0.0, 1.0);
+                attenuation = (t * t) / (1.0 + dist * dist);
+                if (kind == 2) {
+                    // Spot cone: full inside the inner angle, smooth to the outer.
+                    float cos_dir = dot(normalize(light.dir_range.xyz), -L);
+                    float cos_outer = light.color.w;
+                    float cos_inner = light.spot.x;
+                    attenuation *= smoothstep(cos_outer, cos_inner, cos_dir);
+                }
+            }
+
+            vec3 radiance = light.color.rgb * attenuation;
+            if (radiance == vec3(0.0)) {
+                continue;
+            }
+            float caustic_gain = caustics ? water_caustic_gain(v_world_pos, light.dir_range.xyz, light.pos_kind.xyz, kind != 0) : 1.0;
+            // A baked light is already in the lightmap: only the caustics'
+            // change to it is added here.
+            if (baked_here) {
+                if (abs(caustic_gain - 1.0) < 1e-3) {
+                    continue;
+                }
+                caustic_gain -= 1.0;
+            }
+
+            // Facing away: every term below is scaled by N·L (the toon ramp too),
+            // so skip the BRDF and the shadow-map lookups.
+            float NdotL = dot(N, L);
+            if (NdotL <= 0.0) {
+                continue;
+            }
+            vec3 H = normalize(V + L);
+            float NdotH = max(dot(N, H), 0.0);
+            float VdotH = max(dot(V, H), 0.0);
+
+            // Cook-Torrance specular + energy-conserving Lambertian diffuse: the
+            // Fresnel term F is the specular reflectance kS, so the diffuse keeps
+            // only the remaining energy kD = (1 - F). (Metallic is already folded
+            // into diffuse_color, which is 0 for pure metals.)
+            vec3 F = f_schlick(VdotH, f0);
+            float lobe = a_spec / a_light;
+            vec3 spec = d_ggx(NdotH, a_light) * (lobe * lobe)
+                * g_smith(NdotV, NdotL, roughness)
+                * F
+                / max(4.0 * NdotV * NdotL, 1e-4);
+            vec3 kd = vec3(1.0) - F;
+            vec3 lit = (kd * diffuse_color / PI + spec) * NdotL;
+
+            if (FEAT_TOON) {
+                // Cel ramp: quantize N·L into `steps` bands with a soft edge at each
+                // boundary (a clean toon terminator without hard aliasing). `steps`
+                // controls band count, params0.w blends toon<->smooth-PBR.
+                float steps = max(pc.params0.z, 2.0);
+                float scaled = clamp(NdotL, 0.0, 1.0) * steps;
+                float lower = floor(scaled);
+                float sm = clamp(fx.toon.y, 0.01, 0.49);
+                float edge = smoothstep(0.5 - sm, 0.5 + sm, scaled - lower);
+                float banded = (lower + edge) / steps;
+                // Specular as a crisp toon highlight, only on lit bands.
+                vec3 lit_toon = (kd * diffuse_color / PI) * banded
+                    + spec * smoothstep(0.0, 0.02, banded);
+                lit = mix(lit, lit_toon, clamp(pc.params0.w, 0.0, 1.0));
+            }
+
+            color += lit * radiance * shadow_factor(light, v_world_pos, N, L) * caustic_gain;
         }
-
-        vec3 radiance = light.color.rgb * attenuation;
-        if (radiance == vec3(0.0)) {
-            continue;
-        }
-
-        vec3 H = normalize(V + L);
-        float NdotL = max(dot(N, L), 0.0);
-        float NdotH = max(dot(N, H), 0.0);
-        float VdotH = max(dot(V, H), 0.0);
-
-        // Cook-Torrance specular + energy-conserving Lambertian diffuse: the
-        // Fresnel term F is the specular reflectance kS, so the diffuse keeps
-        // only the remaining energy kD = (1 - F). (Metallic is already folded
-        // into diffuse_color, which is 0 for pure metals.)
-        vec3 F = f_schlick(VdotH, f0);
-        vec3 spec = d_ggx(NdotH, roughness * roughness)
-            * g_smith(NdotV, NdotL, roughness)
-            * F
-            / max(4.0 * NdotV * NdotL, 1e-4);
-        vec3 kd = vec3(1.0) - F;
-        vec3 lit = (kd * diffuse_color / PI + spec) * NdotL;
-
-        if (FEAT_TOON) {
-            // Cel ramp: quantize N·L into `steps` bands with a soft edge at each
-            // boundary (a clean toon terminator without hard aliasing). `steps`
-            // controls band count, params0.w blends toon<->smooth-PBR.
-            float steps = max(pc.params0.z, 2.0);
-            float scaled = clamp(NdotL, 0.0, 1.0) * steps;
-            float lower = floor(scaled);
-            float sm = clamp(fx.toon.y, 0.01, 0.49);
-            float edge = smoothstep(0.5 - sm, 0.5 + sm, scaled - lower);
-            float banded = (lower + edge) / steps;
-            // Specular as a crisp toon highlight, only on lit bands.
-            vec3 lit_toon = (kd * diffuse_color / PI) * banded
-                + spec * smoothstep(0.0, 0.02, banded);
-            lit = mix(lit, lit_toon, clamp(pc.params0.w, 0.0, 1.0));
-        }
-
-        color += lit * radiance * shadow_factor(light, v_world_pos, N, L);
     }
 
     // Indirect diffuse (as irradiance/PI), in priority order:
@@ -841,7 +1339,8 @@ void main() {
     //   2. baked probe SH where a volume covers this fragment,
     //   3. flat scene ambient.
     vec3 indirect;
-    if (pc.params1.w >= 0.0) {
+    vec3 flux_gi = vec3(0.0); // realtime screen GI part (view mode 6)
+    if (has_lightmap) {
         int layer = int(pc.params1.w + 0.5);
         indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
         // MIXED LIGHTING: a lightmapped (static-baked) surface ALSO receives the
@@ -856,6 +1355,15 @@ void main() {
         if (frame.debug.z > -0.5) {
             indirect += sample_irradiance_smooth(v_world_pos, N);
         }
+        // Mixed lighting (debug.z > 1.5): Flux gathers only what the bake can't
+        // hold (moving emitters, realtime lights) and it adds on top.
+        if (frame.debug.z > 1.5) {
+            vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
+            vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;
+            vec3 Nv = normalize(mat3(frame.view) * N);
+            flux_gi = screen_gi_upsample(suv, Pv, Nv);
+            indirect += flux_gi;
+        }
     } else if (frame.debug.z > 0.5) {
         // Screen-space GI: depth-aware upsample of the sparse screen probes.
         // Emissive surfaces are in the depth prepass again, so they sample their
@@ -865,7 +1373,15 @@ void main() {
         // edges, keeping coplanar neighbours on steep/grazing faces (no GI noise).
         vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;
         vec3 Nv = normalize(mat3(frame.view) * N);
-        indirect = screen_gi_upsample(suv, Pv, Nv);
+        flux_gi = screen_gi_upsample(suv, Pv, Nv);
+        indirect = flux_gi;
+        // Mixed lighting: the gather is dynamic-only, so a non-lightmapped object
+        // keeps the baked probes underneath it.
+        if (frame.debug.z > 1.5) {
+            vec3 occ_irr;
+            float cov = sample_probes(v_world_pos, N, occ_irr);
+            indirect += mix(frame.ambient.rgb, sample_irradiance_smooth(v_world_pos, N), cov);
+        }
     } else {
         // Probe GI where a cascade covers the fragment, fading to flat ambient
         // at the outermost cascade's edge (coverage < 1) and beyond it (0).
@@ -890,51 +1406,31 @@ void main() {
     // instead of reading flat. Uses the probe/lightmap irradiance as a stand-in
     // for environment radiance (no reflection probes yet). Approximate, but it
     // keeps metals lively. Smoother surfaces concentrate the spec response.
+    indirect += voxel_emit;
     vec3 F_amb = f_schlick_rough(NdotV, f0, roughness);
     vec3 kd_amb = vec3(1.0) - F_amb;
     color += kd_amb * indirect * diffuse_color * ao;
+    // Baked lights' caustics take light away in the dark bands.
+    color = max(color, vec3(0.0));
     float spec_amb = mix(1.0, 0.25, roughness); // rough surfaces scatter it away
     // Specular environment radiance, in priority order:
     //   1. SSR hit (on-screen, smooth/metallic), then
     //   2. the prefiltered reflection-probe cube (roughness -> mip), then
     //   3. the indirect-irradiance stand-in (no skybox -> neutral black cube).
     vec3 R = reflect(-V, N);
+    // Footprint mip: a smooth curved mirror (a chrome sphere) spans many cube
+    // texels per pixel, and sampling mip 0 there aliases into sparkle (fine
+    // floor detail, small bright lights). Measured on the raw reflection
+    // vector, before box projection, whose derivatives jump at box edges.
+    float env_aa_lod = textureQueryLod(u_env, R).x;
     // Box-projected parallax (Unity-style) when a reflection-probe zone covers
     // this fragment: reproject the reflection ray onto the probe's box so flat
     // surfaces line up with the captured environment instead of treating it as
     // infinitely distant. `refl_center.w` = probe intensity (0 = no zone).
     float probe_intensity = frame.refl_center.w;
-    if (probe_intensity > 0.0 && frame.refl_extents.w > 0.5) {
-        // Box (proxy geometry) around refl_box (its own center, offsettable from
-        // the capture point); re-vector below anchors on refl_center = CAPTURE
-        // position — Lagarde's "box center doesn't need to match cubemap center".
-        vec3 bmin = frame.refl_box.xyz - frame.refl_extents.xyz;
-        vec3 bmax = frame.refl_box.xyz + frame.refl_extents.xyz;
-        // Only box-project surfaces INSIDE the probe box. The box is a proxy for the
-        // room geometry as seen from the capture point; for a surface OUTSIDE it (a
-        // floor extending past the probe, say) the ray-box intersection lands on the
-        // wrong face and the reflection is mis-placed — so fall back to the infinite-
-        // cube direction (raw R) there instead of producing a garbage parallax hit.
-        // (REFLECTION_PROBES_MATH.md 6.4: wrong box coverage = offset reflections.)
-        // Small tolerance so surfaces FLUSH with a box face (a mirror on the
-        // wall, the floor itself) still count as inside — the common authoring
-        // is walls exactly on the box, and float error must not drop them to
-        // the no-parallax fallback.
-        vec3 eps = frame.refl_extents.xyz * 0.02 + 0.02;
-        bool inside = all(greaterThanEqual(v_world_pos, bmin - eps))
-                   && all(lessThanEqual(v_world_pos, bmax + eps));
-        if (inside) {
-            vec3 invR = 1.0 / R;
-            vec3 t1 = (bmax - v_world_pos) * invR;
-            vec3 t2 = (bmin - v_world_pos) * invR;
-            vec3 tmax = max(t1, t2);
-            float dist = min(min(tmax.x, tmax.y), tmax.z);
-            // A fragment just outside the box (eps tolerance) can produce a
-            // negative exit distance; clamp so the hit never lands behind it.
-            dist = max(dist, 0.0);
-            vec3 hit = v_world_pos + R * dist;
-            R = hit - frame.refl_center.xyz;
-        }
+    vec3 R_raw = R;
+    if (probe_intensity > 0.0) {
+        R = probe_dir(R, frame.refl_center.xyz, frame.refl_box.xyz, frame.refl_extents.xyz, frame.refl_extents.w > 0.5);
     }
     // No reflection-probe zone → the fallback is the skybox cube, scaled by the
     // skylight/env intensity (frame.ambient.w). So turning ambient/skylight off
@@ -945,7 +1441,25 @@ void main() {
     // procedural sky when none is set), so this is the reflection's base at any
     // angle — never the dark diffuse-GI stand-in. The fullscreen SSR resolve pass
     // (deferred, current-frame) overlays screen-space reflections on top of this.
-    vec3 spec_env = textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * env_scale;
+    vec3 spec_env = textureLod(u_env, R, max(roughness * ENV_MAX_LOD, env_aa_lod)).rgb * env_scale;
+    // Second probe: blend toward it where its box covers this fragment. Where
+    // both boxes do, the higher-priority probe (importance, then smaller box)
+    // wins; outside both, slot 0 (the probe nearest the camera) is used.
+    float probe2_intensity = frame.refl2_center.w;
+    if (probe2_intensity > 0.0 && probe_intensity >= 0.0) {
+        vec3 R2 = probe_dir(R_raw, frame.refl2_center.xyz, frame.refl2_box.xyz, frame.refl2_extents.xyz, frame.refl2_extents.w > 0.5);
+        float lod2 = max(roughness * float(textureQueryLevels(u_env_b) - 1), env_aa_lod);
+        vec3 spec_b = textureLod(u_env_b, R2, lod2).rgb * probe2_intensity;
+        float f0 = probe_influence(v_world_pos, frame.refl_box.xyz, frame.refl_extents.xyz, frame.refl_blend.x);
+        float f1 = probe_influence(v_world_pos, frame.refl2_box.xyz, frame.refl2_extents.xyz, frame.refl_blend.y);
+        float wb = frame.refl_blend.z > 0.5 ? f1 : f1 * (1.0 - f0);
+        spec_env = mix(spec_env, spec_b, wb);
+    }
+    if (probe_intensity < 0.0) {
+        // Reflection-cube capture: no reflections of reflections (no probe
+        // feedback); diffuse GI stands in for the environment.
+        spec_env = indirect;
+    }
     // Planar reflection: this surface has its own mirrored scene render
     // (pc.emission.w = layer+1 in the integer part, roughness fade cutoff in
     // the fraction). Rendered with the same camera/viewport convention as this
@@ -953,7 +1467,8 @@ void main() {
     // true mirror with per-pixel parallax, replacing the probe/env on smooth
     // surfaces and fading back to it as roughness rises. frame.refl_box.w = 0
     // in the planar/capture/preview passes themselves (no recursion).
-    if (pc.emission.w >= 1.0 && frame.refl_box.w > 0.5) {
+    bool planar_mirror = pc.emission.w >= 1.0 && frame.refl_box.w > 0.5;
+    if (planar_mirror) {
         float planar_layer = floor(pc.emission.w) - 1.0;
         float cutoff = max(fract(pc.emission.w), 0.05);
         vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
@@ -978,6 +1493,9 @@ void main() {
     // material checkbox), so the old per-material SSR/RT gate was removed.
     float refl_strength = fx.parallax.y;
     vec3 reflectance = (f0 * env_ab.x + vec3(env_ab.y)) * ao * refl_strength;
+    if (FEAT_WATER) {
+        reflectance = f_schlick(NdotV, vec3(0.02)) * refl_strength * (1.0 - 0.8 * water_foam);
+    }
     color += reflectance * spec_env;
     // FluxVoxel specular-from-volume (frame.fog_params.w = voxel_specular flag):
     // sample the volume in the reflection direction so SMOOTH METALS pick up the
@@ -988,7 +1506,10 @@ void main() {
     // Gate by metallic·(1-roughness): ~0 for dielectric OR rough, only smooth metals
     // get it. (Earlier `reflectance·vrad·roughness` lit rough floors at grazing
     // Fresnel → the "GI only on the camera side" artifact.)
-    if (frame.fog_params.w > 0.5) {
+    // It is a FALLBACK reflection source, not an extra layer: where a probe
+    // zone or a planar mirror already reflects the scene, adding it showed
+    // every emissive twice (sharp from the probe, a smeared voxel streak).
+    if (frame.fog_params.w > 0.5 && probe_intensity == 0.0 && !planar_mirror) {
         float spec_w = metallic * (1.0 - roughness);
         if (spec_w > 0.001) {
             vec3 vrad;
@@ -1003,7 +1524,16 @@ void main() {
     // reflection mode decides whether the resolve runs at all.
     vec3 Nv = normalize(mat3(frame.view) * N);
     float reflectivity = dot(reflectance, vec3(0.2126, 0.7152, 0.0722));
-    o_gbuf = vec4(oct_encode(Nv), roughness, reflectivity);
+    // Packed for the 10:10:10:2 target: roughness (6 bits) in b's high bits,
+    // reflectivity (6 bits) split over b's low 4 and a's 2. Unpacked with an
+    // exact texel fetch in the resolves (never filtered).
+    uint r6 = uint(round(clamp(roughness, 0.0, 1.0) * 63.0));
+    uint f6 = uint(round(clamp(reflectivity, 0.0, 1.0) * 63.0));
+    o_gbuf = vec4(oct_encode(Nv), float((r6 << 4) | (f6 & 15u)) / 1023.0, float(f6 >> 4) / 3.0);
+    if (FEAT_WATER) {
+        // Transparent: the resolve's depth is the floor below, not the surface.
+        o_gbuf = vec4(0.0);
+    }
 
     if (FEAT_EMISSION) {
         // Emission uses its own tiling/offset, can scroll, pulse over time, and
@@ -1038,7 +1568,8 @@ void main() {
     // Viewport render modes (frame.debug.y): 1 = world normals, 2 = indirect/GI
     // term only, 3 = unlit (raw albedo, no lighting/post), 4 = reflection cube
     // (every surface a perfect mirror of u_env at R — reveals the captured cube's
-    // orientation directly, no BRDF/roughness), 5 = reflection direction R as RGB.
+    // orientation directly, no BRDF/roughness), 5 = reflection direction R as RGB,
+    // 6 = the realtime Flux screen GI alone (no bake underneath).
     int gi_dbg = int(frame.debug.y + 0.5);
     if (gi_dbg == 1) {
         o_color = vec4(N * 0.5 + 0.5, 1.0);
@@ -1057,13 +1588,27 @@ void main() {
         // Reflection direction visualized: +X red, +Y green, +Z blue.
         o_color = vec4(normalize(R) * 0.5 + 0.5, 1.0);
         return;
+    } else if (gi_dbg == 6) {
+        o_color = vec4(flux_gi, 1.0);
+        return;
     }
 
     // Fog is now a raymarched volumetric medium in the deferred resolve pass
     // (ssr_resolve.frag) — a real participating medium that hangs + drifts in the
     // air, not a per-surface colour tint — so it's no longer applied here.
 
+    if (FEAT_WATER) {
+        color += water_behind * water_see * (1.0 - f_schlick(NdotV, vec3(0.02)).x);
+    }
+
     color = apply_postfx(color, gl_FragCoord.xy);
     float alpha = (ALPHA_MODE == 2u) ? albedo.a : 1.0;
-    o_color = vec4(color, alpha);
+    if (FEAT_WATER) {
+        alpha = water_alpha;
+    }
+    // Never hand NaN / Inf to the HDR target: bloom and TAA would spread it.
+    if (any(isnan(color)) || any(isinf(color))) {
+        color = vec3(0.0);
+    }
+    o_color = vec4(min(color, vec3(64000.0)), alpha);
 }

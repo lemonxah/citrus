@@ -75,6 +75,9 @@ pub struct FileBrowser {
     /// Current grid order (dirs then files) of the visible folder, so shift can
     /// resolve the range between two entries. Rebuilt each frame in `grid_ui`.
     order: Vec<PathBuf>,
+    /// A file an asset slot asked to show: highlighted (and scrolled to) for
+    /// a moment. The flag says the scroll is still due.
+    ping: Option<(PathBuf, f64, bool)>,
 }
 
 #[derive(Default)]
@@ -87,6 +90,9 @@ pub struct FileBrowserResponse {
     /// Create a new asset inside this directory.
     pub create_material_in: Option<PathBuf>,
     pub create_postfx_in: Option<PathBuf>,
+    pub create_physmat_in: Option<PathBuf>,
+    pub create_anim_controller_in: Option<PathBuf>,
+    pub create_anim_clip_in: Option<PathBuf>,
     pub create_scene_in: Option<PathBuf>,
     pub create_shader_in: Option<PathBuf>,
     pub create_folder_in: Option<PathBuf>,
@@ -121,6 +127,7 @@ impl FileBrowser {
             multi: HashSet::new(),
             last_click: None,
             order: Vec::new(),
+            ping: None,
         }
     }
 
@@ -279,6 +286,22 @@ impl FileBrowser {
         {
             self.begin_rename(path);
         }
+        // An asset slot was clicked: open its folder and point at the file.
+        if let Some(abs) = ui.data_mut(|d| d.remove_temp::<String>(egui::Id::new(crate::components::PING_FILE_KEY))) {
+            let path = PathBuf::from(abs);
+            if let Some(dir) = path.parent() {
+                self.current_dir = dir.to_owned();
+                let mut d = dir.to_owned();
+                while d.starts_with(&self.root) {
+                    self.open_dirs.insert(d.clone());
+                    if !d.pop() {
+                        break;
+                    }
+                }
+            }
+            self.search.clear();
+            self.ping = Some((path, ui.input(|i| i.time), true));
+        }
         if !self.current_dir.starts_with(&self.root) || !self.current_dir.is_dir() {
             self.current_dir = self.root.clone();
         }
@@ -339,7 +362,7 @@ impl FileBrowser {
                     let create = widgets::primary_button_sized(ui, Some(Icon::Plus), "Create", theme::H_FIELD);
                     egui::Popup::menu(&create).show(|ui| self.create_menu(ui, &dir, &mut response));
                     ui.spacing_mut().slider_width = 70.0;
-                    ui.add(egui::Slider::new(&mut self.tile_px, TILE.x..=176.0).show_value(false)).on_hover_text("Tile size");
+                    crate::widgets::slider(ui, egui::Slider::new(&mut self.tile_px, TILE.x..=176.0).show_value(false)).on_hover_text("Tile size");
                     ui.label(RichText::new("Size").size(theme::SIZE_META).color(theme::TEXT_MUTED));
                     widgets::search_field(ui, &mut self.search, "Search files", 180.0);
                 });
@@ -411,14 +434,14 @@ impl FileBrowser {
             let text_color = if current { crate::theme::TEXT_STRONG } else { crate::theme::TEXT_SECONDARY };
             if !subdirs.is_empty() {
                 crate::widgets::paint_caret(
-                    &ui.painter(),
+                    ui.painter(),
                     egui::Rect::from_center_size(egui::pos2(rect.left() + indent + 6.0, rect.center().y), egui::vec2(11.0, 11.0)),
                     open,
                     crate::theme::TEXT_DIM,
                 );
             }
             crate::icons::paint(
-                &ui.painter(),
+                ui.painter(),
                 egui::Rect::from_center_size(egui::pos2(rect.left() + indent + 21.0, rect.center().y), egui::vec2(14.0, 14.0)),
                 crate::icons::Icon::Folder,
                 if current { crate::theme::accent() } else { crate::theme::TEXT_MUTED },
@@ -440,7 +463,7 @@ impl FileBrowser {
             // Aggregate problem badge for the folder's contents.
             let (errs, warns) = self.diag_counts(dir, true);
             Self::diag_dot(
-                &ui.painter(),
+                ui.painter(),
                 egui::pos2(rect.right() - 9.0, rect.center().y),
                 errs,
                 warns,
@@ -471,7 +494,7 @@ impl FileBrowser {
                 ui.painter().rect_stroke(
                     rect,
                     3.0,
-                    egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                    egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -564,6 +587,21 @@ impl FileBrowser {
         } else if tile.hovered() {
             ui.painter().rect_filled(rect, crate::theme::R_TOOLBAR, crate::theme::with_alpha(crate::theme::BG_BUTTON, 0.6));
         }
+        // A pinged file pulses in the accent for a moment.
+        if let Some((p, at, scroll)) = &mut self.ping
+            && p.as_path() == path
+        {
+            let age = ui.input(|i| i.time) - *at;
+            if *scroll {
+                tile.scroll_to_me(Some(egui::Align::Center));
+                *scroll = false;
+            }
+            if age < 1.6 {
+                let a = (1.0 - age / 1.6) as f32;
+                ui.painter().rect_stroke(rect, crate::theme::R_TOOLBAR, egui::Stroke::new(2.0_f32, crate::theme::with_alpha(crate::theme::accent(), a)), egui::StrokeKind::Inside);
+                ui.ctx().request_repaint();
+            }
+        }
 
         let is_rust = !is_dir
             && path
@@ -616,7 +654,7 @@ impl FileBrowser {
             ui.painter().rect_stroke(
                 img_rect,
                 2.0,
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+                egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
                 egui::StrokeKind::Outside,
             );
         } else {
@@ -624,7 +662,7 @@ impl FileBrowser {
             // for an image whose thumbnail isn't decoded yet / failed).
             match spec_icon(path, is_dir) {
                 Some((icon, color)) => crate::icons::paint_with(
-                    &ui.painter(),
+                    ui.painter(),
                     egui::Rect::from_center_size(icon_center, egui::vec2(34.0 * s, 34.0 * s)),
                     icon,
                     color,
@@ -645,7 +683,7 @@ impl FileBrowser {
         // LSP problem badge at the icon's top-right.
         let (errs, warns) = self.diag_counts(path, is_dir);
         Self::diag_dot(
-            &ui.painter(),
+            ui.painter(),
             egui::pos2(icon_center.x + 15.0 * s, icon_center.y - 13.0 * s),
             errs,
             warns,
@@ -777,7 +815,7 @@ impl FileBrowser {
                 ui.painter().rect_stroke(
                     rect,
                     6.0,
-                    egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
+                    egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -809,6 +847,18 @@ impl FileBrowser {
         }
         if ui.button("New Post FX Profile").clicked() {
             response.create_postfx_in = Some(dir.to_owned());
+            ui.close();
+        }
+        if ui.button("New Physics Material").clicked() {
+            response.create_physmat_in = Some(dir.to_owned());
+            ui.close();
+        }
+        if ui.button("New Animator Controller").clicked() {
+            response.create_anim_controller_in = Some(dir.to_owned());
+            ui.close();
+        }
+        if ui.button("New Animation Clip").clicked() {
+            response.create_anim_clip_in = Some(dir.to_owned());
             ui.close();
         }
         if ui.button("New Component (Rust)").clicked() {
@@ -1192,7 +1242,8 @@ fn list_dir(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             dirs.push(path);
-        } else {
+        } else if !citrus_core::asset_ref::is_sidecar(&path) {
+            // `.meta` sidecars travel with their asset, out of sight.
             files.push(path);
         }
     }
@@ -1232,12 +1283,17 @@ fn unique_in_dir(dir: &Path, source: &Path) -> PathBuf {
         .unwrap_or_else(|| make(0))
 }
 
+/// Copy a file or folder. Copies are new assets: their `.meta` sidecars get
+/// fresh ids (importer settings kept), so slots keep pointing at the original.
 fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
         for entry in std::fs::read_dir(src)?.flatten() {
             copy_recursively(&entry.path(), &dst.join(entry.file_name()))?;
         }
+    } else if citrus_core::asset_ref::is_sidecar(src) {
+        let text = std::fs::read_to_string(src)?;
+        std::fs::write(dst, citrus_core::asset_ref::with_fresh_id(&text))?;
     } else {
         std::fs::copy(src, dst)?;
     }
@@ -1246,9 +1302,9 @@ fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Extensions whose type is conveyed by the icon, so the name hides them.
 const KNOWN_EXTS: &[&str] = &[
-    "rs", "gltf", "glb", "fbx", "material", "scene", "citrus", "lightmap", "lightdata", "png",
-    "jpg", "jpeg", "tga", "bmp", "exr", "vert", "frag", "glsl", "slang", "spv", "postfx", "toml", "ron",
-    "json", "md",
+    "rs", "gltf", "glb", "vrm", "fbx", "material", "scene", "citrus", "lightmap", "lightdata", "png",
+    "jpg", "jpeg", "tga", "bmp", "exr", "vert", "frag", "hlsl", "glsl", "slang", "spv", "postfx", "physmat", "toml", "ron",
+    "json", "md", "anim", "animctrl",
 ];
 
 fn lower_ext(path: &Path) -> Option<String> {
@@ -1264,6 +1320,9 @@ enum IconKind {
     Image,
     Shader,
     PostFx,
+    PhysMat,
+    AnimController,
+    AnimClip,
     Lightmap,
     Lightdata,
     Config,
@@ -1276,10 +1335,13 @@ fn icon_kind(path: &Path) -> IconKind {
     match lower_ext(path).as_deref() {
         Some("scene") => IconKind::Scene,
         Some("material") => IconKind::Material,
-        Some("gltf" | "glb" | "fbx") => IconKind::Model,
+        Some("gltf" | "glb" | "vrm" | "fbx") => IconKind::Model,
         Some("png" | "jpg" | "jpeg" | "tga" | "bmp" | "exr") => IconKind::Image,
-        Some("vert" | "frag" | "glsl" | "slang" | "spv") => IconKind::Shader,
+        Some("vert" | "frag" | "hlsl" | "glsl" | "slang" | "spv") => IconKind::Shader,
         Some("postfx") => IconKind::PostFx,
+        Some("physmat") => IconKind::PhysMat,
+        Some("animctrl") => IconKind::AnimController,
+        Some("anim") => IconKind::AnimClip,
         Some("lightmap") => IconKind::Lightmap,
         Some("lightdata") => IconKind::Lightdata,
         Some("toml" | "ron" | "json") => IconKind::Config,
@@ -1316,6 +1378,11 @@ fn spec_icon(path: &Path, is_dir: bool) -> Option<(crate::icons::Icon, egui::Col
     }
 }
 
+/// Phosphor icon glyph for a file (by type), for asset slots.
+pub(crate) fn file_glyph(path: &Path) -> &'static str {
+    phosphor_icon(icon_kind(path))
+}
+
 /// Phosphor icon glyph for a file kind.
 fn phosphor_icon(kind: IconKind) -> &'static str {
     match kind {
@@ -1325,6 +1392,9 @@ fn phosphor_icon(kind: IconKind) -> &'static str {
         IconKind::Image => ph::IMAGE,
         IconKind::Shader => ph::SPARKLE,
         IconKind::PostFx => ph::APERTURE,
+        IconKind::PhysMat => ph::BASKETBALL,
+        IconKind::AnimController => ph::FLOW_ARROW,
+        IconKind::AnimClip => ph::FILM_STRIP,
         IconKind::Lightmap => ph::MAP_TRIFOLD,
         IconKind::Lightdata => ph::DATABASE,
         IconKind::Config => ph::GEAR_SIX,

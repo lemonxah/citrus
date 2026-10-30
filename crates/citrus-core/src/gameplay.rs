@@ -57,6 +57,8 @@ pub struct ScreenInfo {
     pub ui_text_editing: bool,
     /// UI cancel / back (Escape, gamepad East) was pressed.
     pub ui_cancel: bool,
+    /// Headset and controllers (inactive without VR).
+    pub vr: crate::VrFrame,
 }
 
 /// Immediate physics queries, implemented by the engine's physics world.
@@ -358,6 +360,47 @@ impl ComponentCtx<'_> {
         self.modify::<crate::Animator>(target, |a| a.stop());
     }
 
+    pub fn set_animator_int(&mut self, target: impl Into<ObjectRef>, name: &str, value: i32) {
+        let name = name.to_owned();
+        self.modify::<crate::Animator>(target, move |a| a.set_int(&name, value));
+    }
+
+    pub fn set_animator_bool(&mut self, target: impl Into<ObjectRef>, name: &str, value: bool) {
+        let name = name.to_owned();
+        self.modify::<crate::Animator>(target, move |a| a.set_bool(&name, value));
+    }
+
+    /// Fire an Animator Controller trigger (consumed by the transition it starts).
+    pub fn set_animator_trigger(&mut self, target: impl Into<ObjectRef>, name: &str) {
+        let name = name.to_owned();
+        self.modify::<crate::Animator>(target, move |a| a.set_trigger(&name));
+    }
+
+    pub fn reset_animator_trigger(&mut self, target: impl Into<ObjectRef>, name: &str) {
+        let name = name.to_owned();
+        self.modify::<crate::Animator>(target, move |a| a.reset_trigger(&name));
+    }
+
+    /// Force an Animator Controller state by name, cross-fading over `fade` seconds.
+    pub fn play_animator_state(&mut self, target: impl Into<ObjectRef>, state: &str, fade: f32) {
+        let state = state.to_owned();
+        self.modify::<crate::Animator>(target, move |a| a.play_state(&state, fade));
+    }
+
+    /// A parameter of an object's Animator (0 when it has none).
+    pub fn animator_float(&self, target: impl Into<ObjectRef>, name: &str) -> f32 {
+        self.get::<crate::Animator>(target).map(|a| a.get_float(name)).unwrap_or(0.0)
+    }
+
+    pub fn animator_bool(&self, target: impl Into<ObjectRef>, name: &str) -> bool {
+        self.get::<crate::Animator>(target).is_some_and(|a| a.get_bool(name))
+    }
+
+    /// Current controller state of an object's Animator on `layer`.
+    pub fn animator_state(&self, target: impl Into<ObjectRef>, layer: usize) -> Option<String> {
+        self.get::<crate::Animator>(target).and_then(|a| a.current_state(layer).map(str::to_owned))
+    }
+
     // ---- events ----
 
     /// Broadcast an event of any type; every component can read it next frame
@@ -554,5 +597,59 @@ impl ComponentCtx<'_> {
 
     pub fn quit(&mut self) {
         self.commands.push(ComponentCommand::Quit);
+    }
+
+    // ---- water ----
+
+    /// The water surface above or below `p` (world): its height and normal,
+    /// or None when `p` isn't over any Water volume. Matches what floats and
+    /// what's rendered at the current play time.
+    pub fn water_surface(&self, p: glam::Vec3) -> Option<(f32, glam::Vec3)> {
+        let ty = std::any::TypeId::of::<crate::Water>();
+        (0..self.object_ids.len()).find_map(|i| {
+            let water = self.lookup.component(i, ty)?.as_any().downcast_ref::<crate::Water>()?;
+            water.height_at(self.object_matrix(i)?, p, self.water_time)
+        })
+    }
+
+    /// Water in a [`crate::WaterContainer`]: litres and share of its
+    /// capacity (as of the last physics step).
+    pub fn container_water(&self, target: impl Into<ObjectRef>) -> Option<(f32, f32)> {
+        let c = self.get::<crate::WaterContainer>(target)?;
+        let cap = c.runtime.capacity.max(1e-6);
+        Some((c.runtime.litres, (c.runtime.litres / cap).clamp(0.0, 1.0)))
+    }
+
+    /// Add `litres` to a container (what doesn't fit pours over the rim).
+    pub fn fill_container(&mut self, target: impl Into<ObjectRef>, litres: f32) {
+        let litres = litres.max(0.0);
+        self.modify::<crate::WaterContainer>(target, move |c| c.runtime.add += litres);
+    }
+
+    /// Pour `litres` out of a container over its lowest rim point, as a
+    /// stream (whatever it holds, at most).
+    pub fn pour_container(&mut self, target: impl Into<ObjectRef>, litres: f32) {
+        let litres = litres.max(0.0);
+        self.modify::<crate::WaterContainer>(target, move |c| c.runtime.pour += litres);
+    }
+
+    // ---- full-body tracking ----
+
+    /// Calibrate full-body tracking: call while the player stands in a T-pose
+    /// matching their avatar. Lines the avatar up under the headset and stores
+    /// each tracker's offset to its bone.
+    pub fn calibrate_trackers(&mut self) {
+        self.commands.push(ComponentCommand::CalibrateTrackers);
+    }
+
+    pub fn clear_tracker_calibration(&mut self) {
+        self.commands.push(ComponentCommand::ClearTrackerCalibration);
+    }
+
+    /// Start or stop the OSC receiver that takes face tracking from external
+    /// tools (VRCFaceTracking-style `/avatar/parameters/FT/v2/...` floats) on
+    /// `port` (9000 is the usual). Headset face tracking needs no receiver.
+    pub fn set_osc_face_tracking(&mut self, enabled: bool, port: u16) {
+        self.commands.push(ComponentCommand::SetOscFaceTracking(enabled.then_some(port)));
     }
 }

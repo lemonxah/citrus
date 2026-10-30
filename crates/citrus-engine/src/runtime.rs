@@ -45,6 +45,13 @@ pub struct GameConfig {
     /// Audio buses from `project.citrus`.
     pub audio_mixer: citrus_core::AudioMixer,
     pub spatial_audio: citrus_core::SpatialAudioSettings,
+    /// External tracking (OSC) receiver for face tracking from other tools.
+    pub tracking_input: citrus_core::TrackingInputSettings,
+    pub physics: citrus_core::PhysicsSettings,
+    /// User-content (`.citruspak`) cache folder; None = the per-user cache dir.
+    pub content_cache: Option<PathBuf>,
+    /// Enable the F8 user-content developer overlay (also `CITRUS_CONTENT_OVERLAY=1`).
+    pub content_overlay: bool,
 }
 
 impl Default for GameConfig {
@@ -58,6 +65,10 @@ impl Default for GameConfig {
             bindings: citrus_core::Bindings::default(),
             audio_mixer: citrus_core::AudioMixer::default(),
             spatial_audio: citrus_core::SpatialAudioSettings::default(),
+            tracking_input: citrus_core::TrackingInputSettings::default(),
+            physics: citrus_core::PhysicsSettings::default(),
+            content_cache: None,
+            content_overlay: false,
         }
     }
 }
@@ -82,6 +93,8 @@ impl GameConfig {
             bindings: project.bindings,
             audio_mixer: project.audio_mixer,
             spatial_audio: project.spatial_audio,
+            tracking_input: project.tracking_input,
+            physics: project.physics,
             ..Default::default()
         })
     }
@@ -92,11 +105,71 @@ impl GameConfig {
 /// types (the built-ins are already present); it's the statically-linked stand-in
 /// for the editor's plugin dylib load.
 pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
+    run_game_on(EventLoop::new().context("creating event loop")?, config, register)
+}
+
+/// Android entry: call from the game's `#[unsafe(no_mangle)] fn android_main(app: AndroidApp)`
+/// (the crate builds as a `cdylib` with a NativeActivity manifest). `config.assets_root`
+/// must be a real directory, e.g. assets extracted under `app.internal_data_path()`.
+#[cfg(target_os = "android")]
+pub fn run_game_android(
+    app: winit::platform::android::activity::AndroidApp,
+    config: GameConfig,
+    register: impl FnOnce(&mut ComponentRegistry),
+) -> Result<()> {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+    let event_loop = EventLoop::builder().with_android_app(app).build().context("creating event loop")?;
+    run_game_on(event_loop, config, register)
+}
+
+/// Android: the game's assets ship inside the APK (`assets/`), listed one
+/// relative path per line in `assets/citrus_assets.txt` by the packager.
+/// Extract them into the app's internal storage on first run (or when that
+/// list changes) and return the directory to use as `GameConfig::assets_root`.
+#[cfg(target_os = "android")]
+pub fn android_assets_root(app: &winit::platform::android::activity::AndroidApp) -> Result<PathBuf> {
+    use std::io::Read;
+    let read = |path: &str| -> Result<Vec<u8>> {
+        let name = std::ffi::CString::new(path)?;
+        let mut asset = app.asset_manager().open(&name).with_context(|| format!("APK asset {path} missing"))?;
+        let mut bytes = Vec::new();
+        asset.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    let root = app.internal_data_path().context("no internal data path")?.join("assets");
+    let manifest = read("citrus_assets.txt")?;
+    let stamp = root.join(".citrus_assets.txt");
+    if std::fs::read(&stamp).ok().as_deref() == Some(manifest.as_slice()) {
+        return Ok(root);
+    }
+    for rel in String::from_utf8_lossy(&manifest).lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let dest = root.join(rel);
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&dest, read(rel)?).with_context(|| format!("extracting {rel}"))?;
+    }
+    std::fs::write(&stamp, &manifest)?;
+    Ok(root)
+}
+
+fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
     let mut registry = ComponentRegistry::with_builtins();
     register(&mut registry);
     let config_bindings = config.bindings.clone();
+    let slimevr = config.tracking_input.slimevr.then(crate::slimevr::SlimeVr::start);
+    let mut face_input = crate::face_input::FaceInput::default();
+    face_input.set_osc(config.tracking_input.osc_enabled.then_some(config.tracking_input.osc_port));
+    let content_cache = config
+        .content_cache
+        .clone()
+        .unwrap_or_else(|| crate::content::content_cache_dir(&config.title));
+    let overlay_enabled = config.content_overlay || std::env::var_os("CITRUS_CONTENT_OVERLAY").is_some();
+    let mut inbox = vec![content_cache.join("inbox"), config.assets_root.join("content")];
+    if let Some(dirs) = std::env::var_os("CITRUS_CONTENT_DIR") {
+        inbox.extend(std::env::split_paths(&dirs));
+    }
 
-    let event_loop = EventLoop::new().context("creating event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = GameApp {
         config,
@@ -115,6 +188,9 @@ pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry
         flow: crate::scene_loader::SceneFlow::default(),
         post_load: None,
         particles: crate::particles::ParticleRenderer::default(),
+        water: crate::water_render::WaterRenderer::default(),
+        water_fx: crate::water_fx::WaterFx::default(),
+        carry_fx: crate::water_carry::CarryFx::default(),
         ui_keys: UiKeys::default(),
         vr_trigger_prev: false,
         world_ui_draws: Vec::new(),
@@ -122,6 +198,7 @@ pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry
         pointer: None,
         mouse: UiPointer::default(),
         rt_gi: crate::realtime_gi::RealtimeGiState::default(),
+        refl_slots: crate::refl_slots::ReflectionSlots::default(),
         input: InputManager::new(config_bindings),
         // Optional networking via env vars: CITRUS_HOST=<port> or CITRUS_JOIN=<addr>.
         net: start_net_from_env(),
@@ -132,12 +209,76 @@ pub fn run_game(config: GameConfig, register: impl FnOnce(&mut ComponentRegistry
         xr: None,
         xr_session: None,
         vr_targets: citrus_core::TrackerTargets::default(),
+        face_input,
+        slimevr,
+        content: crate::content::ContentManager::with_startup_sources(content_cache, std::env::var("CITRUS_CONTENT").ok()),
+        content_overlay: crate::content::ContentOverlay::new(inbox),
+        content_overlay_enabled: overlay_enabled,
     };
     event_loop.run_app(&mut app)?;
     if let Some(e) = app.init_error.take() {
         return Err(e);
     }
     Ok(())
+}
+
+fn frame_stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CITRUS_FRAME_STATS").is_some())
+}
+
+/// Debug view mode for test captures (`CITRUS_VIEW_MODE=2` = indirect/GI only),
+/// matching the editor's viewport render modes.
+fn view_mode() -> u32 {
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("CITRUS_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Opt-in frame timing log (`CITRUS_FRAME_STATS=1`, vsync off): every 240
+/// frames, the mean frame interval and the renderer's GPU timestamp zones.
+fn frame_stats(renderer: &Renderer) {
+    type Acc = (u32, Option<Instant>, f64, [f64; 9]);
+    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 9]));
+    if !frame_stats_on() {
+        return;
+    }
+    let s = renderer.stats();
+    let Ok(mut a) = ACC.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if let Some(prev) = a.1 {
+        a.0 += 1;
+        a.2 += now.duration_since(prev).as_secs_f64() * 1000.0;
+        let z = [
+            s.gpu_frame_ms,
+            s.gpu_gi_ms,
+            s.gpu_shadows_ms,
+            s.gpu_scene_ms,
+            s.gpu_reflect_ms,
+            s.gpu_post_ms,
+            s.gpu_gi_gather_ms,
+            s.gpu_gi_denoise_ms,
+            s.gpu_gi_integrate_ms,
+        ];
+        for (acc, v) in a.3.iter_mut().zip(z) {
+            *acc += v as f64;
+        }
+    }
+    a.1 = Some(now);
+    if a.0 >= 240 {
+        let n = a.0 as f64;
+        let z = a.3.map(|v| v / n);
+        tracing::info!(
+            target: "frame_stats",
+            "frame {:.3} ms | gpu {:.3} ms (gi {:.3} [gather {:.3}, denoise {:.3}, integrate {:.3}], shadows {:.3}, scene {:.3}, reflect {:.3}, post {:.3}) | {} draw calls ({} instanced), {} objects",
+            a.2 / n, z[0], z[1], z[6], z[7], z[8], z[2], z[3], z[4], z[5],
+            s.draw_calls, s.instanced_draws, s.opaque_draws + s.transparent_draws
+        );
+        *a = (0, Some(now), 0.0, [0.0; 9]);
+    }
 }
 
 struct GameApp {
@@ -164,6 +305,9 @@ struct GameApp {
     flow: crate::scene_loader::SceneFlow,
     post_load: Option<crate::scene_loader::PostLoad>,
     particles: crate::particles::ParticleRenderer,
+    water: crate::water_render::WaterRenderer,
+    water_fx: crate::water_fx::WaterFx,
+    carry_fx: crate::water_carry::CarryFx,
     /// Text typed since the last UI frame.
     ui_keys: UiKeys,
     vr_trigger_prev: bool,
@@ -176,12 +320,14 @@ struct GameApp {
     mouse: UiPointer,
     /// Realtime-GI driver. Runs the scene's realtime-GI setting in the game.
     rt_gi: crate::realtime_gi::RealtimeGiState,
+    /// The two reflection probes' cubes (renderer slots 0 / 1).
+    refl_slots: crate::refl_slots::ReflectionSlots,
     /// Input binding system (2C): keyboard/mouse/gamepad → action snapshot.
     input: InputManager,
     /// Active networking session (2G), if hosting/joined.
     net: Option<NetSession>,
     /// Voice comms (task 8), created lazily once networking is active.
-    voice: Option<crate::voice::VoiceChat>,
+    voice: Option<crate::voice::VoiceSystem>,
     start: Instant,
     last_frame: Instant,
     /// Set if `init` failed; surfaced after the loop exits.
@@ -194,6 +340,13 @@ struct GameApp {
     /// Consumed by the avatar-IK application step (humanoid bone mapping) — wired.
     #[allow(dead_code)]
     vr_targets: citrus_core::TrackerTargets,
+    face_input: crate::face_input::FaceInput,
+    /// SlimeVR server connection (full-body trackers), when enabled.
+    slimevr: Option<crate::slimevr::SlimeVr>,
+    /// User-generated content packages (ctx.load_content / spawn_avatar / …).
+    content: crate::content::ContentManager,
+    content_overlay: crate::content::ContentOverlay,
+    content_overlay_enabled: bool,
 }
 
 impl GameApp {
@@ -206,6 +359,10 @@ impl GameApp {
             ));
         let window = Arc::new(event_loop.create_window(attrs)?);
         let mut renderer = Renderer::new(window.clone())?;
+        if frame_stats_on() {
+            // Measure throughput, not the display's refresh rate.
+            renderer.set_vsync(false);
+        }
 
         // The boot scene loads in the background; frames start once it's in.
         let boot = self.config.boot_scene.clone();
@@ -253,7 +410,7 @@ impl GameApp {
         else {
             return true;
         };
-        let (_rel, scene, post) = match result {
+        let (rel, scene, post) = match result {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("loading scene: {e:#}");
@@ -265,9 +422,13 @@ impl GameApp {
             }
         };
         self.scene = scene;
+        self.content.scene_replaced(&rel);
         // The renderer was reset: drop caches holding its handles.
         self.world_ui = WorldUi::default();
         self.particles = crate::particles::ParticleRenderer::default();
+        self.water = crate::water_render::WaterRenderer::default();
+        self.water_fx = crate::water_fx::WaterFx::default();
+        self.carry_fx = crate::water_carry::CarryFx::default();
         // Loaded scenes carry their own Camera/Light components, but older or
         // hand-written scenes might not, so mirror the editor's safety net.
         self.scene.ensure_camera_components(&self.registry);
@@ -283,6 +444,7 @@ impl GameApp {
                 let mut session = PlaySession::new(&self.scene, &self.config.assets_root, crate::audio::AudioEngine::new());
                 session.set_mixer(self.config.audio_mixer.clone());
                 session.set_spatial_audio(&self.config.spatial_audio);
+                session.set_physics(&self.config.physics, &self.scene);
                 session.set_save_dir(user_save_dir(&self.config.title));
                 self.play = Some(session);
             }
@@ -301,6 +463,9 @@ impl GameApp {
     ) {
         let mut next_scene = None;
         for c in commands {
+            let Some(c) = crate::net_sync::route_command(&mut self.net, &self.scene, c) else {
+                continue;
+            };
             match c {
                 ComponentCommand::LoadScene(rel) => next_scene = Some(rel),
                 ComponentCommand::PreloadScene(rel) => {
@@ -324,16 +489,6 @@ impl GameApp {
                         self.flow.kept.remove(&id);
                     }
                 }
-                ComponentCommand::RequestOwnership(id) => {
-                    if let Some(net) = self.net.as_mut() {
-                        net.request_ownership(id);
-                    }
-                }
-                ComponentCommand::ReleaseOwnership(id) => {
-                    if let Some(net) = self.net.as_mut() {
-                        net.release_ownership(id);
-                    }
-                }
                 ComponentCommand::SetResolution(w, h) => {
                     if let Some(window) = self.window.as_ref() {
                         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
@@ -346,16 +501,19 @@ impl GameApp {
                         tracing::warn!("set shadow resolution: {e:#}");
                     }
                 }
-                ComponentCommand::NetMessage { to, text } => {
-                    if let Some(net) = self.net.as_mut() {
-                        net.send_message(to, &text);
-                    }
-                }
                 ComponentCommand::SetCursorLocked(locked) => {
                     self.cursor_locked = locked;
                     self.apply_cursor_lock();
                 }
                 ComponentCommand::Quit => event_loop.exit(),
+                ComponentCommand::CalibrateTrackers => {
+                    if self.scene.calibrate_vr_tpose(&self.vr_targets) {
+                        tracing::info!("VR: captured T-pose calibration");
+                    }
+                }
+                ComponentCommand::ClearTrackerCalibration => self.scene.clear_vr_calibration(),
+                ComponentCommand::SetOscFaceTracking(port) => self.face_input.set_osc(port),
+                ComponentCommand::Content(c) => self.content.queue(c),
                 other => tracing::warn!("unhandled component command {other:?}"),
             }
         }
@@ -365,6 +523,29 @@ impl GameApp {
     }
 
     /// Lay out, interact with and paint the scene's UI for this frame.
+    /// Pointer, spawn point (2 m ahead of the camera) and possessed pawn for
+    /// the user-content overlay.
+    fn content_overlay_input(&self) -> crate::content::OverlayInput {
+        let cam = self.last_cam_world;
+        let forward = cam.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
+        let flat = Vec3::new(forward.x, 0.0, forward.z).normalize_or(Vec3::NEG_Z);
+        let player = self.scene.objects.iter().find_map(|o| {
+            o.components
+                .iter()
+                .any(|c| c.as_any().downcast_ref::<citrus_core::Pawn>().is_some_and(|p| p.possessed))
+                .then_some(o.id)
+        });
+        crate::content::OverlayInput {
+            pointer: self.pointer.map(|p| egui::pos2(p.x, p.y)),
+            clicked: self.mouse.pressed,
+            spawn_at: (
+                cam.transform_point3(Vec3::ZERO) + forward * 2.0,
+                glam::Quat::from_rotation_arc(Vec3::NEG_Z, flat),
+            ),
+            player,
+        }
+    }
+
     fn run_game_ui(&mut self, width: f32, height: f32) -> citrus_render::EguiDraw {
         let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height));
         let raw = egui::RawInput {
@@ -382,11 +563,18 @@ impl GameApp {
             nav: self.input.ui_nav(),
             keys: std::mem::take(&mut self.ui_keys),
         };
+        let overlay_input = self.content_overlay.open.then(|| self.content_overlay_input());
+        let (overlay, content) = (&mut self.content_overlay, &mut self.content);
+        let mut over_overlay = false;
         let (game_ui, scene, root) = (&mut self.game_ui, &mut self.scene, &self.config.assets_root);
         let mut frame = UiFrame::default();
         let out = self.ui_ctx.run(raw, |ctx| {
             frame = game_ui.run(ctx, view, scene, root, Some(&input), None, UiScope::Screen);
+            if let Some(oi) = &overlay_input {
+                over_overlay = overlay.show(ctx, oi, content);
+            }
         });
+        frame.pointer_over_ui |= over_overlay;
         frame.merge(std::mem::take(&mut self.pending_world_frame));
         self.ui_frame.pointer_over_ui = frame.pointer_over_ui;
         self.ui_frame.text_editing = frame.text_editing;
@@ -455,7 +643,11 @@ impl GameApp {
         if let Some(baked) = post.baked.take() {
             self.scene.baked = baked;
             upload_probes(renderer, self.scene.baked.as_ref());
+            return;
         }
+        // Reflections: baked probes upload their cubes, realtime ones capture
+        // live; `refl_slots.update` does both per frame as the probes change.
+        self.refl_slots.set_baked(std::mem::take(&mut post.reflection));
         self.post_load = None;
     }
 
@@ -463,14 +655,16 @@ impl GameApp {
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        if self.cursor_locked {
+        // The content overlay needs a free cursor while open.
+        let locked = self.cursor_locked && !self.content_overlay.open;
+        if locked {
             let _ = window
                 .set_cursor_grab(CursorGrabMode::Locked)
                 .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
         } else {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
         }
-        window.set_cursor_visible(!self.cursor_locked);
+        window.set_cursor_visible(!locked);
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -495,6 +689,7 @@ impl GameApp {
 
         // Resolve input (keyboard/mouse accumulated + gamepad poll) and the
         // networking view for this frame, then drive components.
+        crate::net_sync::auto_start(&mut self.net, &self.scene);
         if let Some(net) = self.net.as_mut() {
             net.pump();
         }
@@ -513,7 +708,10 @@ impl GameApp {
             .main_camera_view_proj(win_w / win_h)
             .map(|(v, p, _)| (v, p))
             .unwrap_or((Mat4::IDENTITY, Mat4::IDENTITY));
-        let pointer = if self.cursor_locked { None } else { self.pointer };
+        // A position outside the window (a stale or out-of-window report) is
+        // no pointer: it must not edge-pan an RTS camera or hover UI.
+        let pointer = (if self.cursor_locked { None } else { self.pointer })
+            .filter(|p| p.x >= 0.0 && p.y >= 0.0 && p.x < win_w && p.y < win_h);
         let screen = citrus_core::ScreenInfo {
             size: glam::Vec2::new(win_w, win_h),
             pointer,
@@ -524,6 +722,7 @@ impl GameApp {
             ui_submits: std::mem::take(&mut self.ui_frame.submits),
             ui_text_editing: self.ui_frame.text_editing,
             ui_cancel: std::mem::take(&mut self.ui_frame.cancel),
+            vr: vr_frame(self.xr_session.as_ref(), &self.vr_targets),
         };
         let host = match self.play.as_mut() {
             Some(play) => play.tick(
@@ -544,6 +743,23 @@ impl GameApp {
             None => Vec::new(),
         };
         self.apply_host_commands(&mut renderer, event_loop, host);
+        let content = self.content.update(&mut crate::content::ContentHost {
+            renderer: &mut renderer,
+            registry: &self.registry,
+            shaders: &mut self.shaders,
+            root: &self.config.assets_root,
+            scene: &mut self.scene,
+            flow: &mut self.flow,
+        });
+        self.content_overlay.note_events(&content.events);
+        if let Some(play) = self.play.as_mut() {
+            if content.structure_changed {
+                play.structure_changed();
+            }
+            for e in content.events {
+                play.post_event(e);
+            }
+        }
         self.step_post_load(&mut renderer);
         if self.flow.poll(&mut renderer, &self.registry, &mut self.shaders, &self.config.assets_root, &mut self.scene)
             && let Some(play) = self.play.as_mut()
@@ -574,13 +790,25 @@ impl GameApp {
                 hips: b.hips,
                 left_foot: b.left_foot,
                 right_foot: b.right_foot,
+                chest: b.chest,
+                left_elbow: b.left_elbow,
+                right_elbow: b.right_elbow,
+                left_knee: b.left_knee,
+                right_knee: b.right_knee,
             };
+            if let Some(slime) = &self.slimevr {
+                slime.feed(&mut self.vr_targets);
+            }
         }
 
         // Feed VR tracker poses into the scene's humanoid IK targets (gameplay
         // could set these too — IK isn't VR-specific). Then advance + CPU-skin.
+        let face = self.face_input.poll(self.xr_session.as_ref());
+        self.scene.set_local_face(face);
+        let vr_targets = self.scene.vr_apply_calibration(&self.vr_targets);
         self.scene
-            .set_ik_targets(self.xr_session.as_ref().map(|_| self.vr_targets));
+            .set_ik_targets(self.xr_session.as_ref().map(|_| vr_targets));
+        self.scene.update_water_wind(dt);
         self.scene.update_skinning(&mut renderer, dt);
 
         // Shipped game: the main camera's layer culling mask drives which layers
@@ -590,8 +818,19 @@ impl GameApp {
         let cam = screen_view.inverse();
         self.scene.prepare_lods(&mut renderer, &self.config.assets_root);
         self.scene.lod_camera = Some(cam.w_axis.truncate());
+        self.scene.occlusion_camera = Some(cam.w_axis.truncate());
         self.particles
             .update(&mut renderer, &mut self.scene, &self.config.assets_root, cam, dt);
+        if let Some(p) = self.play.as_mut() {
+            p.set_shared_clock(self.net.as_ref().and_then(|n| n.shared_clock()));
+        }
+        let play_time = self.play.as_ref().map(|p| p.water_time());
+        self.water.update(&mut renderer, &mut self.scene, cam.w_axis.truncate(), play_time, dt);
+        let net = self.net.as_ref();
+        let owns = |id: citrus_core::ObjectId| net.is_none_or(|n| !n.is_connected() || n.has_authority_raw(id.raw()));
+        self.scene.update_wave_riders(self.water.time(), dt, true, &owns);
+        self.water_fx.update(&mut renderer, &mut self.scene, cam, play_time, dt);
+        self.carry_fx.update(&mut renderer, &mut self.scene, cam, play_time.is_some(), dt, &mut self.water_fx.sim.particles);
         self.scene.sync_draws(None, 0.0);
 
         let (width, height) = self
@@ -613,26 +852,14 @@ impl GameApp {
         });
         self.last_cam_world = view.inverse();
 
-        // Voice comms (task 8): capture mic on push-to-talk, play remote peers
-        // back spatially (positioned at the object each peer owns).
-        if self.net.is_some() {
-            if self.voice.is_none() {
-                self.voice = crate::voice::VoiceChat::new();
-            }
-            let transmit = self.input.state().down("Voice");
-            if let (Some(voice), Some(net)) = (self.voice.as_mut(), self.net.as_mut()) {
-                voice.capture_and_send(net, transmit);
-                let owners = net.owners_snapshot();
-                let packets = net.take_voice();
-                let positions = self.scene.peer_voice_positions(&owners);
-                voice.receive(packets, &positions);
-                voice.update(cam_pos, 25.0);
-            }
-        }
+        // Voice chat + lip sync (needs a Voice Chat component in the scene).
+        let input = self.input.state();
+        let right = self.last_cam_world.x_axis.truncate();
+        crate::voice::run_frame(&mut self.voice, self.net.as_mut(), &mut self.scene, |a| input.down(a), cam_pos, right);
 
         let env = self.scene.environment.clone();
         // For a baked scene the environment sun is in the bake, not realtime.
-        let sun_realtime = env.sun_enabled && self.scene.baked.is_none();
+        let sun_realtime = env.sun_enabled && !self.scene.lightmaps_in_use();
         let mut lights = Vec::new();
         if sun_realtime {
             lights.push(citrus_render::LightInstance {
@@ -651,8 +878,6 @@ impl GameApp {
             });
         }
         lights.extend(self.scene.gather_lights());
-        // Full light set (incl. baked) for the reflection cube capture.
-        let capture_lights = self.scene.gather_lights_all();
         let world_light = LightData {
             direction: Vec3::from(env.sun_direction).normalize_or(Vec3::NEG_Y),
             color: env.sun_color,
@@ -671,17 +896,35 @@ impl GameApp {
         if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
             tracing::error!("setting shadow resolution: {e:#}");
         }
-        // Realtime-mode probe: keep re-capturing continuously (one face/frame) so
-        // in-game reflections track dynamic lighting. Same policy as the editor.
-        if !renderer.reflection_capture_in_flight() {
-            if let Some(p) = self.scene.active_reflection_probe(Vec3::ZERO) {
-                if p.realtime {
-                    renderer.request_reflection_capture(Vec3::from(p.capture), p.resolution);
-                }
+        // The two reflection probes around the camera (blended per pixel);
+        // realtime ones keep re-capturing so reflections track dynamic lighting.
+        let refl = self.refl_slots.update(&mut renderer, self.scene.active_reflection_probes(cam_pos), true);
+        let camera_views = self.scene.camera_target_views();
+        for v in &camera_views {
+            if let Err(e) = renderer.resize_camera_target(v.id, v.size[0], v.size[1]) {
+                tracing::error!("resizing render-texture camera: {e:#}");
             }
         }
-        let postfx = self.scene.effective_postfx(cam_pos, &self.config.assets_root);
+        let postfx = citrus_render::PostFx {
+            underwater: crate::underwater::view_fx(&self.scene, cam_pos, self.water.time()),
+            ..self.scene.effective_postfx(cam_pos, &self.config.assets_root)
+        };
         let planar = self.scene.planar_surfaces();
+        // Full light set (incl. baked) for the reflection cube capture, only
+        // while one is queued or running (empty = use `lights`).
+        let voxel_emitters = {
+            let gi = &self.scene.environment.realtime_gi;
+            if gi.enabled && gi.mode == citrus_assets::GiMode::FluxVoxel {
+                self.scene.flux_voxel_dynamic_emitters()
+            } else {
+                Vec::new()
+            }
+        };
+        let capture_lights = if renderer.reflection_capture_in_flight() {
+            self.scene.gather_lights_all()
+        } else {
+            Vec::new()
+        };
 
         let ui_draw = self.run_game_ui(win_w, win_h);
         let frame = FrameInput {
@@ -694,18 +937,25 @@ impl GameApp {
             light: world_light,
             lights: &lights,
             capture_lights: &capture_lights,
+            voxel_emitters: &voxel_emitters,
             camera_preview: None,
+            preview_postfx: postfx,
             draw_skybox: env.skybox_enabled,
             shadow_pcf_texel,
             shadow_distance: env.shadow_distance,
             time: t,
+            water_time: self.water.time(),
+            water: self.water.bodies(),
             draws: &self.scene.draws,
             lightmap_preview: false,
-            gi_debug: 0,
+            gi_debug: view_mode(),
             render_viewport: true,
             viewport_extent: None,
             postfx,
-            reflection_probe: self.scene.active_reflection_probe(cam_pos),
+            reflection_probe: refl.0,
+            reflection_probe_b: refl.1,
+            reflection_primary: refl.2,
+            camera_targets: &camera_views,
             planar: &planar,
             fog: self.scene.fog_params(),
             voxel_specular: self.scene.environment.realtime_gi.mode
@@ -716,8 +966,10 @@ impl GameApp {
         };
         if let Err(e) = renderer.render(&frame) {
             tracing::error!("render failed: {e:#}");
+            renderer.report_device_lost(&e);
             event_loop.exit();
         }
+        frame_stats(&renderer);
 
         self.renderer = Some(renderer);
         if let Some(window) = self.window.as_ref() {
@@ -728,7 +980,7 @@ impl GameApp {
 
 /// Push baked probe SH + volume metadata to the renderer (set-0 binding 2), or
 /// clear it when the scene has no bake.
-fn upload_probes(renderer: &mut Renderer, baked: Option<&crate::scene::BakedData>) {
+pub(crate) fn upload_probes(renderer: &mut Renderer, baked: Option<&crate::scene::BakedData>) {
     match baked {
         Some(b) => {
             let volumes: Vec<(Mat4, [f32; 3], [u32; 3], u32)> = b
@@ -816,6 +1068,15 @@ impl ApplicationHandler for GameApp {
             // Feed the binding system (2C).
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state.is_pressed();
+                if pressed
+                    && self.content_overlay_enabled
+                    && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F8)
+                {
+                    self.content_overlay.open = !self.content_overlay.open;
+                    self.apply_cursor_lock();
+                    return;
+                }
                 if pressed && self.ui_frame.text_editing {
                     // Keys go to the focused text field, not gameplay.
                     match event.logical_key {
@@ -883,5 +1144,27 @@ impl ApplicationHandler for GameApp {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+}
+
+/// Headset + controller state for gameplay (`ctx.screen.vr`), from the live
+/// session's latest stage-space poses. Inactive without a running session.
+pub(crate) fn vr_frame(session: Option<&citrus_xr::XrSession>, poses: &citrus_core::TrackerTargets) -> citrus_core::VrFrame {
+    let Some(session) = session.filter(|s| s.running) else {
+        return citrus_core::VrFrame::default();
+    };
+    let input = session.input();
+    citrus_core::VrFrame {
+        active: true,
+        head: poses.head,
+        left_hand: poses.left_hand,
+        right_hand: poses.right_hand,
+        left_stick: glam::Vec2::from(input.left_stick),
+        right_stick: glam::Vec2::from(input.right_stick),
+        left_grip: input.left_grip,
+        right_grip: input.right_grip,
+        left_trigger: false,
+        right_trigger: input.right_trigger,
+        menu: input.menu,
     }
 }

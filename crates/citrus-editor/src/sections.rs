@@ -3,12 +3,12 @@
 //! master enable checkbox follow the Poiyomi pattern (off = feature compiled
 //! out of the shader variant).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use egui::collapsing_header::{CollapsingState, paint_default_icon};
-use egui::{ComboBox, DragValue, Frame, Label, RichText, Sense, Slider, Ui};
+use egui::{ComboBox, DragValue, Label, RichText, Sense, Ui};
 
-use citrus_core::{AlphaModeModel, MatcapBlend, MaterialModel, ShaderPropKindUi, ShaderUiInfo};
+use citrus_core::{AlphaModeModel, MatcapBlend, MaterialModel, ShaderUiInfo};
 use egui_phosphor::regular as ph;
 
 /// Section metadata for search: (title, keywords).
@@ -42,73 +42,31 @@ const SECTIONS: [(&str, &[&str]); 6] = [
 
 const MATCAP_TITLES: [&str; 3] = ["Matcap 1", "Matcap 2", "Matcap 3"];
 
-/// True for file extensions the engine can load as a texture.
-fn is_image_path(p: &Path) -> bool {
-    matches!(
-        p.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some(
-            "png" | "jpg" | "jpeg" | "tga" | "bmp" | "dds" | "hdr" | "exr" | "ktx" | "ktx2"
-                | "webp" | "gif"
-        )
-    )
-}
 
-/// One texture-slot row: assigned filename + a drag-drop target (drag an image
-/// from the file browser) + a clear button. `idx` is the 0..12 slot index
-/// reported on drop via `tex_dropped`. Returns true if cleared in place.
-fn texture_row(
+/// One texture-slot row: an asset chip (drag an image from the file
+/// browser, browse, click to show, double-click to open) holding an `@<id>`
+/// reference. Returns true when the slot changed (in place).
+pub(crate) fn texture_row(
     ui: &mut Ui,
     label: &str,
     idx: usize,
     slot: &mut Option<PathBuf>,
-    tex_dropped: &mut Option<(usize, PathBuf)>,
+    _tex_dropped: &mut Option<(usize, PathBuf)>,
 ) -> bool {
-    let mut cleared = false;
-    let current = slot
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned());
-    let resp = Frame::group(ui.style())
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(label);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if current.is_some() && ui.small_button(ph::X).on_hover_text("Clear").clicked() {
-                        *slot = None;
-                        cleared = true;
-                    }
-                    match &current {
-                        Some(name) => ui.label(RichText::new(name).weak()),
-                        None => ui.label(RichText::new("drop image").small().weak()),
-                    };
-                });
-            });
-        })
-        .response;
-    if let Some(hover) = resp.dnd_hover_payload::<PathBuf>()
-        && is_image_path(&hover)
-    {
-        ui.painter().rect_stroke(
-            resp.rect,
-            4.0,
-            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
-            egui::StrokeKind::Outside,
-        );
+    // What the engine can load as a texture.
+    const IMAGES: [&str; 12] = ["png", "jpg", "jpeg", "tga", "bmp", "dds", "hdr", "exr", "ktx", "ktx2", "webp", "gif"];
+    let mut value = slot.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let salt = format!("texture-slot-{idx}");
+    let changed = crate::widgets::property_row(ui, label, |ui| crate::components::asset_chip(ui, &salt, &mut value, "drop an image", &IMAGES));
+    if changed {
+        *slot = (!value.is_empty()).then(|| PathBuf::from(value));
     }
-    if let Some(dropped) = resp.dnd_release_payload::<PathBuf>()
-        && is_image_path(&dropped)
-    {
-        *tex_dropped = Some((idx, (*dropped).clone()));
-    }
-    cleared
+    changed
 }
 
 /// Per-texture UV transform: tiling (scale) + offset, two compact rows. Returns
 /// true if either changed.
-fn uv_transform_row(ui: &mut Ui, tiling: &mut [f32; 2], offset: &mut [f32; 2]) -> bool {
+pub(crate) fn uv_transform_row(ui: &mut Ui, tiling: &mut [f32; 2], offset: &mut [f32; 2]) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Tiling").small().weak());
@@ -181,7 +139,13 @@ pub fn material_editor_ui(
     });
 
     if m.shader != "standard" {
-        changed |= custom_shader_ui(ui, m, shader_info);
+        changed |= crate::shader_ui::custom_shader_ui(ui, search, m, shader_info, tex_dropped);
+        // Fixed slots every custom shader can sample (t_albedo, t_normal, t_orm, t_emission).
+        section(ui, "Material Textures", None, &mut changed, |ui, changed| {
+            for (slot, label) in [(0, "Albedo"), (1, "Normal Map"), (2, "ORM"), (3, "Emission")] {
+                *changed |= texture_row(ui, label, slot, m.textures.slot_mut(slot).unwrap(), tex_dropped);
+            }
+        });
         // Pipeline state still comes from the standard feature set.
         section(ui, "Transparency", None, &mut changed, |ui, changed| {
             alpha_mode_ui(ui, m, changed);
@@ -213,16 +177,16 @@ pub fn material_editor_ui(
             *changed |= texture_row(ui, "Albedo", 0, m.textures.slot_mut(0).unwrap(), tex_dropped);
             *changed |= uv_transform_row(ui, &mut m.albedo_tiling, &mut m.albedo_offset);
             property_row(ui, "Metallic", changed, |ui| {
-                ui.add(Slider::new(&mut m.metallic, 0.0..=1.0))
+                crate::widgets::slider(ui, egui::Slider::new(&mut m.metallic, 0.0..=1.0))
             });
             property_row(ui, "Roughness", changed, |ui| {
-                ui.add(Slider::new(&mut m.roughness, 0.0..=1.0))
+                crate::widgets::slider(ui, egui::Slider::new(&mut m.roughness, 0.0..=1.0))
             });
             property_row(ui, "Occlusion", changed, |ui| {
-                ui.add(Slider::new(&mut m.occlusion_strength, 0.0..=1.0))
+                crate::widgets::slider(ui, egui::Slider::new(&mut m.occlusion_strength, 0.0..=1.0))
             });
             property_row(ui, "Reflection", changed, |ui| {
-                ui.add(Slider::new(&mut m.reflection_intensity, 0.0..=2.0))
+                crate::widgets::slider(ui, egui::Slider::new(&mut m.reflection_intensity, 0.0..=2.0))
                     .on_hover_text(
                         "Per-material reflection strength (1 = default, 0 = matte). \
                          The reflection TECHNIQUE (Reflection Probes / SSR / Ray-traced) \
@@ -272,7 +236,7 @@ pub fn material_editor_ui(
                     ui.checkbox(&mut m.normal_map_enabled, "")
                 });
                 property_row(ui, "Normal Strength", changed, |ui| {
-                    ui.add(Slider::new(&mut m.normal_strength, 0.0..=2.0))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.normal_strength, 0.0..=2.0))
                 });
             });
             ui.separator();
@@ -289,7 +253,7 @@ pub fn material_editor_ui(
             let has_disp = m.textures.displacement.is_some();
             ui.add_enabled_ui(has_disp, |ui| {
                 property_row(ui, "Displacement Scale", changed, |ui| {
-                    ui.add(Slider::new(&mut m.displacement_scale, 0.0..=0.1))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.displacement_scale, 0.0..=0.1))
                         .on_hover_text(
                             "Parallax occlusion depth (0 = off). Height samples in the \
                              albedo UV tiling; all maps shift together.",
@@ -315,26 +279,26 @@ pub fn material_editor_ui(
                     .weak(),
                 );
                 property_row(ui, "Ramp Steps", changed, |ui| {
-                    ui.add(Slider::new(&mut m.toon_steps, 2.0..=8.0).step_by(1.0))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.toon_steps, 2.0..=8.0).step_by(1.0))
                 });
                 property_row(ui, "Toon Strength", changed, |ui| {
-                    ui.add(Slider::new(&mut m.pbr_toon_blend, 0.0..=1.0))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.pbr_toon_blend, 0.0..=1.0))
                         .on_hover_text("Blend between smooth PBR (0) and full cel ramp (1)")
                 });
                 property_row(ui, "Ramp Smoothness", changed, |ui| {
-                    ui.add(Slider::new(&mut m.ramp_smoothness, 0.01..=0.49))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.ramp_smoothness, 0.01..=0.49))
                         .on_hover_text("Softness of each cel-band terminator")
                 });
                 ui.separator();
                 property_row(ui, "Rim Strength", changed, |ui| {
-                    ui.add(Slider::new(&mut m.rim_strength, 0.0..=3.0))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.rim_strength, 0.0..=3.0))
                         .on_hover_text("Fresnel edge glow (0 = off)")
                 });
                 property_row(ui, "Rim Color", changed, |ui| {
                     ui.color_edit_button_rgb(&mut m.rim_color)
                 });
                 property_row(ui, "Rim Power", changed, |ui| {
-                    ui.add(Slider::new(&mut m.rim_power, 0.5..=8.0))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.rim_power, 0.5..=8.0))
                         .on_hover_text("Higher = tighter edge")
                 });
             },
@@ -374,7 +338,7 @@ pub fn material_editor_ui(
                     tex_dropped,
                 );
                 property_row(ui, "Pulse Speed", changed, |ui| {
-                    ui.add(Slider::new(&mut m.emission_pulse, 0.0..=10.0))
+                    crate::widgets::slider(ui, egui::Slider::new(&mut m.emission_pulse, 0.0..=10.0))
                         .on_hover_text("Brightness oscillation rate (0 = steady)")
                 });
                 ui.horizontal(|ui| {
@@ -423,10 +387,10 @@ pub fn material_editor_ui(
             );
             // Per-layer slot indices into the 12-slot texture set:
             // matcap tex = 6/8/10, matcap mask = 7/9/11.
-            for i in 0..3 {
+            for (i, title) in MATCAP_TITLES.iter().enumerate() {
                 let tex_slot = 6 + i * 2;
                 let mask_slot = 7 + i * 2;
-                section(ui, MATCAP_TITLES[i], None, changed, |ui, changed| {
+                section(ui, title, None, changed, |ui, changed| {
                     *changed |= texture_row(
                         ui,
                         "Matcap",
@@ -455,7 +419,7 @@ pub fn material_editor_ui(
                         *changed = true;
                     }
                     property_row(ui, "Strength", changed, |ui| {
-                        ui.add(Slider::new(&mut m.matcap_strength[i], 0.0..=2.0))
+                        crate::widgets::slider(ui, egui::Slider::new(&mut m.matcap_strength[i], 0.0..=2.0))
                     });
                     *changed |= texture_row(
                         ui,
@@ -504,12 +468,12 @@ fn alpha_mode_ui(ui: &mut Ui, m: &mut MaterialModel, changed: &mut bool) {
     }
     if m.alpha_mode == AlphaModeModel::Cutout {
         property_row(ui, "Cutoff", changed, |ui| {
-            ui.add(Slider::new(&mut m.alpha_cutoff, 0.0..=1.0))
+            crate::widgets::slider(ui, egui::Slider::new(&mut m.alpha_cutoff, 0.0..=1.0))
         });
     }
     if m.alpha_mode == AlphaModeModel::Blend {
         property_row(ui, "Opacity", changed, |ui| {
-            ui.add(Slider::new(&mut m.base_color[3], 0.0..=1.0))
+            crate::widgets::slider(ui, egui::Slider::new(&mut m.base_color[3], 0.0..=1.0))
         });
     }
 }
@@ -538,74 +502,6 @@ fn render_queue_ui(ui: &mut Ui, m: &mut MaterialModel, changed: &mut bool) {
             }
         }
     });
-}
-
-/// Reflected property editor for a custom shader. Returns true on change.
-fn custom_shader_ui(ui: &mut Ui, m: &mut MaterialModel, info: Option<&ShaderUiInfo>) -> bool {
-    let mut changed = false;
-    ui.separator();
-    let Some(info) = info else {
-        ui.label(RichText::new("Loading shader…").weak());
-        return false;
-    };
-    if let Some(error) = &info.error {
-        ui.label(
-            RichText::new("Shader failed to compile")
-                .color(ui.visuals().error_fg_color)
-                .strong(),
-        );
-        ui.label(RichText::new(error).small().monospace());
-        return false;
-    }
-    if m.custom_values.len() < 16 {
-        // Engine fills defaults on resolve; guard against a stale frame.
-        ui.label(RichText::new("Initializing properties…").weak());
-        return false;
-    }
-    section(ui, "Properties", None, &mut changed, |ui, changed| {
-        if info.props.is_empty() {
-            ui.label(
-                RichText::new("This shader declares no properties")
-                    .small()
-                    .weak(),
-            );
-        }
-        for prop in &info.props {
-            let at = prop.offset;
-            match prop.kind {
-                ShaderPropKindUi::Float { min, max } => {
-                    property_row(ui, &prop.label, changed, |ui| {
-                        ui.add(Slider::new(&mut m.custom_values[at], min..=max))
-                    });
-                }
-                ShaderPropKindUi::Toggle => {
-                    let mut on = m.custom_values[at] != 0.0;
-                    property_row(ui, &prop.label, changed, |ui| {
-                        let response = ui.checkbox(&mut on, "");
-                        if response.changed() {
-                            m.custom_values[at] = on as u32 as f32;
-                        }
-                        response
-                    });
-                }
-                ShaderPropKindUi::Color => {
-                    property_row(ui, &prop.label, changed, |ui| {
-                        let slice: &mut [f32; 4] =
-                            (&mut m.custom_values[at..at + 4]).try_into().unwrap();
-                        ui.color_edit_button_rgba_unmultiplied(slice)
-                    });
-                }
-                ShaderPropKindUi::Color3 => {
-                    property_row(ui, &prop.label, changed, |ui| {
-                        let slice: &mut [f32; 3] =
-                            (&mut m.custom_values[at..at + 3]).try_into().unwrap();
-                        ui.color_edit_button_rgb(slice)
-                    });
-                }
-            }
-        }
-    });
-    changed
 }
 
 /// Collapsible section. The whole header (arrow *and* title) toggles

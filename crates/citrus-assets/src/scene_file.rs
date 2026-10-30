@@ -44,6 +44,8 @@ pub enum PrimitiveShape {
     Sphere,
     Capsule,
     Plane,
+    /// Open-top box with walls (a bucket / tub).
+    Bucket,
 }
 
 impl PrimitiveShape {
@@ -53,6 +55,7 @@ impl PrimitiveShape {
             Self::Sphere => "Sphere",
             Self::Capsule => "Capsule",
             Self::Plane => "Plane",
+            Self::Bucket => "Bucket",
         }
     }
 }
@@ -61,11 +64,16 @@ fn default_shader() -> String {
     "standard".into()
 }
 
-/// Which material an object uses.
+/// Which material an object uses. The inline snapshot is large, but a scene
+/// holds few of these and boxing it would change every match site.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum MaterialRef {
     /// A `.material` asset file (project-relative path).
     File(String),
+    /// The object's own material exactly as its model (or primitive) brings
+    /// it: nothing stored, so unedited model materials cost no scene space.
+    Model,
     /// Snapshot of parameters applied over whatever textures the object's
     /// imported material carried.
     Inline {
@@ -142,6 +150,231 @@ pub struct SceneEntry {
     /// Quaternion xyzw.
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+    /// On a model's root: the model whose untouched parts aren't stored (they
+    /// are rebuilt from the model file on load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelInstanceRef>,
+    /// On a stored model part: which of the model's parts it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_part: Option<u32>,
+}
+
+/// A model placed in a scene, stored as a reference plus what changed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelInstanceRef {
+    pub path: String,
+    /// Parts deleted from this instance (indices into the model's parts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<u32>,
+}
+
+/// One part (instance) of a model as imported: what a pristine scene object
+/// for it looks like.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelPart {
+    pub name: String,
+    pub mesh: usize,
+    pub extra_meshes: Vec<usize>,
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+impl ModelPart {
+    /// The parts of a loaded model, in the order its objects are created.
+    pub fn of(model: &crate::Scene) -> Vec<ModelPart> {
+        model
+            .instances
+            .iter()
+            .filter_map(|inst| {
+                let slot0 = inst.slots.first()?;
+                let (s, r, t) = inst.transform.to_scale_rotation_translation();
+                Some(ModelPart {
+                    name: inst.name.clone(),
+                    mesh: slot0.mesh,
+                    extra_meshes: inst.slots[1..].iter().map(|x| x.mesh).collect(),
+                    translation: t.to_array(),
+                    rotation: r.to_array(),
+                    scale: s.to_array(),
+                })
+            })
+            .collect()
+    }
+}
+
+fn close(a: &[f32], b: &[f32]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5)
+}
+
+/// Stable id for part `k` of the model instance whose root has id `root`.
+fn part_id(root: &str, k: usize) -> String {
+    let mut h1 = 0xcbf2_9ce4_8422_2325u64;
+    let mut h2 = 0x8422_2325_cbf2_9ce4u64;
+    for b in root.bytes().chain((k as u64).to_le_bytes()) {
+        h1 = (h1 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        h2 = (h2 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(5);
+    }
+    let b = (((h1 as u128) << 64) | h2 as u128).to_be_bytes();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+impl SceneFile {
+    /// Model paths this file needs, including ones only referenced by a
+    /// compacted model root.
+    pub fn model_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for e in &self.entries {
+            let path = match (&e.source, &e.model) {
+                (_, Some(m)) => Some(&m.path),
+                (ObjectSource::Model { path, .. }, None) => Some(path),
+                _ => None,
+            };
+            if let Some(p) = path
+                && !out.contains(p)
+            {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+
+    /// Store each model placed in the scene as its root plus what changed:
+    /// parts still exactly as imported (and not referenced by anything) are
+    /// dropped, deleted parts are listed, edited ones stay as entries tagged
+    /// with their part index. `parts_of` lists a model's parts.
+    pub fn compact_models(&mut self, parts_of: &dyn Fn(&str) -> Option<Vec<ModelPart>>) {
+        let n = self.entries.len();
+        let mut has_children = vec![false; n];
+        for e in &self.entries {
+            if let Some(p) = e.parent.filter(|p| *p < n) {
+                has_children[p] = true;
+            }
+        }
+        let all_data: String = self.entries.iter().flat_map(|e| e.components.iter().map(|c| c.data.as_str())).collect::<Vec<_>>().join(" ");
+        let mut drop = vec![false; n];
+        for r in 0..n {
+            if self.entries[r].parent.is_some() || !matches!(self.entries[r].source, ObjectSource::Empty) || self.entries[r].model.is_some() {
+                continue;
+            }
+            let children: Vec<usize> = (0..n).filter(|&c| self.entries[c].parent == Some(r)).collect();
+            let model_children: Vec<usize> = children.iter().copied().filter(|&c| matches!(self.entries[c].source, ObjectSource::Model { .. })).collect();
+            let Some(path) = model_children.first().and_then(|&c| match &self.entries[c].source {
+                ObjectSource::Model { path, .. } => Some(path.clone()),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if !model_children.iter().all(|&c| matches!(&self.entries[c].source, ObjectSource::Model { path: p, .. } if *p == path)) {
+                continue;
+            }
+            let Some(parts) = parts_of(&path) else { continue };
+            // Match each model child to a distinct part: same meshes, preferring
+            // the same name, in order.
+            let mut claimed = vec![false; parts.len()];
+            let mut assign = Vec::new();
+            for &c in &model_children {
+                let ObjectSource::Model { mesh, extra_meshes, .. } = &self.entries[c].source else { unreachable!() };
+                let fits = |k: usize| !claimed[k] && parts[k].mesh == *mesh && parts[k].extra_meshes == *extra_meshes;
+                let name = &self.entries[c].name;
+                let k = (0..parts.len()).find(|&k| fits(k) && parts[k].name == *name).or_else(|| (0..parts.len()).find(|&k| fits(k)));
+                match k {
+                    Some(k) => {
+                        claimed[k] = true;
+                        assign.push((c, k));
+                    }
+                    None => break,
+                }
+            }
+            if assign.len() != model_children.len() {
+                continue;
+            }
+            for &(c, k) in &assign {
+                let e = &self.entries[c];
+                let p = &parts[k];
+                let pristine = e.name == p.name
+                    && e.enabled
+                    && !e.static_geometry
+                    && e.lightmap_scale == 1.0
+                    && e.layer == 0
+                    && matches!(e.material, MaterialRef::Model)
+                    && e.extra_materials.iter().all(|m| matches!(m, MaterialRef::Model))
+                    && e.extra_materials.len() == p.extra_meshes.len()
+                    && e.components.is_empty()
+                    && !has_children[c]
+                    && (e.id.is_empty() || !all_data.contains(&e.id))
+                    && close(&e.translation, &p.translation)
+                    && close(&e.rotation, &p.rotation)
+                    && close(&e.scale, &p.scale);
+                if pristine {
+                    drop[c] = true;
+                } else {
+                    self.entries[c].model_part = Some(k as u32);
+                }
+            }
+            let removed = (0..parts.len()).filter(|&k| !claimed[k]).map(|k| k as u32).collect();
+            self.entries[r].model = Some(ModelInstanceRef { path, removed });
+        }
+        if !drop.iter().any(|d| *d) {
+            return;
+        }
+        let mut new_index = vec![None; n];
+        let mut next = 0;
+        for i in 0..n {
+            if !drop[i] {
+                new_index[i] = Some(next);
+                next += 1;
+            }
+        }
+        let old = std::mem::take(&mut self.entries);
+        self.entries = old
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !drop[*i])
+            .map(|(_, mut e)| {
+                e.parent = e.parent.and_then(|p| new_index.get(p).copied().flatten());
+                e
+            })
+            .collect();
+    }
+
+    /// Rebuild the parts compacted away by [`Self::compact_models`]: every
+    /// part of a model root that wasn't removed and isn't stored as an entry
+    /// is appended as a pristine child with a stable id.
+    pub fn expand_models(&mut self, parts_of: &dyn Fn(&str) -> Option<Vec<ModelPart>>) {
+        let n = self.entries.len();
+        for r in 0..n {
+            let Some(m) = self.entries[r].model.clone() else { continue };
+            let Some(parts) = parts_of(&m.path) else { continue };
+            let stored: Vec<u32> = (0..n).filter(|&c| self.entries[c].parent == Some(r)).filter_map(|c| self.entries[c].model_part).collect();
+            let root_id = self.entries[r].id.clone();
+            for (k, p) in parts.iter().enumerate() {
+                if m.removed.contains(&(k as u32)) || stored.contains(&(k as u32)) {
+                    continue;
+                }
+                self.entries.push(SceneEntry {
+                    id: part_id(&root_id, k),
+                    name: p.name.clone(),
+                    source: ObjectSource::Model { path: m.path.clone(), mesh: p.mesh, extra_meshes: p.extra_meshes.clone() },
+                    enabled: true,
+                    static_geometry: false,
+                    lightmap_scale: 1.0,
+                    layer: 0,
+                    material: MaterialRef::Model,
+                    extra_materials: vec![MaterialRef::Model; p.extra_meshes.len()],
+                    parent: Some(r),
+                    components: Vec::new(),
+                    translation: p.translation,
+                    rotation: p.rotation,
+                    scale: p.scale,
+                    model: None,
+                    model_part: Some(k as u32),
+                });
+            }
+        }
+    }
 }
 
 /// Scene-level environment: ambient fill + a world "sun/moon" directional
@@ -432,6 +665,11 @@ pub struct RealtimeGi {
     pub march_distance: f32,
     /// Firefly clamp on bounce samples; caps bright outliers (lower = calmer).
     pub firefly_clamp: f32,
+    /// Multiplier on how much light emissive objects throw into the GI (their
+    /// on-screen brightness is unchanged). 1 = physical; small emitters at
+    /// emission intensity ~1 are dim light sources, so raise this (like
+    /// Lumen's emissive boost) for stronger coloured pools.
+    pub emissive_boost: f32,
     /// World-probe fallback policy for the in-game camera / off-screen surfaces.
     pub probe_fallback: ProbeFallback,
     /// Screen-space reflections: trace specular rays against the depth prepass +
@@ -444,8 +682,13 @@ pub struct RealtimeGi {
     /// SSR roughness cutoff: surfaces rougher than this skip the march.
     pub ssr_roughness_cutoff: f32,
     /// Reflection model: 0 = environment cube only, 1 = screen-space (SSR),
-    /// 2 = ray-traced (1 bounce; needs GPU ray-query support, falls back to SSR).
+    /// 2 = ray-traced (needs GPU ray-query support, falls back to SSR).
     pub reflection_mode: u8,
+    /// Ray-traced reflections: rays per pixel. Rough surfaces spread them over
+    /// their glossy lobe, so more rays = smoother glossy reflections.
+    pub rt_samples: u32,
+    /// Ray-traced reflections: bounces (2+ shows mirrors / metals inside reflections).
+    pub rt_bounces: u32,
     // --- FluxVoxel backend ---
     /// Probes per world meter for the auto scene-covering FluxVoxel grid (used
     /// when there are 0 author-placed FluxVolumes). Higher = finer GI, more cost.
@@ -501,6 +744,7 @@ impl Default for RealtimeGi {
             gdf_resolution: 128,
             march_distance: 0.0, // auto
             firefly_clamp: 4.0,
+            emissive_boost: 1.0,
             // Default: Flux only (no world-probe march). The DDGI fallback is
             // opt-in for projects using the in-game camera / off-screen GI.
             probe_fallback: ProbeFallback::Off,
@@ -509,6 +753,8 @@ impl Default for RealtimeGi {
             ssr_max_distance: 40.0,
             ssr_roughness_cutoff: 0.6,
             reflection_mode: 1,
+            rt_samples: 1,
+            rt_bounces: 1,
             voxel_density: 1.0,
             voxel_auto_grid: true,
             voxel_grid_mode: VoxelGridMode::WholeScene,
@@ -702,4 +948,97 @@ pub fn save_scene_file(path: impl AsRef<Path>, scene: &SceneFile) -> Result<()> 
     }
     std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod model_instance_tests {
+    use super::*;
+
+    fn parts() -> Vec<ModelPart> {
+        (0..4)
+            .map(|k| ModelPart {
+                name: format!("Part{k}"),
+                mesh: k,
+                extra_meshes: Vec::new(),
+                translation: [k as f32, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0; 3],
+            })
+            .collect()
+    }
+
+    fn entry(name: &str, source: ObjectSource, parent: Option<usize>, t: [f32; 3]) -> SceneEntry {
+        SceneEntry {
+            id: format!("00000000-0000-0000-0000-{:012}", name.len() * 1000 + t[0] as usize),
+            name: name.into(),
+            source,
+            enabled: true,
+            static_geometry: false,
+            lightmap_scale: 1.0,
+            layer: 0,
+            material: MaterialRef::Model,
+            extra_materials: Vec::new(),
+            parent,
+            components: Vec::new(),
+            translation: t,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            model: None,
+            model_part: None,
+        }
+    }
+
+    fn model(k: usize) -> ObjectSource {
+        ObjectSource::Model { path: "models/house.glb".into(), mesh: k, extra_meshes: Vec::new() }
+    }
+
+    #[test]
+    fn pristine_parts_drop_out_and_come_back() {
+        let mut file = SceneFile::default();
+        file.entries.push(entry("House", ObjectSource::Empty, None, [0.0; 3]));
+        file.entries.push(entry("Part0", model(0), Some(0), [0.0, 0.0, 0.0]));
+        file.entries.push(entry("Part1", model(1), Some(0), [1.0, 5.0, 0.0])); // moved
+        // Part2 deleted by the user.
+        file.entries.push(entry("Part3", model(3), Some(0), [3.0, 0.0, 0.0]));
+        file.entries.push(entry("Lamp", ObjectSource::Empty, Some(0), [0.0; 3]));
+        // Something references Part3, so it must keep its id and stay stored.
+        let part3_id = file.entries[3].id.clone();
+        file.entries[4].components.push(ComponentData { kind: "Spin".into(), data: format!("(target:(Some(\"{part3_id}\")))") });
+
+        let full = file.clone();
+        file.compact_models(&|_| Some(parts()));
+        assert_eq!(file.entries.len(), 4, "Part0 dropped");
+        assert_eq!(file.entries[0].model, Some(ModelInstanceRef { path: "models/house.glb".into(), removed: vec![2] }));
+        assert_eq!(file.entries[1].model_part, Some(1));
+        assert!(file.entries.iter().all(|e| e.parent.is_none_or(|p| p < file.entries.len())));
+
+        let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default()).unwrap();
+        let mut back: SceneFile = ron::from_str(&text).unwrap();
+        back.expand_models(&|_| Some(parts()));
+        back.expand_models(&|_| Some(parts()));
+        assert_eq!(back.entries.len(), full.entries.len(), "expansion is idempotent and restores the part");
+        let p0 = back.entries.iter().find(|e| e.name == "Part0").unwrap();
+        assert_eq!((p0.translation, p0.parent), ([0.0; 3], Some(0)));
+        assert!(back.entries.iter().all(|e| e.name != "Part2"), "removed stays removed");
+        let moved = back.entries.iter().find(|e| e.name == "Part1").unwrap();
+        assert_eq!(moved.translation, [1.0, 5.0, 0.0]);
+        let ids: Vec<&str> = back.entries.iter().map(|e| e.id.as_str()).collect();
+        let mut again = back.clone();
+        again.entries.truncate(4);
+        again.expand_models(&|_| Some(parts()));
+        assert_eq!(again.entries.last().unwrap().id, *ids.last().unwrap(), "rebuilt parts keep stable ids");
+    }
+
+    #[test]
+    fn edited_materials_and_components_keep_a_part_stored() {
+        let mut file = SceneFile::default();
+        file.entries.push(entry("House", ObjectSource::Empty, None, [0.0; 3]));
+        for k in 0..4 {
+            file.entries.push(entry(&format!("Part{k}"), model(k), Some(0), [k as f32, 0.0, 0.0]));
+        }
+        file.entries[2].material = MaterialRef::File("materials/brick.material".into());
+        file.entries[3].components.push(ComponentData { kind: "Spin".into(), data: "()".into() });
+        file.compact_models(&|_| Some(parts()));
+        assert_eq!(file.entries.len(), 3, "root + the two edited parts");
+    }
 }

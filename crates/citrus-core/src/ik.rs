@@ -12,6 +12,9 @@
 //! resulting positions back into the skeleton's local joint rotations.
 
 use glam::{Quat, Vec3};
+use serde::{Deserialize, Serialize};
+
+use crate::{ObjectRef, TypedComponent};
 
 /// Full-body IK end-effector targets (world-space pose per limb). The source is
 /// open: VR trackers, gameplay (look-at / hand reach / foot planting), a
@@ -19,7 +22,7 @@ use glam::{Quat, Vec3};
 /// from these. `None` for a limb leaves it at its animated/rest pose.
 ///
 /// (Named `TrackerTargets` for the VR path; [`IkTargets`] is the general alias.)
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrackerTargets {
     pub head: Option<(Vec3, Quat)>,
     pub left_hand: Option<(Vec3, Quat)>,
@@ -27,11 +30,174 @@ pub struct TrackerTargets {
     pub hips: Option<(Vec3, Quat)>,
     pub left_foot: Option<(Vec3, Quat)>,
     pub right_foot: Option<(Vec3, Quat)>,
+    pub chest: Option<(Vec3, Quat)>,
+    pub left_elbow: Option<(Vec3, Quat)>,
+    pub right_elbow: Option<(Vec3, Quat)>,
+    pub left_knee: Option<(Vec3, Quat)>,
+    pub right_knee: Option<(Vec3, Quat)>,
+}
+
+/// Number of tracker roles (the length of [`TrackerTargets::slots`]).
+pub const TRACKER_SLOTS: usize = 11;
+
+/// Tracker role names in slot order.
+pub const TRACKER_ROLES: [&str; TRACKER_SLOTS] = [
+    "Head",
+    "Left hand",
+    "Right hand",
+    "Hips",
+    "Left foot",
+    "Right foot",
+    "Chest",
+    "Left elbow",
+    "Right elbow",
+    "Left knee",
+    "Right knee",
+];
+
+impl TrackerTargets {
+    /// Every role in slot order (head, hands, hips, feet, chest, elbows, knees).
+    pub fn slots(&self) -> [Option<(Vec3, Quat)>; TRACKER_SLOTS] {
+        [
+            self.head,
+            self.left_hand,
+            self.right_hand,
+            self.hips,
+            self.left_foot,
+            self.right_foot,
+            self.chest,
+            self.left_elbow,
+            self.right_elbow,
+            self.left_knee,
+            self.right_knee,
+        ]
+    }
+
+    pub fn from_slots(s: [Option<(Vec3, Quat)>; TRACKER_SLOTS]) -> Self {
+        Self {
+            head: s[0],
+            left_hand: s[1],
+            right_hand: s[2],
+            hips: s[3],
+            left_foot: s[4],
+            right_foot: s[5],
+            chest: s[6],
+            left_elbow: s[7],
+            right_elbow: s[8],
+            left_knee: s[9],
+            right_knee: s[10],
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.slots().iter().any(Option::is_some)
+    }
+
+    /// Every pose moved by the rigid transform `m` (scale is ignored for the
+    /// rotations, applied to the positions).
+    pub fn transformed(&self, m: glam::Mat4) -> Self {
+        let (_, r, _) = m.to_scale_rotation_translation();
+        let mut s = self.slots();
+        for p in s.iter_mut().flatten() {
+            *p = (m.transform_point3(p.0), (r * p.1).normalize());
+        }
+        Self::from_slots(s)
+    }
 }
 
 /// General-purpose alias: full-body IK targets for any humanoid avatar, from any
 /// source (not VR-specific).
 pub type IkTargets = TrackerTargets;
+
+/// Where a [`HumanoidIk`] gets its tracker targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IkSource {
+    /// The network's targets on a remote player's avatar, the local trackers
+    /// otherwise.
+    #[default]
+    Auto,
+    /// This machine's VR headset, controllers and trackers.
+    LocalTrackers,
+    /// The targets a Network Avatar on this object receives.
+    Network,
+    /// One scene object per tracker role.
+    Objects,
+}
+
+impl IkSource {
+    pub const ALL: [IkSource; 4] = [IkSource::Auto, IkSource::LocalTrackers, IkSource::Network, IkSource::Objects];
+    pub fn label(self) -> &'static str {
+        match self {
+            IkSource::Auto => "Auto",
+            IkSource::LocalTrackers => "Local trackers",
+            IkSource::Network => "Network",
+            IkSource::Objects => "Objects",
+        }
+    }
+}
+
+/// Engine-filled state of a [`HumanoidIk`], not saved.
+#[derive(Clone, Debug, Default)]
+pub struct HumanoidIkRuntime {
+    /// Targets used by the last solve, in the avatar's own space.
+    pub targets: TrackerTargets,
+    /// The model was recognised as humanoid.
+    pub humanoid: bool,
+}
+
+/// Full-body IK for a humanoid model: poses it from VR trackers (head, hands,
+/// hips, feet, chest, elbows, knees), a remote player's replicated trackers
+/// or scene objects, on top of its Animator (or rest) pose.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HumanoidIk {
+    pub source: IkSource,
+    /// Objects source: one object per tracker role, in `TRACKER_ROLES` order.
+    pub objects: Vec<ObjectRef>,
+    /// Local trackers are relative to this object (unset = the scene's VR
+    /// Player, or the world origin without one).
+    pub tracking_root: ObjectRef,
+    /// 0..1 mix over the incoming pose.
+    pub weight: f32,
+    /// Share of the head's turn the spine follows.
+    pub spine_twist: f32,
+    /// 0..1: shoulders turning toward reaching hands.
+    pub shoulder_rotation: f32,
+    /// Without foot trackers, keep feet planted and step procedurally.
+    pub plant_feet: bool,
+    /// A planted foot steps once this far from where it belongs (m).
+    pub step_distance: f32,
+    /// Or once the body turned this far from it (degrees).
+    pub step_angle: f32,
+    /// Seconds per step.
+    pub step_time: f32,
+    pub step_height: f32,
+    #[serde(skip)]
+    pub runtime: HumanoidIkRuntime,
+}
+
+impl Default for HumanoidIk {
+    fn default() -> Self {
+        Self {
+            source: IkSource::Auto,
+            objects: vec![ObjectRef::NONE; TRACKER_SLOTS],
+            tracking_root: ObjectRef::NONE,
+            weight: 1.0,
+            spine_twist: 0.5,
+            shoulder_rotation: 0.5,
+            plant_feet: true,
+            step_distance: 0.25,
+            step_angle: 45.0,
+            step_time: 0.22,
+            step_height: 0.08,
+            runtime: HumanoidIkRuntime::default(),
+        }
+    }
+}
+
+impl TypedComponent for HumanoidIk {
+    const NAME: &'static str = "Humanoid IK";
+}
 
 /// One tracker's calibration: the fixed rigid offset from the raw tracker pose to
 /// the avatar bone it drives, captured once while the player holds a known

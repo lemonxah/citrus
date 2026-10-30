@@ -111,6 +111,24 @@ impl VrRig {
     }
 }
 
+/// Headset + controller state for gameplay this frame (`ctx.screen.vr`).
+/// Poses are in the tracking (stage) space; a `VrPlayer` maps them to world
+/// through its own transform. `active` is false without a running headset.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VrFrame {
+    pub active: bool,
+    pub head: Option<(Vec3, Quat)>,
+    pub left_hand: Option<(Vec3, Quat)>,
+    pub right_hand: Option<(Vec3, Quat)>,
+    pub left_stick: glam::Vec2,
+    pub right_stick: glam::Vec2,
+    pub left_grip: f32,
+    pub right_grip: f32,
+    pub left_trigger: bool,
+    pub right_trigger: bool,
+    pub menu: bool,
+}
+
 /// A world-space ray (origin + unit direction), e.g. a controller's pointer.
 #[derive(Clone, Copy, Debug)]
 pub struct Ray {

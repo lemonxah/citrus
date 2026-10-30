@@ -5,12 +5,26 @@
 //! menu bar, transform gizmos, picking, and drag & drop assets.
 
 // Always compiled (runtime + bundling path; no egui / editor).
+pub mod anim_graph;
 mod audio;
+mod cloth;
+mod face_drive;
+mod face_input;
+mod slimevr;
+mod ron_fields;
+mod viseme;
+mod voice_codec;
 mod bundle;
 mod humanoid;
 pub mod audio_mixer;
 pub mod navmesh;
 pub mod particles;
+pub mod water_render;
+pub mod water_fx;
+pub mod water_carry;
+mod editor_water;
+mod water_walls;
+mod underwater;
 pub mod prefab;
 mod log_capture;
 pub mod physics;
@@ -18,13 +32,19 @@ mod plugins;
 mod game_ui;
 mod play;
 mod realtime_gi;
+mod refl_slots;
 mod runtime;
 mod scene;
 mod scene_loader;
+// User-generated content packages (.citruspak) loaded at runtime.
+pub mod content;
+pub mod occlusion;
 // Public so the headless `gi_preview` example can drive the real probe march.
 pub mod sw_gi;
 mod input_engine;
-mod net;
+// Public so tools (dedicated servers, bots, test harnesses) can drive sessions directly.
+pub mod net;
+mod net_sync;
 mod voice;
 mod shaders;
 
@@ -47,7 +67,13 @@ mod tasks;
 mod undo;
 
 pub use runtime::{GameConfig, run_game};
-pub use bundle::{build_project_dir, scaffold_project};
+#[cfg(target_os = "android")]
+pub use runtime::{android_assets_root, run_game_android};
+#[cfg(target_os = "android")]
+pub use winit::platform::android::activity::AndroidApp;
+pub use bundle::{BuildTarget, build_project_dir, scaffold_project};
+pub mod templates;
+pub use templates::{ProjectTemplate, TemplateCategory};
 
 
 /// Install the tracing subscriber (stdout + the in-app Log tab capture).
@@ -60,10 +86,19 @@ mod command_palette;
 #[cfg(feature = "editor")]
 mod editor_app;
 #[cfg(feature = "editor")]
+mod net_window;
+#[cfg(feature = "editor")]
+mod new_project_ui;
+#[cfg(feature = "editor")]
+mod river_edit;
+#[cfg(feature = "editor")]
 mod ui_edit;
 #[cfg(feature = "editor")]
 mod ui_editor;
 #[cfg(feature = "editor")]
+mod anim_controller_editor;
+#[cfg(feature = "editor")]
+mod anim_clip_editor;
 mod ui_templates;
 #[cfg(feature = "editor")]
 pub use editor_app::{AppConfig, run};

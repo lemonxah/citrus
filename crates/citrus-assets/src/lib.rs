@@ -4,10 +4,14 @@
 //! parsing (humanoid rig, expressions, spring bones) on top of the glTF
 //! loader.
 
+mod anim_clip;
+mod anim_controller;
 mod asset_meta;
 mod bake_file;
 mod fbx_loader;
 mod gltf_loader;
+pub mod vrm;
+pub mod simplify;
 mod lightmap_uv;
 mod material_file;
 mod post_file;
@@ -15,12 +19,23 @@ mod procedural;
 mod project_file;
 mod scene_file;
 mod shader_file;
+mod shader_props;
 mod skeleton;
 mod tex_cache;
+pub mod package;
 
 pub use asset_meta::{
     AssetMeta, ImporterSettings, META_EXT, ModelImport, load_asset_meta,
     load_or_create_asset_meta, meta_path, save_asset_meta,
+};
+pub use anim_clip::{
+    ANIM_CLIP_EXTENSION, AnimClip, AnimTrack, ClipEvent, KeyInterp, Keyframe, TrackProperty,
+    load_anim_clip, save_anim_clip,
+};
+pub use anim_controller::{
+    ANIM_CONTROLLER_EXTENSION, AnimCondition, AnimLayer, AnimParamKind, AnimParameter, AnimState,
+    AnimTransition, AnimatorController, CondOp, LayerBlend, Motion, StateMachine,
+    load_anim_controller, save_anim_controller,
 };
 pub use fbx_loader::{load_fbx, load_fbx_with};
 pub use gltf_loader::load_gltf;
@@ -38,21 +53,29 @@ pub use bake_file::{
 };
 pub use post_file::{
     Bloom, ChromaticAberration, ColorGrading, POSTFX_EXTENSION, PostFxProfile, TonemapMode,
-    Vignette, blend_profiles, load_postfx, save_postfx,
+    Vignette, blend_over, blend_profiles, load_postfx, save_postfx,
 };
-pub use procedural::{primitive_mesh, test_scene};
+pub use procedural::{BUCKET_FLOOR, BUCKET_WALL, primitive_mesh, test_scene};
 pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
 pub use scene_file::{
-    ComponentData, EditorCamera, FluxQuality, GiMode, MaterialRef, ObjectSource, PrimitiveShape,
+    ComponentData, EditorCamera, FluxQuality, GiMode, MaterialRef, ModelInstanceRef, ModelPart, ObjectSource, PrimitiveShape,
     ProbeFallback, RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile,
     VoxelGridMode, WorldEnvironment, load_scene_file, save_scene_file,
 };
-pub use tex_cache::{load_texture_bc, texture_mean, texture_mean_linear};
+pub use tex_cache::{
+    load_texture_bc, seed_texture_cache, texture_cache_blob, texture_mean, texture_mean_linear, validate_compressed,
+};
 pub use shader_file::{
-    SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, ShaderProp, ShaderPropKind,
-    ShaderSource, compile_shader, load_shader_file, parse_shader_source, precompile_shader_file,
+    ALPHA_MODE_CONSTANT_ID, HLSL_SHADER_EXTENSION, ShaderCondOp, ShaderCondTerm, ShaderCondition,
+    HLSL_SHADER_TEMPLATE, KeywordSet, MAX_SHADER_KEYWORDS, MAX_SHADER_TEXTURES, PropStorage,
+    SHADER_EXTENSION, SHADER_PROP_FLOATS, SHADER_TEMPLATE, SHADER_TEXTURE_SLOT_BASE,
+    SHADER_UBO_MAX_BYTES, SHADER_VALUE_BASE, ShaderGroup, ShaderLang, ShaderPreset, ShaderProp,
+    ShaderPropKind, ShaderSource, TextureDefault, assemble_shader, bake_shader_variant,
+    compile_shader, compile_shader_variant, is_shader_path, keyword_hash, load_baked_variant,
+    load_shader_file, parse_shader_source, parse_shader_source_lang, precompile_shader_file,
+    shader_lang_for, variant_path,
 };
 
 use std::path::{Path, PathBuf};
@@ -100,8 +123,20 @@ pub struct SceneMaterial {
     pub emission: Option<usize>,
 }
 
+/// One blendshape (morph target) of a mesh: sparse per-vertex offsets.
+#[derive(Clone, Debug, Default)]
+pub struct MorphTarget {
+    pub name: String,
+    /// (vertex index, position offset, normal offset).
+    pub deltas: Vec<(u32, [f32; 3], [f32; 3])>,
+}
+
 pub struct Scene {
     pub meshes: Vec<MeshData>,
+    /// Blendshapes per mesh, parallel to `meshes` (shorter or empty = none).
+    pub morphs: Vec<Vec<MorphTarget>>,
+    /// VRM spring bones and colliders (empty for other models).
+    pub springs: vrm::SpringImport,
     pub textures: Vec<TextureData>,
     pub materials: Vec<SceneMaterial>,
     pub instances: Vec<Instance>,
@@ -119,7 +154,7 @@ pub fn is_model_file(path: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .as_deref(),
-        Some("gltf" | "glb" | "fbx")
+        Some("gltf" | "glb" | "vrm" | "fbx")
     )
 }
 
@@ -167,7 +202,7 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
         .map(str::to_lowercase)
         .as_deref()
     {
-        Some("gltf" | "glb") => load_gltf(path),
+        Some("gltf" | "glb" | "vrm") => load_gltf(path),
         Some("fbx") => load_fbx(path),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }?;
@@ -189,7 +224,7 @@ pub fn load_model_with_meta(path: impl AsRef<Path>) -> Result<Scene> {
         .map(str::to_lowercase)
         .as_deref()
     {
-        Some("gltf" | "glb") => load_gltf(path),
+        Some("gltf" | "glb" | "vrm") => load_gltf(path),
         Some("fbx") => load_fbx_with(path, &model),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }?;

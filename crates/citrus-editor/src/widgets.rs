@@ -298,12 +298,22 @@ pub fn axis_field(ui: &mut Ui, axis: usize, value: &mut f32, decimals: usize, sp
 
 /// X / Y / Z fields in equal columns. True when any changed.
 pub fn vec3_field(ui: &mut Ui, values: &mut [f32; 3], decimals: usize, speed: f64) -> bool {
+    vec3_field_mixed(ui, values, decimals, speed, [false; 3]).iter().any(|c| *c)
+}
+
+/// [`vec3_field`] with per-axis mixed flags (shown as an em dash); returns
+/// which axes changed.
+pub fn vec3_field_mixed(ui: &mut Ui, values: &mut [f32; 3], decimals: usize, speed: f64, mixed: [bool; 3]) -> [bool; 3] {
     let w = ((ui.available_width() - 8.0) / 3.0).max(40.0);
-    let mut changed = false;
+    let mut changed = [false; 3];
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (a, v) in values.iter_mut().enumerate() {
-            changed |= axis_field(ui, a, v, decimals, speed, w).changed();
+            let resp = axis_field(ui, a, v, decimals, speed, w);
+            changed[a] = resp.changed();
+            if mixed[a] && !resp.has_focus() {
+                mixed_overlay(ui, resp.rect);
+            }
         }
     });
     changed
@@ -319,11 +329,60 @@ pub fn property_row_w<R>(ui: &mut Ui, label: impl Into<WidgetText>, label_width:
         ui.set_min_height(theme::H_FIELD);
         let (rect, _) = ui.allocate_exact_size(Vec2::new(label_width, theme::H_FIELD), Sense::hover());
         let text: WidgetText = label.into();
+        let mixed = is_mixed(ui, text.text());
         let galley = text.color(theme::TEXT_MUTED).into_galley(ui, Some(egui::TextWrapMode::Truncate), label_width, egui::TextStyle::Body);
         ui.painter().galley(egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5), galley, theme::TEXT_MUTED);
-        add(ui)
+        let start = ui.cursor().min.x;
+        let out = add(ui);
+        if mixed {
+            let row = ui.min_rect();
+            mixed_overlay(ui, egui::Rect::from_min_max(egui::pos2(start, row.top()), row.max));
+        }
+        out
     })
     .inner
+}
+
+/// egui temp-data key: normalized names of the fields that differ across a
+/// multi-object selection, for the component being drawn.
+pub const MIXED_FIELDS_KEY: &str = "citrus-mixed-fields";
+
+/// A label or field name in the form mixed-field lists use: lowercase
+/// letters and digits only, any "(...)" note dropped.
+pub fn mixed_key(name: &str) -> String {
+    let base = name.split('(').next().unwrap_or(name);
+    base.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// Whether the row labelled `label` shows a value that differs across the
+/// selection.
+pub fn is_mixed(ui: &Ui, label: &str) -> bool {
+    let key = mixed_key(label);
+    !key.is_empty()
+        && ui.data(|d| d.get_temp::<Vec<String>>(egui::Id::new(MIXED_FIELDS_KEY))).is_some_and(|v| v.contains(&key))
+}
+
+/// Cover a value that differs across the selection with an em dash (Unity
+/// style). Hidden while hovered or being typed into, so the field stays
+/// usable; editing it sets that value on every selected object.
+pub fn mixed_overlay(ui: &Ui, rect: egui::Rect) {
+    if ui.rect_contains_pointer(rect) {
+        return;
+    }
+    let typing = ui.ctx().wants_keyboard_input()
+        && ui.input(|i| i.pointer.press_origin()).is_some_and(|p| rect.contains(p));
+    if typing {
+        return;
+    }
+    let p = ui.painter();
+    p.rect_filled(rect.shrink(1.0), radius(theme::R_FIELD), theme::BG_FIELD);
+    p.text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "\u{2014}",
+        theme::mono(theme::SIZE_META),
+        theme::TEXT_SECONDARY,
+    );
 }
 
 /// Uppercase section eyebrow (Environment tab groups).
@@ -400,6 +459,37 @@ pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> R
     )
 }
 
+/// A slider with the track filled and the knob in the accent colour. egui
+/// paints the knob with the same style colour as the rail, so the knob is
+/// recoloured after it's drawn.
+pub fn slider(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
+    let accent = theme::accent();
+    let layer = ui.layer_id();
+    let start = ui.ctx().graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
+    let response = ui
+        .scope(|ui| {
+            ui.visuals_mut().selection.bg_fill = accent;
+            ui.add(slider)
+        })
+        .inner;
+    let knob = if response.hovered() || response.dragged() { theme::ACCENT_HOVER } else { accent };
+    ui.ctx().graphics_mut(|g| {
+        let list = g.entry(layer);
+        let end = list.next_idx().0;
+        let circles: Vec<usize> =
+            list.all_entries().enumerate().skip(start).take(end - start).filter(|(_, c)| matches!(c.shape, egui::Shape::Circle(_))).map(|(i, _)| i).collect();
+        for i in circles {
+            list.mutate_shape(egui::layers::ShapeIdx(i), |c| {
+                if let egui::Shape::Circle(circle) = &mut c.shape {
+                    circle.fill = knob;
+                    circle.stroke = Stroke::new(1.0_f32, theme::TEXT_ON_ACCENT);
+                }
+            });
+        }
+    });
+    response
+}
+
 /// Collapsible component / section header (34 px): caret, optional
 /// type-coloured icon, semibold title, optional enable checkbox, then any
 /// trailing controls (kebab menu). Returns whether the body is open.
@@ -411,7 +501,20 @@ pub fn section_header(
     enabled: Option<&mut bool>,
     trailing: impl FnOnce(&mut Ui),
 ) -> (bool, bool) {
-    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    section_header_with(ui, id, icon, title, enabled, true, trailing)
+}
+
+/// [`section_header`] starting closed unless `default_open`.
+pub fn section_header_with(
+    ui: &mut Ui,
+    id: egui::Id,
+    icon: Option<(Icon, Color32)>,
+    title: &str,
+    enabled: Option<&mut bool>,
+    default_open: bool,
+    trailing: impl FnOnce(&mut Ui),
+) -> (bool, bool) {
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
     let mut toggled_enabled = false;
     let open = state.is_open();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::hover());

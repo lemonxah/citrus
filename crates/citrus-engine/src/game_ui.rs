@@ -511,7 +511,7 @@ impl GameUi {
     fn texture(&mut self, ctx: &egui::Context, root: &Path, path: &str) -> Option<egui::TextureHandle> {
         self.textures
             .entry(path.to_owned())
-            .or_insert_with(|| match citrus_assets::load_texture_file(root.join(path), true) {
+            .or_insert_with(|| match citrus_assets::load_texture_file(citrus_core::asset_ref::resolve_path(root, path), true) {
                 Ok(t) if !t.hdr => {
                     let img = egui::ColorImage::from_rgba_unmultiplied([t.width as usize, t.height as usize], &t.pixels);
                     Some(ctx.load_texture(format!("ui:{path}"), img, egui::TextureOptions::LINEAR))
@@ -536,7 +536,7 @@ impl GameUi {
         }
         let family = FontFamily::Name(path.into());
         if self.fonts.insert(path.to_owned()) {
-            match std::fs::read(root.join(path)) {
+            match std::fs::read(citrus_core::asset_ref::resolve_path(root, path)) {
                 Ok(bytes) => ctx.add_font(egui::epaint::text::FontInsert::new(
                     path,
                     egui::FontData::from_owned(bytes),
@@ -800,6 +800,7 @@ impl WorldUi {
                 lightmap_size: 0,
                 static_geometry: false,
                 planar_index: -1,
+                occluded: false,
             });
         }
         (draws, frame)

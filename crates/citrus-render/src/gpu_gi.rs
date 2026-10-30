@@ -122,7 +122,7 @@ struct IntegratePush {
     inv_view_proj: [[f32; 4]; 4],
     cam: [f32; 4],
     dims: [i32; 4], // screen_w, screen_h, probe_w, probe_h
-    misc: [f32; 4], // flip_y, probe_div, pad, pad
+    misc: [f32; 4], // flip_y, indirect intensity, emitter count, pad
 }
 
 /// Per-frame Flux trace resources that must outlive the command-buffer recording
@@ -134,6 +134,9 @@ pub struct ScreenGiTransient {
     desc_pool: vk::DescriptorPool,
     light_buf: Buffer,
     emitter_buf: Buffer,
+    /// Element capacities of the light / emitter buffers (reused while they fit).
+    light_cap: usize,
+    emitter_cap: usize,
     param_buf: Buffer,
     /// RtGiParams UBO for the hardware gather (only when the RT backend ran).
     rt_param_buf: Option<Buffer>,
@@ -296,9 +299,18 @@ pub struct GpuGi {
     rt_set_layout: Option<vk::DescriptorSetLayout>,
     rt_pipeline_layout: Option<vk::PipelineLayout>,
     rt_pipeline: Option<vk::Pipeline>,
+    /// Timestamp pool for per-pass GPU zones (gather / denoise / integrate)
+    /// while profiling; set by the renderer around `screen_resolve_record`.
+    pub timestamps: std::cell::Cell<Option<vk::QueryPool>>,
 }
 
 impl GpuGi {
+    fn ts(&self, device: &ash::Device, cb: vk::CommandBuffer, slot: u32) {
+        if let Some(pool) = self.timestamps.get() {
+            unsafe { device.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::ALL_COMMANDS, pool, slot) };
+        }
+    }
+
     pub fn new(ctx: &GpuContext) -> Result<Self> {
         let device = &ctx.device;
         let stage = vk::ShaderStageFlags::COMPUTE;
@@ -492,7 +504,8 @@ impl GpuGi {
 
         // Full-res integrate: scalar GI (sampled) + depth (sampled) + screen-probe
         // SH (ssbo) → integrated GI (storage).
-        let integrate_bindings = [sampled(0), sampled(1), ssbo(2), storage_img(3)];
+        // Emitters (ssbo 4): their direct light is shaded per pixel here.
+        let integrate_bindings = [sampled(0), sampled(1), ssbo(2), storage_img(3), ssbo(4), sampled(5), ubo(6)];
         let integrate_set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&integrate_bindings),
@@ -617,6 +630,7 @@ impl GpuGi {
             rt_set_layout,
             rt_pipeline_layout,
             rt_pipeline,
+            timestamps: std::cell::Cell::new(None),
         })
     }
 
@@ -917,6 +931,9 @@ impl GpuGi {
         // buffer; `params.probe_info.x` = volume count, 0 = none → shader skips it).
         probe_buffer: vk::Buffer,
         mut params: ScreenGiParams,
+        // This frame slot's resources from its previous trace (retired): reused
+        // (pool reset, buffers rewritten) instead of reallocating every trace.
+        reuse: Option<ScreenGiTransient>,
     ) -> Result<Option<ScreenGiTransient>> {
         let Some(gdf) = self.gdf.as_ref() else {
             return Ok(None);
@@ -958,72 +975,58 @@ impl GpuGi {
         // snap when fresh, trust the new trace more while moving, converge gently
         // when still. (history_valid only gates the descriptor sanity below.)
         let _ = history_valid;
-        let light_buf =
-            host_ssbo(device, &mut alloc, bytemuck::cast_slice(&gi_lights), "sgi lights")?;
-        let emitter_buf = host_ssbo(
-            device,
-            &mut alloc,
-            bytemuck::cast_slice(&gi_emitters),
-            "sgi emitters",
-        )?;
-        let mut param_buf = Buffer::new(
-            device,
-            &mut alloc,
-            size_of::<ScreenGiParams>() as u64,
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            MemoryLocation::CpuToGpu,
-            "sgi params",
-        )?;
-        param_buf.write(0, bytemuck::bytes_of(&params));
         // Hardware RT gather active only when a TLAS was supplied AND the device
         // built the RT pipeline. Its own RtGiParams UBO (subset of the SDF params).
         let rt_active = rt.is_some() && self.rt_pipeline.is_some();
-        let rt_param_buf = if rt_active {
-            let mut b = Buffer::new(
-                device,
-                &mut alloc,
-                size_of::<RtGiParams>() as u64,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-                MemoryLocation::CpuToGpu,
-                "sgi rt params",
-            )?;
-            b.write(0, bytemuck::bytes_of(&RtGiParams::from_screen(&params)));
-            Some(b)
-        } else {
-            None
+        let reused = match reuse {
+            Some(t) if t.light_cap >= gi_lights.len() && t.emitter_cap >= gi_emitters.len() => {
+                unsafe { device.reset_descriptor_pool(t.desc_pool, vk::DescriptorPoolResetFlags::empty())? };
+                Some(t)
+            }
+            Some(mut t) => {
+                t.destroy(device, &mut alloc);
+                None
+            }
+            None => None,
         };
+        let (desc_pool, mut light_buf, mut emitter_buf, light_cap, emitter_cap, mut param_buf, mut rt_param_buf) =
+            match reused {
+                Some(t) => (t.desc_pool, t.light_buf, t.emitter_buf, t.light_cap, t.emitter_cap, t.param_buf, t.rt_param_buf),
+                None => {
+                    let light_cap = gi_lights.len().next_power_of_two().max(16);
+                    let emitter_cap = gi_emitters.len().next_power_of_two().max(16);
+                    let light_buf = host_ssbo(device, &mut alloc, &vec![0u8; light_cap * size_of::<GiLight>()], "sgi lights")?;
+                    let emitter_buf =
+                        host_ssbo(device, &mut alloc, &vec![0u8; emitter_cap * size_of::<GiEmitter>()], "sgi emitters")?;
+                    let param_buf = Buffer::new(
+                        device,
+                        &mut alloc,
+                        size_of::<ScreenGiParams>() as u64,
+                        vk::BufferUsageFlags::UNIFORM_BUFFER,
+                        MemoryLocation::CpuToGpu,
+                        "sgi params",
+                    )?;
+                    (self.new_screen_pool(device)?, light_buf, emitter_buf, light_cap, emitter_cap, param_buf, None)
+                }
+            };
+        light_buf.write(0, bytemuck::cast_slice(&gi_lights));
+        emitter_buf.write(0, bytemuck::cast_slice(&gi_emitters));
+        param_buf.write(0, bytemuck::bytes_of(&params));
+        if rt_active {
+            if rt_param_buf.is_none() {
+                rt_param_buf = Some(Buffer::new(
+                    device,
+                    &mut alloc,
+                    size_of::<RtGiParams>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                    "sgi rt params",
+                )?);
+            }
+            rt_param_buf.as_mut().unwrap().write(0, bytemuck::bytes_of(&RtGiParams::from_screen(&params)));
+        }
         drop(alloc);
 
-        let pool_sizes = [
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 9, // SDF gather:4 + RT gather:2 + denoise:1 + integrate:2
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 14, // SDF gather:6 + RT gather:6 (+probe cache) + integrate:1 (+1 slack)
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 4, // SDF/RT gather out + denoise out + integrate out
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 2, // SDF params + RT params
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
-                descriptor_count: 1, // RT gather TLAS
-            },
-        ];
-        let desc_pool = unsafe {
-            device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(4) // SDF or RT gather + denoise + integrate (+slack)
-                    .pool_sizes(&pool_sizes),
-                None,
-            )?
-        };
         let layouts = [self.screen_set_layout];
         let set = unsafe {
             device.allocate_descriptor_sets(
@@ -1147,7 +1150,9 @@ impl GpuGi {
                 );
             device.cmd_pipeline_barrier(
                 cb,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                // Wait for the previous frame's reads of this image (forward
+                // sampling / next-frame history) before overwriting it.
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1175,7 +1180,9 @@ impl GpuGi {
                     &[],
                 );
             }
+            self.ts(device, cb, 2 * crate::gpu_zone::GI_GATHER as u32);
             device.cmd_dispatch(cb, groups_x, groups_y, 1);
+            self.ts(device, cb, 2 * crate::gpu_zone::GI_GATHER as u32 + 1);
             // Gather out: GENERAL -> SHADER_READ_ONLY so the DENOISE compute can
             // sample it (and the forward as a fallback). Made available to compute.
             let to_read = vk::ImageMemoryBarrier::default()
@@ -1236,7 +1243,9 @@ impl GpuGi {
                 );
             device.cmd_pipeline_barrier(
                 cb,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                // Wait for the previous frame's reads of this image (forward
+                // sampling / next-frame history) before overwriting it.
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1264,7 +1273,9 @@ impl GpuGi {
                 0,
                 bytemuck::bytes_of(&dn_push),
             );
+            self.ts(device, cb, 2 * crate::gpu_zone::GI_DENOISE as u32);
             device.cmd_dispatch(cb, groups_x, groups_y, 1);
+            self.ts(device, cb, 2 * crate::gpu_zone::GI_DENOISE as u32 + 1);
             // filtered image: GENERAL -> SHADER_READ_ONLY so the INTEGRATE compute
             // can sample it (made available to compute, not fragment).
             let f_to_read = vk::ImageMemoryBarrier::default()
@@ -1311,6 +1322,9 @@ impl GpuGi {
             self.write_image(device, in_set, 0, depth_sampler, filtered_view); // scalar GI
             self.write_image(device, in_set, 1, depth_sampler, depth_view);    // depth prepass
             write_ssbo(device, in_set, 2, sh_buf);                             // per-probe SH
+            write_ssbo(device, in_set, 4, emitter_buf.handle);                 // emitters
+            self.write_image(device, in_set, 5, self.dist_sampler, gdf.dist_tex.view); // GDF (emitter shadows)
+            write_ubo(device, in_set, 6, param_buf.handle);                    // gather params (GDF bounds, eps)
             let in_img_info = [vk::DescriptorImageInfo::default()
                 .image_view(final_view)
                 .image_layout(vk::ImageLayout::GENERAL)];
@@ -1334,7 +1348,9 @@ impl GpuGi {
                 );
             device.cmd_pipeline_barrier(
                 cb,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                // Wait for the previous frame's reads of this image (forward
+                // sampling / next-frame history) before overwriting it.
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1350,7 +1366,7 @@ impl GpuGi {
                     extent.width as i32,
                     extent.height as i32,
                 ],
-                misc: [params.misc[3] as f32, 0.0, 0.0, 0.0],
+                misc: [params.misc[3] as f32, params.sky[3], emitters.len() as f32, 0.0],
             };
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.integrate_pipeline);
             device.cmd_bind_descriptor_sets(
@@ -1368,7 +1384,9 @@ impl GpuGi {
                 0,
                 bytemuck::bytes_of(&in_push),
             );
+            self.ts(device, cb, 2 * crate::gpu_zone::GI_INTEGRATE as u32);
             device.cmd_dispatch(cb, full_extent.width.div_ceil(8), full_extent.height.div_ceil(8), 1);
+            self.ts(device, cb, 2 * crate::gpu_zone::GI_INTEGRATE as u32 + 1);
             // integrated image: GENERAL -> SHADER_READ_ONLY for the forward pass.
             let fin_to_read = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -1397,9 +1415,45 @@ impl GpuGi {
             desc_pool,
             light_buf,
             emitter_buf,
+            light_cap,
+            emitter_cap,
             param_buf,
             rt_param_buf,
         }))
+    }
+
+    /// Descriptor pool for one trace (gather + denoise + integrate sets).
+    fn new_screen_pool(&self, device: &ash::Device) -> Result<vk::DescriptorPool> {
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 10, // SDF gather:4 + RT gather:2 + denoise:1 + integrate:3
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 16, // SDF gather:6 + RT gather:6 (+probe cache) + integrate:2 (+1 slack)
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 4, // SDF/RT gather out + denoise out + integrate out
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 3, // SDF params + RT params + integrate
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+                descriptor_count: 1, // RT gather TLAS
+            },
+        ];
+        Ok(unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(4) // SDF or RT gather + denoise + integrate (+slack)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )?
+        })
     }
 
     fn write_image(
@@ -1493,3 +1547,14 @@ fn write_ssbo(device: &ash::Device, set: vk::DescriptorSet, binding: u32, buffer
         .buffer_info(&info);
     unsafe { device.update_descriptor_sets(&[write], &[]) };
 }
+
+fn write_ubo(device: &ash::Device, set: vk::DescriptorSet, binding: u32, buffer: vk::Buffer) {
+    let info = [vk::DescriptorBufferInfo::default().buffer(buffer).range(vk::WHOLE_SIZE)];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(binding)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .buffer_info(&info);
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+

@@ -26,19 +26,58 @@ impl GpuTexture {
         height: u32,
         format: vk::Format,
     ) -> Result<Self> {
+        Self::cleared(
+            device,
+            allocator,
+            pool,
+            queue,
+            width,
+            height,
+            format,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+        )
+    }
+
+    /// A sampled image with `usage` (plus TRANSFER_DST), cleared to zero and
+    /// left in SHADER_READ_ONLY_OPTIMAL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cleared(
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        pool: vk::CommandPool,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Self> {
+        Self::cleared_mips(device, allocator, pool, queue, width, height, format, usage, 1)
+    }
+
+    /// [`Self::cleared`] with `levels` mips, every one cleared; the view
+    /// covers them all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cleared_mips(
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        pool: vk::CommandPool,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        levels: u32,
+    ) -> Result<Self> {
+        let levels = levels.max(1);
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D { width, height, depth: 1 })
-            .mip_levels(1)
+            .mip_levels(levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(
-                vk::ImageUsageFlags::COLOR_ATTACHMENT
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_DST,
-            )
+            .usage(usage | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&info, None)? };
         let requirements = unsafe { device.get_image_memory_requirements(image) };
@@ -52,7 +91,7 @@ impl GpuTexture {
         unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
+            .level_count(levels)
             .layer_count(1);
         one_time_submit(device, pool, queue, |cb| unsafe {
             let to_dst = vk::ImageMemoryBarrier2::default()
@@ -711,4 +750,92 @@ impl GpuTexture {
             let _ = allocator.free(allocation);
         }
     }
+}
+
+/// Fill mips 1.. of `image` (`size` square, `levels` mips) from mip 0 by
+/// linear blits, in `cb`. Mip 0 starts in `layout` after a write at
+/// `src_stage` / `src_access`, the other mips in SHADER_READ_ONLY_OPTIMAL
+/// (read at `readers`); all of them end in SHADER_READ_ONLY_OPTIMAL for
+/// `readers`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_mip_chain(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    size: u32,
+    levels: u32,
+    layout: vk::ImageLayout,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    readers: vk::PipelineStageFlags2,
+) {
+    let range = |base: u32, count: u32| {
+        vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).base_mip_level(base).level_count(count).layer_count(1)
+    };
+    let barrier = |r: vk::ImageSubresourceRange, old: vk::ImageLayout, new: vk::ImageLayout, ss, sa, ds, da| {
+        let b = [vk::ImageMemoryBarrier2::default()
+            .image(image)
+            .old_layout(old)
+            .new_layout(new)
+            .src_stage_mask(ss)
+            .src_access_mask(sa)
+            .dst_stage_mask(ds)
+            .dst_access_mask(da)
+            .subresource_range(r)];
+        unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
+    };
+    let transfer = vk::PipelineStageFlags2::TRANSFER;
+    let sampled = vk::AccessFlags2::SHADER_SAMPLED_READ;
+    if levels <= 1 {
+        barrier(range(0, 1), layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, src_stage, src_access, readers, sampled);
+        return;
+    }
+    barrier(range(0, 1), layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, src_stage, src_access, transfer, vk::AccessFlags2::TRANSFER_READ);
+    for level in 1..levels {
+        barrier(
+            range(level, 1),
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            readers,
+            vk::AccessFlags2::empty(),
+            transfer,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        );
+        let edge = |l: u32| (size >> l).max(1) as i32;
+        let layers = |l: u32| vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(l).layer_count(1);
+        let blit = vk::ImageBlit::default()
+            .src_subresource(layers(level - 1))
+            .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: edge(level - 1), y: edge(level - 1), z: 1 }])
+            .dst_subresource(layers(level))
+            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: edge(level), y: edge(level), z: 1 }]);
+        unsafe {
+            device.cmd_blit_image(
+                cb,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[blit],
+                vk::Filter::LINEAR,
+            )
+        };
+        barrier(
+            range(level, 1),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            transfer,
+            vk::AccessFlags2::TRANSFER_WRITE,
+            transfer,
+            vk::AccessFlags2::TRANSFER_READ,
+        );
+    }
+    barrier(
+        range(0, levels),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        transfer,
+        vk::AccessFlags2::TRANSFER_READ,
+        readers,
+        sampled,
+    );
 }

@@ -161,4 +161,58 @@ float plane_depth_weight(vec3 frag_pos, vec3 frag_normal, vec3 sample_pos,
     return exp2(neg_scale * rel * rel);
 }
 
+// --------------------------------------------------------- probe placement
+// World position from a full-res depth texel (negative-height viewport: flip).
+vec3 flux_world_from_texel(mat4 inv_vp, ivec2 full, ivec2 t, float depth, bool flip) {
+    vec2 uv = (vec2(t) + 0.5) / vec2(full);
+    vec2 ndc = uv * 2.0 - 1.0;
+    if (flip) ndc.y = -ndc.y;
+    vec4 w = inv_vp * vec4(ndc, depth, 1.0);
+    return w.xyz / w.w;
+}
+
+// Place screen probe `px` (of `probe_dims`) on a real surface pixel: the
+// closest-to-camera full-res texel of its tile (a bilinear depth at the tile
+// corner averaged across creases and sat off the surface), with the normal from
+// +-1 full-res neighbours, picking the closer-in-depth side per axis so the
+// tangent stays on this surface. Returns false for sky.
+bool flux_probe_surface(sampler2D depth_tex, uvec2 px, uvec2 probe_dims, mat4 inv_vp, bool flip,
+                        out vec3 p, out vec3 n) {
+    ivec2 full = textureSize(depth_tex, 0);
+    ivec2 tsz = max(full / ivec2(probe_dims), ivec2(1));
+    ivec2 t0 = ivec2(px) * tsz;
+    float depth = 1.0;
+    ivec2 best = clamp(t0, ivec2(0), full - 1);
+    for (int y = 0; y < tsz.y; ++y) {
+        for (int x = 0; x < tsz.x; ++x) {
+            ivec2 t = clamp(t0 + ivec2(x, y), ivec2(0), full - 1);
+            float d = texelFetch(depth_tex, t, 0).r;
+            if (d < depth) { depth = d; best = t; }
+        }
+    }
+    if (depth >= 1.0) return false;
+    p = flux_world_from_texel(inv_vp, full, best, depth, flip);
+    ivec2 lo = full - 1;
+    float dl = texelFetch(depth_tex, clamp(best - ivec2(1, 0), ivec2(0), lo), 0).r;
+    float dr = texelFetch(depth_tex, clamp(best + ivec2(1, 0), ivec2(0), lo), 0).r;
+    float dd = texelFetch(depth_tex, clamp(best - ivec2(0, 1), ivec2(0), lo), 0).r;
+    float du = texelFetch(depth_tex, clamp(best + ivec2(0, 1), ivec2(0), lo), 0).r;
+    vec3 dpx = (abs(dl - depth) < abs(dr - depth))
+        ? p - flux_world_from_texel(inv_vp, full, best - ivec2(1, 0), dl, flip)
+        : flux_world_from_texel(inv_vp, full, best + ivec2(1, 0), dr, flip) - p;
+    vec3 dpy = (abs(dd - depth) < abs(du - depth))
+        ? p - flux_world_from_texel(inv_vp, full, best - ivec2(0, 1), dd, flip)
+        : flux_world_from_texel(inv_vp, full, best + ivec2(0, 1), du, flip) - p;
+    vec3 c = cross(dpx, dpy);
+    if (dot(c, c) < 1e-20) return false;
+    n = normalize(c);
+    return true;
+}
+
+// Ray-origin offset scaled to the probe pixel's world footprint (a fixed few
+// cm pushed rays through thin gaps in creases, or wasn't enough far away).
+float flux_probe_offset(float cam_dist, int full_h) {
+    return max(cam_dist * (3.0 / float(max(full_h, 1))), 0.004);
+}
+
 #endif // FLUX_COMMON

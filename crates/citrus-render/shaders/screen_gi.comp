@@ -31,7 +31,7 @@ layout(set = 0, binding = 8) uniform sampler2D u_history;
 // cascade march. A ray that hits geometry reads converged, multi-bounce
 // irradiance from this cache instead of re-shading — the "trace returns cached
 // lighting" model (a surface cache). Matches standard.frag's conventions.
-struct Probe { vec4 c[5]; }; // c[0..3]=radiance+dist SH, c[4]=dist² SH (Chebyshev)
+struct Probe { vec4 c[6]; }; // c[0..3]=radiance+dist SH, c[4]=dist² SH (Chebyshev)
 layout(set = 0, binding = 9) readonly buffer Probes { Probe probes[]; };
 
 // Per-screen-probe SH-L1 output (screen-probe gather → SH projection). c[0..3].rgb
@@ -39,8 +39,9 @@ layout(set = 0, binding = 9) readonly buffer Probes { Probe probes[]; };
 // the forward integrate, so absolute magnitude is irrelevant and stays driven by
 // the temporally-stable scalar gi_image). c[0].w = cam distance; c[1..3].w = the
 // probe's reconstructed normal — the reference direction the scalar was integrated
-// at, so the forward can form sh(pixel_n)/sh(probe_n).
-struct ScreenProbe { vec4 c[4]; };
+// at, so the forward can form sh(pixel_n)/sh(probe_n). c[4].x = emitter visibility
+// bitmask (bit i = emitter i unoccluded from this probe), as uint bits.
+struct ScreenProbe { vec4 c[5]; };
 layout(set = 0, binding = 10) writeonly buffer ScreenProbesOut { ScreenProbe sh_out[]; };
 // Previous frame's per-probe SH (ping-pong), reprojected + blended for temporal
 // accumulation of the SH itself (ScreenProbeTemporal on the SH) — so the DotSH3
@@ -107,7 +108,7 @@ vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
         vec3 t = (local + size * 0.5) / size;
         if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) continue;
         ivec3 cnt = ivec3(v.counts.xyz + 0.5);
-        vec3 center = -v.world_to_local[3].xyz; // meta stores translate(-center)
+        vec3 center = -(transpose(mat3(v.world_to_local)) * v.world_to_local[3].xyz); // volume origin (rotation-aware)
         vec3 cell = size / max(vec3(cnt - 1), vec3(1.0));
         vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
         ivec3 g0 = ivec3(floor(g));
@@ -124,7 +125,7 @@ vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
             uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
             // Probe world position from grid coords → probe→fragment direction.
             vec3 gn = vec3(gc) / max(vec3(cnt - 1), vec3(1.0));
-            vec3 ppos = center + (gn - 0.5) * size;
+            vec3 ppos = center + transpose(mat3(v.world_to_local)) * ((gn - 0.5) * size) + probes[idx].c[5].xyz;
             vec3 to_frag = world_pos - ppos;
             float pd = length(to_frag);
             vec3 dir = pd > 1e-5 ? to_frag / pd : n;
@@ -201,7 +202,16 @@ bool march(vec3 ro, vec3 rd, float eps, float max_dist, out vec3 hit, out uint w
     }
     return false;
 }
+// Distance along the ray to where it leaves the GDF box (nothing can occlude
+// past it; a directional light's shadow ray would otherwise run every step).
+float gdf_exit(vec3 ro, vec3 rd) {
+    vec3 inv = 1.0 / mix(rd, vec3(1e-8), lessThan(abs(rd), vec3(1e-8)));
+    vec3 t0 = (pc.gdf_min.xyz - ro) * inv, t1 = (pc.gdf_max.xyz - ro) * inv;
+    vec3 tf = max(t0, t1);
+    return max(min(tf.x, min(tf.y, tf.z)), 0.0);
+}
 bool occluded(vec3 ro, vec3 rd, float dist, float eps) {
+    dist = min(dist, gdf_exit(ro, rd) + eps);
     float t = eps * 2.0;
     for (uint i = 0u; i < MAX_STEPS; ++i) {
         if (t > dist - eps) return false;
@@ -211,12 +221,13 @@ bool occluded(vec3 ro, vec3 rd, float dist, float eps) {
     }
     return false;
 }
+// Tetrahedral gradient: 4 distance taps instead of 6 central differences.
 vec3 scene_normal(vec3 p, float eps) {
-    vec2 e = vec2(eps, 0.0);
-    vec3 g = vec3(
-        scene_distance(p + e.xyy) - scene_distance(p - e.xyy),
-        scene_distance(p + e.yxy) - scene_distance(p - e.yxy),
-        scene_distance(p + e.yyx) - scene_distance(p - e.yyx));
+    const vec2 k = vec2(1.0, -1.0);
+    vec3 g = k.xyy * scene_distance(p + k.xyy * eps)
+           + k.yyx * scene_distance(p + k.yyx * eps)
+           + k.yxy * scene_distance(p + k.yxy * eps)
+           + k.xxx * scene_distance(p + k.xxx * eps);
     return length(g) > 1e-8 ? normalize(g) : vec3(0.0, 1.0, 0.0);
 }
 float light_cos(float deg) { return cos(radians(deg) * 0.5); }
@@ -246,7 +257,9 @@ vec3 emitter_light(vec3 p, vec3 n, float eps) {
         if (ndl <= 0.0) continue;
         // Occlusion: march the GDF to just before the sphere; skip if a solid
         // occluder (e.g. the couch) blocks it, so the emitter can't leak through.
-        if (occluded(p + n * (eps * 2.0), l, max(dist - r, eps * 2.0), eps)) continue;
+        // Stop clearly short of the sphere: its radius is an estimate, and ending
+        // exactly at the surface grazed the emitter itself on some frames.
+        if (occluded(p + n * (eps * 2.0), l, max(dist - r * 1.25 - 0.02, eps * 2.0), eps)) continue;
         float sa = sphere_solid_angle(r, max(dist, r * 1.001));
         sum += emitters[i].emission.rgb * (ndl * sa);
     }
@@ -275,9 +288,11 @@ vec3 direct_light(vec3 p, vec3 n, float eps) {
             to_light = tl;
         }
         float ndl = max(dot(n, to_light), 0.0);
-        if (ndl <= 0.0 || atten <= 0.0) continue;
+        vec3 c = l.color.rgb * (ndl * atten);
+        // No shadow march for a light that can't visibly light this hit.
+        if (max(c.r, max(c.g, c.b)) < 1e-3) continue;
         if (occluded(p + n * (eps * 2.0), to_light, dist, eps)) continue;
-        sum += l.color.rgb * (ndl * atten);
+        sum += c;
     }
     return sum;
 }
@@ -331,9 +346,11 @@ vec3 incoming(vec3 origin, vec3 dir, float eps, float max_dist, uint bounces, in
         // this surface, so a covered hit terminates the path with albedo * E/PI —
         // no recursion, near-zero variance. This is the keystone that replaces
         // the noisy per-ray re-shade + bounce.
+        // Mixed lighting (probe_info.y): the cache holds baked static light, which
+        // the lightmaps already carry; shade only the realtime terms.
         float cov;
         vec3 cached_irr = cache_irradiance(hp, n, cov);
-        if (cov > 0.0) {
+        if (cov > 0.0 && pc.probe_info.y < 0.5) {
             // Near-field occlusion: a hit only a voxel or two away is contact
             // occlusion, not a bright bouncer; fade the contribution in over a
             // few voxels of ray travel so light doesn't pool right under meshes.
@@ -373,35 +390,24 @@ void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
     uint sw = pc.misc.y, sh = pc.misc.z;
     if (px.x >= sw || px.y >= sh) return;
-    vec2 uv = (vec2(px) + 0.5) / vec2(sw, sh);
-    float depth = texture(u_depth, uv).r;
-    if (depth >= 1.0) { imageStore(u_out, ivec2(px), vec4(0.0)); return; } // sky
-
-    vec3 p = world_from_depth(uv, depth);
-    // Reconstruct the surface normal from neighbouring depth samples. A naive
-    // forward difference makes the tangent span a silhouette where the neighbour
-    // sits on a different surface, giving a bogus normal that traces into geometry
-    // and leaves a dark no-GI band hugging every object edge. Instead pick, per
-    // axis, the forward or backward neighbour that is closer in depth, so the
-    // tangent stays on this surface right up to the silhouette.
-    vec2 texel = 1.0 / vec2(sw, sh);
-    float dl = texture(u_depth, uv - vec2(texel.x, 0.0)).r;
-    float dr = texture(u_depth, uv + vec2(texel.x, 0.0)).r;
-    float dd = texture(u_depth, uv - vec2(0.0, texel.y)).r;
-    float du = texture(u_depth, uv + vec2(0.0, texel.y)).r;
-    vec3 dpx = (abs(dl - depth) < abs(dr - depth))
-        ? p - world_from_depth(uv - vec2(texel.x, 0.0), dl)
-        : world_from_depth(uv + vec2(texel.x, 0.0), dr) - p;
-    vec3 dpy = (abs(dd - depth) < abs(du - depth))
-        ? p - world_from_depth(uv - vec2(0.0, texel.y), dd)
-        : world_from_depth(uv + vec2(0.0, texel.y), du) - p;
-    vec3 n = normalize(cross(dpx, dpy));
+    uint pidx = px.y * sw + px.x;
+    // Probe on a real surface texel of its tile (see flux_probe_surface).
+    vec3 p, n;
+    if (!flux_probe_surface(u_depth, px, uvec2(sw, sh), pc.inv_view_proj, pc.misc.w != 0u, p, n)) {
+        // Sky: zero the SH too, or the integrate reads this slot's stale SH.
+        imageStore(u_out, ivec2(px), vec4(0.0));
+        sh_out[pidx].c[0] = vec4(0.0); sh_out[pidx].c[1] = vec4(0.0);
+        sh_out[pidx].c[2] = vec4(0.0); sh_out[pidx].c[3] = vec4(0.0);
+        sh_out[pidx].c[4] = vec4(0.0);
+        return;
+    }
     if (dot(n, pc.cam.xyz - p) < 0.0) n = -n; // face the camera
+    float cam_dist = length(p - pc.cam.xyz);
 
     float eps = pc.march.x, max_dist = pc.march.y;
     uint samples = max(pc.counts.x, 1u);
     uint rng = hash(px.x * 1973u + px.y * 9277u + pc.misc.x * 26699u);
-    vec3 origin = p + n * gdf_surface_offset(eps);
+    vec3 origin = p + n * max(gdf_surface_offset(eps), flux_probe_offset(cam_dist, textureSize(u_depth, 0).y));
     vec3 irr = vec3(0.0);
     // Firefly clamp (march.w) caps bright bounce outliers without clipping the
     // analytic emitter NEE added below; tunable from the Flux Advanced settings.
@@ -416,8 +422,7 @@ void main() {
     // consistent brightness), and re-points correctly for any pixel normal.
     // RadianceSH_k = (1/N) Σ L_i * Y_k(d_i) / pdf(d_i), pdf = cos/PI for the cosine
     // hemisphere sample → weight = PI/cos (clamped to bound the grazing 1/cos
-    // variance). Y_k uses the EXACT signed basis (sh_basis3): the signs matter now
-    // that the integrate does a real DotSH3 (they cancelled in the old ratio).
+    // variance). Y_k uses the EXACT signed basis (sh_basis3).
     vec3 sh0 = vec3(0.0), sh1 = vec3(0.0), sh2 = vec3(0.0), sh3 = vec3(0.0);
     for (uint i = 0u; i < samples; ++i) {
         vec2 u = fract(hammersley(i, samples) + cp_jitter);
@@ -431,42 +436,19 @@ void main() {
         sh3 += L * (-0.488603 * d.x  * cw);
     }
     float inv_n = 1.0 / float(samples);
+    // Emitter direct light and its shadow are resolved per pixel by the
+    // integrate, in world space (nothing probe-placed, so nothing drifts).
+    uint vis_mask = 0u;
     sh0 *= inv_n * pc.sky.w; sh1 *= inv_n * pc.sky.w;
     sh2 *= inv_n * pc.sky.w; sh3 *= inv_n * pc.sky.w;
-    // Project the analytic emitter NEE into the SH too (so the DotSH3 integrate
-    // captures the smooth emitter pools, like the scalar's emitter_light term).
-    // Each emitter contributes a radiance lobe emission*solidAngle toward it.
-    for (uint e = 0u; e < pc.counts.w; ++e) {
-        vec3 ec = emitters[e].center_radius.xyz;
-        float er = max(emitters[e].center_radius.w, 1e-3);
-        vec3 ed = ec - origin; float edist = length(ed);
-        vec3 el = edist > 1e-4 ? ed / edist : n;
-        // Occlusion (matches emitter_light): skip emitters hidden behind solid
-        // geometry so their directional SH doesn't leak through it.
-        if (occluded(origin + n * (eps * 2.0), el, max(edist - er, eps * 2.0), eps)) continue;
-        vec3 Eem = emitters[e].emission.rgb * sphere_solid_angle(er, max(edist, er * 1.001));
-        sh0 += Eem * ( 0.282095);
-        sh1 += Eem * (-0.488603 * el.y);
-        sh2 += Eem * ( 0.488603 * el.z);
-        sh3 += Eem * (-0.488603 * el.x);
-    }
-    // (The per-probe SH is written at the end, AFTER temporal accumulation below.)
     // Cosine-weighted hemisphere importance-samples the cosine term, so the
     // diffuse irradiance estimate is the mean of the samples.
-    irr = irr / float(samples);
-    // This surface's direct view of the emitter spheres (analytic NEE): the
-    // smooth bounce pool under/around emitters. (Hemisphere rays above carry the
-    // rest of the indirect: bounces off other surfaces, sky, etc.)
-    irr += emitter_light(origin, n, eps) / PI;
-    // Indirect strength (sky.w), applied before the temporal blend so history
-    // accumulates in the same scaled units (consistent when intensity is steady).
-    irr *= pc.sky.w;
+    irr = irr * inv_n * pc.sky.w;
     // Temporal accumulation with reprojection: find where this world point was
     // in the previous frame's screen and blend that history in, so the camera
     // can move and the noise still converges (no smear). Disocclusion: only
     // trust the history if its stored camera distance matches; otherwise it's a
     // different surface revealed this frame, so use the fresh sample.
-    float cam_dist = length(p - pc.cam.xyz);
     float alpha = clamp(pc.march.z, 0.02, 1.0);
     vec4 pclip = pc.prev_view_proj * vec4(p, 1.0);
     // alpha 1 = no usable history (first frame / resized targets): skip the
@@ -481,54 +463,57 @@ void main() {
             float prev_dist = length(p - pc.prev_cam.xyz);
             bool h_ok = !any(isnan(h)) && !any(isinf(h));
             if (h_ok && abs(h.a - prev_dist) < max(prev_dist * 0.08, 0.1)) {
-                // Temporal variance / firefly clamp (screen-probe temporal model): a
-                // grazing (low-angle) light lights only a thin bright strip, so the
-                // random bounce occasionally returns a value far above the converged
-                // mean — a firefly. Even at low alpha that outlier pumps the
-                // accumulator and shimmers as it decays (the user's "flicker only at
-                // low light angle"; a steep light lights broadly → low variance → no
-                // flicker). Clamp THIS frame's estimate to a multiple of the history
-                // luminance (hue-preserving) so an outlier can't drive the blend.
-                // The +floor lets genuinely dark regions still brighten from zero.
-                // This is RELATIVE (to the converged value), unlike the absolute
-                // firefly_clamp above which in low light sits well above the mean.
+                // Temporal variance / firefly clamp (screen-probe temporal model):
+                // clamp THIS frame's estimate to a multiple of the history luminance
+                // (hue-preserving) so an outlier can't drive the blend. Tighter in
+                // the dark (2.5x) than bright (4x); a small floor for cold starts.
                 vec3 LW = vec3(0.2126, 0.7152, 0.0722);
                 float h_luma = dot(h.rgb, LW);
                 float i_luma = dot(irr, LW);
-                // Adaptive ratio: tighter in the dark (where relative variance — and
-                // thus flicker — is worst), looser where bright (let real bounce
-                // brighten). 2.5× dark → 4× bright. Small floor for cold starts.
                 float ratio = mix(2.5, 4.0, clamp(h_luma / 0.5, 0.0, 1.0));
                 float max_luma = h_luma * ratio + 0.03;
-                if (i_luma > max_luma) irr *= max_luma / max(i_luma, 1e-4);
-                irr = mix(h.rgb, irr, alpha); // valid history, accumulate
+                float clamp_k = i_luma > max_luma ? max_luma / max(i_luma, 1e-4) : 1.0;
+                irr = mix(h.rgb, irr * clamp_k, alpha); // valid history, accumulate
                 // Temporal accumulation of the SH itself (ScreenProbeTemporal on the
-                // SH): read the reprojected previous-frame probe and blend each
-                // coefficient with the same alpha, so the integrate consumes a
-                // temporally-denoised SH rather than a raw per-frame one. Gated by
-                // the same disocclusion test as the scalar above.
-                ivec2 pp = ivec2(puv * vec2(pc.misc.yz));
-                pp = clamp(pp, ivec2(0), ivec2(pc.misc.yz) - 1);
-                uint pj = uint(pp.y) * pc.misc.y + uint(pp.x);
-                vec3 p0 = sh_prev[pj].c[0].rgb, p1 = sh_prev[pj].c[1].rgb;
-                vec3 p2 = sh_prev[pj].c[2].rgb, p3 = sh_prev[pj].c[3].rgb;
-                vec3 psum = p0 + p1 + p2 + p3;
-                if (!any(isnan(psum)) && !any(isinf(psum))) {
-                    sh0 = mix(p0, sh0, alpha);
-                    sh1 = mix(p1, sh1, alpha);
-                    sh2 = mix(p2, sh2, alpha);
-                    sh3 = mix(p3, sh3, alpha);
+                // SH): bilinear over the 4 reprojected previous probes, each tap kept
+                // only if it was on this surface (distance + normal), with the same
+                // clamp and alpha as the scalar.
+                vec2 g = puv * vec2(sw, sh) - 0.5;
+                ivec2 g0 = ivec2(floor(g));
+                vec2 f = g - vec2(g0);
+                vec3 h0 = vec3(0.0), h1 = vec3(0.0), h2 = vec3(0.0), h3 = vec3(0.0);
+                float hw = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    ivec2 o = ivec2(k & 1, k >> 1);
+                    ivec2 q = clamp(g0 + o, ivec2(0), ivec2(sw, sh) - 1);
+                    ScreenProbe sp = sh_prev[uint(q.y) * sw + uint(q.x)];
+                    float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+                    vec3 pn3 = vec3(sp.c[1].w, sp.c[2].w, sp.c[3].w);
+                    bool same = abs(sp.c[0].w - prev_dist) < max(prev_dist * 0.08, 0.1) && dot(pn3, n) > 0.8;
+                    vec3 ps = sp.c[0].rgb + sp.c[1].rgb + sp.c[2].rgb + sp.c[3].rgb;
+                    if (!same || any(isnan(ps)) || any(isinf(ps))) continue;
+                    h0 += sp.c[0].rgb * bw; h1 += sp.c[1].rgb * bw;
+                    h2 += sp.c[2].rgb * bw; h3 += sp.c[3].rgb * bw;
+                    hw += bw;
+                }
+                if (hw > 1e-3) {
+                    float ih = 1.0 / hw;
+                    sh0 = mix(h0 * ih, sh0 * clamp_k, alpha);
+                    sh1 = mix(h1 * ih, sh1 * clamp_k, alpha);
+                    sh2 = mix(h2 * ih, sh2 * clamp_k, alpha);
+                    sh3 = mix(h3 * ih, sh3 * clamp_k, alpha);
                 }
             }
         }
     }
     // Write the temporally-accumulated per-probe SH (misc.y = probe-grid width).
     // cam_dist + normal in the .w lanes for the integrate's depth-weighted blend.
-    uint pidx = px.y * pc.misc.y + px.x;
     sh_out[pidx].c[0] = vec4(sh0, cam_dist);
     sh_out[pidx].c[1] = vec4(sh1, n.x);
     sh_out[pidx].c[2] = vec4(sh2, n.y);
     sh_out[pidx].c[3] = vec4(sh3, n.z);
+    // c[4].yzw = the probe's world position (plane-aware integrate weights).
+    sh_out[pidx].c[4] = vec4(uintBitsToFloat(vis_mask), p);
     // alpha channel stores camera distance for the forward depth-aware upsample
     // AND next-frame reprojection disocclusion.
     imageStore(u_out, ivec2(px), vec4(irr, cam_dist));

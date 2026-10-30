@@ -17,13 +17,23 @@ fn main() {
         "shadow.vert",
         "fullscreen.vert",
         "post.frag",
+        // Mip-chain bloom (prefilter, downsample, upsample).
+        "bloom.comp",
         // Deferred SSR resolve (fullscreen, current-frame screen-space reflections).
         "ssr_resolve.frag",
+        // Underwater view fog / caustics over the HDR scene.
+        "underwater.frag",
         // VR overlay quad (left-hand UI panel + pointer markers in the eye images).
         "vr_quad.vert",
         "vr_quad.frag",
         // Ray-traced reflections (1 bounce, ray query against the scene TLAS).
         "rt_reflect.comp",
+        // Displaced water positions for the RT reflections' water BLAS refit.
+        "water_displace.comp",
+        // Shallow-water simulation of the interactive water layer.
+        "water_sim.comp",
+        // FFT line passes of the water simulation's dispersive layer.
+        "water_fft.comp",
         // Lighting bake (compiled only used when ray query is available).
         "bake_gbuffer.vert",
         "bake_gbuffer.frag",

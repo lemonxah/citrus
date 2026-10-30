@@ -17,4 +17,9 @@ egui-ash-renderer.workspace = true
 glam.workspace = true
 serde.workspace = true
 anyhow.workspace = true
+half.workspace = true
 tracing.workspace = true
+
+# Android: winit needs an activity backend for the `android_main` entry point.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { workspace = true, features = ["android-native-activity"] }

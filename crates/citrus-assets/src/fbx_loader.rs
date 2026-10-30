@@ -44,6 +44,8 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
         materials: Vec::new(),
         instances: Vec::new(),
         skeletons: Vec::new(),
+        morphs: Vec::new(),
+        springs: Default::default(),
         animations: Vec::new(),
     };
 
@@ -73,12 +75,11 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
         // Build the armature + animation clips from the first skinned mesh's
         // deformer (cluster order matches the skin-local joint indices on the
         // vertices); sample every FBX anim stack onto the bone nodes.
-        if scene.skeletons.is_empty() {
-            if let Some((skel, clips)) = build_rig(&fbx, mesh) {
+        if scene.skeletons.is_empty()
+            && let Some((skel, clips)) = build_rig(&fbx, mesh) {
                 scene.skeletons.push(skel);
                 scene.animations.extend(clips);
             }
-        }
         let transform = matrix_to_mat4(&node.geometry_to_world);
         let node_name = if node.element.name.is_empty() {
             format!("node {}", node.element.element_id)
@@ -98,6 +99,11 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
                     let Some(mesh_data) = convert_part(mesh, part_index)? else {
                         continue;
                     };
+                    let morphs = part_morphs(mesh, part_index);
+                    if !morphs.is_empty() {
+                        scene.morphs.resize(scene.meshes.len(), Vec::new());
+                        scene.morphs.push(morphs);
+                    }
                     scene.meshes.push(mesh_data);
                     let mesh_index = scene.meshes.len() - 1;
 
@@ -530,6 +536,7 @@ fn material_for(
                 AlphaMode::Opaque
             },
             double_sided: material.features.double_sided.enabled,
+            water: false,
         },
         albedo,
         normal,
@@ -592,3 +599,48 @@ fn matrix_to_mat4(m: &ufbx::Matrix) -> Mat4 {
         1.0,
     ])
 }
+
+/// Blend shapes of one material part, remapped from control points onto the
+/// part's triangle-corner vertices (same corner order as `convert_part`).
+fn part_morphs(mesh: &ufbx::Mesh, part_index: usize) -> Vec<crate::MorphTarget> {
+    let channels: Vec<&ufbx::BlendChannel> = mesh.blend_deformers.iter().flat_map(|d| d.channels.iter()).map(|c| &**c).collect();
+    if channels.is_empty() {
+        return Vec::new();
+    }
+    let face_indices: Vec<u32> = match mesh.material_parts.get(part_index) {
+        Some(part) => part.face_indices.as_ref().to_vec(),
+        None => (0..mesh.faces.len() as u32).collect(),
+    };
+    let mut tri_indices = vec![0u32; mesh.max_face_triangles.max(1) * 3];
+    let mut corners: Vec<u32> = Vec::new();
+    for &face_index in &face_indices {
+        let face = mesh.faces[face_index as usize];
+        let n = ufbx::triangulate_face(&mut tri_indices, mesh, face);
+        for &corner in &tri_indices[..n as usize * 3] {
+            corners.push(mesh.vertex_indices[corner as usize]);
+        }
+    }
+    let mut out = Vec::new();
+    for channel in channels {
+        let Some(shape) = channel.target_shape.as_ref() else { continue };
+        let mut offsets: std::collections::HashMap<u32, ([f32; 3], [f32; 3])> = std::collections::HashMap::new();
+        for k in 0..shape.num_offsets {
+            let p = shape.position_offsets[k];
+            let n = shape.normal_offsets.get(k).map(|n| [n.x as f32, n.y as f32, n.z as f32]).unwrap_or_default();
+            offsets.insert(shape.offset_vertices[k], ([p.x as f32, p.y as f32, p.z as f32], n));
+        }
+        let deltas: Vec<(u32, [f32; 3], [f32; 3])> = corners
+            .iter()
+            .enumerate()
+            .filter_map(|(v, cp)| offsets.get(cp).map(|(p, n)| (v as u32, *p, *n)))
+            .collect();
+        if deltas.is_empty() {
+            continue;
+        }
+        let name = channel.element.name.to_string();
+        let name = name.rsplit(['.', '|']).next().unwrap_or(&name).to_owned();
+        out.push(crate::MorphTarget { name, deltas });
+    }
+    out
+}
+

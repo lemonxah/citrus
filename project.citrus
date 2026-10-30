@@ -9,6 +9,7 @@
         snap: false,
         grid_size: 0.5,
         vim_mode: true,
+        accent: Some((245, 200, 75)),
     ),
     bindings: (
         schemes: [
@@ -298,22 +299,7 @@
     ),
     audio_mixer: (
         buses: {
-            "music": (
-                volume: 1.0,
-                muted: false,
-                parent: Some("master"),
-            ),
-            "master": (
-                volume: 1.0,
-                muted: false,
-                parent: None,
-            ),
             "ui": (
-                volume: 1.0,
-                muted: false,
-                parent: Some("master"),
-            ),
-            "voice": (
                 volume: 1.0,
                 muted: false,
                 parent: Some("master"),
@@ -323,6 +309,50 @@
                 muted: false,
                 parent: Some("master"),
             ),
+            "master": (
+                volume: 1.0,
+                muted: false,
+                parent: None,
+            ),
+            "voice": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
+            "music": (
+                volume: 1.0,
+                muted: false,
+                parent: Some("master"),
+            ),
         },
+    ),
+    spatial_audio: (
+        reflections: Parametric,
+        listener_reverb: true,
+        rays: 2048,
+        bounces: 8,
+        duration: 1.0,
+        order: 1,
+        diffuse_samples: 32,
+        update_rate: 10.0,
+        max_sources: 16,
+        ray_tracer: Default,
+        hrtf_sofa: "",
+        output: Headphones,
+        bake_rays: 16384,
+        bake_bounces: 16,
+        bake_duration: 2.0,
+    ),
+    tracking_input: (
+        slimevr: false,
+        osc_enabled: false,
+        osc_port: 9000,
+    ),
+    physics: (
+        gravity: (0.0, -9.81, 0.0),
+        default_material: "",
+        contact_stiffness: 30.0,
+        contact_damping: 5.0,
+        solver_iterations: 4,
     ),
 )

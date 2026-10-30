@@ -56,7 +56,7 @@ pub fn audio_settings_ui(ui: &mut Ui, s: &mut SpatialAudioSettings) -> AudioSett
         widgets::property_row(ui, "Duration", |ui| {
             c |= ui.add(DragValue::new(&mut s.duration).speed(0.05).range(0.1..=10.0).suffix(" s")).changed();
         });
-        widgets::property_row(ui, "Ambisonic order", |ui| c |= ui.add(egui::Slider::new(&mut s.order, 1..=3)).changed());
+        widgets::property_row(ui, "Ambisonic order", |ui| c |= crate::widgets::slider(ui, egui::Slider::new(&mut s.order, 1..=3)).changed());
         widgets::property_row(ui, "Diffuse samples", |ui| {
             c |= ui.add(DragValue::new(&mut s.diffuse_samples).speed(4).range(1..=1024)).changed();
         });

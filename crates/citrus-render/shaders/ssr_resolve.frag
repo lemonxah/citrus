@@ -18,6 +18,7 @@ layout(set = 0, binding = 0) uniform sampler2D u_color; // current lit HDR colou
 layout(set = 0, binding = 1) uniform sampler2D u_gbuf;  // reflectance.rgb, roughness.a
 layout(set = 0, binding = 2) uniform sampler2D u_depth; // scene depth prepass
 layout(set = 0, binding = 3) uniform samplerCube u_env; // prefiltered environment
+layout(set = 0, binding = 5) uniform samplerCube u_env_b; // second reflection probe
 
 layout(set = 0, binding = 4) uniform SsrData {
     mat4 proj;
@@ -34,7 +35,13 @@ layout(set = 0, binding = 4) uniform SsrData {
     vec4 fog_sun;      // xyz dir to sun, w time
     vec4 screen;       // x width, y height, z _, w _
     vec4 refl_box;     // xyz probe box CENTER (capture + box offset), w _
+    vec4 refl2_center; // second probe (binding 5), same layout; w = intensity (0 = none)
+    vec4 refl2_extents;
+    vec4 refl2_box;
+    vec4 refl_blend;   // x slot 0 blend, y slot 1 blend, z slot 1 on top
 } u;
+
+#include "probe_blend.glsl"
 
 // Max roughness mip of the CURRENTLY bound cube, queried at runtime (correct for
 // the 64px skybox cube or a higher-res captured probe cube). Matches standard.frag.
@@ -173,10 +180,17 @@ vec4 trace(vec3 P, vec3 N) {
 
     // Per-pixel jitter on the march start so the discrete steps don't line up into
     // coherent vertical streaks (breaks the pattern into fine noise).
-    float jitter = (fract(sin(dot(uv0 * screen, vec2(12.9898, 78.233))) * 43758.5453) - 0.5)
-                 * strideFrac;
+    vec2 px = floor(uv0 * screen);
+    float ign = fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))));
+    float jitter = (ign - 0.5) * 0.5 * strideFrac;
+
+    // Rays heading back toward the camera (view space looks down -Z) mostly
+    // land on surfaces the depth buffer can't see; fade them out.
+    float toward_camera = 1.0 - smoothstep(0.1, 0.6, dir.z);
+    if (toward_camera <= 0.0) return vec4(0.0);
 
     float prevT = 0.0;
+    float prevRayZ = P.z;
     // Start NOT-in-front: a hit is only accepted once the ray has been seen
     // clearly in front of the scene (dz <= 0) at least once. Without this the
     // first steps sit on the originating surface (dz ~ 0, immediately "behind")
@@ -199,8 +213,19 @@ vec4 trace(vec3 P, vec3 N) {
         // foreground object (e.g. the thin cylinder's silhouette) — that's an
         // occlusion, not a reflection, so DON'T register it (this is what removes
         // the vertical column smeared between an object and its reflection).
-        float thickness = max(1.0, 0.15 * abs(rayZ));
-        if (wasInFront && dz > 0.0 && dz < thickness) {
+        // Hit only when the ray's depth span over this step overlaps the
+        // surface's depth band (its front plus an assumed thickness). Unlike a
+        // "behind by less than N" test this holds for long grazing steps (which
+        // used to smear a small object along the ray) and rejects rays that pass
+        // well behind an object (its front still faces the camera, so the
+        // normal test below can't catch that case).
+        float ray_near = -max(prevRayZ, rayZ);
+        float ray_far = -min(prevRayZ, rayZ);
+        float surf = -sZ;
+        float thickness = clamp(0.03 * surf, 0.05, 0.25);
+        prevRayZ = rayZ;
+        bool crossed = ray_far >= surf && ray_near <= surf + thickness;
+        if (wasInFront && crossed) {
             float lo = prevT, hi = t;
             for (int k = 0; k < 8; ++k) {
                 float mt = (lo + hi) * 0.5;
@@ -213,10 +238,19 @@ vec4 trace(vec3 P, vec3 N) {
             float residual = abs(scene_z(hitUv) - hrz);
             float conf = 1.0 - smoothstep(max(0.04 * abs(hrz), 0.04),
                                           max(0.16 * abs(hrz), 0.16), residual);
-            if (conf > 0.01) {
-                vec2 e = smoothstep(vec2(0.0), vec2(0.1), hitUv)
-                       * (1.0 - smoothstep(vec2(0.9), vec2(1.0), hitUv));
-                return vec4(texture(u_color, hitUv).rgb, e.x * e.y * conf);
+            // Back-face rejection: a surface whose normal faces along the ray
+            // can't be what the ray reflects off (it passed behind it). This is
+            // what stretched small objects into streaks.
+            vec3 hitN = oct_decode(texture(u_gbuf, hitUv).rg);
+            bool facing = dot(hitN, dir) < 0.05;
+            if (conf > 0.01 && facing) {
+                vec2 e = smoothstep(vec2(0.0), vec2(0.06), hitUv)
+                       * (1.0 - smoothstep(vec2(0.94), vec2(1.0), hitUv));
+                // Decisive: either SSR or the probe, not a half-and-half ghost.
+                float a = smoothstep(0.45, 0.8, e.x * e.y * conf * toward_camera);
+                if (a > 0.0) {
+                    return vec4(texture(u_color, hitUv).rgb, a);
+                }
             }
         }
         wasInFront = dz <= 0.0;
@@ -225,12 +259,20 @@ vec4 trace(vec3 P, vec3 N) {
     return vec4(0.0);
 }
 
+// Roughness + reflectivity from the packed G-buffer texel (see standard.frag).
+vec2 gbuf_rough_refl(vec4 g) {
+    uint b = uint(round(g.b * 1023.0));
+    uint a = uint(round(g.a * 3.0));
+    return vec2(float(b >> 4) / 63.0, float((b & 15u) | (a << 4)) / 63.0);
+}
+
 void main() {
     vec3 base = texture(u_color, v_uv).rgb;
     float depth = texture(u_depth, v_uv).r;
-    vec4 g = texture(u_gbuf, v_uv);
-    float roughness = g.b;
-    float reflectivity = g.a; // env-reflection weight (0 = not a reflector)
+    vec4 g = texelFetch(u_gbuf, ivec2(gl_FragCoord.xy), 0);
+    vec2 rr = gbuf_rough_refl(g);
+    float roughness = rr.x;
+    float reflectivity = rr.y; // env-reflection weight (0 = not a reflector)
     bool is_sky = depth >= 0.9999;
 
     vec3 outc = base;
@@ -257,6 +299,7 @@ void main() {
             vec3 Nw = normalize(mat3(u.inv_view) * N);
             vec3 Vw = normalize(u.camera_pos.xyz - worldPos);
             vec3 Rw = reflect(-Vw, Nw);
+            vec3 Rw_raw = Rw;
             float probe_intensity = u.refl_center.w;
             if (probe_intensity > 0.0 && u.refl_extents.w > 0.5) {
                 vec3 bmin = u.refl_box.xyz - u.refl_extents.xyz;
@@ -278,6 +321,15 @@ void main() {
             }
             float env_scale = probe_intensity > 0.0 ? probe_intensity : 1.0;
             vec3 env = textureLod(u_env, Rw, roughness * ENV_MAX_LOD).rgb * env_scale;
+            // Same two-probe blend the forward pass applied, so the SSR
+            // replacement subtracts exactly the environment it added.
+            if (u.refl2_center.w > 0.0 && probe_intensity >= 0.0) {
+                vec3 R2 = probe_box_dir(worldPos, Rw_raw, u.refl2_center.xyz, u.refl2_box.xyz, u.refl2_extents.xyz, u.refl2_extents.w > 0.5);
+                vec3 env_b = textureLod(u_env_b, R2, roughness * float(textureQueryLevels(u_env_b) - 1)).rgb * u.refl2_center.w;
+                float wb = probe_b_weight(worldPos, u.refl_box.xyz, u.refl_extents.xyz, u.refl_blend.x,
+                                          u.refl2_box.xyz, u.refl2_extents.xyz, u.refl_blend.y, u.refl_blend.z > 0.5);
+                env = mix(env, env_b, wb);
+            }
             vec4 ssr = trace(P, N);
             if (ssr.a > 0.0) {
                 float rough_fade = 1.0 - smoothstep(u.ssr.w * 0.5, u.ssr.w, roughness);

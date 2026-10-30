@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use citrus_core::{AudioListener, AudioMixer, AudioRolloff, AudioSource, ObjectId, SpatialAudioSettings};
 use glam::{Mat4, Quat, Vec3};
@@ -291,6 +293,11 @@ pub struct AudioEngine {
     /// Latest moving-occluder transforms (sent each update).
     #[cfg(feature = "steam-audio")]
     dynamic_transforms: Vec<(ObjectId, Mat4)>,
+    /// Underwater muffle every voice follows (0..1, f32 bits).
+    muffle: Arc<AtomicU32>,
+    /// The underwater ambience loop playing (its clip and sink).
+    ambience: Option<(String, Sink)>,
+    underwater: crate::underwater::UnderwaterMix,
 }
 
 /// One-shot falloff: linear from 1 m to 30 m.
@@ -331,6 +338,9 @@ impl AudioEngine {
                 probe_boxes: Vec::new(),
                 #[cfg(feature = "steam-audio")]
                 dynamic_transforms: Vec::new(),
+                muffle: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+                ambience: None,
+                underwater: Default::default(),
             })
             .inspect(|engine| tracing::info!("spatial audio: {}", engine.spatializer())),
             Err(e) => {
@@ -381,18 +391,55 @@ impl AudioEngine {
         for shot in self.oneshots.drain(..) {
             shot.sink.stop();
         }
+        if let Some((_, sink)) = self.ambience.take() {
+            sink.stop();
+        }
+    }
+
+    /// Follow the listener's underwater state (`under`: the water its ear is
+    /// in, if any), fading over `dt` (unscaled seconds): muffle every voice and
+    /// play the water's ambience loop (unmuffled) at the faded volume.
+    pub fn set_underwater(
+        &mut self,
+        under: Option<&citrus_core::UnderwaterSettings>,
+        dt: f32,
+        project_root: &Path,
+        mixer: &AudioMixer,
+    ) {
+        self.underwater.step(under, dt);
+        self.muffle.store(self.underwater.muffle().to_bits(), Ordering::Relaxed);
+        let want = self.underwater.ambience().map(|(clip, volume)| (clip.to_string(), volume));
+        let want = want.as_ref().map(|(clip, volume)| (clip.as_str(), *volume));
+        if self.ambience.as_ref().map(|(clip, _)| clip.as_str()) != want.map(|(clip, _)| clip) {
+            if let Some((_, sink)) = self.ambience.take() {
+                sink.stop();
+            }
+            if let Some((clip, _)) = want
+                && let Some((sink, decoder)) = self.open(project_root, clip)
+            {
+                sink.append(decoder.repeat_infinite());
+                self.ambience = Some((clip.to_string(), sink));
+            }
+        }
+        if let (Some((_, sink)), Some((_, volume))) = (self.ambience.as_ref(), want) {
+            sink.set_volume(volume * mixer.effective_gain("sfx"));
+        }
     }
 
     /// Append `source` to `sink` through Steam Audio when it's available and
     /// the clip needs it (spatial, ambisonic, surround bed), returning the
     /// voice's parameter slot; otherwise append it as is.
-    #[allow(unused_variables)]
     fn append<S>(&self, sink: &Sink, source: S, init: Option<SlotInit>) -> Option<Slot>
     where
         S: Source + Send + 'static,
         S::Item: rodio::Sample + Send,
         f32: rodio::cpal::FromSample<S::Item>,
     {
+        self.append_muffled(sink, Muffled::new(source.convert_samples::<f32>(), self.muffle.clone()), init)
+    }
+
+    #[allow(unused_variables)]
+    fn append_muffled<S: Source<Item = f32> + Send + 'static>(&self, sink: &Sink, source: S, init: Option<SlotInit>) -> Option<Slot> {
         #[cfg(feature = "steam-audio")]
         if let (Some(sa), Some(SlotInit(emitter, listener, opts))) = (self.steam.as_ref(), init)
             && sa.wants(&opts, source.channels())
@@ -486,7 +533,7 @@ impl AudioEngine {
     }
 
     fn open(&self, project_root: &Path, clip: &str) -> Option<(Sink, Decoder<BufReader<std::fs::File>>)> {
-        let path = project_root.join(clip);
+        let path = citrus_core::asset_ref::resolve_path(project_root, clip);
         let file = std::fs::File::open(&path)
             .map_err(|e| tracing::error!("opening audio {}: {e}", path.display()))
             .ok()?;
@@ -645,6 +692,58 @@ impl AudioEngine {
             s.occlusion = occ;
             s.transmission = transmission;
         }
+    }
+}
+
+/// A voice through the underwater muffle (see `underwater::MuffleFilter`).
+struct Muffled<S> {
+    inner: S,
+    filter: crate::underwater::MuffleFilter,
+    target: Arc<AtomicU32>,
+    muffle: f32,
+    channel: usize,
+}
+
+impl<S: Source<Item = f32>> Muffled<S> {
+    fn new(inner: S, target: Arc<AtomicU32>) -> Self {
+        let filter = crate::underwater::MuffleFilter::new(inner.channels(), inner.sample_rate());
+        Self { inner, filter, target, muffle: 0.0, channel: 0 }
+    }
+}
+
+impl<S: Source<Item = f32>> Iterator for Muffled<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        let x = self.inner.next()?;
+        if self.channel == 0 {
+            self.muffle = f32::from_bits(self.target.load(Ordering::Relaxed));
+            if self.filter.channels() != self.inner.channels().max(1) as usize {
+                self.filter = crate::underwater::MuffleFilter::new(self.inner.channels(), self.inner.sample_rate());
+            }
+        }
+        let y = self.filter.process(x, self.channel, self.muffle);
+        self.channel = (self.channel + 1) % self.filter.channels();
+        Some(y)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<S: Source<Item = f32>> Source for Muffled<S> {
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
     }
 }
 

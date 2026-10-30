@@ -211,11 +211,10 @@ fn stream_frames(asset_dir: &Path, tx: mpsc::Sender<Frame>) {
     }
     for name in ["splash.webp", "splash.gif"] {
         let p = asset_dir.join(name);
-        if let Ok(bytes) = std::fs::read(&p) {
-            if pure_rust_bytes(&bytes, name, &tx) {
+        if let Ok(bytes) = std::fs::read(&p)
+            && pure_rust_bytes(&bytes, name, &tx) {
                 return;
             }
-        }
     }
     pure_rust_bytes(SPLASH_WEBP, "splash.webp", &tx);
 }
@@ -254,7 +253,7 @@ fn ffmpeg_stream(path: &Path, tx: &mpsc::Sender<Frame>) -> std::io::Result<()> {
         match out.read_exact(&mut buf) {
             Ok(()) => {
                 let px: Vec<u32> = buf
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0]))
                     .collect();
                 cum += delay;
@@ -302,7 +301,7 @@ fn pure_rust_bytes(bytes: &[u8], name: &str, tx: &mpsc::Sender<Frame>) -> bool {
     for frame in frames {
         let Ok(frame) = frame else { break };
         let (num, den) = frame.delay().numer_denom_ms();
-        let delay = if den == 0 { 40 } else { (num / den).max(16) };
+        let delay = num.checked_div(den).map_or(40, |d| d.max(16));
         cum += delay;
         let px = scale_to_bg(&frame.into_buffer());
         any = true;

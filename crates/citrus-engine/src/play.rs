@@ -28,6 +28,9 @@ use crate::prefab::Prefab;
 use crate::scene::{LoadedScene, PassEnv};
 use crate::shaders::ShaderLibrary;
 
+#[path = "play_net.rs"]
+mod play_net;
+
 /// Upper bound on fixed steps per frame, so a long hitch can't snowball.
 const MAX_STEPS: u32 = 8;
 
@@ -63,6 +66,9 @@ pub struct PlayTimings {
 
 pub struct PlaySession {
     physics: PhysicsWorld,
+    physics_settings: citrus_core::PhysicsSettings,
+    /// Water clock minus play time (non-zero when following a shared clock).
+    water_offset: f32,
     nav: NavSystem,
     audio: Option<AudioEngine>,
     project_root: PathBuf,
@@ -81,6 +87,15 @@ pub struct PlaySession {
     save_dir: PathBuf,
     strings: citrus_core::Localization,
     mixer: citrus_core::AudioMixer,
+    /// Object-hierarchy rigs for Animators without a skinned mesh: the rig and
+    /// the scene object id of each node (rest = transforms at first use).
+    object_rigs: HashMap<ObjectId, (crate::anim_graph::Rig, Vec<ObjectId>)>,
+    /// World position of each parameter-driver source last frame.
+    driver_prev: HashMap<ObjectId, Vec3>,
+    /// Water Containers' water and the streams poured from them.
+    carry: crate::water_carry::CarrySim,
+    /// Static objects and still colliders as walls in the simulated water.
+    water_walls: crate::water_walls::WaterWalls,
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +111,9 @@ impl PlaySession {
     /// (None = silent); hand it back with [`PlaySession::end`].
     pub fn new(scene: &LoadedScene, project_root: &Path, audio: Option<AudioEngine>) -> Self {
         Self {
-            physics: PhysicsWorld::build(scene),
+            physics: PhysicsWorld::build_with(scene, Some(project_root), &citrus_core::PhysicsSettings::default()),
+            physics_settings: citrus_core::PhysicsSettings::default(),
+            water_offset: 0.0,
             nav: NavSystem::default(),
             audio,
             project_root: project_root.to_owned(),
@@ -113,7 +130,34 @@ impl PlaySession {
             save_dir: project_root.join(".citrus").join("saves"),
             strings: load_strings(project_root),
             mixer: citrus_core::AudioMixer::default(),
+            object_rigs: HashMap::new(),
+            driver_prev: HashMap::new(),
+            carry: crate::water_carry::CarrySim::default(),
+            water_walls: crate::water_walls::WaterWalls::default(),
         }
+    }
+
+    /// The water clock: play time, or the networked game's shared clock.
+    pub fn water_time(&self) -> f32 {
+        self.time + self.water_offset
+    }
+
+    /// Follow a clock every peer agrees on for the water (the host's, from
+    /// [`crate::net::NetSession::shared_clock`]); None = local play time.
+    pub fn set_shared_clock(&mut self, clock: Option<f64>) {
+        let target = clock.map_or(0.0, |c| (c - self.time as f64) as f32);
+        if (target - self.water_offset).abs() > 0.5 {
+            self.water_offset = target;
+        } else {
+            self.water_offset += (target - self.water_offset) * 0.1;
+        }
+    }
+
+    /// Project physics (gravity, contact stiffness, default material). Rebuilds
+    /// the simulation, so call it before the first tick.
+    pub fn set_physics(&mut self, settings: &citrus_core::PhysicsSettings, scene: &LoadedScene) {
+        self.physics_settings = settings.clone();
+        self.physics = PhysicsWorld::build_with(scene, Some(&self.project_root), settings);
     }
 
     /// Where `ctx.write_save` / `load_save` slots live (default: the
@@ -144,12 +188,15 @@ impl PlaySession {
 
     /// A different scene was loaded mid-play: start it fresh.
     pub fn scene_changed(&mut self, scene: &LoadedScene) {
-        self.physics = PhysicsWorld::build(scene);
+        self.physics = PhysicsWorld::build_with(scene, Some(&self.project_root), &self.physics_settings);
         self.nav = NavSystem::default();
         self.started.clear();
         self.accumulator = 0.0;
         self.events_prev.clear();
         self.events_next.clear();
+        self.object_rigs.clear();
+        self.driver_prev.clear();
+        self.carry.reset();
         if let Some(audio) = self.audio.as_mut() {
             audio.stop_all();
         }
@@ -159,6 +206,12 @@ impl PlaySession {
     pub fn structure_changed(&mut self) {
         self.physics.mark_dirty();
         self.nav.invalidate();
+    }
+
+    /// Deliver an engine-side event (e.g. content loading) to every component
+    /// on the next tick via `ctx.events`.
+    pub fn post_event<E: std::any::Any>(&mut self, event: E) {
+        self.events_prev.push(AnyBox(Box::new(event)));
     }
 
     /// Stop playing; returns the audio device for reuse.
@@ -180,12 +233,14 @@ impl PlaySession {
         let events = std::mem::take(&mut self.events_prev);
         let mut host = Vec::new();
 
+        self.net_pre_tick(w, inp.net, &mut host);
         self.start_pending(w, inp, dt, unscaled, &events, &mut host);
         self.apply_animation_output(w, inp, dt, unscaled, &events, &mut host);
 
         let phys_start = Instant::now();
         let mut fixed_ms = 0.0;
         self.physics.sync_structure(w.scene);
+        self.carry.track(w.scene, dt);
         self.accumulator += dt;
         let mut steps = 0;
         while self.accumulator >= FIXED_DT && steps < MAX_STEPS {
@@ -198,6 +253,29 @@ impl PlaySession {
             let ids = w.scene.id_index();
             let world = w.scene.world_transforms();
             self.physics.push_poses(w.scene, &ids, &world);
+            let vortices = crate::water_fx::scene_vortices(w.scene, &world, self.water_time());
+            let mut water = self.physics.apply_water(w.scene, &world, self.water_time(), &vortices);
+            water.fx_pushes.append(&mut w.scene.water_fx_pushes);
+            for &(i, frac) in &water.submerged {
+                if let Some(b) = w.scene.objects[i]
+                    .components
+                    .iter_mut()
+                    .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Buoyancy>())
+                {
+                    b.submerged = frac;
+                }
+            }
+            let water_t = self.water_time();
+            self.carry.step(w.scene, &world, Some(&mut self.physics), water_t, FIXED_DT, &mut water);
+            crate::physics::step_ripples(w.scene, &world, self.listener.w_axis.truncate(), &water, Some(&self.physics), water_t, FIXED_DT);
+            self.water_walls.update(w.scene, &world);
+            w.scene.water_splashes.extend(water.splashes.iter().copied());
+            // One wake per body per frame is plenty for the effects.
+            for wake in &water.wakes {
+                if !w.scene.water_wakes.iter().any(|x| x.at.distance_squared(wake.at) < 1e-4) {
+                    w.scene.water_wakes.push(crate::water_fx::FxWake { at: wake.at, flow: wake.flow, radius: wake.radius });
+                }
+            }
             self.physics.step();
             self.accumulator -= FIXED_DT;
             steps += 1;
@@ -207,10 +285,18 @@ impl PlaySession {
         }
         if steps > 0 {
             self.physics.reset_forces();
+            // What the inspector shows as each body's real mass and density.
+            for o in w.scene.objects.iter_mut() {
+                let id = o.id;
+                if let Some(rb) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::RigidBody>()) {
+                    rb.measured = self.physics.mass_and_volume(id);
+                }
+            }
         }
         let ids = w.scene.id_index();
-        self.physics
-            .write_back(w.scene, &ids, (self.accumulator / FIXED_DT).clamp(0.0, 1.0));
+        let alpha = (self.accumulator / FIXED_DT).clamp(0.0, 1.0);
+        self.physics.write_back(w.scene, &ids, alpha);
+        w.scene.water_pours = self.carry.snapshot(alpha);
         // Navmeshes bake once the physics world has stepped (its query
         // structure is built by the step).
         if steps > 0 && self.nav.needs_bake() {
@@ -225,12 +311,17 @@ impl PlaySession {
 
         self.pass(w, inp, dt, unscaled, &events, &mut host, |_| true, |_, c, ctx| c.update(ctx));
         self.nav.move_agents(w.scene, &mut self.physics, dt);
+        self.drive_animator_params(w.scene, dt);
+        self.animate_objects(w.scene, dt);
         self.pass(w, inp, dt, unscaled, &events, &mut host, |_| true, |_, c, ctx| c.late_update(ctx));
 
         let audio_start = Instant::now();
+        let water_t = self.water_time();
         if let Some(audio) = self.audio.as_mut() {
             audio.sync_geometry(w.scene);
             audio.update(&crate::audio::gather_cues(w.scene), self.listener, &self.mixer);
+            let under = crate::underwater::listener(w.scene, self.listener.w_axis.truncate(), water_t);
+            audio.set_underwater(under.as_ref(), unscaled, &self.project_root, &self.mixer);
         }
         let audio_ms = audio_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -278,6 +369,117 @@ impl PlaySession {
         }
     }
 
+    /// Feed Animator parameter drivers (movement speed, grounded, another
+    /// Animator's parameter).
+    fn drive_animator_params(&mut self, scene: &mut LoadedScene, dt: f32) {
+        use citrus_core::{DriverSource, PhysicsQuery as _};
+        let ids = scene.id_index();
+        let mut writes: Vec<(usize, String, f32)> = Vec::new();
+        let mut seen: Vec<(ObjectId, Vec3)> = Vec::new();
+        for (i, o) in scene.objects.iter().enumerate() {
+            let Some(a) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::Animator>()) else {
+                continue;
+            };
+            for d in &a.drivers {
+                if d.parameter.is_empty() {
+                    continue;
+                }
+                let src_id = d.object.id().unwrap_or(o.id);
+                let Some(&src) = ids.get(&src_id) else {
+                    continue;
+                };
+                let value = match d.source {
+                    DriverSource::AnimatorParameter => scene.objects[src]
+                        .components
+                        .iter()
+                        .find_map(|c| c.as_any().downcast_ref::<citrus_core::Animator>())
+                        .map(|other| other.get_float(&d.source_parameter)),
+                    DriverSource::Grounded => Some(if self.physics.grounded(src_id) { 1.0 } else { 0.0 }),
+                    _ => {
+                        let world = scene.world_transform(src);
+                        let pos = world.w_axis.truncate();
+                        seen.push((src_id, pos));
+                        let vel = match self.driver_prev.get(&src_id) {
+                            Some(prev) if dt > 1e-6 => (pos - *prev) / dt,
+                            _ => Vec3::ZERO,
+                        };
+                        let fwd = world.transform_vector3(Vec3::NEG_Z).normalize_or_zero();
+                        let right = world.transform_vector3(Vec3::X).normalize_or_zero();
+                        Some(match d.source {
+                            DriverSource::Speed => Vec3::new(vel.x, 0.0, vel.z).length(),
+                            DriverSource::VerticalSpeed => vel.y,
+                            DriverSource::ForwardSpeed => vel.dot(fwd),
+                            _ => vel.dot(right),
+                        })
+                    }
+                };
+                if let Some(v) = value {
+                    writes.push((i, d.parameter.clone(), v * d.scale));
+                }
+            }
+        }
+        if dt > 1e-6 {
+            for (id, pos) in seen {
+                self.driver_prev.insert(id, pos);
+            }
+        }
+        for (i, name, v) in writes {
+            if let Some(a) = scene.objects[i]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>())
+            {
+                a.set_float(&name, v);
+            }
+        }
+    }
+
+    /// Evaluate Animators on objects without a skinned mesh: controllers and
+    /// `.anim` clips animate the object and its descendants' transforms.
+    fn animate_objects(&mut self, scene: &mut LoadedScene, dt: f32) {
+        let targets: Vec<usize> = (0..scene.objects.len())
+            .filter(|&i| {
+                scene.objects[i].components.iter().any(|c| c.as_any().is::<citrus_core::Animator>())
+                    && scene.is_active(i)
+                    && !scene.has_skinned_mesh(i)
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        scene.anim_assets.set_root(&self.project_root);
+        let ids = scene.id_index();
+        for i in targets {
+            let id = scene.objects[i].id;
+            let valid = self
+                .object_rigs
+                .get(&id)
+                .is_some_and(|(_, nodes)| nodes.iter().all(|n| ids.contains_key(n)));
+            if !valid {
+                let (rig, nodes) = crate::anim_graph::object_rig(scene, i);
+                let nodes = nodes.iter().map(|&n| scene.objects[n].id).collect();
+                self.object_rigs.insert(id, (rig, nodes));
+            }
+            let (rig, node_ids) = &self.object_rigs[&id];
+            let nodes: Vec<usize> = node_ids.iter().filter_map(|n| ids.get(n).copied()).collect();
+            let LoadedScene { objects, anim_assets, .. } = &mut *scene;
+            let Some(animator) = objects[i]
+                .components
+                .iter_mut()
+                .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>())
+            else {
+                continue;
+            };
+            if animator.controller.is_empty() && animator.clip.is_empty() && animator.state.current.is_none() {
+                continue;
+            }
+            let ctrl = anim_assets.prepare(animator);
+            let set = crate::anim_graph::ClipSet { imported: &[], indices: &[], assets: &anim_assets.clips };
+            let out = crate::anim_graph::advance(animator, ctrl.as_deref(), rig, &set, dt);
+            crate::anim_graph::apply_pose_to_objects(scene, &nodes, &out.pose);
+        }
+    }
+
     /// Root motion and animation events produced by the last skinning update.
     fn apply_animation_output(
         &mut self,
@@ -303,6 +505,9 @@ impl PlaySession {
             }
             if a.state.root_delta != Vec3::ZERO {
                 motion.push((i, std::mem::take(&mut a.state.root_delta)));
+            }
+            for (layer, from, to) in std::mem::take(&mut a.state.state_changes) {
+                self.events_next.push(AnyBox(Box::new(citrus_core::AnimatorStateChanged { object: o.id, layer, from, to })));
             }
         }
         for (i, delta) in motion {
@@ -406,6 +611,7 @@ impl PlaySession {
             dt,
             unscaled_dt: unscaled,
             time: self.time,
+            water_time: self.water_time(),
             time_scale: self.time_scale,
             input: inp.input,
             net: inp.net,
@@ -537,6 +743,9 @@ impl PlaySession {
                 }
                 ComponentCommand::SetBusVolume { bus, volume } => self.mixer.set_volume(&bus, volume),
                 ComponentCommand::SetBusMuted { bus, muted } => self.mixer.set_muted(&bus, muted),
+                c @ (ComponentCommand::NetSpawn { .. } | ComponentCommand::NetDespawn(_) | ComponentCommand::NetSetVar { .. }) => {
+                    self.apply_net_command(w, c, host)
+                }
                 other => host.push(other),
             }
         }
@@ -544,7 +753,7 @@ impl PlaySession {
 
     fn spawn_prefab(&mut self, w: &mut World, path: &str, root_id: ObjectId, translation: Vec3, rotation: Quat) {
         if !self.prefabs.contains_key(path) {
-            match Prefab::load(self.project_root.join(path)) {
+            match Prefab::load(citrus_core::asset_ref::resolve_path(&self.project_root, path)) {
                 Ok(p) => {
                     self.prefabs.insert(path.to_owned(), p);
                 }
@@ -555,14 +764,9 @@ impl PlaySession {
             }
         }
         let prefab = &self.prefabs[path];
-        let mut entries = prefab.instantiate(translation.to_array());
-        let mut first_root = true;
+        let mut entries = prefab.instantiate_rooted(translation.to_array(), Some(root_id));
         for e in entries.iter_mut().filter(|e| e.parent.is_none()) {
             e.rotation = rotation.to_array();
-            if first_root {
-                e.id = root_id.to_string();
-                first_root = false;
-            }
         }
         let Some(renderer) = w.renderer.as_deref_mut() else {
             tracing::error!("spawn_prefab {path:?}: no renderer");
@@ -934,6 +1138,57 @@ mod tests {
         assert_eq!(get::<EventLog>(&scene, id).names, vec!["Footstep".to_string()]);
         assert_eq!(scene.objects[0].translation, Vec3::new(0.0, 0.0, 1.5));
         assert!(get::<citrus_core::Animator>(&scene, id).state.fired.is_empty());
+    }
+
+    #[test]
+    fn anim_clips_drive_child_transforms_and_params_follow_drivers() {
+        use citrus_assets::{AnimClip, AnimTrack, KeyInterp, Keyframe, TrackProperty};
+        let registry = registry();
+        let mut scene = LoadedScene::empty();
+        let leader = obj(&mut scene, Vec3::ZERO, true, vec![Box::new(citrus_core::Animator::default())]);
+        let follower = citrus_core::Animator {
+            clip: "wave.anim".into(),
+            drivers: vec![citrus_core::ParamDriver {
+                parameter: "Mood".into(),
+                source: citrus_core::DriverSource::AnimatorParameter,
+                object: ObjectRef::new(leader),
+                source_parameter: "Mood".into(),
+                scale: 2.0,
+            }],
+            ..Default::default()
+        };
+        let root = obj(&mut scene, Vec3::ZERO, true, vec![Box::new(follower)]);
+        obj(&mut scene, Vec3::ZERO, true, vec![]);
+        scene.objects[2].name = "Arm".into();
+        scene.objects[2].parent = Some(1);
+        scene.anim_assets.set_clip(
+            "wave.anim",
+            AnimClip {
+                length: 1.0,
+                tracks: vec![AnimTrack {
+                    target: "Arm".into(),
+                    property: TrackProperty::Translation,
+                    keys: vec![
+                        Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Linear },
+                        Keyframe { time: 1.0, value: [0.0, 6.0, 0.0, 0.0], interp: KeyInterp::Linear },
+                    ],
+                }],
+                ..Default::default()
+            },
+        );
+        let i = scene.index_of(leader).unwrap();
+        scene.objects[i]
+            .components
+            .iter_mut()
+            .find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>())
+            .unwrap()
+            .set_float("Mood", 1.5);
+        let mut session = PlaySession::new(&scene, Path::new("."), None);
+        tick(&mut session, &mut scene, &registry, 30);
+        let y = scene.objects[2].translation.y;
+        assert!((y - 3.0).abs() < 0.05, "arm moved by the clip: {y}");
+        assert_eq!(scene.objects[1].translation, Vec3::ZERO, "root not animated by the clip");
+        assert_eq!(get::<citrus_core::Animator>(&scene, root).get_float("Mood"), 3.0);
     }
 
     #[derive(Serialize, Deserialize, Default)]

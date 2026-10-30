@@ -448,8 +448,10 @@ dependencies = [
  "intel_tex_2",
  "ron",
  "serde",
+ "serde_json",
  "tracing",
  "ufbx",
+ "zip",
 ]
 
 [[package]]
@@ -539,6 +541,7 @@ dependencies = [
  "egui-ash-renderer",
  "glam 0.30.10",
  "gpu-allocator",
+ "half",
  "openxr",
  "raw-window-handle",
  "serde",

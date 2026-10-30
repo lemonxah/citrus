@@ -1,0 +1,1084 @@
+//! The Animation tab: author `.anim` clips on a timeline. Tracks animate the
+//! target object (the selection's nearest Animator, or the selection) and its
+//! children by relative path, or bones of a skinned model. Keys are diamonds
+//! (select, drag in time, delete, copy / paste, per-key interpolation); the
+//! playhead scrubs and plays a preview in edit mode, and Record turns gizmo /
+//! inspector transform edits on the hierarchy into keys at the playhead.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use citrus_assets::{AnimClip, AnimTrack, ClipEvent, KeyInterp, Keyframe, TrackProperty};
+use citrus_core::{Animator, LightComponent, ObjectId};
+use citrus_editor::egui_phosphor::regular as ph;
+use citrus_editor::icons::Icon;
+use citrus_editor::{theme, widgets};
+use egui::{CornerRadius, Pos2, Rect, Sense, Shape, Stroke, Vec2};
+use glam::{EulerRot, Quat, Vec3};
+
+use crate::anim_controller_editor::{AnimControllerTab, create_asset, scan_files};
+use crate::anim_graph::{ClipRef, Pose, Rig, apply_pose_to_objects, object_rig};
+use crate::scene::LoadedScene;
+
+const ROW_H: f32 = 24.0;
+const RULER_H: f32 = 24.0;
+
+/// A key drag: where it started (seconds) and the (track, key, time) it moves.
+type KeyDrag = (f32, Vec<(usize, usize, f32)>);
+
+pub struct AnimClipTab {
+    path: Option<String>,
+    clip: AnimClip,
+    dirty: bool,
+    target: Option<ObjectId>,
+    playhead: f32,
+    playing: bool,
+    preview: bool,
+    recording: bool,
+    /// Transforms (and light intensity) before preview started.
+    originals: HashMap<ObjectId, (Vec3, Quat, Vec3, f32)>,
+    /// What preview last wrote, to spot edits made while recording.
+    applied: HashMap<ObjectId, (Vec3, Quat, Vec3)>,
+    selected: Vec<(usize, usize)>,
+    clipboard: Vec<(usize, Keyframe)>,
+    pps: f32,
+    scroll: f32,
+    vscroll: f32,
+    drag: Option<KeyDrag>,
+    scrubbing: bool,
+    /// Asked the editor to show this tab.
+    pub open_request: bool,
+    files: Vec<String>,
+}
+
+impl Default for AnimClipTab {
+    fn default() -> Self {
+        Self {
+            path: None,
+            clip: AnimClip::default(),
+            dirty: false,
+            target: None,
+            playhead: 0.0,
+            playing: false,
+            preview: false,
+            recording: false,
+            originals: HashMap::new(),
+            applied: HashMap::new(),
+            selected: Vec::new(),
+            clipboard: Vec::new(),
+            pps: 200.0,
+            scroll: 0.0,
+            vscroll: 0.0,
+            drag: None,
+            scrubbing: false,
+            open_request: false,
+            files: Vec::new(),
+        }
+    }
+}
+
+fn has_animator(scene: &LoadedScene, i: usize) -> bool {
+    scene.objects[i].components.iter().any(|c| c.as_any().is::<Animator>())
+}
+
+fn is_descendant(scene: &LoadedScene, mut i: usize, root: usize) -> bool {
+    for _ in 0..256 {
+        if i == root {
+            return true;
+        }
+        match scene.objects[i].parent {
+            Some(p) => i = p,
+            None => return false,
+        }
+    }
+    false
+}
+
+fn light_intensity(scene: &LoadedScene, i: usize) -> Option<f32> {
+    scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<LightComponent>()).map(|l| l.intensity)
+}
+
+fn quat_to_euler_deg(q: [f32; 4]) -> [f32; 3] {
+    let (x, y, z) = Quat::from_array(q).normalize().to_euler(EulerRot::XYZ);
+    [x.to_degrees(), y.to_degrees(), z.to_degrees()]
+}
+
+fn euler_deg_to_quat(e: [f32; 3]) -> [f32; 4] {
+    Quat::from_euler(EulerRot::XYZ, e[0].to_radians(), e[1].to_radians(), e[2].to_radians()).to_array()
+}
+
+/// Rig of the target hierarchy plus the scene index of each node.
+struct Target {
+    index: usize,
+    rig: Rig,
+    nodes: Vec<usize>,
+    bones: Vec<(String, crate::anim_graph::Trs)>,
+}
+
+impl AnimClipTab {
+    pub fn open(&mut self, root: &Path, rel: &str) {
+        if self.path.as_deref() == Some(rel) {
+            return;
+        }
+        if self.dirty {
+            self.save(root);
+        }
+        match citrus_assets::load_anim_clip(root.join(rel)) {
+            Ok(c) => {
+                self.clip = c;
+                self.path = Some(rel.to_owned());
+                self.dirty = false;
+                self.selected.clear();
+                self.playhead = 0.0;
+                self.playing = false;
+            }
+            Err(e) => tracing::error!("opening animation clip {rel}: {e:#}"),
+        }
+    }
+
+    fn save(&mut self, root: &Path) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        match citrus_assets::save_anim_clip(root.join(path), &self.clip) {
+            Ok(()) => self.dirty = false,
+            Err(e) => tracing::error!("saving animation clip: {e:#}"),
+        }
+    }
+
+    fn changed(&mut self, scene: &mut LoadedScene) {
+        self.dirty = true;
+        if let Some(path) = &self.path {
+            scene.anim_assets.set_clip(path, self.clip.clone());
+        }
+    }
+
+    fn snap(&self, t: f32, free: bool) -> f32 {
+        let fps = self.clip.frame_rate.max(1.0);
+        let t = t.max(0.0);
+        if free { t } else { (t * fps).round() / fps }
+    }
+
+    fn end_preview(&mut self, scene: &mut LoadedScene) {
+        let ids = scene.id_index();
+        for (id, (t, r, s, f)) in self.originals.drain() {
+            if let Some(&i) = ids.get(&id) {
+                let o = &mut scene.objects[i];
+                o.translation = t;
+                o.rotation = r;
+                o.scale = s;
+                if let Some(l) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<LightComponent>()) {
+                    l.intensity = f;
+                }
+            }
+        }
+        self.applied.clear();
+        self.preview = false;
+        self.recording = false;
+        self.playing = false;
+    }
+
+    fn resolve_target(&mut self, scene: &mut LoadedScene, selected: Option<usize>) -> Option<Target> {
+        let current = self.target.and_then(|id| scene.index_of(id));
+        if let Some(s) = selected {
+            let keep = current.is_some_and(|c| is_descendant(scene, s, c));
+            if !keep {
+                let mut pick = s;
+                let mut cur = Some(s);
+                while let Some(c) = cur {
+                    if has_animator(scene, c) {
+                        pick = c;
+                        break;
+                    }
+                    cur = scene.objects[c].parent;
+                }
+                let new = scene.objects[pick].id;
+                if self.target != Some(new) {
+                    if self.preview {
+                        self.end_preview(scene);
+                    }
+                    self.target = Some(new);
+                }
+            }
+        }
+        let index = self.target.and_then(|id| scene.index_of(id))?;
+        let (rig, nodes) = object_rig(scene, index);
+        let bones = scene.skeleton_rest_pose(index);
+        Some(Target { index, rig, nodes, bones })
+    }
+
+    /// Current value of a track's property on the target (object, bone rest
+    /// or sampled curve).
+    fn current_value(&self, scene: &LoadedScene, target: &Target, track: &AnimTrack) -> [f32; 4] {
+        if let Some(n) = target.rig.index(&track.target) {
+            let o = &scene.objects[target.nodes[n]];
+            return match track.property {
+                TrackProperty::Translation => o.translation.extend(0.0).to_array(),
+                TrackProperty::Rotation => o.rotation.to_array(),
+                TrackProperty::Scale => o.scale.extend(0.0).to_array(),
+                TrackProperty::LightIntensity => [light_intensity(scene, target.nodes[n]).unwrap_or(0.0), 0.0, 0.0, 0.0],
+            };
+        }
+        if !track.keys.is_empty() {
+            return track.sample(self.clip.local_time(self.playhead, self.clip.looping));
+        }
+        let rest = target.bones.iter().find(|(n, _)| *n == track.target).map(|(_, t)| *t).unwrap_or_default();
+        match track.property {
+            TrackProperty::Translation => rest.t.extend(0.0).to_array(),
+            TrackProperty::Rotation => rest.r.to_array(),
+            TrackProperty::Scale => rest.s.extend(0.0).to_array(),
+            TrackProperty::LightIntensity => [0.0; 4],
+        }
+    }
+
+    fn key_track(&mut self, track: usize, value: [f32; 4]) {
+        let t = self.snap(self.playhead, false);
+        self.clip.tracks[track].set_key(t, value);
+        if t > self.clip.length {
+            self.clip.length = t;
+        }
+    }
+
+    fn add_track(&mut self, scene: &LoadedScene, target: &Target, path: &str, property: TrackProperty) {
+        if self.clip.track_index(path, property).is_some() {
+            return;
+        }
+        let mut track = AnimTrack { target: path.to_owned(), property, keys: Vec::new() };
+        let v = self.current_value(scene, target, &track);
+        track.set_key(self.snap(self.playhead, false), v);
+        self.clip.tracks.push(track);
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, selected: Option<usize>, root: &Path, playing_game: bool) {
+        scene.anim_assets.set_root(root);
+        let selected = selected.filter(|&i| i < scene.objects.len());
+        if playing_game && self.preview {
+            self.end_preview(scene);
+        }
+        let target = self.resolve_target(scene, selected);
+        let mut edited = false;
+
+        egui::TopBottomPanel::top("citrus-anim-clip-toolbar")
+            .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show_inside(ui, |ui| edited |= self.toolbar(ui, scene, root, target.as_ref(), selected, playing_game));
+
+        if self.path.is_none() {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::BG_VIEWPORT)).show_inside(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.3);
+                    ui.label(egui::RichText::new("No animation clip open").font(theme::semibold(theme::SIZE_TITLE)).color(theme::TEXT_STRONG));
+                    ui.label(egui::RichText::new("Select a .anim in Files, or create a clip for the selected object.").color(theme::TEXT_MUTED));
+                    ui.add_space(10.0);
+                    if widgets::primary_button(ui, Some(Icon::Plus), "Create Clip").clicked() {
+                        self.create_for_target(scene, root, target.as_ref());
+                    }
+                });
+            });
+            return;
+        }
+
+        egui::TopBottomPanel::bottom("citrus-anim-clip-keys")
+            .resizable(true)
+            .default_height(118.0)
+            .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(12, 8)))
+            .show_inside(ui, |ui| edited |= self.key_inspector(ui));
+
+        egui::SidePanel::left("citrus-anim-clip-tracks")
+            .resizable(true)
+            .default_width(250.0)
+            .frame(egui::Frame::new().fill(theme::BG_PANEL))
+            .show_inside(ui, |ui| edited |= self.track_list(ui, scene, target.as_ref()));
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG_VIEWPORT))
+            .show_inside(ui, |ui| edited |= self.timeline(ui, scene, target.as_ref()));
+
+        // Preview playback and recording.
+        if self.playing {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            self.playhead += dt;
+            let len = self.clip.length.max(1e-3);
+            if self.playhead > len {
+                if self.clip.looping {
+                    self.playhead = self.playhead.rem_euclid(len);
+                } else {
+                    self.playhead = len;
+                    self.playing = false;
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+        if self.preview
+            && let Some(t) = &target
+        {
+            if self.recording {
+                edited |= self.record_edits(scene, t);
+            }
+            self.apply_preview(scene, t);
+        }
+        if edited {
+            self.changed(scene);
+        }
+        if self.dirty && !ui.input(|i| i.pointer.any_down()) && !ui.ctx().wants_keyboard_input() {
+            self.save(root);
+        }
+    }
+
+    fn create_for_target(&mut self, scene: &mut LoadedScene, root: &Path, target: Option<&Target>) {
+        create_asset(&root.join("animations"), false, root, &mut AnimControllerTab::default(), self);
+        self.open_request = false;
+        // Give the target an Animator playing it when it has none.
+        if let (Some(t), Some(path)) = (target, self.path.clone()) {
+            let o = &mut scene.objects[t.index];
+            match o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>()) {
+                Some(a) if a.controller.is_empty() && a.clip.is_empty() => a.clip = path,
+                Some(_) => {}
+                None => o.components.push(Box::new(Animator { clip: path, ..Default::default() })),
+            }
+        }
+    }
+
+    fn toolbar(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene: &mut LoadedScene,
+        root: &Path,
+        target: Option<&Target>,
+        selected: Option<usize>,
+        playing_game: bool,
+    ) -> bool {
+        let mut edited = false;
+        ui.horizontal(|ui| {
+            ui.set_min_height(theme::H_TOOLBAR);
+            ui.label(egui::RichText::new(ph::FILM_STRIP).size(15.0).color(theme::TEXT_MUTED));
+            match &self.path {
+                Some(p) => {
+                    let stem = Path::new(p).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    ui.label(egui::RichText::new(stem).font(theme::semibold(theme::SIZE_TITLE)).color(theme::TEXT_STRONG)).on_hover_text(p.as_str());
+                    widgets::chip(ui, if self.dirty { "Unsaved" } else { "Saved" });
+                }
+                None => {
+                    ui.label(egui::RichText::new("No clip").color(theme::TEXT_MUTED));
+                }
+            }
+            if widgets::secondary_button(ui, Some(Icon::Plus), "New").clicked() {
+                self.create_for_target(scene, root, target);
+            }
+            let open = widgets::secondary_button(ui, Some(Icon::Folder), "Open");
+            if open.clicked() {
+                self.files = scan_files(root, citrus_assets::ANIM_CLIP_EXTENSION);
+            }
+            egui::Popup::menu(&open).show(|ui| {
+                if self.files.is_empty() {
+                    ui.label(egui::RichText::new("No .anim files in the project").color(theme::TEXT_MUTED));
+                }
+                for f in self.files.clone() {
+                    if ui.selectable_label(self.path.as_deref() == Some(f.as_str()), &f).clicked() {
+                        self.open(root, &f);
+                        ui.close();
+                    }
+                }
+            });
+            if self.path.is_none() {
+                return;
+            }
+            ui.separator();
+            ui.add_enabled_ui(!playing_game && target.is_some(), |ui| {
+                if widgets::icon_button_sized(ui, Icon::Eye, "Preview the clip on the target in the scene", self.preview, Vec2::splat(theme::H_FIELD))
+                    .clicked()
+                {
+                    if self.preview {
+                        self.end_preview(scene);
+                    } else {
+                        self.preview = true;
+                    }
+                }
+                let rec_color = if self.recording { theme::STATUS_ERROR } else { theme::TEXT_MUTED };
+                if ui
+                    .add(egui::Button::new(egui::RichText::new(ph::RECORD).size(15.0).color(rec_color)).selected(self.recording))
+                    .on_hover_text("Record: moving, rotating or scaling the target hierarchy keys it at the playhead")
+                    .clicked()
+                {
+                    self.recording = !self.recording;
+                    if self.recording {
+                        self.preview = true;
+                    }
+                }
+                if ui.button(egui::RichText::new(ph::SKIP_BACK).size(14.0)).on_hover_text("Go to start").clicked() {
+                    self.playhead = 0.0;
+                }
+                let (icon, tip) = if self.playing { (Icon::Pause, "Pause preview") } else { (Icon::Play, "Play preview") };
+                if widgets::icon_button_sized(ui, icon, tip, self.playing, Vec2::splat(theme::H_FIELD)).clicked() {
+                    self.playing = !self.playing;
+                    self.preview |= self.playing;
+                }
+            });
+            ui.add(egui::DragValue::new(&mut self.playhead).speed(0.01).range(0.0..=1000.0).max_decimals(3).suffix(" s"))
+                .on_hover_text("Playhead");
+            ui.separator();
+            ui.label(egui::RichText::new("Length").color(theme::TEXT_MUTED));
+            edited |= ui.add(egui::DragValue::new(&mut self.clip.length).speed(0.01).range(0.01..=600.0).max_decimals(3).suffix(" s")).changed();
+            edited |= ui.checkbox(&mut self.clip.looping, "Loop").changed();
+            ui.label(egui::RichText::new("FPS").color(theme::TEXT_MUTED));
+            edited |= ui.add(egui::DragValue::new(&mut self.clip.frame_rate).speed(1.0).range(1.0..=240.0)).changed();
+            ui.separator();
+            if let Some(t) = target {
+                if widgets::secondary_button(ui, Some(Icon::Plus), "Key")
+                    .on_hover_text("Key the selected object's tracks (all tracks when the target is selected) at the playhead")
+                    .clicked()
+                {
+                    let only = selected.and_then(|s| t.nodes.iter().position(|&n| n == s)).filter(|&n| n != 0).map(|n| t.rig.names[n].clone());
+                    for k in 0..self.clip.tracks.len() {
+                        if only.as_ref().is_some_and(|p| *p != self.clip.tracks[k].target) {
+                            continue;
+                        }
+                        let v = self.current_value(scene, t, &self.clip.tracks[k]);
+                        self.key_track(k, v);
+                    }
+                    edited = true;
+                }
+                let has_ctrl = scene.objects[t.index]
+                    .components
+                    .iter()
+                    .find_map(|c| c.as_any().downcast_ref::<Animator>())
+                    .is_some_and(|a| !a.controller.is_empty());
+                if !has_ctrl
+                    && let Some(path) = self.path.clone()
+                    && widgets::secondary_button(ui, None, "Use on Animator")
+                        .on_hover_text("Make the target's Animator play this clip")
+                        .clicked()
+                {
+                    let o = &mut scene.objects[t.index];
+                    match o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Animator>()) {
+                        Some(a) => a.clip = path,
+                        None => o.components.push(Box::new(Animator { clip: path, ..Default::default() })),
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    widgets::chip(ui, &format!("Target: {}", scene.objects[t.index].name));
+                });
+            }
+        });
+        edited
+    }
+
+    fn track_label(&self, scene: &LoadedScene, target: Option<&Target>, track: &AnimTrack) -> (String, bool) {
+        let name = if track.target.is_empty() {
+            target.map(|t| scene.objects[t.index].name.clone()).unwrap_or_else(|| "(root)".into())
+        } else {
+            track.target.rsplit('/').next().unwrap_or(&track.target).to_owned()
+        };
+        let found = target.is_none_or(|t| t.rig.index(&track.target).is_some() || t.bones.iter().any(|(n, _)| *n == track.target));
+        (format!("{name} : {}", track.property.label()), found)
+    }
+
+    fn track_list(&mut self, ui: &mut egui::Ui, scene: &LoadedScene, target: Option<&Target>) -> bool {
+        let mut edited = false;
+        let rect = ui.max_rect();
+        let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), RULER_H + 4.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(header.shrink2(Vec2::new(8.0, 2.0))), |ui| {
+            ui.horizontal_centered(|ui| {
+                let add = widgets::secondary_button_sized(ui, Some(Icon::Plus), "Add Property", theme::H_BUTTON_SMALL);
+                egui::Popup::menu(&add).show(|ui| {
+                    let Some(t) = target else {
+                        ui.label(egui::RichText::new("Select an object to animate").color(theme::TEXT_MUTED));
+                        return;
+                    };
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for (n, path) in t.rig.names.iter().enumerate() {
+                            let label = if path.is_empty() { scene.objects[t.index].name.clone() } else { path.clone() };
+                            let light = light_intensity(scene, t.nodes[n]).is_some();
+                            ui.menu_button(label, |ui| {
+                                for p in TrackProperty::ALL {
+                                    if p == TrackProperty::LightIntensity && !light {
+                                        continue;
+                                    }
+                                    let exists = self.clip.track_index(path, p).is_some();
+                                    if ui.add_enabled(!exists, egui::Button::new(p.label())).clicked() {
+                                        self.add_track(scene, t, path, p);
+                                        edited = true;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        if !t.bones.is_empty() {
+                            ui.separator();
+                            ui.menu_button("Bones", |ui| {
+                                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                                    for (bone, _) in &t.bones {
+                                        ui.menu_button(bone, |ui| {
+                                            for p in [TrackProperty::Translation, TrackProperty::Rotation, TrackProperty::Scale] {
+                                                let exists = self.clip.track_index(bone, p).is_some();
+                                                if ui.add_enabled(!exists, egui::Button::new(p.label())).clicked() {
+                                                    self.add_track(scene, t, bone, p);
+                                                    edited = true;
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+                        }
+                    });
+                });
+            });
+        });
+        let body = Rect::from_min_max(Pos2::new(rect.left(), header.bottom()), rect.max);
+        let painter = ui.painter_at(body);
+        let mut remove = None;
+        for k in 0..self.clip.tracks.len() {
+            let y = body.top() + k as f32 * ROW_H - self.vscroll;
+            let row = Rect::from_min_size(Pos2::new(body.left(), y), Vec2::new(body.width(), ROW_H));
+            if row.bottom() < body.top() || row.top() > body.bottom() {
+                continue;
+            }
+            if k % 2 == 1 {
+                painter.rect_filled(row, CornerRadius::ZERO, theme::with_alpha(theme::BG_APP, 0.5));
+            }
+            let selected = self.selected.iter().any(|(t, _)| *t == k);
+            if selected {
+                painter.rect_filled(row, CornerRadius::ZERO, theme::accent_faint());
+            }
+            let (label, found) = self.track_label(scene, target, &self.clip.tracks[k]);
+            painter.text(
+                Pos2::new(row.left() + 12.0, row.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(theme::SIZE_BODY),
+                if found { theme::TEXT_BODY } else { theme::TEXT_HIDDEN },
+            );
+            let btn = Rect::from_center_size(Pos2::new(row.right() - 16.0, row.center().y), Vec2::splat(20.0));
+            if body.contains_rect(btn) || body.intersects(btn) {
+                let r = ui.put(btn, |ui: &mut egui::Ui| widgets::icon_button(ui, Icon::Trash, "Remove track", false));
+                if r.clicked() {
+                    remove = Some(k);
+                }
+            }
+        }
+        if let Some(k) = remove {
+            self.clip.tracks.remove(k);
+            self.selected.clear();
+            edited = true;
+        }
+        if ui.rect_contains_pointer(body) {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            let max = (self.clip.tracks.len() as f32 * ROW_H - body.height()).max(0.0);
+            self.vscroll = (self.vscroll - scroll).clamp(0.0, max);
+        }
+        if self.clip.tracks.is_empty() {
+            painter.text(
+                body.center_top() + Vec2::new(0.0, 24.0),
+                egui::Align2::CENTER_TOP,
+                "Add Property to animate the target or a child",
+                egui::FontId::proportional(theme::SIZE_META),
+                theme::TEXT_DIM,
+            );
+        }
+        edited
+    }
+
+    fn time_to_x(&self, area: Rect, t: f32) -> f32 {
+        area.left() + 10.0 + (t - self.scroll) * self.pps
+    }
+
+    fn x_to_time(&self, area: Rect, x: f32) -> f32 {
+        (x - area.left() - 10.0) / self.pps + self.scroll
+    }
+
+    fn timeline(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, target: Option<&Target>) -> bool {
+        let mut edited = false;
+        let area = ui.available_rect_before_wrap();
+        let response = ui.allocate_rect(area, Sense::click_and_drag());
+        let painter = ui.painter_at(area);
+        let ruler = Rect::from_min_size(area.min, Vec2::new(area.width(), RULER_H + 4.0));
+        let rows = Rect::from_min_max(Pos2::new(area.left(), ruler.bottom()), area.max);
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let (mods, scroll) = ui.input(|i| (i.modifiers, i.smooth_scroll_delta));
+
+        // Zoom (wheel) and pan (Shift + wheel, middle drag).
+        if response.hovered() {
+            if mods.shift {
+                self.scroll = (self.scroll - (scroll.y + scroll.x) / self.pps).max(0.0);
+            } else if scroll.y.abs() > 0.0
+                && let Some(p) = pointer
+            {
+                let t = self.x_to_time(area, p.x);
+                self.pps = (self.pps * (1.0 + scroll.y * 0.002)).clamp(20.0, 2000.0);
+                self.scroll = (t - (p.x - area.left() - 10.0) / self.pps).max(0.0);
+            } else if scroll.x.abs() > 0.0 {
+                self.scroll = (self.scroll - scroll.x / self.pps).max(0.0);
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Middle) {
+            self.scroll = (self.scroll - response.drag_delta().x / self.pps).max(0.0);
+        }
+
+        // Past-the-end shading.
+        let end_x = self.time_to_x(area, self.clip.length);
+        if end_x < area.right() {
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(end_x.max(area.left()), rows.top()), area.max),
+                CornerRadius::ZERO,
+                theme::with_alpha(theme::BG_CHROME, 0.6),
+            );
+        }
+
+        // Ruler.
+        painter.rect_filled(ruler, CornerRadius::ZERO, theme::BG_PANEL);
+        let steps = [1.0 / 60.0, 1.0 / 30.0, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
+        let major = steps.iter().copied().find(|s| s * self.pps >= 64.0).unwrap_or(60.0);
+        let minor = major / 5.0;
+        let t0 = (self.scroll / minor).floor() * minor;
+        let mut t = t0;
+        let t_end = self.x_to_time(area, area.right());
+        while t <= t_end {
+            let x = self.time_to_x(area, t);
+            let is_major = ((t / major).round() * major - t).abs() < minor * 0.1;
+            let h = if is_major { 10.0 } else { 4.0 };
+            painter.line_segment([Pos2::new(x, ruler.bottom() - h), Pos2::new(x, ruler.bottom())], Stroke::new(1.0_f32, theme::TEXT_DIM));
+            if is_major {
+                painter.line_segment([Pos2::new(x, rows.top()), Pos2::new(x, rows.bottom())], Stroke::new(1.0_f32, theme::with_alpha(theme::LINE_PANEL, 0.7)));
+                painter.text(
+                    Pos2::new(x + 3.0, ruler.top() + 3.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{:.2}", t),
+                    theme::mono(theme::SIZE_TINY),
+                    theme::TEXT_MUTED,
+                );
+            }
+            t += minor;
+        }
+        painter.line_segment([Pos2::new(end_x, ruler.top()), Pos2::new(end_x, rows.bottom())], Stroke::new(1.0_f32, theme::TEXT_DIM));
+
+        // Events (small flags on the ruler).
+        for e in &self.clip.events {
+            let x = self.time_to_x(area, e.time);
+            painter.add(Shape::convex_polygon(
+                vec![Pos2::new(x, ruler.bottom() - 12.0), Pos2::new(x + 6.0, ruler.bottom() - 9.0), Pos2::new(x, ruler.bottom() - 6.0)],
+                theme::STATUS_INFO,
+                Stroke::NONE,
+            ));
+        }
+
+        // Rows + keys.
+        let row_rect = |k: usize| Rect::from_min_size(Pos2::new(area.left(), rows.top() + k as f32 * ROW_H - self.vscroll), Vec2::new(area.width(), ROW_H));
+        let mut hovered_key: Option<(usize, usize)> = None;
+        for (k, track) in self.clip.tracks.iter().enumerate() {
+            let r = row_rect(k);
+            if r.bottom() < rows.top() || r.top() > rows.bottom() {
+                continue;
+            }
+            if k % 2 == 1 {
+                painter.rect_filled(r.intersect(rows), CornerRadius::ZERO, theme::with_alpha(theme::BG_APP, 0.5));
+            }
+            for (j, key) in track.keys.iter().enumerate() {
+                let x = self.time_to_x(area, key.time);
+                if x < area.left() - 8.0 || x > area.right() + 8.0 {
+                    continue;
+                }
+                let c = Pos2::new(x, r.center().y);
+                let hit = pointer.is_some_and(|p| (p - c).length() < 7.0 && rows.contains(p));
+                if hit {
+                    hovered_key = Some((k, j));
+                }
+                let selected = self.selected.contains(&(k, j));
+                let fill = if selected {
+                    theme::accent()
+                } else if hit {
+                    theme::TEXT_STRONG
+                } else {
+                    theme::TEXT_SECONDARY
+                };
+                let s = 5.5;
+                let pts = match key.interp {
+                    KeyInterp::Step => vec![c + Vec2::new(-s, -s), c + Vec2::new(s, -s), c + Vec2::new(s, s), c + Vec2::new(-s, s)],
+                    _ => vec![c + Vec2::new(0.0, -s), c + Vec2::new(s, 0.0), c + Vec2::new(0.0, s), c + Vec2::new(-s, 0.0)],
+                };
+                painter.add(Shape::convex_polygon(pts, fill, Stroke::new(1.0_f32, theme::BG_CHROME)));
+            }
+        }
+
+        // Interaction.
+        let free = mods.alt;
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            if ruler.contains(p) {
+                self.scrubbing = true;
+            } else if let Some(hk) = hovered_key {
+                if !self.selected.contains(&hk) {
+                    if !mods.ctrl && !mods.command {
+                        self.selected.clear();
+                    }
+                    self.selected.push(hk);
+                }
+                let orig = self
+                    .selected
+                    .iter()
+                    .filter_map(|&(t, k)| self.clip.tracks.get(t).and_then(|tr| tr.keys.get(k)).map(|key| (t, k, key.time)))
+                    .collect();
+                self.drag = Some((self.x_to_time(area, p.x), orig));
+            }
+        }
+        if response.dragged_by(egui::PointerButton::Primary)
+            && let Some(p) = pointer
+        {
+            if self.scrubbing {
+                self.playhead = self.snap(self.x_to_time(area, p.x), free);
+                self.preview |= target.is_some();
+            } else if let Some((start, orig)) = &self.drag {
+                let delta = self.x_to_time(area, p.x) - start;
+                for &(t, k, time) in orig {
+                    let new = self.snap(time + delta, free);
+                    if let Some(key) = self.clip.tracks.get_mut(t).and_then(|tr| tr.keys.get_mut(k)) {
+                        key.time = new;
+                    }
+                }
+                edited = true;
+            }
+        }
+        if response.drag_stopped() {
+            self.scrubbing = false;
+            if self.drag.take().is_some() {
+                self.resort_selection();
+                edited = true;
+            }
+        }
+        if response.clicked_by(egui::PointerButton::Primary)
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            if ruler.contains(p) {
+                self.playhead = self.snap(self.x_to_time(area, p.x), free);
+                self.preview |= target.is_some();
+            } else if let Some(hk) = hovered_key {
+                if mods.ctrl || mods.command {
+                    if let Some(i) = self.selected.iter().position(|s| *s == hk) {
+                        self.selected.remove(i);
+                    } else {
+                        self.selected.push(hk);
+                    }
+                } else {
+                    self.selected = vec![hk];
+                }
+            } else {
+                self.selected.clear();
+            }
+        }
+        if response.double_clicked()
+            && hovered_key.is_none()
+            && let Some(p) = response.interact_pointer_pos()
+            && rows.contains(p)
+        {
+            let k = ((p.y - rows.top() + self.vscroll) / ROW_H).floor() as usize;
+            if k < self.clip.tracks.len() {
+                let time = self.snap(self.x_to_time(area, p.x), free);
+                let v = match target {
+                    Some(t) if (time - self.playhead).abs() < 1e-4 => self.current_value(scene, t, &self.clip.tracks[k]),
+                    _ => self.clip.tracks[k].sample(time),
+                };
+                let j = self.clip.tracks[k].set_key(time, v);
+                self.selected = vec![(k, j)];
+                edited = true;
+            }
+        }
+        response.context_menu(|ui| {
+            if self.selected.is_empty() {
+                ui.label(egui::RichText::new("Select keys first").color(theme::TEXT_MUTED));
+                return;
+            }
+            for interp in KeyInterp::ALL {
+                if ui.button(interp.label()).clicked() {
+                    self.set_interp(interp);
+                    edited = true;
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui.button("Delete keys").clicked() {
+                self.delete_selected();
+                edited = true;
+                ui.close();
+            }
+        });
+
+        // Keyboard: Delete, Ctrl+C / Ctrl+V.
+        if (response.hovered() || response.has_focus()) && !ui.ctx().wants_keyboard_input() {
+            let (del, copy, paste) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Delete),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))) || (i.modifiers.command && i.key_pressed(egui::Key::V)),
+                )
+            });
+            if del && !self.selected.is_empty() {
+                self.delete_selected();
+                edited = true;
+            }
+            if copy {
+                self.copy_selected();
+            }
+            if paste && !self.clipboard.is_empty() {
+                self.paste();
+                edited = true;
+            }
+        }
+
+        // Playhead.
+        let x = self.time_to_x(area, self.playhead);
+        if x >= area.left() && x <= area.right() {
+            let color = if self.recording { theme::STATUS_ERROR } else { theme::accent() };
+            painter.line_segment([Pos2::new(x, ruler.top()), Pos2::new(x, rows.bottom())], Stroke::new(1.5_f32, color));
+            painter.add(Shape::convex_polygon(
+                vec![Pos2::new(x - 5.0, ruler.top()), Pos2::new(x + 5.0, ruler.top()), Pos2::new(x, ruler.top() + 7.0)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        if self.recording {
+            painter.rect_stroke(area.shrink(1.0), CornerRadius::ZERO, Stroke::new(2.0_f32, theme::with_alpha(theme::STATUS_ERROR, 0.6)), egui::StrokeKind::Inside);
+        }
+        painter.text(
+            area.left_bottom() + Vec2::new(10.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            "Click ruler: scrub · Double-click row: add key · Drag keys · Del · Ctrl+C / Ctrl+V · Wheel: zoom · Shift+wheel: pan · Alt: no snap",
+            egui::FontId::proportional(theme::SIZE_META),
+            theme::TEXT_DIM,
+        );
+        if self.drag.is_some() || self.scrubbing {
+            ui.ctx().request_repaint();
+        }
+        edited
+    }
+
+    fn set_interp(&mut self, interp: KeyInterp) {
+        for &(t, k) in &self.selected {
+            if let Some(key) = self.clip.tracks.get_mut(t).and_then(|tr| tr.keys.get_mut(k)) {
+                key.interp = interp;
+            }
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        let mut sel = self.selected.clone();
+        sel.sort_by(|a, b| b.cmp(a));
+        for (t, k) in sel {
+            if let Some(tr) = self.clip.tracks.get_mut(t)
+                && k < tr.keys.len()
+            {
+                tr.keys.remove(k);
+            }
+        }
+        self.selected.clear();
+    }
+
+    fn copy_selected(&mut self) {
+        let keys: Vec<(usize, Keyframe)> = self
+            .selected
+            .iter()
+            .filter_map(|&(t, k)| self.clip.tracks.get(t).and_then(|tr| tr.keys.get(k)).map(|key| (t, *key)))
+            .collect();
+        let first = keys.iter().map(|(_, k)| k.time).fold(f32::INFINITY, f32::min);
+        self.clipboard = keys.into_iter().map(|(t, mut k)| {
+            k.time -= first;
+            (t, k)
+        }).collect();
+    }
+
+    fn paste(&mut self) {
+        let base = self.snap(self.playhead, false);
+        self.selected.clear();
+        for (t, k) in self.clipboard.clone() {
+            if let Some(tr) = self.clip.tracks.get_mut(t) {
+                let time = base + k.time;
+                let j = tr.set_key(time, k.value);
+                tr.keys[j].interp = k.interp;
+                self.clip.length = self.clip.length.max(time);
+            }
+        }
+    }
+
+    /// After moving keys: sort tracks, merge duplicates, and keep the moved
+    /// keys selected.
+    fn resort_selection(&mut self) {
+        let picked: Vec<(usize, f32)> = self
+            .selected
+            .iter()
+            .filter_map(|&(t, k)| self.clip.tracks.get(t).and_then(|tr| tr.keys.get(k)).map(|key| (t, key.time)))
+            .collect();
+        for tr in &mut self.clip.tracks {
+            tr.sort();
+            tr.keys.dedup_by(|a, b| (a.time - b.time).abs() < 5e-4);
+        }
+        self.selected = picked
+            .into_iter()
+            .filter_map(|(t, time)| {
+                self.clip.tracks[t].keys.iter().position(|k| (k.time - time).abs() < 5e-4).map(|k| (t, k))
+            })
+            .collect();
+    }
+
+    fn key_inspector(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut edited = false;
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() * 0.6).max(280.0));
+                match self.selected.len() {
+                    0 => {
+                        widgets::eyebrow(ui, "Key");
+                        ui.label(egui::RichText::new("Select a key to edit its time, value and curve.").size(theme::SIZE_META).color(theme::TEXT_DIM));
+                    }
+                    1 => {
+                        let (t, k) = self.selected[0];
+                        let Some(track) = self.clip.tracks.get_mut(t) else {
+                            return;
+                        };
+                        let property = track.property;
+                        let Some(key) = track.keys.get_mut(k) else {
+                            return;
+                        };
+                        widgets::eyebrow(ui, &format!("Key  {}", property.label()));
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Time").color(theme::TEXT_MUTED));
+                            if ui.add(egui::DragValue::new(&mut key.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed() {
+                                edited = true;
+                            }
+                            ui.label(egui::RichText::new("Curve").color(theme::TEXT_MUTED));
+                            egui::ComboBox::from_id_salt("citrus-key-interp").selected_text(key.interp.label()).show_ui(ui, |ui| {
+                                for i in KeyInterp::ALL {
+                                    edited |= ui.selectable_value(&mut key.interp, i, i.label()).changed();
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Value").color(theme::TEXT_MUTED));
+                            match property {
+                                TrackProperty::Rotation => {
+                                    let mut e = quat_to_euler_deg(key.value);
+                                    if widgets::vec3_field(ui, &mut e, 1, 0.5) {
+                                        key.value = euler_deg_to_quat(e);
+                                        edited = true;
+                                    }
+                                }
+                                TrackProperty::LightIntensity => {
+                                    edited |= ui.add(egui::DragValue::new(&mut key.value[0]).speed(0.05)).changed();
+                                }
+                                _ => {
+                                    let mut v = [key.value[0], key.value[1], key.value[2]];
+                                    if widgets::vec3_field(ui, &mut v, 3, 0.01) {
+                                        key.value[..3].copy_from_slice(&v);
+                                        edited = true;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    n => {
+                        widgets::eyebrow(ui, &format!("{n} keys"));
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Curve").color(theme::TEXT_MUTED));
+                            for i in KeyInterp::ALL {
+                                if ui.button(i.label()).clicked() {
+                                    self.set_interp(i);
+                                    edited = true;
+                                }
+                            }
+                            if widgets::icon_button(ui, Icon::Trash, "Delete keys", false).clicked() {
+                                self.delete_selected();
+                                edited = true;
+                            }
+                        });
+                    }
+                }
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    widgets::eyebrow(ui, "Events");
+                    if widgets::icon_button(ui, Icon::Plus, "Add an event at the playhead", false).clicked() {
+                        self.clip.events.push(ClipEvent { time: self.snap(self.playhead, false), name: "Event".into() });
+                        edited = true;
+                    }
+                });
+                let mut remove = None;
+                egui::ScrollArea::vertical().id_salt("citrus-clip-events").max_height(70.0).show(ui, |ui| {
+                    for (k, e) in self.clip.events.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            edited |= ui.add(egui::DragValue::new(&mut e.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed();
+                            edited |= ui.add(egui::TextEdit::singleline(&mut e.name).desired_width(110.0)).changed();
+                            if widgets::icon_button(ui, Icon::Close, "Remove event", false).clicked() {
+                                remove = Some(k);
+                            }
+                        });
+                    }
+                });
+                if let Some(k) = remove {
+                    self.clip.events.remove(k);
+                    edited = true;
+                }
+            });
+        });
+        if edited {
+            for tr in &mut self.clip.tracks {
+                tr.sort();
+            }
+        }
+        edited
+    }
+
+    /// While recording, key transform channels the user changed since the
+    /// last preview write.
+    fn record_edits(&mut self, scene: &LoadedScene, target: &Target) -> bool {
+        let mut edited = false;
+        let time = self.snap(self.playhead, false);
+        for (n, &i) in target.nodes.iter().enumerate() {
+            let o = &scene.objects[i];
+            let Some(&(t, r, s)) = self.applied.get(&o.id) else {
+                continue;
+            };
+            let path = target.rig.names[n].clone();
+            let key = |prop: TrackProperty, v: [f32; 4], clip: &mut AnimClip| {
+                let k = match clip.track_index(&path, prop) {
+                    Some(k) => k,
+                    None => {
+                        clip.tracks.push(AnimTrack { target: path.clone(), property: prop, keys: Vec::new() });
+                        clip.tracks.len() - 1
+                    }
+                };
+                clip.tracks[k].set_key(time, v);
+                clip.length = clip.length.max(time);
+            };
+            if (o.translation - t).length() > 1e-5 {
+                key(TrackProperty::Translation, o.translation.extend(0.0).to_array(), &mut self.clip);
+                edited = true;
+            }
+            if o.rotation.angle_between(r) > 1e-4 {
+                key(TrackProperty::Rotation, o.rotation.to_array(), &mut self.clip);
+                edited = true;
+            }
+            if (o.scale - s).length() > 1e-5 {
+                key(TrackProperty::Scale, o.scale.extend(0.0).to_array(), &mut self.clip);
+                edited = true;
+            }
+        }
+        edited
+    }
+
+    /// Pose the target hierarchy at the playhead (originals kept for restore).
+    fn apply_preview(&mut self, scene: &mut LoadedScene, target: &Target) {
+        for &i in &target.nodes {
+            let o = &scene.objects[i];
+            self.originals
+                .entry(o.id)
+                .or_insert((o.translation, o.rotation, o.scale, light_intensity(scene, i).unwrap_or(0.0)));
+        }
+        let mut pose = Pose::rest(&target.rig);
+        ClipRef::Asset(&self.clip).sample(&target.rig, self.playhead, self.clip.looping, &mut pose);
+        apply_pose_to_objects(scene, &target.nodes, &pose);
+        for &i in &target.nodes {
+            let o = &scene.objects[i];
+            self.applied.insert(o.id, (o.translation, o.rotation, o.scale));
+        }
+    }
+}

@@ -48,7 +48,7 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 | VR (planned) | OpenXR via the [openxr](https://crates.io/crates/openxr) crate (Monado / SteamVR runtimes) |
 | Editor GUI | [egui](https://crates.io/crates/egui) + egui_dock, rendered in-engine |
 | Worlds/props | glTF 2.0, FBX (ufbx) |
-| Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones (planned) |
+| Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones (planned); Bone Cloth for hair / skirts with auto-fitted body colliders |
 | Audio | [rodio](https://crates.io/crates/rodio) (.wav/.flac/.mp3) |
 | Default shader | citrus standard uber-shader, Poiyomi-inspired — see [docs/shaders.md](docs/shaders.md) |
 | Windowing | winit |
@@ -108,7 +108,10 @@ custom **GLSL shaders**. Full reference in [docs/components.md](docs/components.
 project (`scenes/ materials/ shaders/ textures/ src/main.rs` + a `plugins/components`
 crate + `project.citrus`) that builds and runs immediately; **File → Project Settings**
 sets the starting (boot) scene; **File → Build Game** (or `citrus --build`) compiles a
-**standalone executable + bundled `assets/`** under `build/`. A shipped game links the
+**standalone executable + bundled `assets/`** under `build/`. **File → Build Game for
+Windows** (or `citrus --build <dir> --target windows`) cross-compiles from Linux with
+`cargo xwin` into `build-windows/` (needs `cargo install cargo-xwin` and
+`rustup target add x86_64-pc-windows-msvc`). A shipped game links the
 runtime only (`citrus-engine` with the editor cargo feature off), so no editor/egui_dock
 in the binary; the boot scene comes from `project.citrus` and is overridable in the
 editable `src/main.rs`. Unsaved-changes prompt on exit.

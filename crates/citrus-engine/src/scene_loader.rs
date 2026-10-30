@@ -31,7 +31,7 @@ impl SkyboxData {
         if let Some(faces) = faces.filter(|f| f.iter().all(|s| !s.is_empty())) {
             let loaded: Result<Vec<_>, _> = faces
                 .iter()
-                .map(|rel| citrus_assets::load_texture_file(root.join(rel), true))
+                .map(|rel| citrus_assets::load_texture_file(citrus_core::asset_ref::resolve_path(root, rel), true))
                 .collect();
             match loaded {
                 Ok(data) => return Self::Cube(data),
@@ -39,7 +39,7 @@ impl SkyboxData {
             }
         }
         match skybox {
-            Some(rel) => match citrus_assets::load_texture_file(root.join(rel), true) {
+            Some(rel) => match citrus_assets::load_texture_file(citrus_core::asset_ref::resolve_path(root, rel), true) {
                 Ok(data) => Self::Equirect(data),
                 Err(e) => {
                     tracing::error!("loading skybox {rel}: {e:#}");
@@ -61,6 +61,7 @@ impl SkyboxData {
         };
         if let Err(e) = result {
             tracing::error!("setting skybox: {e:#}");
+            renderer.report_device_lost(&e);
         }
     }
 }
@@ -77,6 +78,10 @@ pub struct LoadedSceneData {
     pub shaders: Vec<(String, PrecompiledShader)>,
     /// `<scene>.audiobake` sidecar (Steam Audio probe batch), if present.
     pub audio_bake: Option<Vec<u8>>,
+    /// `<scene>.occlusion` sidecar (baked visibility), if present.
+    pub occlusion: Option<crate::occlusion::OcclusionData>,
+    /// `<scene>.reflprobe` sidecar (baked reflection cube faces), if present.
+    pub reflection: crate::refl_slots::ReflProbeSet,
 }
 
 /// Load a scene's CPU / transfer-queue side. `extra_models` are additional
@@ -88,9 +93,29 @@ pub fn load_on_worker(
     extra_models: &[String],
     status: &dyn Fn(&str),
 ) -> Result<LoadedSceneData, String> {
+    load_on_worker_checked(path, root, uploader, extra_models, status, &|_| Ok(()))
+}
+
+/// What [`load_on_worker_checked`] has decoded so far, before it is uploaded.
+pub enum LoadStage<'a> {
+    Models(&'a citrus_assets::SceneFile, &'a HashMap<String, citrus_assets::Scene>),
+    Textures(&'a [citrus_render::CompressedTexture]),
+}
+
+/// [`load_on_worker`] with a `check` run on the decoded data before each GPU
+/// upload (user-content resource limits); an error aborts the load.
+pub fn load_on_worker_checked(
+    path: &Path,
+    root: &Path,
+    uploader: Option<&citrus_render::Uploader>,
+    extra_models: &[String],
+    status: &dyn Fn(&str),
+    check: &dyn Fn(LoadStage) -> Result<(), String>,
+) -> Result<LoadedSceneData, String> {
     status("Loading 3D models…");
-    let file = citrus_assets::load_scene_file(path).map_err(|e| format!("{e:#}"))?;
+    let mut file = citrus_assets::load_scene_file(path).map_err(|e| format!("{e:#}"))?;
     let mut models = LoadedScene::parse_scene_models(&file, root).map_err(|e| format!("{e:#}"))?;
+    file.expand_models(&|p| models.get(p).map(citrus_assets::ModelPart::of));
     for rel in extra_models {
         if !models.contains_key(rel) {
             match citrus_assets::load_model_with_meta(root.join(rel)) {
@@ -101,6 +126,7 @@ pub fn load_on_worker(
             }
         }
     }
+    check(LoadStage::Models(&file, &models))?;
     let mut prepared = None;
     let mut material_textures = None;
     if let Some(up) = uploader {
@@ -122,6 +148,7 @@ pub fn load_on_worker(
             })
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+            check(LoadStage::Textures(&compressed))?;
             status("Uploading textures…");
             let prep = up.prepare_compressed(&compressed).map_err(|e| format!("{e:#}"))?;
             material_textures = Some((refs, prep));
@@ -141,6 +168,8 @@ pub fn load_on_worker(
     status("Compiling shaders…");
     let shaders = crate::shaders::precompile_scene_shaders(&file, root);
     let audio_bake = std::fs::read(path.with_extension("audiobake")).ok();
+    let occlusion = crate::occlusion::OcclusionData::read_sidecar(&path.with_extension(""));
+    let reflection = crate::refl_slots::read_reflprobes(&path.with_extension("reflprobe"));
     Ok(LoadedSceneData {
         path: path.to_owned(),
         file,
@@ -151,6 +180,8 @@ pub fn load_on_worker(
         baked,
         shaders,
         audio_bake,
+        occlusion,
+        reflection,
     })
 }
 
@@ -181,6 +212,8 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 pub struct PostLoad {
     pub skybox: Option<SkyboxData>,
     pub baked: Option<Option<BakedData>>,
+    /// Baked reflection cubes read from the scene's sidecar (per probe).
+    pub reflection: crate::refl_slots::ReflProbeSet,
 }
 
 /// Main-thread install: preloads the compiled shaders, then builds the scene
@@ -229,11 +262,13 @@ pub fn install(
         scene.install_model_template(renderer, &path, asset, prep)?;
     }
     scene.audio_bake = data.audio_bake.map(std::sync::Arc::new);
+    scene.occlusion = data.occlusion;
     Ok((
         scene,
         PostLoad {
             skybox: Some(data.skybox),
             baked: Some(data.baked),
+            reflection: data.reflection,
         },
     ))
 }
@@ -258,6 +293,17 @@ impl BackgroundLoad {
             path: rel.to_owned(),
             rx,
             result: None,
+        }
+    }
+
+    /// A load whose result is already known (user content decoded by the
+    /// content manager's own worker), so it can go through `SceneFlow`.
+    pub fn ready(path: impl Into<String>, result: Result<LoadedSceneData, String>) -> Self {
+        let (_tx, rx) = channel();
+        Self {
+            path: path.into(),
+            rx,
+            result: Some(result),
         }
     }
 
@@ -337,6 +383,18 @@ impl SceneFlow {
             }
         }
         models
+    }
+
+    /// Model paths of the objects that will be carried into the next scene
+    /// (a custom loader imports them alongside the new scene).
+    pub fn kept_model_paths(&self, scene: &LoadedScene, root: &Path, shaders: &ShaderLibrary) -> Vec<String> {
+        self.kept_models(scene, root, shaders)
+    }
+
+    /// Switch to a scene that was already loaded elsewhere (a downloaded
+    /// world package). Installed by [`Self::poll_switch`] like any switch.
+    pub fn switch_to_loaded(&mut self, path: &str, data: LoadedSceneData) {
+        self.switching = Some(BackgroundLoad::ready(path, Ok(data)));
     }
 
     /// Start loading `rel` in the background (no-op if already loading).
@@ -478,6 +536,8 @@ mod tests {
             translation: [1.0, 2.0, 3.0],
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0; 3],
+            model: None,
+            model_part: None,
         });
         let path = dir.join("scenes/a.scene");
         citrus_assets::save_scene_file(&path, &file).unwrap();

@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use egui::{Frame, RichText, Ui};
+use egui::{RichText, Ui};
 
 use citrus_core::{Component, ComponentRegistry, MaterialModel, ObjectId, ShaderUiInfo};
 
@@ -20,7 +20,19 @@ pub struct TransformModel {
     pub scale: [f32; 3],
 }
 
+/// Which header / transform values differ across a multi-object selection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MixedInfo {
+    pub name: bool,
+    pub enabled: bool,
+    pub static_geometry: bool,
+    pub translation: [bool; 3],
+    pub rotation: [bool; 3],
+    pub scale: [bool; 3],
+}
+
 pub struct ObjectInfoModel {
+    pub mixed: MixedInfo,
     pub name: String,
     /// Whether the object renders / contributes light.
     pub enabled: bool,
@@ -33,6 +45,9 @@ pub struct ObjectInfoModel {
     pub transform: TransformModel,
     /// (vertices, triangles) for mesh objects.
     pub mesh: Option<(u32, u32)>,
+    /// Project-relative `.material` behind the active material slot (None =
+    /// the model's own material).
+    pub material_file: Option<String>,
 }
 
 pub enum InspectorContent<'a> {
@@ -51,6 +66,8 @@ pub enum InspectorContent<'a> {
         /// Layer display names, so layer pickers (camera culling mask) stay
         /// consistent with the Layers window.
         layer_names: &'a [String],
+        /// Inline editor for assets assigned to component slots.
+        asset_editor: Option<&'a crate::components::AssetEditor<'a>>,
     },
     MaterialFile {
         path: String,
@@ -154,6 +171,7 @@ impl InspectorPanel {
                     .add(
                         egui::TextEdit::singleline(name)
                             .frame(false)
+                            .hint_text("\u{2014}")
                             .font(theme::semibold(theme::SIZE_TITLE))
                             .text_color(theme::TEXT_STRONG)
                             .desired_width(w),
@@ -253,6 +271,7 @@ impl InspectorPanel {
                 editor_components,
                 objects,
                 layer_names,
+                asset_editor,
             } => {
                 self.object_ui(
                     ui,
@@ -264,6 +283,7 @@ impl InspectorPanel {
                     editor_components,
                     objects,
                     layer_names,
+                    asset_editor,
                     shaders,
                     &mut response,
                 );
@@ -332,6 +352,7 @@ impl InspectorPanel {
         editor_components: &EditorComponents,
         objects: &[(ObjectId, String)],
         layer_names: &[String],
+        asset_editor: Option<&crate::components::AssetEditor<'_>>,
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
@@ -342,6 +363,7 @@ impl InspectorPanel {
         let (open, _) = crate::widgets::section_header(ui, ui.make_persistent_id("citrus-transform"), None, "Transform", None, |ui| {
             reset = crate::widgets::icon_button(ui, crate::icons::Icon::Reset, "Reset transform", false).clicked();
         });
+        let mixed = info.mixed;
         let t = &mut info.transform;
         if reset {
             t.translation = [0.0; 3];
@@ -351,18 +373,36 @@ impl InspectorPanel {
         }
         if open {
             egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 }).show(ui, |ui| {
-                response.object_changed |= transform_row(ui, "Position", &mut t.translation, 0.02, 2);
-                response.object_changed |= transform_row(ui, "Rotation", &mut t.rotation_deg, 0.5, 1);
-                response.object_changed |= transform_row(ui, "Scale", &mut t.scale, 0.01, 2);
+                response.object_changed |= transform_row(ui, "Position", &mut t.translation, 0.02, 2, mixed.translation);
+                response.object_changed |= transform_row(ui, "Rotation", &mut t.rotation_deg, 0.5, 1, mixed.rotation);
+                response.object_changed |= scale_row(ui, &mut t.scale, mixed.scale);
             });
         }
 
         if let Some(material) = material {
-            self.material_ui(ui, info, material, shader_info, shaders, response);
+            // Collapsed by default so the components below stay in reach.
+            crate::widgets::divider(ui);
+            let name = material.name.clone();
+            let (open, _) = crate::widgets::section_header_with(
+                ui,
+                ui.make_persistent_id("citrus-material-section"),
+                None,
+                "Mesh & Material",
+                None,
+                false,
+                |ui| {
+                    ui.label(RichText::new(name).size(crate::theme::SIZE_META).color(crate::theme::TEXT_DIM));
+                },
+            );
+            if open {
+                egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 }).show(ui, |ui| {
+                    self.material_ui(ui, info, material, shader_info, shaders, response);
+                });
+            }
         }
 
         // Components (Unity-style: list + Add Component at the bottom).
-        let comp = components_ui(ui, components, registry, editor_components, objects, layer_names);
+        let comp = components_ui(ui, components, registry, editor_components, objects, layer_names, asset_editor);
         response.object_changed |= comp.changed;
         response.add_component = comp.add;
         response.remove_component = comp.remove;
@@ -377,7 +417,6 @@ impl InspectorPanel {
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
-        ui.separator();
         if let Some((vertices, triangles)) = info.mesh {
             ui.label(RichText::new("Mesh").strong());
             ui.label(format!("{vertices} vertices · {triangles} triangles"));
@@ -404,31 +443,16 @@ impl InspectorPanel {
         // The active material slot (the slot selector, when an object has more
         // than one, is drawn by the engine above the inspector body). Dropping a
         // `.material` here assigns it to the selected slot.
-        let slot = Frame::group(ui.style())
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Active Material");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(&material.name).strong());
-                    });
-                });
-                ui.label(RichText::new("drop a .material file here").small().weak());
-            })
-            .response;
-        if let Some(hover) = slot.dnd_hover_payload::<PathBuf>()
-            && hover.extension().is_some_and(|e| e == "material")
+        // The active slot's material as an asset slot: drop, browse or make a
+        // `.material`; click to show it in Files, double-click to open it.
+        let mut value = info.material_file.clone().unwrap_or_default();
+        let hint = format!("{} (from the model)", material.name);
+        let changed = crate::widgets::property_row(ui, "Material", |ui| crate::components::asset_chip(ui, "active-material", &mut value, &hint, &["material"]));
+        let root: Option<String> = ui.data(|d| d.get_temp(egui::Id::new(crate::PROJECT_ROOT_KEY)));
+        if changed
+            && let (Some(rel), Some(root)) = (crate::components::resolve_slot(ui, &value), root)
         {
-            ui.painter().rect_stroke(
-                slot.rect,
-                4.0,
-                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
-                egui::StrokeKind::Outside,
-            );
-        }
-        if let Some(dropped) = slot.dnd_release_payload::<PathBuf>()
-            && dropped.extension().is_some_and(|e| e == "material")
-        {
-            response.material_dropped = Some((*dropped).clone());
+            response.material_dropped = Some(PathBuf::from(root).join(rel));
         }
 
         ui.separator();
@@ -456,8 +480,41 @@ impl InspectorPanel {
 }
 
 /// `Label  [X ....] [Y ....] [Z ....]` with axis tiles (scrub on the tile).
-fn transform_row(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64, decimals: usize) -> bool {
-    crate::widgets::property_row_w(ui, label, 64.0, |ui| crate::widgets::vec3_field(ui, values, decimals, speed))
+fn transform_row(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64, decimals: usize, mixed: [bool; 3]) -> bool {
+    crate::widgets::property_row_w(ui, label, 64.0, |ui| crate::widgets::vec3_field_mixed(ui, values, decimals, speed, mixed))
+        .iter()
+        .any(|c| *c)
+}
+
+/// The Scale row with a link toggle: while linked, changing one axis scales
+/// the other two by the same ratio (proportions kept).
+fn scale_row(ui: &mut Ui, values: &mut [f32; 3], mixed: [bool; 3]) -> bool {
+    let lock_id = egui::Id::new("citrus-scale-linked");
+    let mut linked = ui.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(lock_id));
+    let before = *values;
+    // The lock sits in the label column, right after "Scale", so the axis
+    // fields line up with Position and Rotation above.
+    let changed = crate::widgets::property_row_w(ui, "Scale", 64.0, |ui| {
+        let row = ui.min_rect();
+        let text = egui::WidgetText::from("Scale").into_galley(ui, Some(egui::TextWrapMode::Truncate), 64.0, egui::TextStyle::Body);
+        let size = egui::Vec2::splat(crate::theme::H_TOGGLE);
+        let at = egui::pos2(row.left() + text.size().x + 4.0, row.center().y - size.y * 0.5);
+        let icon = if linked { crate::icons::Icon::Lock } else { crate::icons::Icon::LockOpen };
+        let tip = if linked { "Scale linked: axes change together" } else { "Link the scale axes" };
+        let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(at, size)));
+        if crate::widgets::icon_button(&mut cell, icon, tip, linked).clicked() {
+            linked = !linked;
+        }
+        crate::widgets::vec3_field_mixed(ui, values, 2, 0.01, mixed)
+    });
+    ui.data_mut(|d| d.insert_persisted(lock_id, linked));
+    if linked && let Some(axis) = (0..3).find(|&k| changed[k]) {
+        let (old, new) = (before[axis], values[axis]);
+        for k in (0..3).filter(|&k| k != axis) {
+            values[k] = if old.abs() > 1e-6 { before[k] * new / old } else { new };
+        }
+    }
+    changed.iter().any(|c| *c)
 }
 
 fn human_size(bytes: u64) -> String {

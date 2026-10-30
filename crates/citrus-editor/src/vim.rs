@@ -294,8 +294,7 @@ fn apply_subst(
             continue;
         }
         let mut last = 0usize; // byte cursor in `line`
-        let mut n = 0;
-        for caps in re.captures_iter(line) {
+        for (n, caps) in re.captures_iter(line).enumerate() {
             if !global && n >= 1 {
                 break;
             }
@@ -310,7 +309,6 @@ fn apply_subst(
             off += rep_str.chars().count();
             ranges.push((start, off));
             last = m.end();
-            n += 1;
         }
         let tail = &line[last..];
         out.push_str(tail);
@@ -350,10 +348,9 @@ fn cur_line_of(base: &str, cur_char: usize) -> usize {
 pub fn preview_substitute(base: &str, cmd: &str, cur_char: usize) -> Option<SubstPreview> {
     let (whole, rest) = if let Some(r) = cmd.strip_prefix("%s") {
         (true, r)
-    } else if let Some(r) = cmd.strip_prefix('s') {
-        (false, r)
     } else {
-        return None;
+        let r = cmd.strip_prefix('s')?;
+        (false, r)
     };
     let sub = parse_subst(whole, rest)?;
     let re = match regex::Regex::new(sub.pat) {
@@ -634,7 +631,7 @@ fn motion(cs: &[char], start: usize, ch: char, count: usize, _state: &VimState) 
             }
             'l' => {
                 let le = line_end(cs, i);
-                if i + 1 <= le && i < le { i + 1 } else { i }
+                if i < le { i + 1 } else { i }
             }
             'j' => move_line(cs, i, 1),
             'k' => move_line(cs, i, -1),

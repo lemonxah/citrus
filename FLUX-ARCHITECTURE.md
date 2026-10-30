@@ -335,3 +335,20 @@ into the SH (L1 lobe) so DotSH3 captures the smooth emitter pools.
 ### Other remaining
 - Pure-DotSH3 brightness parity vs the old hybrid is approximate (clamped 1/cos bias at
   grazing + L1 emitter lobe vs analytic NEE); tune the gather constants if it reads off.
+
+## Emitter shadows (2026-10-30)
+
+Analytic emitter light at a pixel is shadowed in `flux_integrate.comp` by a
+cone trace of the global distance field from that pixel's world position
+toward the sphere (distance-field area-light shadows: the cone half-angle is the
+sphere's angular radius, so the penumbra follows its size and distance). It
+replaced per-screen-probe visibility bits, which were binary, placed at a fixed
+texel per probe tile and blended over the 3x3 probe neighbourhood, so the
+shadow under an emitter slid as the camera zoomed or turned. The integrate now
+binds the GDF (binding 5) and the gather's parameter block (binding 6, GDF bounds
+and eps). Screen probes now also store their world position (`c[4].yzw`) and the
+integrate weights neighbours with Lumen's plane distance (`plane_depth_weight`)
+instead of a raw camera-distance test. Still open from the same review: probe
+placement jitter with temporal accumulation, and the per-probe SH ratio
+re-pointing.
+

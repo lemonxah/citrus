@@ -234,10 +234,19 @@ and runs `start` on its first active frame.
 
 ### Physics
 
-Needs a collider (`Box` / `Sphere` / `Mesh Collider`). Add a `Rigid Body` to
-make it move (Dynamic = simulated, Kinematic = moved by gameplay but pushes
-dynamics, Fixed / none = static). The simulation runs at a fixed 60 Hz and
-dynamic bodies are interpolated for smooth rendering.
+Needs a collider (`Box` / `Sphere` / `Capsule` / `Mesh Collider`). Add a
+`Rigid Body` to make it move (Dynamic = simulated, Kinematic = moved by gameplay
+but pushes dynamics, Fixed / none = static). Adding a Rigid Body in the inspector also adds a collider if the object
+has none (Mesh Collider for mesh objects, Box Collider otherwise). The simulation runs at a fixed
+60 Hz and dynamic bodies are interpolated for smooth rendering.
+
+Surface behaviour comes from physics materials (`.physmat`, file browser > New
+Physics Material): friction, bounciness, how each combines with the other
+surface, density (sets the mass when the Rigid Body's Mass is 0), buoyancy and
+water drag multipliers, and a contact offset. Drop one on a Rigid Body's or a
+collider's Material slot; a collider's material beats its body's, which beats
+the project default (Project Settings > Physics, alongside gravity, contact
+stiffness and damping, and solver iterations).
 
 ```rust
 // Queries (immediate). raycast ignores triggers and the caller's own colliders.
@@ -368,6 +377,44 @@ sliding the mesh.
 **GPU skinning** (default on): Animator meshes are skinned by a compute pass,
 so many animated characters cost little CPU.
 
+**Animator Controllers** (`.animctrl`, Unity-style state machines). Set the
+Animator's Controller field (drag the file on, or Create -> New Animator
+Controller in Files) and press Open to edit it in the **Animator Controller**
+tab. A controller has typed parameters (Float, Int, Bool, Trigger) and layers;
+each layer is a graph of states (a clip, a `.anim` path or a blend tree, with
+speed, an optional speed parameter, loop, and on-enter / on-exit event names)
+joined by transitions (conditions, exit time, cross-fade duration, offset,
+interruptible). Any State transitions are checked first. Extra layers blend
+over the base layer (Override with a weight, or Additive over the rest pose)
+and can be masked to bones or child paths (each with its children).
+
+```rust
+ctx.set_animator_float(self.body, "Speed", speed);
+ctx.set_animator_bool(self.body, "Grounded", ctx.is_grounded());
+ctx.set_animator_trigger(self.body, "Jump");        // consumed by the transition it fires
+ctx.play_animator_state(self.body, "Die", 0.1);     // force a state
+let state = ctx.animator_state(self.body, 0);        // current state on layer 0
+// On the component: set_int / get_bool / reset_trigger / current_state /
+// is_in_state / is_in_transition / state_normalized_time / play_state_on_layer.
+for e in ctx.events::<AnimatorStateChanged>() { /* e.object, e.layer, e.from, e.to */ }
+```
+
+State on-enter / on-exit names arrive like clip events (`on_animation_event`,
+`AnimationEvent`), and every state change emits `AnimatorStateChanged`, so other
+components and other state machines can react. **Parameter drivers** (Inspector
+-> Parameter drivers) feed a parameter every frame from an object's movement
+(speed, vertical, forward, right), its ground check, or another Animator's
+parameter, so controllers can follow each other without code.
+
+**Animation clips** (`.anim`) are made in the **Animation** tab: tracks animate
+the target object (the selection's nearest Animator) and its children by
+relative path, or bones of a skinned model, with Position / Rotation / Scale /
+Light Intensity keys (Constant, Linear or Auto cubic). Scrub the ruler, press
+Play to preview in the editor, or turn on Record and move / rotate / scale the
+hierarchy with the gizmo or Inspector to key it at the playhead. An Animator on
+a plain object hierarchy plays `.anim` clips (as its Clip, or from a
+controller) by moving the objects themselves.
+
 ### UI
 
 UI is built from components on scene objects. The **UI Editor** tab (next to
@@ -475,6 +522,63 @@ ctx.play_particles(self.smoke);
 ctx.stop_particles(self.smoke);
 ```
 
+### Full-body tracking
+
+Add `Humanoid IK` to a humanoid skinned model. Source Auto drives it from this
+machine's headset, controllers and trackers (head, hands, hips, feet, chest,
+elbows, knees; tracking space sits on the VR Player), or from the replicated
+trackers when it belongs to a remote player's Network Avatar. Objects drives
+each role from a scene object. Without a hip tracker the pelvis follows the
+head; without foot trackers the feet stay planted and step. Calibrate while
+the player holds a T-pose:
+
+```rust
+ctx.calibrate_trackers();
+ctx.clear_tracker_calibration();
+```
+
+### Face tracking, lip sync and voice
+
+`Face Tracking` drives a model's blendshapes from Unified Expressions data. The
+headset's face and eye tracking is read directly through OpenXR (WiVRn, Virtual
+Desktop, SteamVR where it exposes `XR_FB_face_tracking2` and
+`XR_EXT_eye_gaze_interaction`); tools that send OSC (VRCFaceTracking, Babble,
+Steam Link) work when Project Settings > External tracking enables the receiver,
+or from code with `ctx.set_osc_face_tracking(true, 9000)`. Blendshapes match by
+name automatically (Unified Expressions, ARKit, VRM blinks); `mappings` cover the
+rest. Remote players' faces replicate through their Network Avatar.
+
+`Blend Shapes` holds fixed weights you set in the inspector or from code.
+`Lip Sync` drives viseme blendshapes (`vrc.v_aa`, `v_aa`, VRM A/I/U/E/O, VRoid
+`Fcl_MTH_A`) from the speaker's voice, when face tracking is off or always; on
+avatars without visemes it moves the jaw and lips instead. `Voice Chat` (one per
+scene) turns voice on; see [networking.md](networking.md#voice-chat).
+
+SlimeVR: Project Settings > External tracking > SlimeVR connects to a running
+SlimeVR server directly (as its SteamVR driver would), sends the headset and
+controllers and reads the waist, feet, knees, elbows and chest trackers.
+
+### Bone cloth
+
+Add `Bone Cloth` to a skinned model and pick root joints (hair roots, a skirt
+ring, a tail); every joint below them swings. Add `Cloth Colliders` to the same
+model for spheres, tapered capsules and planes that follow joints, or press
+**Fit capsules** to wrap the hips, legs and arms from the skinned vertices.
+Tune motion in the inspector (stiffness toward the animated pose, gravity,
+friction, edge collision, world inertia and the teleport thresholds). The cloth
+runs in the skinning pass, so it works with Animators, GPU skinning and
+full-body IK avatars. Cloth can also collide with the Cloth Colliders of other
+objects listed under **Collide with another object**.
+
+`Mesh Cloth` simulates a whole skinned submesh (skirts, dresses, capes):
+pin it with a vertex colour channel, bones or the top band, then tune stretch,
+bending, keep-shape and self-collision. `Wind Zone` blows on both kinds of
+cloth and raises waves on Water. VRM avatars (`.vrm`) bring their spring bones
+in as Bone Cloth and Cloth Colliders when added to a scene.
+
+Read the simulated particles from code with
+`ctx.get::<BoneCloth>(id).and_then(|c| c.runtime.sim.as_ref())`.
+
 ### Multi-scene games and seamless loading
 
 Scenes load on a background thread. Preload the next scene while a transition
@@ -495,6 +599,19 @@ distance" and fires when the activator enters the trigger. Carried objects
 keep their ids and respawn at a matching Spawn Point if their Pawn has a
 spawn tag. Additive scenes use probe / realtime lighting (their baked
 lightmaps aren't applied).
+
+### User-generated content
+
+Load `.citruspak` worlds, avatars and props at runtime (path, URL or content id);
+results arrive as `ContentEvent`s. Details: [user-content.md](user-content.md).
+
+```rust
+let req = ctx.load_content("https://example.com/forest.citruspak");
+let (req, root) = ctx.spawn_content("chair.citruspak", pos, rot);
+ctx.spawn_avatar(self.player, "avatars/robot.citruspak");
+ctx.enter_world(world_id);
+for e in ctx.content_events() { /* Progress / Loaded / Spawned / WorldEntered / Failed */ }
+```
 
 ### Save data, localization, audio buses
 
@@ -566,11 +683,19 @@ in `citrus-core`; their inspectors/gizmos in `citrus-editor`.
 | `Light Probe Volume` | Box grid of irradiance probes for the bake |
 | `Audio Source` | Spatial / non-spatial clip with distance rolloff |
 | `Audio Listener` | Marks the "ears" for spatial audio |
-| `Box Collider` / `Sphere Collider` / `Mesh Collider` | Collision shapes; `is_trigger` makes a trigger. Mesh = exact triangles when static, convex hull when moving |
-| `Rigid Body` | Dynamic / Kinematic / Fixed body, mass, bounciness, friction, gravity scale |
+| `Box Collider` / `Sphere Collider` / `Capsule Collider` / `Mesh Collider` | Collision shapes; `is_trigger` makes a trigger. Mesh = exact triangles when static, convex hull when moving. Optional physics material |
+| `Rigid Body` | Dynamic / Kinematic / Fixed body, mass, gravity scale, physics material (or plain bounciness / friction) |
 | `Character Controller` | Kinematic capsule for walking characters (`move_character`, `is_grounded`) |
 | `Pawn` | Ready-made player controller (first / third person, top-down, strategy) |
-| `Animator` | Plays / cross-fades skeletal clips on this object's skinned meshes |
+| `Face Tracking`, `Blend Shapes`, `Lip Sync` | Unified Expressions face tracking onto blendshapes and eye bones, fixed blendshape weights, viseme lip sync from voice |
+| `Voice Chat` | Scene voice settings: proximity / global, falloff, voice activity / push to talk, Opus bitrate |
+| `Humanoid IK` | Full-body tracking IK for a humanoid model: local trackers, a remote player's replicated trackers or scene objects; planted feet with procedural steps |
+| `Mesh Cloth`, `Wind Zone` | Simulates a skinned garment mesh; wind for cloth and water |
+| `Water`, `Buoyancy` | A body of water (Gerstner waves, wind seas, depth, current, look). Every Rigid Body floats by its density; `Buoyancy` optionally overrides the lift and sample points (`ctx.water_surface(p)`) |
+| `Wave Rider` | Rides the waves without a physics body: Float (sits on the surface at its draft) or Suspended (keeps its depth, orbital motion fading with depth); size, weight and tilt shape the response, steep waves push light things along. Deterministic from the anchor and the shared water clock, so networked clients agree; read `state.on_surface`, `state.depth`, `state.surface` |
+| `Waterfall`, `Whirlpool` | A sheet of water poured off a lip (drag the lip and speed handles) that lands in spray, mist, foam and a swirling plunge pool; a standalone swirl that carries floating bodies and foam |
+| `Bone Cloth`, `Cloth Colliders` | Secondary motion for joint chains (hair, skirts, tails) and the joint-following spheres / tapered capsules / planes it collides with, with capsule auto-fit |
+| `Animator` | Plays / cross-fades clips (imported or `.anim`) on skinned meshes or object hierarchies, optionally driven by an Animator Controller state machine |
 | `UI Canvas`, `UI Rect`, `UI Panel`, `UI Image`, `UI Text`, `UI Button`, `UI Toggle`, `UI Slider`, `UI Text Field`, `UI Progress Bar`, `UI Pause Menu` | In-game UI (see [UI](#ui)) |
 | `Joint` | Fixed / hinge / ball / slider / spring / rope between bodies |
 | `NavMesh Surface`, `Nav Agent` | Navigation mesh bake + path-following characters |
@@ -578,8 +703,26 @@ in `citrus-core`; their inspectors/gizmos in `citrus-editor`.
 | `Scene Portal` | Trigger-driven seamless scene switch / streaming |
 | `LOD Group` | Swap to lower-detail models by camera distance |
 | `Spawn Point` | Tagged spawn location (`ctx.spawn_point(tag)`) |
+| `Network Object`, `Network Variables`, `Network Animator`, `Network Avatar`, `Network Manager` | Multiplayer: replicated identity / transform / physics, synced variables, animator and VR pose sync, session settings (see [networking.md](networking.md)) |
+| `Avatar Descriptor` | Root of an avatar content package: eye point, humanoid bone-map overrides, body capsule (see [user-content.md](user-content.md)) |
 | `Spin` | Constant rotation about a local axis |
 | `Bob` | Sine hover along an axis |
+| `Health`, `Target Dummy` | Hit points with regen and a death action (`DamageEvent` / `DeathEvent`); a shooting-range target that tips over, scores (`ScoreEvent`) and stands back up |
+| `Hitscan Weapon` | Raycast gun: fire on an action or a held VR trigger, damage, impulse, spread, magazine / reserve / reload, muzzle and impact particles |
+| `First Person Controller`, `Third Person Controller` | FPS movement (look, WASD, jump, sprint, crouch); TPS with a collision-aware over-the-shoulder boom and aim mode |
+| `Follow Camera`, `RTS Camera` | Smoothed top-down follow with wheel zoom; strategy camera with edge / WASD pan, zoom, rotate and bounds |
+| `Click To Move`, `Interactable` | Click the ground to path there on the navmesh, click an interactable to walk up and use it (toggle an object, rebake the navmesh) |
+| `RTS Selection`, `Selectable`, `Resource Store` | Box / click selection, right-click moves in grid formation, selection rings, named resources with income |
+| `HUD Binding` | Writes Health / Ammo / Score / a resource / selected count into a UI Text (`{value}`, `{max}`) or UI Progress Bar |
+| `VR Player`, `Grabbable`, `VR Avatar` | VR rig (head + hands from `ctx.screen.vr`, teleport arc, smooth move, snap turn, grab + trigger, desktop fallback), pick-up objects, a body that follows the head |
+
+The gameplay kit components (Health through VR Avatar above) live in
+`citrus-core/src/kit/` and are what the New Project templates are built from;
+their pure helpers (`formation_offsets`, `screen_rect`, `rts_camera_pose`,
+`boom_position`, `teleport_arc`, `spread_direction`) are public for games that
+want the math without the component. Headset state reaches every component as
+`ctx.screen.vr` (`VrFrame`: stage-space head / hand poses, sticks, grips,
+triggers; `active` is false without a running headset).
 
 ## Editor traits
 
@@ -677,5 +820,6 @@ Plain widgets (sliders, buttons, labels, painters) are fine.
 
 - [Features.md](../Features.md) — in-game API roadmap (object graph, components,
   physics queries, input, spawn/despawn) and the editor/gameplay component split.
+- [networking.md](networking.md) — multiplayer components and the `ctx` networking API.
 - `crates/citrus-core/src/lib.rs` — the authoritative API.
 - `plugins/components/src/lib.rs` — the `Orbit` example, end to end.

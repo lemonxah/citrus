@@ -57,11 +57,13 @@ pub fn store() -> &'static LogStore {
 /// startup in place of the bare `tracing_subscriber::fmt().init()`.
 pub fn init() {
     // `calloop` spams benign "event for non-existence source" WARNs during
-    // cursor-grab churn on Wayland; cap it at error so it stays quiet even when
-    // RUST_LOG raises the global level.
+    // cursor-grab churn on Wayland, and `sctk_adwaita` (the Wayland title bar)
+    // warns about desktop button layouts it doesn't draw (e.g. `icon`); cap
+    // both at error so they stay quiet even when RUST_LOG raises the level.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info".into())
-        .add_directive("calloop=error".parse().expect("valid directive"));
+        .add_directive("calloop=error".parse().expect("valid directive"))
+        .add_directive("sctk_adwaita=error".parse().expect("valid directive"));
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer())

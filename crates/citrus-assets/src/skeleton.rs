@@ -41,10 +41,19 @@ impl Skeleton {
     }
 
     /// Compose per-joint local transforms into the skinning matrix palette
-    /// (`joint_world * inverse_bind`). Handles arbitrary joint order (glTF skins
-    /// aren't topologically sorted) via a fixpoint that resolves a joint once its
-    /// parent's world matrix is known.
+    /// (`joint_world * inverse_bind`).
     pub fn palette(&self, locals: &[Mat4]) -> Vec<Mat4> {
+        self.world_matrices(locals)
+            .iter()
+            .zip(&self.joints)
+            .map(|(w, j)| *w * j.inverse_bind)
+            .collect()
+    }
+
+    /// Per-joint model-space matrices for `locals`. Handles arbitrary joint
+    /// order (glTF skins aren't topologically sorted) via a fixpoint that
+    /// resolves a joint once its parent's world matrix is known.
+    pub fn world_matrices(&self, locals: &[Mat4]) -> Vec<Mat4> {
         let n = self.joints.len();
         let mut world = vec![Mat4::IDENTITY; n];
         let mut done = vec![false; n];
@@ -75,10 +84,6 @@ impl Skeleton {
             }
         }
         world
-            .iter()
-            .zip(&self.joints)
-            .map(|(w, j)| *w * j.inverse_bind)
-            .collect()
     }
 }
 

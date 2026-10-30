@@ -28,6 +28,10 @@ pub struct XrContext {
     time_supported: bool,
     /// `XR_HTCX_vive_tracker_interaction` available → suggest tracker bindings.
     tracker_supported: bool,
+    /// `XR_FB_face_tracking2` (WiVRn, Virtual Desktop, Quest Pro / 3).
+    face_supported: bool,
+    /// `XR_EXT_eye_gaze_interaction`.
+    eye_gaze_supported: bool,
 }
 
 impl XrContext {
@@ -70,6 +74,11 @@ impl XrContext {
         if tracker_supported {
             extensions.htcx_vive_tracker_interaction = true;
         }
+        // Face and eye tracking: used when the runtime offers them.
+        let face_supported = available.fb_face_tracking2;
+        extensions.fb_face_tracking2 = face_supported;
+        let eye_gaze_supported = available.ext_eye_gaze_interaction;
+        extensions.ext_eye_gaze_interaction = eye_gaze_supported;
 
         let app_info = openxr::ApplicationInfo {
             application_name: app_name,
@@ -113,6 +122,8 @@ impl XrContext {
             position_tracking: props.tracking_properties.position_tracking,
             time_supported,
             tracker_supported,
+            face_supported,
+            eye_gaze_supported,
         }))
     }
 
@@ -206,6 +217,12 @@ impl XrContext {
         let a_hips = mk("hips", "Hips")?;
         let a_left_foot = mk("left_foot", "Left Foot")?;
         let a_right_foot = mk("right_foot", "Right Foot")?;
+        let a_chest = mk("chest", "Chest")?;
+        let a_left_elbow = mk("left_elbow", "Left Elbow")?;
+        let a_right_elbow = mk("right_elbow", "Right Elbow")?;
+        let a_left_knee = mk("left_knee", "Left Knee")?;
+        let a_right_knee = mk("right_knee", "Right Knee")?;
+        let a_eye_gaze = mk("eye_gaze", "Eye Gaze")?;
 
         // Locomotion / interaction inputs (analog sticks + grips, digital trigger +
         // menu button). Bound to the Oculus Touch profile below (the common case);
@@ -245,20 +262,34 @@ impl XrContext {
                 ],
             );
         }
-        if let (true, Ok(w), Ok(lf), Ok(rf)) = (
-            self.tracker_supported,
-            path("/user/vive_tracker_htcx/role/waist/input/grip/pose"),
-            path("/user/vive_tracker_htcx/role/left_foot/input/grip/pose"),
-            path("/user/vive_tracker_htcx/role/right_foot/input/grip/pose"),
-        ) {
+        if self.tracker_supported {
+            let roles: [(&str, &openxr::Action<openxr::Posef>); 8] = [
+                ("waist", &a_hips),
+                ("left_foot", &a_left_foot),
+                ("right_foot", &a_right_foot),
+                ("chest", &a_chest),
+                ("left_elbow", &a_left_elbow),
+                ("right_elbow", &a_right_elbow),
+                ("left_knee", &a_left_knee),
+                ("right_knee", &a_right_knee),
+            ];
+            let bindings: Vec<openxr::Binding> = roles
+                .iter()
+                .filter_map(|(role, action)| {
+                    let p = path(&format!("/user/vive_tracker_htcx/role/{role}/input/grip/pose")).ok()?;
+                    Some(openxr::Binding::new(*action, p))
+                })
+                .collect();
             let _ = self.instance.suggest_interaction_profile_bindings(
                 path("/interaction_profiles/htc/vive_tracker_htcx").unwrap_or(openxr::Path::NULL),
-                &[
-                    openxr::Binding::new(&a_hips, w),
-                    openxr::Binding::new(&a_left_foot, lf),
-                    openxr::Binding::new(&a_right_foot, rf),
-                ],
+                &bindings,
             );
+        }
+        if self.eye_gaze_supported
+            && let (Ok(profile), Ok(gaze)) =
+                (path("/interaction_profiles/ext/eye_gaze_interaction"), path("/user/eyes_ext/input/gaze_ext/pose"))
+        {
+            let _ = self.instance.suggest_interaction_profile_bindings(profile, &[openxr::Binding::new(&a_eye_gaze, gaze)]);
         }
         // Locomotion/interaction bindings on the Oculus Touch profile (Quest, Rift;
         // the most common runtime). Pose hands also bind here so controllers track.
@@ -300,6 +331,14 @@ impl XrContext {
         let hips = space(&a_hips)?;
         let left_foot = space(&a_left_foot)?;
         let right_foot = space(&a_right_foot)?;
+        let chest = space(&a_chest)?;
+        let left_elbow = space(&a_left_elbow)?;
+        let right_elbow = space(&a_right_elbow)?;
+        let left_knee = space(&a_left_knee)?;
+        let right_knee = space(&a_right_knee)?;
+        let eye_gaze = if self.eye_gaze_supported { space(&a_eye_gaze).ok() } else { None };
+        let face_tracker = if self.face_supported { create_face_tracker(&self.instance, &session) } else { None };
+        tracing::info!(face = face_tracker.is_some(), eye_gaze = eye_gaze.is_some(), "OpenXR face / eye tracking");
 
         Ok(XrSession {
             instance: self.instance.clone(),
@@ -315,6 +354,13 @@ impl XrContext {
             hips,
             left_foot,
             right_foot,
+            chest,
+            left_elbow,
+            right_elbow,
+            left_knee,
+            right_knee,
+            eye_gaze,
+            face_tracker,
             a_lstick_x,
             a_lstick_y,
             a_rstick_x,
@@ -356,6 +402,11 @@ pub struct BodyPoses {
     pub hips: Option<(glam::Vec3, glam::Quat)>,
     pub left_foot: Option<(glam::Vec3, glam::Quat)>,
     pub right_foot: Option<(glam::Vec3, glam::Quat)>,
+    pub chest: Option<(glam::Vec3, glam::Quat)>,
+    pub left_elbow: Option<(glam::Vec3, glam::Quat)>,
+    pub right_elbow: Option<(glam::Vec3, glam::Quat)>,
+    pub left_knee: Option<(glam::Vec3, glam::Quat)>,
+    pub right_knee: Option<(glam::Vec3, glam::Quat)>,
 }
 
 /// A live OpenXR session sharing the renderer's Vulkan device. Drives its own
@@ -376,6 +427,13 @@ pub struct XrSession {
     hips: openxr::Space,
     left_foot: openxr::Space,
     right_foot: openxr::Space,
+    chest: openxr::Space,
+    left_elbow: openxr::Space,
+    right_elbow: openxr::Space,
+    left_knee: openxr::Space,
+    right_knee: openxr::Space,
+    eye_gaze: Option<openxr::Space>,
+    face_tracker: Option<openxr::sys::FaceTracker2FB>,
     a_lstick_x: openxr::Action<f32>,
     a_lstick_y: openxr::Action<f32>,
     a_rstick_x: openxr::Action<f32>,
@@ -494,6 +552,50 @@ impl XrSession {
         ))
     }
 
+    /// This frame's `XR_FB_face_tracking2` weights (70, in the extension's
+    /// order), when the runtime tracks the face.
+    pub fn face_weights(&self) -> Option<Vec<f32>> {
+        let tracker = self.face_tracker?;
+        let ext = self.instance.exts().fb_face_tracking2.as_ref()?;
+        if !self.running || !self.time_supported {
+            return None;
+        }
+        let time = self.instance.now().ok()?;
+        let mut weights = vec![0.0f32; 70];
+        let mut confidences = vec![0.0f32; 2];
+        let info = openxr::sys::FaceExpressionInfo2FB { ty: openxr::sys::FaceExpressionInfo2FB::TYPE, next: std::ptr::null(), time };
+        let mut out = openxr::sys::FaceExpressionWeights2FB {
+            ty: openxr::sys::FaceExpressionWeights2FB::TYPE,
+            next: std::ptr::null_mut(),
+            weight_count: weights.len() as u32,
+            weights: weights.as_mut_ptr(),
+            confidence_count: confidences.len() as u32,
+            confidences: confidences.as_mut_ptr(),
+            is_valid: openxr::sys::FALSE,
+            is_eye_following_blendshapes_valid: openxr::sys::FALSE,
+            data_source: openxr::sys::FaceTrackingDataSource2FB::VISUAL,
+            time: openxr::sys::Time::from_nanos(0),
+        };
+        let r = unsafe { (ext.get_face_expression_weights2)(tracker, &info, &mut out) };
+        (r == openxr::sys::Result::SUCCESS && out.is_valid == openxr::sys::TRUE).then_some(weights)
+    }
+
+    /// Combined eye gaze relative to the head (forward is -Z), when the runtime
+    /// reports it.
+    pub fn eye_gaze(&self) -> Option<glam::Quat> {
+        let space = self.eye_gaze.as_ref()?;
+        if !self.running || !self.time_supported {
+            return None;
+        }
+        let time = self.instance.now().ok()?;
+        let loc = space.locate(&self.view, time).ok()?;
+        if !loc.location_flags.contains(openxr::SpaceLocationFlags::ORIENTATION_VALID) {
+            return None;
+        }
+        let o = loc.pose.orientation;
+        Some(glam::Quat::from_xyzw(o.x, o.y, o.z, o.w))
+    }
+
     /// All tracked full-body poses this frame (head + hands + waist + feet) in
     /// the stage space. Feed straight into `citrus_core::TrackerTargets`.
     pub fn body_poses(&self) -> BodyPoses {
@@ -510,6 +612,11 @@ impl XrSession {
             hips: self.locate(&self.hips, time),
             left_foot: self.locate(&self.left_foot, time),
             right_foot: self.locate(&self.right_foot, time),
+            chest: self.locate(&self.chest, time),
+            left_elbow: self.locate(&self.left_elbow, time),
+            right_elbow: self.locate(&self.right_elbow, time),
+            left_knee: self.locate(&self.left_knee, time),
+            right_knee: self.locate(&self.right_knee, time),
         }
     }
 
@@ -695,3 +802,28 @@ impl XrSession {
         ))
     }
 }
+
+/// A face tracker for `XR_FB_face_tracking2` (visual data source), or None
+/// when the runtime refuses one.
+fn create_face_tracker(
+    instance: &openxr::Instance,
+    session: &openxr::Session<openxr::Vulkan>,
+) -> Option<openxr::sys::FaceTracker2FB> {
+    let ext = instance.exts().fb_face_tracking2.as_ref()?;
+    let mut sources = [openxr::sys::FaceTrackingDataSource2FB::VISUAL];
+    let info = openxr::sys::FaceTrackerCreateInfo2FB {
+        ty: openxr::sys::FaceTrackerCreateInfo2FB::TYPE,
+        next: std::ptr::null(),
+        face_expression_set: openxr::sys::FaceExpressionSet2FB::DEFAULT,
+        requested_data_source_count: sources.len() as u32,
+        requested_data_sources: sources.as_mut_ptr(),
+    };
+    let mut tracker = <openxr::sys::FaceTracker2FB as openxr::sys::Handle>::NULL;
+    let r = unsafe { (ext.create_face_tracker2)(session.as_raw(), &info, &mut tracker) };
+    if r != openxr::sys::Result::SUCCESS {
+        tracing::warn!("OpenXR face tracker not created: {r:?}");
+        return None;
+    }
+    Some(tracker)
+}
+

@@ -12,6 +12,8 @@ use ash::vk;
 
 use crate::types::{AlphaMode, MaterialFeatures, Vertex};
 
+/// Bytes per instance in the instance vertex stream (one column-major mat4).
+pub const INSTANCE_STRIDE: u32 = 64;
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.spv"));
 const ERROR_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/error.frag.spv"));
@@ -22,6 +24,12 @@ const SKYBOX_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.
 const SHADOW_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
 
 pub(crate) const PUSH_CONSTANT_SIZE: u32 = 128;
+/// Keyword specialization constants per custom shader (ids 0..N).
+pub const CUSTOM_KEYWORDS: usize = 32;
+/// Custom-shader texture properties (set 2, bindings 1..=N).
+pub const CUSTOM_TEXTURES: usize = 20;
+/// Specialization constant id of `citrus_alpha_mode` in custom shaders.
+const CUSTOM_ALPHA_CONSTANT_ID: u32 = 63;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct PipelineKey {
@@ -30,6 +38,9 @@ pub(crate) struct PipelineKey {
     pub emission: bool,
     pub alpha_mode: u32,
     pub double_sided: bool,
+    /// Water surface: Gerstner displacement in the vertex stage, the water
+    /// shading path in the fragment stage.
+    pub water: bool,
     /// Error/missing-material fallback: pink swirl, ignores other flags.
     pub error: bool,
     /// Selection outline: inverted hull, front-face culled flat purple.
@@ -48,6 +59,25 @@ pub(crate) struct PipelineKey {
     /// 0 = standard shader; otherwise a custom fragment shader
     /// (`ShaderId` + 1). Custom variants skip specialization constants.
     pub shader: u32,
+    /// Mirrored passes (reflection cube faces, planar mirrors) reverse the
+    /// on-screen winding: clockwise is the front face, so culling and
+    /// `gl_FrontFacing` (which flips the shading normal) stay correct.
+    pub mirrored: bool,
+    /// Color attachment format of the pass this variant draws into. Filled by
+    /// [`PipelineCache::get`] from the current pass target; part of the key so
+    /// HDR, LDR and capture passes each get a matching pipeline.
+    pub color_format: vk::Format,
+    /// Depth prepass: standard vertex shader (invariant position, so depths
+    /// match the main pass exactly), no color attachments; vertex-only for
+    /// opaque draws, with the fragment shader for cutout / custom draws so
+    /// discarded texels stay empty.
+    pub prepass: bool,
+    /// Main pass over a prepass depth: compare EQUAL, no depth write.
+    pub depth_equal: bool,
+    /// Custom-shader keyword values (specialization constant id = index).
+    /// Each distinct set is its own lazily built, cached pipeline in which the
+    /// driver folds the constants and strips disabled feature code.
+    pub spec: [u8; CUSTOM_KEYWORDS],
 }
 
 impl PipelineKey {
@@ -62,6 +92,7 @@ impl PipelineKey {
                 AlphaMode::Blend => 2,
             },
             double_sided: f.double_sided,
+            water: f.water,
             error: false,
             outline: false,
             depth_only: false,
@@ -69,6 +100,11 @@ impl PipelineKey {
             shadow: false,
             gbuf: false,
             shader: 0,
+            mirrored: false,
+            color_format: vk::Format::UNDEFINED,
+            prepass: false,
+            depth_equal: false,
+            spec: [0; CUSTOM_KEYWORDS],
         }
     }
 
@@ -79,6 +115,7 @@ impl PipelineKey {
             emission: false,
             alpha_mode: 0,
             double_sided: true,
+            water: false,
             error: true,
             outline: false,
             depth_only: false,
@@ -86,6 +123,11 @@ impl PipelineKey {
             shadow: false,
             gbuf: false,
             shader: 0,
+            mirrored: false,
+            color_format: vk::Format::UNDEFINED,
+            prepass: false,
+            depth_equal: false,
+            spec: [0; CUSTOM_KEYWORDS],
         }
     }
 
@@ -96,6 +138,7 @@ impl PipelineKey {
             emission: false,
             alpha_mode: 0,
             double_sided: false,
+            water: false,
             error: false,
             outline: true,
             depth_only: false,
@@ -103,6 +146,11 @@ impl PipelineKey {
             shadow: false,
             gbuf: false,
             shader: 0,
+            mirrored: false,
+            color_format: vk::Format::UNDEFINED,
+            prepass: false,
+            depth_equal: false,
+            spec: [0; CUSTOM_KEYWORDS],
         }
     }
 
@@ -113,6 +161,7 @@ impl PipelineKey {
             emission: false,
             alpha_mode: 0,
             double_sided: false,
+            water: false,
             error: false,
             outline: false,
             depth_only: true,
@@ -120,6 +169,11 @@ impl PipelineKey {
             shadow: false,
             gbuf: false,
             shader: 0,
+            mirrored: false,
+            color_format: vk::Format::UNDEFINED,
+            prepass: false,
+            depth_equal: false,
+            spec: [0; CUSTOM_KEYWORDS],
         }
     }
 
@@ -130,6 +184,7 @@ impl PipelineKey {
             emission: false,
             alpha_mode: 0,
             double_sided: false,
+            water: false,
             error: false,
             outline: false,
             depth_only: false,
@@ -137,6 +192,11 @@ impl PipelineKey {
             shadow: false,
             gbuf: false,
             shader: 0,
+            mirrored: false,
+            color_format: vk::Format::UNDEFINED,
+            prepass: false,
+            depth_equal: false,
+            spec: [0; CUSTOM_KEYWORDS],
         }
     }
 
@@ -147,6 +207,7 @@ impl PipelineKey {
             emission: false,
             alpha_mode: 0,
             double_sided: false,
+            water: false,
             error: false,
             outline: false,
             depth_only: false,
@@ -154,6 +215,11 @@ impl PipelineKey {
             shadow: true,
             gbuf: false,
             shader: 0,
+            mirrored: false,
+            color_format: vk::Format::UNDEFINED,
+            prepass: false,
+            depth_equal: false,
+            spec: [0; CUSTOM_KEYWORDS],
         }
     }
 }
@@ -171,22 +237,19 @@ pub(crate) struct PipelineCache {
     custom_frags: Vec<vk::ShaderModule>,
     pub set0_layout: vk::DescriptorSetLayout,
     pub set1_layout: vk::DescriptorSetLayout,
+    /// Set 2: custom-shader material block (binding 0) + texture properties.
+    pub set2_layout: vk::DescriptorSetLayout,
     pub layout: vk::PipelineLayout,
     color_format: vk::Format,
     depth_format: vk::Format,
     /// Second color attachment format for `gbuf` variants (deferred SSR).
     gbuf_format: vk::Format,
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
+    /// Color format of the pass being recorded (see `set_target_format`).
+    target_format: vk::Format,
 }
 
 impl PipelineCache {
-    /// Color attachment format every non-gbuf pipeline was built for. Offscreen
-    /// passes reusing these pipelines (planar reflections) must render into
-    /// this format.
-    pub fn color_format(&self) -> vk::Format {
-        self.color_format
-    }
-
     pub fn new(
         device: &ash::Device,
         color_format: vk::Format,
@@ -280,14 +343,13 @@ impl PipelineCache {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // SSR: full-res scene depth (the Flux depth prepass), sampled to
-            // reconstruct view position/normal for the screen-space march.
+            // Water: depth of the opaque scene, copied before the transparent draws.
             vk::DescriptorSetLayoutBinding::default()
                 .binding(5)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // SSR: previous frame's lit colour, sampled at the reflection hit.
+            // Water: HDR colour of the opaque scene (refraction).
             vk::DescriptorSetLayoutBinding::default()
                 .binding(6)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -305,6 +367,19 @@ impl PipelineCache {
                 .binding(8)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Second reflection probe (two-probe blending): its own cube.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(9)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Each water body's ripple field (by body slot): the caustics on
+            // what lies under it.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(10)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(crate::MAX_WATER_BODIES as u32)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
         let set0_layout = unsafe {
@@ -329,7 +404,12 @@ impl PipelineCache {
                     .binding(i)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                    // 16 doubles as the water ripple field, read by the vertex stage.
+                    .stage_flags(if i == 16 {
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+                    } else {
+                        vk::ShaderStageFlags::FRAGMENT
+                    })
             })
             .collect();
         // Binding 4: per-material "FX" uniform block (rim, animated emission,
@@ -340,7 +420,7 @@ impl PipelineCache {
                 .binding(4)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
         );
         let set1_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -349,7 +429,31 @@ impl PipelineCache {
             )?
         };
 
-        let set_layouts = [set0_layout, set1_layout];
+        // set 2: custom-shader properties. Binding 0 is the generated std140
+        // block, bindings 1..=CUSTOM_TEXTURES the declared texture properties.
+        // Only custom-shader draws bind it.
+        let mut custom_bindings = vec![vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        for i in 1..=CUSTOM_TEXTURES as u32 {
+            custom_bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(i)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            );
+        }
+        let set2_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&custom_bindings),
+                None,
+            )?
+        };
+
+        let set_layouts = [set0_layout, set1_layout, set2_layout];
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .size(PUSH_CONSTANT_SIZE)];
@@ -374,11 +478,13 @@ impl PipelineCache {
             custom_frags: Vec::new(),
             set0_layout,
             set1_layout,
+            set2_layout,
             layout,
             color_format,
             depth_format,
             gbuf_format,
             pipelines: HashMap::new(),
+            target_format: color_format,
         })
     }
 
@@ -399,7 +505,18 @@ impl PipelineCache {
         Ok(self.custom_frags.len() - 1)
     }
 
-    pub fn get(&mut self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
+    /// Set the color format of the pass about to be recorded; every variant
+    /// fetched afterwards targets it.
+    pub fn set_target_format(&mut self, format: vk::Format) {
+        self.target_format = format;
+    }
+
+    pub fn get(&mut self, device: &ash::Device, mut key: PipelineKey) -> Result<vk::Pipeline> {
+        if key.shadow || key.prepass {
+            key.color_format = vk::Format::UNDEFINED;
+        } else if key.color_format == vk::Format::UNDEFINED {
+            key.color_format = self.target_format;
+        }
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
         }
@@ -410,13 +527,14 @@ impl PipelineCache {
     }
 
     fn create_variant(&self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
-        let spec_data: [u32; 4] = [
+        let spec_data: [u32; 5] = [
             key.toon as u32,
             key.normal_map as u32,
             key.emission as u32,
             key.alpha_mode,
+            key.water as u32,
         ];
-        let spec_entries: Vec<_> = (0..4u32)
+        let spec_entries: Vec<_> = (0..5u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,
                 offset: id * 4,
@@ -426,6 +544,23 @@ impl PipelineCache {
         let spec = vk::SpecializationInfo::default()
             .map_entries(&spec_entries)
             .data(bytemuck::cast_slice(&spec_data));
+        // Custom shaders: keyword constants 0..N plus the alpha mode. Entries
+        // for ids a module doesn't declare are ignored by Vulkan.
+        let mut custom_data = [0u32; CUSTOM_KEYWORDS + 1];
+        for (i, v) in key.spec.iter().enumerate() {
+            custom_data[i] = *v as u32;
+        }
+        custom_data[CUSTOM_KEYWORDS] = key.alpha_mode;
+        let custom_entries: Vec<_> = (0..=CUSTOM_KEYWORDS as u32)
+            .map(|i| vk::SpecializationMapEntry {
+                constant_id: if i as usize == CUSTOM_KEYWORDS { CUSTOM_ALPHA_CONSTANT_ID } else { i },
+                offset: i * 4,
+                size: 4,
+            })
+            .collect();
+        let custom_spec = vk::SpecializationInfo::default()
+            .map_entries(&custom_entries)
+            .data(bytemuck::cast_slice(&custom_data));
 
         let vert_module = if key.shadow {
             self.shadow_vert
@@ -457,11 +592,11 @@ impl PipelineCache {
                 .module(self.error_frag)
                 .name(c"main")
         } else if key.shader > 0 {
-            // Custom shaders define no specialization constants.
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(self.custom_frags[key.shader as usize - 1])
                 .name(c"main")
+                .specialization_info(&custom_spec)
         } else {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
@@ -469,21 +604,39 @@ impl PipelineCache {
                 .name(c"main")
                 .specialization_info(&spec)
         };
-        let vertex_stage = vk::PipelineShaderStageCreateInfo::default()
+        let mut vertex_stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vert_module)
             .name(c"main");
-        // The shadow pass is depth-only: vertex stage alone, no fragment.
-        let stages: Vec<vk::PipelineShaderStageCreateInfo> = if key.shadow {
+        if vert_module == self.vert {
+            vertex_stage = vertex_stage.specialization_info(&spec);
+        }
+        // The shadow pass is depth-only: vertex stage alone, no fragment. So is
+        // the prepass for plain opaque draws (nothing can discard).
+        let prepass_vertex_only = key.prepass && key.alpha_mode != 1 && key.shader == 0 && !key.error;
+        let stages: Vec<vk::PipelineShaderStageCreateInfo> = if key.shadow || prepass_vertex_only {
             vec![vertex_stage]
         } else {
             vec![vertex_stage, frag_stage]
         };
 
-        let bindings = [vk::VertexInputBindingDescription::default()
-            .binding(0)
-            .stride(size_of::<Vertex>() as u32)
-            .input_rate(vk::VertexInputRate::VERTEX)];
+        let bindings = [
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX),
+            // Per-instance model matrix (standard / outline vertex shaders).
+            vk::VertexInputBindingDescription::default()
+                .binding(1)
+                .stride(INSTANCE_STRIDE)
+                .input_rate(vk::VertexInputRate::INSTANCE),
+        ];
+        let instance_attributes = [0u32, 1, 2, 3].map(|c| vk::VertexInputAttributeDescription {
+            location: 8 + c,
+            binding: 1,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: c * 16,
+        });
         let attributes = [
             vk::VertexInputAttributeDescription {
                 location: 0,
@@ -537,13 +690,19 @@ impl PipelineCache {
                 offset: 88,
             },
         ];
-        // The skybox is a vertex-buffer-less fullscreen triangle.
+        let instanced_attributes: Vec<_> = attributes.iter().chain(&instance_attributes).copied().collect();
+        // The skybox is a vertex-buffer-less fullscreen triangle; the shadow
+        // vertex shader still takes its model matrix from push constants.
         let vertex_input = if key.skybox {
             vk::PipelineVertexInputStateCreateInfo::default()
+        } else if key.shadow {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings[..1])
+                .vertex_attribute_descriptions(&attributes)
         } else {
             vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(&bindings)
-                .vertex_attribute_descriptions(&attributes)
+                .vertex_attribute_descriptions(&instanced_attributes)
         };
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
@@ -568,8 +727,8 @@ impl PipelineCache {
                 vk::CullModeFlags::BACK
             })
             // Counter-clockwise like glTF; the scene viewport flips Y with
-            // negative height, preserving winding.
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            // negative height, preserving winding. Mirrored passes reverse it.
+            .front_face(if key.mirrored { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE })
             .line_width(1.0);
 
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -580,8 +739,10 @@ impl PipelineCache {
             .depth_test_enable(true)
             // Skybox tests against the cleared far depth but never writes, so
             // geometry drawn afterwards always wins.
-            .depth_write_enable(!key.skybox && ((!transparent && !key.outline) || key.depth_only))
-            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL);
+            .depth_write_enable(
+                key.prepass || (!key.depth_equal && !key.skybox && ((!transparent && !key.outline) || key.depth_only)),
+            )
+            .depth_compare_op(if key.depth_equal { vk::CompareOp::EQUAL } else { vk::CompareOp::LESS_OR_EQUAL });
 
         let blend_attachment = if key.depth_only {
             // No color writes; only the depth buffer is touched.
@@ -611,7 +772,7 @@ impl PipelineCache {
         } else {
             vec![blend_attachment]
         };
-        let color_blend = if key.shadow {
+        let color_blend = if key.shadow || key.prepass {
             vk::PipelineColorBlendStateCreateInfo::default()
         } else {
             vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments)
@@ -620,12 +781,13 @@ impl PipelineCache {
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+        let cf = if key.color_format == vk::Format::UNDEFINED { self.color_format } else { key.color_format };
         let color_formats: Vec<vk::Format> = if key.gbuf {
-            vec![self.color_format, self.gbuf_format]
+            vec![cf, self.gbuf_format]
         } else {
-            vec![self.color_format]
+            vec![cf]
         };
-        let mut rendering = if key.shadow {
+        let mut rendering = if key.shadow || key.prepass {
             // Depth-only target: no color attachments.
             vk::PipelineRenderingCreateInfo::default().depth_attachment_format(self.depth_format)
         } else {
@@ -689,6 +851,7 @@ impl PipelineCache {
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_set_layout(self.set0_layout, None);
             device.destroy_descriptor_set_layout(self.set1_layout, None);
+            device.destroy_descriptor_set_layout(self.set2_layout, None);
             device.destroy_shader_module(self.vert, None);
             device.destroy_shader_module(self.frag, None);
             device.destroy_shader_module(self.error_frag, None);

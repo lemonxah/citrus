@@ -30,11 +30,23 @@ pub enum SpawnKind {
     Light(citrus_core::LightKind),
     LightProbeVolume,
     PostFxVolume,
+    GlobalPostFxVolume,
     ReflectionProbe,
     FluxVolume,
     AudioSource,
     BoxCollider,
     SphereCollider,
+    CapsuleCollider,
+    /// A Mesh Collider on the selected mesh objects.
+    MeshCollider,
+    /// A 20 x 20 m lake.
+    Water,
+    /// A cube with a collider and a rigid body half as dense as water.
+    FloatingCube,
+    /// An open-top container with a rigid body that holds water.
+    Bucket,
+    Waterfall,
+    Whirlpool,
     Cube,
     Sphere,
     Capsule,
@@ -93,12 +105,20 @@ impl SpawnKind {
             Self::Camera => "Camera",
             Self::Light(kind) => kind.label(),
             Self::LightProbeVolume => "Light Probe Volume",
-            Self::PostFxVolume => "Post FX Volume",
+            Self::PostFxVolume => "Post FX Volume (Box)",
+            Self::GlobalPostFxVolume => "Post FX Volume (Global)",
             Self::ReflectionProbe => "Reflection Probe",
             Self::FluxVolume => "Flux Volume",
             Self::AudioSource => "Audio Source",
             Self::BoxCollider => "Box Collider",
             Self::SphereCollider => "Sphere Collider",
+            Self::CapsuleCollider => "Capsule Collider",
+            Self::MeshCollider => "Mesh Collider",
+            Self::Water => "Water",
+            Self::FloatingCube => "Floating Cube",
+            Self::Bucket => "Bucket",
+            Self::Waterfall => "Waterfall",
+            Self::Whirlpool => "Whirlpool",
             Self::Cube => "Cube",
             Self::Sphere => "Sphere",
             Self::Capsule => "Capsule",
@@ -126,6 +146,8 @@ pub struct ScenePanelResponse {
     pub import_model: Option<std::path::PathBuf>,
     /// Eye clicked: flip this object's active flag.
     pub toggle_enabled: Option<usize>,
+    /// "Group Into Empty": these objects go under a new Empty.
+    pub group: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -163,6 +185,14 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             ui.close();
         }
     }
+    ui.menu_button("Water", |ui| {
+        for kind in [SpawnKind::Water, SpawnKind::Waterfall, SpawnKind::Whirlpool, SpawnKind::FloatingCube, SpawnKind::Bucket] {
+            if ui.button(kind.label()).clicked() {
+                response.spawn = Some(kind);
+                ui.close();
+            }
+        }
+    });
     ui.menu_button("Light", |ui| {
         for kind in citrus_core::LightKind::ALL {
             if ui.button(kind.label()).clicked() {
@@ -170,22 +200,19 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
                 ui.close();
             }
         }
-        ui.separator();
-        if ui.button("Light Probe Volume").clicked() {
-            response.spawn = Some(SpawnKind::LightProbeVolume);
-            ui.close();
-        }
-        if ui.button("Reflection Probe").clicked() {
-            response.spawn = Some(SpawnKind::ReflectionProbe);
-            ui.close();
-        }
-        if ui.button("Flux Volume").clicked() {
-            response.spawn = Some(SpawnKind::FluxVolume);
-            ui.close();
-        }
-        if ui.button("Post FX Volume").clicked() {
-            response.spawn = Some(SpawnKind::PostFxVolume);
-            ui.close();
+    });
+    ui.menu_button("Volume", |ui| {
+        for kind in [
+            SpawnKind::PostFxVolume,
+            SpawnKind::GlobalPostFxVolume,
+            SpawnKind::LightProbeVolume,
+            SpawnKind::ReflectionProbe,
+            SpawnKind::FluxVolume,
+        ] {
+            if ui.button(kind.label()).clicked() {
+                response.spawn = Some(kind);
+                ui.close();
+            }
         }
     });
     ui.menu_button("3D Object", |ui| {
@@ -222,6 +249,14 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
             response.spawn = Some(SpawnKind::SphereCollider);
             ui.close();
         }
+        if ui.button("Capsule Collider").clicked() {
+            response.spawn = Some(SpawnKind::CapsuleCollider);
+            ui.close();
+        }
+        if ui.button("Mesh Collider").on_hover_text("Add a Mesh Collider to the selected mesh objects").clicked() {
+            response.spawn = Some(SpawnKind::MeshCollider);
+            ui.close();
+        }
     });
 }
 
@@ -236,6 +271,13 @@ pub struct ScenePanel {
     /// and read back after `ui` when `selection_changed`. The `selected` anchor
     /// (last-clicked) is passed in/out separately and is always also in `multi`.
     multi: HashSet<usize>,
+    /// The tree has keyboard focus (last click landed in it): arrow keys
+    /// navigate.
+    focused: bool,
+    /// Row to scroll into view this frame (after keyboard navigation).
+    scroll_to: Option<usize>,
+    /// Selection as of last frame, to notice picks made elsewhere (viewport).
+    last_selected: Option<usize>,
 }
 
 impl ScenePanel {
@@ -272,6 +314,28 @@ impl ScenePanel {
         selected: &mut Option<usize>,
     ) -> ScenePanelResponse {
         let mut response = ScenePanelResponse::default();
+        // Selected elsewhere (the viewport): open every collapsed parent above
+        // it and scroll its row into view.
+        if *selected != self.last_selected
+            && let Some(sel) = *selected
+            && sel < rows.len()
+        {
+            let mut p = rows[sel].parent;
+            let mut guard = 0;
+            while let Some(i) = p.filter(|&i| i < rows.len()) {
+                self.collapsed.remove(&i);
+                p = rows[i].parent;
+                guard += 1;
+                if guard > rows.len() {
+                    break;
+                }
+            }
+            self.scroll_to = Some(sel);
+        }
+        let panel_rect = ui.max_rect();
+        if let Some(p) = ui.input(|i| i.pointer.any_pressed().then(|| i.pointer.interact_pos()).flatten()) {
+            self.focused = panel_rect.contains(p);
+        }
         // Header strip: title + count, Add menu, kebab.
         egui::Frame::new().inner_margin(egui::Margin::symmetric(theme::PAD as i8, 0)).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -323,6 +387,10 @@ impl ScenePanel {
             }
         }
 
+        if self.focused && self.renaming.is_none() && !ui.memory(|m| m.focused().is_some()) {
+            self.keyboard_nav(ui, rows, &children, &roots, &filter, selected, &mut response);
+        }
+
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -366,7 +434,7 @@ impl ScenePanel {
                     && payload
                         .extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fbx" | "gltf" | "glb" | "obj"))
+                        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "fbx" | "gltf" | "glb" | "vrm" | "obj"))
                         .unwrap_or(false)
                 {
                     response.import_model = Some((*payload).clone());
@@ -382,7 +450,85 @@ impl ScenePanel {
                 }
                 bg.context_menu(|ui| spawn_menu(ui, &mut response));
             });
+        self.last_selected = *selected;
         response
+    }
+
+    /// Arrow keys: Up / Down step through the visible rows, Right expands (or
+    /// steps into the first child), Left collapses (or steps out to the parent).
+    #[allow(clippy::too_many_arguments)]
+    fn keyboard_nav(
+        &mut self,
+        ui: &Ui,
+        rows: &[SceneObjectRow],
+        children: &[Vec<usize>],
+        roots: &[usize],
+        filter: &str,
+        selected: &mut Option<usize>,
+        response: &mut ScenePanelResponse,
+    ) {
+        let (up, down, left, right) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
+        if !(up || down || left || right) || rows.is_empty() {
+            return;
+        }
+        let visible: Vec<usize> = if filter.is_empty() {
+            let mut out = Vec::new();
+            let mut stack: Vec<usize> = roots.iter().rev().copied().collect();
+            while let Some(n) = stack.pop() {
+                out.push(n);
+                if !self.collapsed.contains(&n) {
+                    stack.extend(children[n].iter().rev().copied());
+                }
+            }
+            out
+        } else {
+            (0..rows.len())
+                .filter(|&i| rows[i].name.to_lowercase().contains(filter) || rows[i].kind.label().to_lowercase().contains(filter))
+                .collect()
+        };
+        if visible.is_empty() {
+            return;
+        }
+        let cur = selected.filter(|i| *i < rows.len());
+        let pos = cur.and_then(|c| visible.iter().position(|&v| v == c));
+        let mut target = None;
+        if up || down {
+            target = Some(match pos {
+                None => if down { visible[0] } else { visible[visible.len() - 1] },
+                Some(p) if up => visible[p.saturating_sub(1)],
+                Some(p) => visible[(p + 1).min(visible.len() - 1)],
+            });
+        } else if let Some(c) = cur {
+            let has_children = !children[c].is_empty() && filter.is_empty();
+            if right && has_children {
+                if self.collapsed.remove(&c) {
+                    self.scroll_to = Some(c);
+                } else {
+                    target = Some(children[c][0]);
+                }
+            } else if left {
+                if has_children && !self.collapsed.contains(&c) {
+                    self.collapsed.insert(c);
+                    self.scroll_to = Some(c);
+                } else if let Some(p) = rows[c].parent.filter(|p| *p < rows.len()) {
+                    target = Some(p);
+                }
+            }
+        }
+        if let Some(t) = target.filter(|t| Some(*t) != cur) {
+            *selected = Some(t);
+            self.multi.clear();
+            self.multi.insert(t);
+            self.scroll_to = Some(t);
+            response.selection_changed = true;
+        }
     }
 
     /// Collapse (`collapse=true`) or expand the whole subtree rooted at
@@ -571,6 +717,10 @@ impl ScenePanel {
             collapsed,
             hidden[index],
         );
+        if self.scroll_to == Some(index) {
+            row.scroll_to_me(None);
+            self.scroll_to = None;
+        }
         if eye_clicked {
             response.toggle_enabled = Some(index);
             return;
@@ -687,7 +837,7 @@ impl ScenePanel {
                     painter.rect_stroke(
                         row.rect,
                         3.0,
-                        egui::Stroke::new(1.5, color),
+                        egui::Stroke::new(1.5_f32, color),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -695,19 +845,28 @@ impl ScenePanel {
                     painter.hline(
                         row.rect.left()..=row.rect.right(),
                         row.rect.top(),
-                        egui::Stroke::new(2.5, color),
+                        egui::Stroke::new(2.5_f32, color),
                     );
                 }
                 DropZone::After => {
                     painter.hline(
                         row.rect.left()..=row.rect.right(),
                         row.rect.bottom(),
-                        egui::Stroke::new(2.5, color),
+                        egui::Stroke::new(2.5_f32, color),
                     );
                 }
             }
         }
         row.context_menu(|ui| {
+            let selected: Vec<usize> = if self.multi.contains(&index) { self.multi.iter().copied().collect() } else { vec![index] };
+            if ui
+                .button(format!("{} Group Into Empty", ph::FOLDER_SIMPLE_PLUS))
+                .on_hover_text("Put the selected objects under a new empty at their centre")
+                .clicked()
+            {
+                response.group = Some(selected);
+                ui.close();
+            }
             if rows[index].parent.is_some() && ui.button("Unparent").clicked() {
                 response.reparent.push((index, None));
                 ui.close();

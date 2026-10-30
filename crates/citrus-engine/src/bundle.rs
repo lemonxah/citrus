@@ -9,14 +9,63 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use citrus_assets::{MaterialRef, ObjectSource, PrimitiveShape, ProjectFile, SceneEntry, SceneFile};
-use citrus_render::{MaterialFeatures, MaterialParams};
+use citrus_assets::ProjectFile;
 
 /// Asset subfolders every project gets.
 const ASSET_DIRS: &[&str] = &["scenes", "materials", "shaders", "textures", "models", "audio", "prefabs"];
 
 /// Top-level project folders that are code or build output, never game content.
-const NON_ASSET_DIRS: &[&str] = &["build", "target", "src", "plugins"];
+const NON_ASSET_DIRS: &[&str] = &["build", "build-windows", "target", "src", "plugins"];
+
+/// Which platform `build_game` produces an executable for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildTarget {
+    /// The platform the editor runs on (output in `build/`).
+    Host,
+    /// 64-bit Windows (MSVC ABI). From Linux/macOS this cross-compiles with
+    /// `cargo xwin`; output in `build-windows/`.
+    Windows,
+}
+
+impl BuildTarget {
+    pub const ALL: [BuildTarget; 2] = [BuildTarget::Host, BuildTarget::Windows];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BuildTarget::Host if cfg!(windows) => "Windows (this machine)",
+            BuildTarget::Host if cfg!(target_os = "macos") => "macOS (this machine)",
+            BuildTarget::Host => "Linux (this machine)",
+            BuildTarget::Windows => "Windows x64",
+        }
+    }
+
+    /// Parse a CLI name (`host`, `windows`).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "host" | "native" => Some(BuildTarget::Host),
+            "windows" | "win" | "win64" | "x86_64-pc-windows-msvc" => Some(BuildTarget::Windows),
+            _ => None,
+        }
+    }
+
+    /// True when this target needs a cross toolchain from the current host.
+    fn is_cross(self) -> bool {
+        self == BuildTarget::Windows && !cfg!(windows)
+    }
+
+    fn is_windows(self) -> bool {
+        match self {
+            BuildTarget::Host => cfg!(windows),
+            BuildTarget::Windows => true,
+        }
+    }
+
+    fn output_dir(self) -> &'static str {
+        if self.is_cross() { "build-windows" } else { "build" }
+    }
+}
+
+const WINDOWS_TRIPLE: &str = "x86_64-pc-windows-msvc";
 
 /// Locate the citrus checkout so generated projects can path-depend on its
 /// crates. Walks up from the running editor's executable looking for the
@@ -57,73 +106,19 @@ fn crate_name(project_name: &str) -> String {
     s
 }
 
-fn inline_material() -> MaterialRef {
-    MaterialRef::Inline {
-        params: MaterialParams::default(),
-        features: MaterialFeatures::default(),
-        shader: "standard".into(),
-        custom: Default::default(),
-        render_queue: None,
-        textures: Default::default(),
-    }
-}
-
-fn entry(name: &str, source: ObjectSource, translation: [f32; 3], scale: [f32; 3]) -> SceneEntry {
-    SceneEntry {
-        id: String::new(),
-        name: name.into(),
-        source,
-        enabled: true,
-        static_geometry: false,
-        lightmap_scale: 1.0,
-        layer: 0,
-        material: inline_material(),
-        extra_materials: Vec::new(),
-        parent: None,
-        components: Vec::new(),
-        translation,
-        rotation: [0.0, 0.0, 0.0, 1.0],
-        scale,
-    }
-}
-
-/// A minimal but non-empty starter scene: a camera looking at a lit cube on a
-/// ground plane (the world sun is on by default, so it renders immediately).
-fn starter_scene() -> SceneFile {
-    SceneFile {
-        entries: vec![
-            entry("Main Camera", ObjectSource::Camera, [0.0, 1.5, 5.0], [1.0; 3]),
-            entry(
-                "Ground",
-                ObjectSource::Primitive {
-                    shape: PrimitiveShape::Plane,
-                },
-                [0.0, 0.0, 0.0],
-                [10.0, 1.0, 10.0],
-            ),
-            entry(
-                "Cube",
-                ObjectSource::Primitive {
-                    shape: PrimitiveShape::Cube,
-                },
-                [0.0, 0.5, 0.0],
-                [1.0; 3],
-            ),
-        ],
-        skybox: None,
-        environment: Default::default(),
-        layers: Default::default(),
-        editor_camera: None,
-        collapsed: Vec::new(),
-    }
-}
-
-/// Create a fresh project under `parent/<name>` and return its root path.
-/// Errors if the folder already exists and is non-empty.
-pub fn scaffold_project(parent: &Path, name: &str) -> Result<PathBuf> {
+/// Create a fresh project under `parent/<name>` from a project template
+/// (`crate::templates::TEMPLATES` id, e.g. "empty", "fps") and return its root
+/// path. Errors if a project already exists there.
+pub fn scaffold_project(parent: &Path, name: &str, template: &str) -> Result<PathBuf> {
     let root = parent.join(name);
     if root.join("project.citrus").exists() {
         bail!("a citrus project already exists at {}", root.display());
+    }
+    if crate::templates::find(template).is_none() {
+        bail!(
+            "unknown project template {template:?} (expected one of: {})",
+            crate::templates::TEMPLATES.iter().map(|t| t.id).collect::<Vec<_>>().join(", ")
+        );
     }
     let citrus = citrus_root()?;
     let pkg = crate_name(name);
@@ -223,13 +218,14 @@ fn main() -> Result<()> {{
     // create_template defaults to cdylib only; a bundled game links it as rlib.
     add_rlib_crate_type(&root.join("plugins/components/Cargo.toml"))?;
 
-    // Starter scene + project file.
-    citrus_assets::save_scene_file(root.join("scenes/main.scene"), &starter_scene())
-        .context("writing starter scene")?;
+    // Template content (scenes, materials, prefabs, sample assets) + project file.
+    let (boot, bindings) =
+        crate::templates::write_content(&root, Some(&citrus), template).context("writing template content")?;
     let project = ProjectFile {
         name: name.to_string(),
-        last_scene: Some("scenes/main.scene".into()),
-        boot_scene: Some("scenes/main.scene".into()),
+        last_scene: Some(boot.clone()),
+        boot_scene: Some(boot),
+        bindings,
         ..Default::default()
     };
     citrus_assets::save_project_file(&root, &project).context("writing project.citrus")?;
@@ -259,6 +255,7 @@ fn add_rlib_crate_type(manifest: &Path) -> Result<()> {
 pub fn build_game(
     project_root: &Path,
     project: &ProjectFile,
+    target: BuildTarget,
     mut log: impl FnMut(String),
 ) -> Result<PathBuf> {
     if !project_root.join("src/main.rs").is_file() || !project_root.join("Cargo.toml").is_file() {
@@ -269,15 +266,25 @@ pub fn build_game(
     }
     let pkg = crate_name(&project.name);
 
-    log(format!("cargo build --release ({pkg})…"));
     // `cargo rustc` passes the rpath to the game binary only (no dependency
     // rebuild), so it finds the Steam Audio library shipped next to it.
-    let mut args = vec!["rustc", "--release", "--bin", &pkg];
-    if cfg!(target_os = "linux") {
-        args.extend(["--", "-C", "link-arg=-Wl,-rpath,$ORIGIN"]);
-    } else if cfg!(target_os = "macos") {
-        args.extend(["--", "-C", "link-arg=-Wl,-rpath,@executable_path"]);
+    // Windows loads DLLs from the executable's folder without one.
+    let mut args: Vec<&str> = Vec::new();
+    if target.is_cross() {
+        check_xwin()?;
+        args.extend(["xwin", "rustc", "--release", "--target", WINDOWS_TRIPLE]);
+    } else {
+        args.extend(["rustc", "--release"]);
     }
+    args.extend(["--bin", &pkg]);
+    if !target.is_windows() {
+        if cfg!(target_os = "linux") {
+            args.extend(["--", "-C", "link-arg=-Wl,-rpath,$ORIGIN"]);
+        } else if cfg!(target_os = "macos") {
+            args.extend(["--", "-C", "link-arg=-Wl,-rpath,@executable_path"]);
+        }
+    }
+    log(format!("cargo build --release ({pkg}, {})…", target.label()));
     let output = std::process::Command::new("cargo")
         .current_dir(project_root)
         .args(&args)
@@ -288,17 +295,22 @@ pub fn build_game(
         bail!("cargo build failed:\n{}", stderr.trim());
     }
 
-    let exe_name = if cfg!(windows) {
+    let exe_name = if target.is_windows() {
         format!("{pkg}.exe")
     } else {
         pkg.clone()
     };
-    let built = project_root.join("target/release").join(&exe_name);
+    let profile_dir = if target.is_cross() {
+        project_root.join("target").join(WINDOWS_TRIPLE).join("release")
+    } else {
+        project_root.join("target/release")
+    };
+    let built = profile_dir.join(&exe_name);
     if !built.is_file() {
         bail!("build succeeded but {} is missing", built.display());
     }
 
-    let build_dir = project_root.join("build");
+    let build_dir = project_root.join(target.output_dir());
     let assets_dir = build_dir.join("assets");
     // Fresh output each time so deleted assets don't linger.
     let _ = std::fs::remove_dir_all(&build_dir);
@@ -308,7 +320,7 @@ pub fn build_game(
     let out_exe = build_dir.join(&exe_name);
     std::fs::copy(&built, &out_exe)
         .with_context(|| format!("copying {}", built.display()))?;
-    if let Some(lib) = steam_audio_library(&project_root.join("target/release")) {
+    if let Some(lib) = steam_audio_library(&profile_dir, target) {
         log("copying Steam Audio library…".into());
         let name = lib.file_name().expect("library file name");
         std::fs::copy(&lib, build_dir.join(name))
@@ -327,12 +339,29 @@ pub fn build_game(
         }
     }
 
-    log("copying assets…".into());
-    for dir in asset_dirs(project_root)? {
-        copy_dir(&project_root.join(&dir), &assets_dir.join(&dir))?;
+    log("cooking assets…".into());
+    let cooked = cook_assets(project_root)?;
+    for rel in &cooked.files {
+        let (from, to) = (project_root.join(rel), assets_dir.join(rel));
+        if let Some(dir) = to.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::copy(&from, &to).with_context(|| format!("copying {}", from.display()))?;
     }
+    for w in &cooked.warnings {
+        log(format!("warning: {w}"));
+    }
+    log(format!(
+        "cooked {} file(s), {:.1} MB (left out {} unreferenced file(s), {:.1} MB)",
+        cooked.files.len(),
+        cooked.bytes as f64 / 1e6,
+        cooked.skipped,
+        cooked.skipped_bytes as f64 / 1e6
+    ));
     log("precompiling shaders…".into());
     precompile_shaders(&assets_dir, &mut log);
+    let baked = crate::shaders::bake_project_variants(&assets_dir, &mut log);
+    log(format!("baked {baked} shader keyword variant(s)"));
     // The game reads boot_scene/title from project.citrus at startup.
     std::fs::copy(
         project_root.join("project.citrus"),
@@ -349,8 +378,8 @@ const STEAM_AUDIO_LICENSE: &str = include_str!("../assets/licenses/steam-audio-L
 
 /// The Steam Audio shared library built for this profile (newest
 /// `build/audionimbus-sys-*/out/lib` copy), if the game uses it.
-fn steam_audio_library(profile_dir: &Path) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
+fn steam_audio_library(profile_dir: &Path, target: BuildTarget) -> Option<PathBuf> {
+    let name = if target.is_windows() {
         "phonon.dll"
     } else if cfg!(target_os = "macos") {
         "libphonon.dylib"
@@ -366,6 +395,32 @@ fn steam_audio_library(profile_dir: &Path) -> Option<PathBuf> {
         .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
 }
 
+/// Cross-compiling to Windows needs `cargo-xwin` (downloads the MSVC CRT and
+/// Windows SDK on first use) and the rustup target.
+fn check_xwin() -> Result<()> {
+    let xwin = std::process::Command::new("cargo")
+        .args(["xwin", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !xwin {
+        bail!(
+            "Windows builds from this platform need cargo-xwin: run `cargo install --locked cargo-xwin` \
+             and `rustup target add {WINDOWS_TRIPLE}`"
+        );
+    }
+    let targets = std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output();
+    if let Ok(out) = targets
+        && out.status.success()
+        && !String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == WINDOWS_TRIPLE)
+    {
+        bail!("the Rust {WINDOWS_TRIPLE} target is missing: run `rustup target add {WINDOWS_TRIPLE}`");
+    }
+    Ok(())
+}
+
 /// Compile every custom `.frag` under `dir` to a `.frag.spv` sidecar so the
 /// shipped game never needs `glslc`. Failures are logged, not fatal (the game
 /// then falls back to runtime compilation for that shader).
@@ -377,11 +432,10 @@ fn precompile_shaders(dir: &Path, log: &mut impl FnMut(String)) {
         let path = entry.path();
         if path.is_dir() {
             precompile_shaders(&path, log);
-        } else if path.extension().is_some_and(|e| e == "frag") {
-            if let Err(e) = citrus_assets::precompile_shader_file(&path) {
+        } else if citrus_assets::is_shader_path(&path)
+            && let Err(e) = citrus_assets::precompile_shader_file(&path) {
                 log(format!("warning: shader {} not precompiled: {e:#}", path.display()));
             }
-        }
     }
 }
 
@@ -408,25 +462,110 @@ fn asset_dirs(project_root: &Path) -> Result<Vec<String>> {
 
 /// Build a project given only its root: loads `project.citrus` and logs to
 /// stdout. Convenience for the CLI (`citrus --build <dir>`).
-pub fn build_project_dir(project_root: &Path) -> Result<PathBuf> {
+pub fn build_project_dir(project_root: &Path, target: BuildTarget) -> Result<PathBuf> {
     let project =
         citrus_assets::load_project_file(project_root).context("reading project.citrus")?;
-    build_game(project_root, &project, |m| println!("build: {m}"))
+    build_game(project_root, &project, target, |m| println!("build: {m}"))
 }
 
-/// Recursive directory copy (files + subdirs).
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)
-                .with_context(|| format!("copying {}", from.display()))?;
+/// What a build ships: every file reachable from the project's scenes,
+/// prefabs, its `resources/` folder and paths named in its code.
+pub struct CookedAssets {
+    pub files: Vec<String>,
+    pub bytes: u64,
+    pub skipped: usize,
+    pub skipped_bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+/// Work out which content files a build needs. Roots: every `.scene` and
+/// `.prefab`, everything under `resources/` (loaded by path at run time),
+/// and any project file whose path appears as a string literal in `src/`.
+/// Dependencies are followed through every RON asset, model sidecar and
+/// external model file (the content-package scanner).
+pub fn cook_assets(project_root: &Path) -> Result<CookedAssets> {
+    let mut all = Vec::new();
+    for dir in asset_dirs(project_root)? {
+        list_files(project_root, &project_root.join(&dir), &mut all);
+    }
+    let mut roots: Vec<String> = all
+        .iter()
+        .filter(|r| r.ends_with(".scene") || r.ends_with(".prefab") || r.starts_with("resources/"))
+        .cloned()
+        .collect();
+    let mut code = String::new();
+    let mut src_files = Vec::new();
+    list_files(project_root, &project_root.join("src"), &mut src_files);
+    for f in src_files.iter().filter(|f| f.ends_with(".rs")) {
+        code.push_str(&std::fs::read_to_string(project_root.join(f)).unwrap_or_default());
+    }
+    roots.extend(all.iter().filter(|r| code.contains(&format!("\"{r}\""))).cloned());
+    let mut keep = std::collections::BTreeSet::new();
+    let mut warnings = Vec::new();
+    for root in roots {
+        let text = std::fs::read_to_string(project_root.join(&root)).unwrap_or_default();
+        let (deps, w) = citrus_assets::package::collect_dependencies(project_root, &root, &text);
+        keep.extend(deps);
+        keep.insert(root);
+        warnings.extend(w.into_iter().filter(|w| !w.contains("not allowed in content packages")));
+    }
+    let size = |r: &String| std::fs::metadata(project_root.join(r)).map(|m| m.len()).unwrap_or(0);
+    let files: Vec<String> = keep.into_iter().filter(|r| project_root.join(r).is_file()).collect();
+    let skipped: Vec<&String> = all.iter().filter(|r| !files.contains(r)).collect();
+    Ok(CookedAssets {
+        bytes: files.iter().map(size).sum(),
+        skipped: skipped.len(),
+        skipped_bytes: skipped.iter().map(|r| size(r)).sum(),
+        files,
+        warnings,
+    })
+}
+
+/// Project-relative paths of every file under `dir` (hidden entries skipped).
+fn list_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            list_files(root, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
-    Ok(())
 }
+
+#[cfg(test)]
+mod cook_tests {
+    use super::*;
+
+    #[test]
+    fn cook_keeps_what_scenes_and_code_reach() {
+        let root = std::env::temp_dir().join(format!("citrus-cook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("scenes/level.scene", r#"(entries: [(name: "Box", material: File("materials/wood.material"))])"#);
+        write("materials/wood.material", r#"(textures: (albedo: Some("textures/wood.png")))"#);
+        write("textures/wood.png", "png");
+        write("textures/unused.png", "png-not-referenced");
+        write("prefabs/enemy.prefab", r#"(entries: [])"#);
+        write("audio/boom.wav", "wav");
+        write("audio/old.wav", "old");
+        write("resources/config.ron", "()");
+        write("src/lib.rs", r#"fn f() { play("audio/boom.wav"); }"#);
+        let cooked = cook_assets(&root).unwrap();
+        for f in ["scenes/level.scene", "materials/wood.material", "textures/wood.png", "prefabs/enemy.prefab", "audio/boom.wav", "resources/config.ron"] {
+            assert!(cooked.files.iter().any(|x| x == f), "missing {f}: {:?}", cooked.files);
+        }
+        assert!(!cooked.files.iter().any(|x| x == "textures/unused.png" || x == "audio/old.wav"));
+        assert_eq!(cooked.skipped, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+

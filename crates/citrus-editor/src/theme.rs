@@ -114,8 +114,10 @@ pub enum ObjectKind {
     UiOther,
     ReflectionProbe,
     FluxVolume,
+    PostFxVolume,
     Audio,
     Physics,
+    Water,
     Group,
 }
 
@@ -125,6 +127,8 @@ pub const TYPE_CAMERA: Color32 = hex(0xA78BFA);
 pub const TYPE_UI: Color32 = hex(0x39C6B0);
 pub const TYPE_GI: Color32 = hex(0xE879B5);
 pub const TYPE_GROUP: Color32 = hex(0xA3A6AF);
+pub const TYPE_POSTFX: Color32 = hex(0x818CF8);
+pub const TYPE_WATER: Color32 = hex(0x50AAE6);
 
 impl ObjectKind {
     pub fn color(self) -> Color32 {
@@ -135,6 +139,8 @@ impl ObjectKind {
             Camera => TYPE_CAMERA,
             UiCanvas | UiToggle | UiText | UiOther => TYPE_UI,
             ReflectionProbe | FluxVolume => TYPE_GI,
+            PostFxVolume => TYPE_POSTFX,
+            Water => TYPE_WATER,
             Audio | Physics | Group => TYPE_GROUP,
         }
     }
@@ -153,8 +159,10 @@ impl ObjectKind {
             UiText => Icon::UiText,
             ReflectionProbe => Icon::ReflectionProbe,
             FluxVolume => Icon::FluxVolume,
+            PostFxVolume => Icon::PostFxVolume,
             Audio => Icon::Audio,
             Physics => Icon::FluxVolume,
+            Water => Icon::Water,
             Group => Icon::Folder,
         }
     }
@@ -175,8 +183,10 @@ impl ObjectKind {
             UiOther => "UI element",
             ReflectionProbe => "Reflection probe",
             FluxVolume => "Flux volume",
+            PostFxVolume => "Post FX volume",
             Audio => "Audio",
             Physics => "Physics",
+            Water => "Water",
             Group => "Group",
         }
     }

@@ -4,10 +4,10 @@
         exposure: 0.0,
     ),
     bloom: (
-        enabled: false,
-        threshold: 5.6,
+        enabled: true,
+        threshold: 0.4,
         intensity: 3.0,
-        radius: 1.0,
+        radius: 0.7,
     ),
     color_grading: (
         enabled: false,

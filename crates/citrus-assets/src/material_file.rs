@@ -37,6 +37,9 @@ pub struct MaterialTextures {
     pub metallic: Option<PathBuf>,
     /// Height / displacement map (parallax occlusion mapping).
     pub displacement: Option<PathBuf>,
+    /// Custom-shader texture properties by property name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub shader: BTreeMap<String, PathBuf>,
 }
 
 impl MaterialTextures {
@@ -54,6 +57,7 @@ impl MaterialTextures {
             && self.roughness.is_none()
             && self.metallic.is_none()
             && self.displacement.is_none()
+            && self.shader.is_empty()
     }
 }
 
@@ -100,12 +104,13 @@ pub fn save_material_file(path: impl AsRef<Path>, material: &MaterialFile) -> Re
 /// as RGBA8.
 pub fn load_texture_file(path: impl AsRef<Path>, srgb: bool) -> Result<TextureData> {
     let path = path.as_ref();
-    let is_exr = path
+    // EXR and Radiance HDR both carry linear float radiance.
+    let is_float = path
         .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("exr"));
+        .is_some_and(|e| e.eq_ignore_ascii_case("exr") || e.eq_ignore_ascii_case("hdr"));
     let dynimg =
         open_image_compat(path).with_context(|| format!("loading texture {}", path.display()))?;
-    if is_exr {
+    if is_float {
         // Native HDR float: keep the full linear float range as RGBA f16 — no
         // clamping to LDR, no PNG round-trip.
         let img = dynimg.into_rgba32f();

@@ -50,6 +50,10 @@ pub struct MaterialTexturePaths {
     pub metallic: Option<std::path::PathBuf>,
     /// Height / displacement map (slot 15) for parallax occlusion mapping.
     pub displacement: Option<std::path::PathBuf>,
+    /// Custom-shader texture properties (slots 16..), in the shader's texture
+    /// declaration order: (property name, path). Synced to the shader layout
+    /// by the engine; saved by name.
+    pub shader: Vec<(String, Option<std::path::PathBuf>)>,
 }
 
 /// Display labels for the 15 texture slots, in binding order. Index matches
@@ -76,6 +80,9 @@ pub const TEXTURE_SLOT_LABELS: [&str; 16] = [
 impl MaterialTexturePaths {
     /// Mutable access to slot `i` (0..15) in binding order; `None` if out of range.
     pub fn slot_mut(&mut self, i: usize) -> Option<&mut Option<std::path::PathBuf>> {
+        if i >= 16 {
+            return self.shader.get_mut(i - 16).map(|(_, p)| p);
+        }
         Some(match i {
             0 => &mut self.albedo,
             1 => &mut self.normal,
@@ -209,29 +216,129 @@ pub struct MaterialModel {
     pub textures: MaterialTexturePaths,
 }
 
-/// Reflected custom-shader property kinds (mirrors the pragma metadata parsed
+/// Reflected custom-shader property kinds (mirrors the declarations parsed
 /// by citrus-assets; the engine converts between the two).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ShaderPropKindUi {
+    /// Slider.
     Float { min: f32, max: f32 },
+    /// Unbounded drag value.
+    Drag,
+    /// Integer; `min == max` = unbounded.
+    Int { min: i32, max: i32 },
     Toggle,
-    Color,
-    Color3,
+    Enum(Vec<String>),
+    Color { hdr: bool },
+    Color3 { hdr: bool },
+    Vector(u8),
+    /// Texture picker for `MaterialTexturePaths` slot `slot`; the property's
+    /// four values are its tiling (xy) and offset (zw).
+    Texture { slot: usize, default: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShaderCmpUi {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Visibility condition: OR of AND-groups of (value offset, op, value).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShaderCondUi(pub Vec<Vec<(usize, ShaderCmpUi, f32)>>);
+
+impl ShaderCondUi {
+    pub fn eval(&self, values: &[f32]) -> bool {
+        self.0.is_empty()
+            || self.0.iter().any(|all| {
+                all.iter().all(|&(at, op, b)| {
+                    let a = values.get(at).copied().unwrap_or(0.0);
+                    match op {
+                        ShaderCmpUi::Eq => (a - b).abs() < 0.5,
+                        ShaderCmpUi::Ne => (a - b).abs() >= 0.5,
+                        ShaderCmpUi::Lt => a < b,
+                        ShaderCmpUi::Le => a <= b,
+                        ShaderCmpUi::Gt => a > b,
+                        ShaderCmpUi::Ge => a >= b,
+                    }
+                })
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ShaderPropUi {
+    pub name: String,
     pub label: String,
     pub kind: ShaderPropKindUi,
     /// Flat float offset into `MaterialModel::custom_values`.
     pub offset: usize,
+    /// Specialization-constant keyword (changing it selects another variant).
+    pub keyword: bool,
+    /// Index into `ShaderUiInfo::groups`.
+    pub group: Option<usize>,
+    pub header: Option<String>,
+    pub show_if: ShaderCondUi,
+    pub tooltip: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderGroupUi {
+    pub label: String,
+    /// Header checkbox: index into `ShaderUiInfo::props`.
+    pub toggle: Option<usize>,
+    pub show_if: ShaderCondUi,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderPresetUi {
+    pub name: String,
+    /// (value offset, values).
+    pub values: Vec<(usize, Vec<f32>)>,
 }
 
 /// Everything the inspector needs to draw a custom shader's material UI.
 #[derive(Clone, Debug, Default)]
 pub struct ShaderUiInfo {
     pub display_name: String,
+    /// "GLSL" or "HLSL".
+    pub language: &'static str,
     pub props: Vec<ShaderPropUi>,
+    pub groups: Vec<ShaderGroupUi>,
+    pub presets: Vec<ShaderPresetUi>,
     /// Compile/parse error; shown instead of properties.
     pub error: Option<String>,
+}
+
+impl ShaderUiInfo {
+    /// Apply preset `i` to a material's values.
+    pub fn apply_preset(&self, i: usize, values: &mut [f32]) {
+        if let Some(p) = self.presets.get(i) {
+            for (at, v) in &p.values {
+                if at + v.len() <= values.len() {
+                    values[*at..at + v.len()].copy_from_slice(v);
+                }
+            }
+        }
+    }
+
+    /// Index of the preset whose assignments all match `values`.
+    pub fn matching_preset(&self, values: &[f32]) -> Option<usize> {
+        self.presets.iter().position(|p| {
+            p.values
+                .iter()
+                .all(|(at, v)| values.get(*at..at + v.len()).is_some_and(|cur| cur == v.as_slice()))
+        })
+    }
+
+    /// Enabled keyword count (variant summary).
+    pub fn active_keywords(&self, values: &[f32]) -> usize {
+        self.props
+            .iter()
+            .filter(|p| p.keyword && values.get(p.offset).is_some_and(|v| *v != 0.0))
+            .count()
+    }
 }

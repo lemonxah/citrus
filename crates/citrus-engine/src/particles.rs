@@ -188,7 +188,7 @@ impl ParticleRenderer {
                 } else {
                     let path = cfg.texture.clone();
                     *self.textures.entry(path.clone()).or_insert_with(|| {
-                        citrus_assets::load_texture_file(root.join(&path), true)
+                        citrus_assets::load_texture_file(citrus_core::asset_ref::resolve_path(root, &path), true)
                             .and_then(|t| renderer.upload_texture(&t))
                             .map_err(|e| tracing::warn!("particle texture {path}: {e:#}"))
                             .ok()
@@ -252,6 +252,7 @@ impl ParticleRenderer {
                 lightmap_size: 0,
                 static_geometry: false,
                 planar_index: -1,
+                occluded: false,
             });
         }
         self.sims.retain(|id, _| alive.contains(id));
@@ -280,7 +281,7 @@ fn lerp4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * t)
 }
 
-fn vertex(p: Vec3, uv: [f32; 2], color: [f32; 4]) -> citrus_render::Vertex {
+pub(crate) fn vertex(p: Vec3, uv: [f32; 2], color: [f32; 4]) -> citrus_render::Vertex {
     citrus_render::Vertex {
         position: p.to_array(),
         normal: [0.0, 0.0, 1.0],
@@ -294,7 +295,7 @@ fn vertex(p: Vec3, uv: [f32; 2], color: [f32; 4]) -> citrus_render::Vertex {
 }
 
 /// `n` quads worth of (degenerate) vertices + indices.
-fn quads(n: usize) -> citrus_render::MeshData {
+pub(crate) fn quads(n: usize) -> citrus_render::MeshData {
     let mut indices = Vec::with_capacity(n * 6);
     for q in 0..n as u32 {
         let b = q * 4;

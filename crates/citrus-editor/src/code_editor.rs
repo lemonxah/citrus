@@ -241,11 +241,10 @@ impl CodeEditor {
                 let mode_before = vstate.mode;
                 // In command mode, run the command against the original text:
                 // last frame's live preview is discarded and recomputed.
-                if mode_before == VimMode::Command {
-                    if let Some(base) = &vstate.preview_base {
+                if mode_before == VimMode::Command
+                    && let Some(base) = &vstate.preview_base {
                         *text = base.clone();
                     }
-                }
                 let before = text.clone();
                 let mut outcome = crate::vim::handle(&mut vstate, text, cur, &captured);
                 // Stash the base on entering command mode; clear on leaving
@@ -299,8 +298,8 @@ impl CodeEditor {
             // is open so the highlights persist and the text reflects the
             // current cmdline. Not marked dirty — committed only on Enter,
             // reverted to the base on Escape (both handled above).
-            if vstate.mode == VimMode::Command {
-                if let Some(base) = vstate.preview_base.clone() {
+            if vstate.mode == VimMode::Command
+                && let Some(base) = vstate.preview_base.clone() {
                     match crate::vim::preview_substitute(&base, &vstate.cmdline, cur) {
                         Some(prev) => {
                             *text = prev.text;
@@ -310,7 +309,6 @@ impl CodeEditor {
                         None => *text = base,
                     }
                 }
-            }
         }
 
         // The editor scrolls so long files (and go-to-definition jumps) work.
@@ -975,6 +973,6 @@ fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: egui::Colo
         up = !up;
     }
     if points.len() >= 2 {
-        painter.add(egui::Shape::line(points, egui::Stroke::new(1.0, color)));
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
     }
 }

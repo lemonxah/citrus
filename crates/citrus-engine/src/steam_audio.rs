@@ -39,6 +39,10 @@ use audionimbus::{
     VirtualSurroundEffect, VirtualSurroundEffectParams, VirtualSurroundEffectSettings, num_ambisonics_channels,
 };
 use citrus_core::{ObjectId, OutputLayout, RayTracerKind, ReflectionMode, SpatialAudioSettings};
+
+/// Simulated voices and which of their direct / reflection / pathing results
+/// are in use.
+type SimSources<R> = HashMap<VoiceKey, (SimSource<R>, (bool, bool, bool))>;
 use glam::{Mat4, Vec3};
 use rodio::cpal::FromSample;
 use rodio::source::UniformSourceIterator;
@@ -1160,7 +1164,7 @@ where
     simulator.set_scene(&world.scene);
     simulator.commit();
     let mut probes: Option<(ProbeBatch, bool, bool)> = None;
-    let mut sources: HashMap<VoiceKey, (SimSource<RE>, (bool, bool, bool))> = HashMap::new();
+    let mut sources: SimSources<RE> = HashMap::new();
     let reverb = SimSource::<RE>::try_new(&simulator).map_err(|e| format!("reverb source: {e}"))?;
     simulator.add_source(&reverb);
     simulator.commit();

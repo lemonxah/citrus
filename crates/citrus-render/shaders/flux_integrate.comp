@@ -17,15 +17,32 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D u_scalar; // probe-res denoised GI (rgb), a = cam dist
 layout(set = 0, binding = 1) uniform sampler2D u_depth;  // full-res depth prepass
-struct ScreenProbe { vec4 c[4]; };                       // c[i].rgb = SH-L1; c0.w=dist, c1..3.w=normal
+// c[i].rgb = SH-L1; c0.w=dist, c1..3.w=normal; c4.yzw = probe world position
+struct ScreenProbe { vec4 c[5]; };
 layout(set = 0, binding = 2) readonly buffer ScreenProbesIn { ScreenProbe sh_in[]; };
 layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D u_out;
+struct Emitter { vec4 center_radius; vec4 emission; };
+layout(set = 0, binding = 4) readonly buffer Emitters { Emitter emitters[]; };
+// The global distance field and the gather's parameter block (only the
+// leading members this pass reads; the layout matches screen_gi.comp).
+layout(set = 0, binding = 5) uniform sampler3D u_dist;
+layout(set = 0, binding = 6) uniform GatherParams {
+    mat4 g_inv_view_proj;
+    mat4 g_prev_view_proj;
+    vec4 g_cam;
+    vec4 g_prev_cam;
+    vec4 gdf_min;
+    vec4 gdf_max;
+    vec4 g_sky;
+    uvec4 g_counts;
+    vec4 g_march; // x = eps
+} gp;
 
 layout(push_constant) uniform Push {
     mat4 inv_view_proj; // clip -> world
     vec4 cam;           // xyz camera world pos
     ivec4 dims;         // x=screen_w, y=screen_h, z=probe_w, w=probe_h
-    vec4 misc;          // x=flip_y(1/0), y=probe_div, zw=pad
+    vec4 misc;          // x=flip_y(1/0), y=indirect intensity, z=emitter count, w=pad
 } pc;
 
 vec3 world_from_depth(vec2 uv, float depth) {
@@ -43,6 +60,62 @@ SH3RGB probe_to_sh3(ScreenProbe p) {
     sh.g.v0 = vec4(p.c[0].g, p.c[1].g, p.c[2].g, p.c[3].g);
     sh.b.v0 = vec4(p.c[0].b, p.c[1].b, p.c[2].b, p.c[3].b);
     return sh;
+}
+
+float sphere_solid_angle(float r, float d) {
+    if (d <= r) return 2.0 * FLUX_PI;
+    float s = min(r / d, 0.999);
+    return 2.0 * FLUX_PI * (1.0 - sqrt(1.0 - s * s));
+}
+
+float scene_distance(vec3 p) {
+    vec3 q = clamp(p, gp.gdf_min.xyz, gp.gdf_max.xyz);
+    float outside = length(p - q);
+    if (outside > 1e-6) return outside;
+    vec3 tc = (p - gp.gdf_min.xyz) / max(gp.gdf_max.xyz - gp.gdf_min.xyz, vec3(1e-6));
+    return texture(u_dist, tc).r;
+}
+
+// Soft shadow toward a spherical emitter by cone tracing the distance field
+// (distance-field area-light shadows): the cone's half-angle is the sphere's
+// angular radius, so the penumbra widens with its size and distance. Traced
+// from this pixel's own world position, so it is identical from every view.
+float emitter_shadow(vec3 P, vec3 N, vec3 L, float to_surface, float r) {
+    float eps = max(gp.g_march.x, 1e-3);
+    vec3 ro = P + N * (eps * 2.0);
+    float tan_half = r / max(to_surface + r, 1e-3);
+    float vis = 1.0;
+    float t = eps * 3.0;
+    for (int i = 0; i < 48; ++i) {
+        if (t >= to_surface) break;
+        float h = scene_distance(ro + L * t);
+        vis = min(vis, h / max(t * tan_half, eps));
+        if (vis < 0.01) return 0.0;
+        t += clamp(h, eps, 0.5);
+    }
+    vis = clamp(vis, 0.0, 1.0);
+    return vis * vis * (3.0 - 2.0 * vis);
+}
+
+// Emissive spheres' direct light at this pixel (irradiance/PI), from the
+// pixel's own position and normal, with a world-space distance-field shadow,
+// so nothing about it depends on the camera.
+vec3 emitter_irradiance(vec3 P, vec3 N) {
+    uint count = uint(pc.misc.z + 0.5);
+    if (count == 0u) return vec3(0.0);
+    vec3 sum = vec3(0.0);
+    for (uint e = 0u; e < count; ++e) {
+        vec3 c = emitters[e].center_radius.xyz;
+        float r = max(emitters[e].center_radius.w, 1e-3);
+        vec3 d = c - P;
+        float dist = length(d);
+        vec3 l = dist > 1e-4 ? d / dist : N;
+        float ndl = clamp(dot(N, l) + 0.3, 0.0, 1.0) / 1.3;
+        if (ndl <= 0.0) continue;
+        float vis = emitter_shadow(P, N, l, max(dist - r, 0.0), r);
+        sum += emitters[e].emission.rgb * (ndl * vis * sphere_solid_angle(r, max(dist, r * 1.001)));
+    }
+    return sum * (pc.misc.y / FLUX_PI);
 }
 
 void main() {
@@ -72,6 +145,7 @@ void main() {
     if (dot(N, N) < 1e-12) { imageStore(u_out, px, scalar); return; }
     N = normalize(N);
     if (dot(N, pc.cam.xyz - P) < 0.0) N = -N;
+    vec3 emit = vec3(0.0);
 
     // SPATIAL-SH filter (ScreenProbeSpatialFilter on the SH): gather a depth-weighted
     // neighbourhood of probe SHs around this pixel, weighted by a spatial Gaussian ×
@@ -81,9 +155,13 @@ void main() {
     // clean, not raw per-frame grain.
     vec2 pf = uv * vec2(pc.dims.zw) - 0.5;
     ivec2 p0 = ivec2(floor(pf + 0.5)); // nearest probe
-    float pixel_cd = scalar.a;
+    // This pixel's own camera distance (the bilinear scalar.a blends distances
+    // across edges).
+    float pixel_cd = length(P - pc.cam.xyz);
+    emit = emitter_irradiance(P, N);
     const int R = 2; // 5×5 probe neighbourhood
     ScreenProbe acc; acc.c[0] = vec4(0.0); acc.c[1] = vec4(0.0); acc.c[2] = vec4(0.0); acc.c[3] = vec4(0.0);
+    vec3 scalar_acc = vec3(0.0); // denoised magnitude, same edge-aware weights
     float wsum = 0.0;
     for (int j = -R; j <= R; ++j) {
         for (int i = -R; i <= R; ++i) {
@@ -91,6 +169,7 @@ void main() {
             uint idx = uint(pc2.y * pc.dims.z + pc2.x);
             ScreenProbe sp = sh_in[idx];
             float cd = sp.c[0].w;
+            vec3 sp_n = vec3(sp.c[1].w, sp.c[2].w, sp.c[3].w);
             if (cd <= 0.0) continue; // no-GI probe
             // Spatial gaussian on the CONTINUOUS probe-space distance to this pixel
             // (pf), not the integer offset from the nearest probe. The integer form
@@ -102,23 +181,39 @@ void main() {
             // per-cell blockiness.
             vec2 dpf = vec2(pc2) - pf;
             float sw = exp(-dot(dpf, dpf) * 0.3);                         // spatial gaussian
-            float dw = exp(-abs(cd - pixel_cd) / max(pixel_cd * 0.08, 0.1)); // depth edge-stop
-            float w = sw * dw;
+            // Plane-aware depth weight (Lumen's integrate): how far the probe sits
+            // off this pixel's tangent plane, relative to the camera distance. A
+            // raw camera-distance test rejected most neighbours on surfaces seen at
+            // a grazing angle, leaving view-dependent blotches.
+            float dw = plane_depth_weight(P, N, sp.c[4].yzw, pixel_cd, -100.0);
+            // Normal edge-stop: a concave crease is continuous in depth, so the
+            // depth test alone mixed probes from both faces (stripes along it).
+            float nw = pow(clamp(dot(N, sp_n), 0.0, 1.0), 8.0);
+            float w = sw * dw * nw;
             if (w <= 0.0) continue;
             acc.c[0] += sp.c[0] * w; acc.c[1] += sp.c[1] * w;
             acc.c[2] += sp.c[2] * w; acc.c[3] += sp.c[3] * w;
+            scalar_acc += texelFetch(u_scalar, pc2, 0).rgb * w;
             wsum += w;
         }
     }
-    if (wsum <= 1e-5) { imageStore(u_out, px, scalar); return; }
+    if (wsum <= 1e-5) { imageStore(u_out, px, vec4(scalar.rgb + emit, scalar.a)); return; }
     float inv = 1.0 / wsum;
     acc.c[0] *= inv; acc.c[1] *= inv; acc.c[2] *= inv; acc.c[3] *= inv;
 
-    // Pure screen-probe integrate (EvaluateSHIrradiance = 4π·DotSH3 with the cosine-
-    // lobe transfer, here folded as /PI to the irradiance/PI the forward expects).
-    // The SH is now temporally + spatially denoised, so this carries BOTH magnitude
-    // and per-pixel direction directly from the SH — the strict 1:1 path.
+    // Screen-probe integrate (EvaluateSHIrradiance = 4π·DotSH3 with the cosine-
+    // lobe transfer, folded as /PI to the irradiance/PI the forward expects).
+    // Magnitude comes from the denoised scalar gather (unbiased, low variance);
+    // the SH re-points it to this pixel's normal as a clamped ratio against the
+    // probes' own (weighted) normal, as the header describes. The SH estimator's
+    // grazing-angle clamp biased it low exactly where light reaches creases.
     SH3RGB sh = probe_to_sh3(acc);
-    vec3 irradiance = eval_sh_irradiance(N, 1.0, sh) / FLUX_PI;
-    imageStore(u_out, px, vec4(max(irradiance, vec3(0.0)), scalar.a));
+    vec3 n_probe = vec3(acc.c[1].w, acc.c[2].w, acc.c[3].w);
+    n_probe = dot(n_probe, n_probe) > 1e-8 ? normalize(n_probe) : N;
+    vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+    float e_pix = dot(eval_sh_irradiance(N, 1.0, sh), LW);
+    float e_probe = dot(eval_sh_irradiance(n_probe, 1.0, sh), LW);
+    float ratio = e_probe > 1e-6 ? clamp(e_pix / e_probe, 0.25, 4.0) : 1.0;
+    vec3 irradiance = scalar_acc * inv * ratio;
+    imageStore(u_out, px, vec4(max(irradiance, vec3(0.0)) + emit, pixel_cd));
 }

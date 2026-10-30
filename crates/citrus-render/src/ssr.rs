@@ -49,6 +49,11 @@ pub(crate) struct SsrUniforms {
     /// xyz = probe box CENTER (world; capture pos + box offset), w unused.
     /// `refl_center` above is the CAPTURE position (parallax re-vector anchor).
     pub refl_box: [f32; 4],
+    /// Second reflection probe (binding 5) + blend weights, as in the frame UBO.
+    pub refl2_center: [f32; 4],
+    pub refl2_extents: [f32; 4],
+    pub refl2_box: [f32; 4],
+    pub refl_blend: [f32; 4],
 }
 
 /// Per-render-target SSR resources.
@@ -108,7 +113,8 @@ pub(crate) struct SsrResolve {
 
 impl SsrResolve {
     pub fn new(device: &ash::Device) -> Result<Self> {
-        // Bindings: 0 scene colour, 1 gbuf, 2 depth, 3 env cube, 4 uniforms.
+        // Bindings: 0 scene colour, 1 gbuf, 2 depth, 3 env cube, 4 uniforms,
+        // 5 second probe cube.
         let sampler_binding = |b: u32| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(b)
@@ -126,6 +132,7 @@ impl SsrResolve {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            sampler_binding(5),
         ];
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -278,7 +285,7 @@ impl SsrResolve {
                 &vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&[
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 5,
+                        descriptor_count: 6,
                     },
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -370,6 +377,7 @@ impl SsrResolve {
         color_view: vk::ImageView,
         depth_view: vk::ImageView,
         env_view: vk::ImageView,
+        env_b_view: vk::ImageView,
         uniforms: &SsrUniforms,
     ) {
         target.ubo.write(0, bytemuck::bytes_of(uniforms));
@@ -388,6 +396,10 @@ impl SsrResolve {
             .sampler(self.sampler)
             .image_view(env_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let env_b_info = [vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(env_b_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(target.resolve_set)
@@ -404,6 +416,11 @@ impl SsrResolve {
                 .dst_binding(3)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&env_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(target.resolve_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&env_b_info),
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 

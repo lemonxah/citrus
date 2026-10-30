@@ -49,9 +49,9 @@ transform-gizmo-egui = "0.8" # 0.9 needs egui 0.34
 egui_dock = "0.18"           # 0.19 needs egui 0.34
 
 # assets
-gltf = { version = "1.4", features = ["KHR_materials_emissive_strength"] }
+gltf = { version = "1.4", features = ["KHR_materials_emissive_strength", "extras"] }
 ufbx = "0.11"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "exr", "gif", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "exr", "hdr", "gif", "webp"] }
 half = "2"
 intel_tex_2 = "0.4"
 

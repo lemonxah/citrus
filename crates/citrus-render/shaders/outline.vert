@@ -19,6 +19,13 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 misc;
 } frame;
 
+// Per-instance model matrix (instance-rate vertex stream), so draws of one
+// mesh + material batch into a single instanced draw (pc.model is unused).
+layout(location = 8) in vec4 a_model0;
+layout(location = 9) in vec4 a_model1;
+layout(location = 10) in vec4 a_model2;
+layout(location = 11) in vec4 a_model3;
+
 layout(push_constant) uniform Push {
     mat4 model;
     vec4 base_color;
@@ -28,6 +35,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 void main() {
+    mat4 model = mat4(a_model0, a_model1, a_model2, a_model3);
     // Inflate radially from the mesh center: the direction depends only on
     // position, so vertices duplicated across hard edges (per-face normals)
     // move together and the hull stays watertight, with no gaps at cube corners.
@@ -37,8 +45,8 @@ void main() {
     vec3 dir = (length(radial) > 1e-5 && dot(normalize(radial), a_normal) > 0.05)
         ? normalize(radial)
         : a_normal;
-    vec3 world_dir = normalize(mat3(pc.model) * dir);
-    vec4 world = pc.model * vec4(a_position, 1.0);
+    vec3 world_dir = normalize(mat3(model) * dir);
+    vec4 world = model * vec4(a_position, 1.0);
     // Roughly constant screen-space width: scale with view distance.
     float dist = length(frame.camera_pos.xyz - world.xyz);
     world.xyz += world_dir * 0.005 * dist * pc.params1.w;

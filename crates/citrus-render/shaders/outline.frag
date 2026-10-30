@@ -7,7 +7,15 @@ layout(location = 0) out vec4 o_color;
 // reflector. Zero reflectance keeps the resolve pass from reflecting it.
 layout(location = 1) out vec4 o_gbuf;
 
+layout(push_constant) uniform Push {
+    mat4 model;
+    vec4 base_color;
+    vec4 emission;
+    vec4 params0;
+    vec4 params1; // x > 0.5: per-material toon outline coloured by base_color
+} pc;
+
 void main() {
-    o_color = vec4(0.72, 0.25, 1.0, 1.0);
+    o_color = pc.params1.x > 0.5 ? pc.base_color : vec4(0.72, 0.25, 1.0, 1.0);
     o_gbuf = vec4(0.0);
 }

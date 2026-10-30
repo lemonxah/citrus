@@ -26,6 +26,10 @@ pub enum TaskKind {
     FocusReimport,
     /// Steam Audio reverb / pathing bake.
     AudioBake,
+    /// Occlusion-culling visibility bake.
+    OcclusionBake,
+    /// `cargo build` + asset bundling of the game executable.
+    BuildGame,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,6 +122,10 @@ pub enum TaskPayload {
     },
     /// A Steam Audio bake for `scene_path` (already written as its sidecar).
     AudioBake { scene_path: PathBuf, bytes: Vec<u8> },
+    /// An occlusion bake for `scene_path` (already written as its sidecar).
+    Occlusion { scene_path: PathBuf, data: Box<crate::occlusion::OcclusionData>, secs: f32 },
+    /// A finished game build: the executable, or the failure text.
+    GameBuilt(Result<PathBuf, String>),
 }
 
 pub struct TaskResult {

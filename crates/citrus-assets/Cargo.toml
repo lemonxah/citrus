@@ -15,6 +15,9 @@ half.workspace = true
 intel_tex_2.workspace = true
 glam.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 ron.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# .citruspak content packages (zip; already in the tree via audionimbus-sys).
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

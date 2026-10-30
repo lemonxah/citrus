@@ -1,6 +1,8 @@
 //! Ready-made UI layouts for the editor's UI Editor (Main Menu, Pause Menu,
 //! HUD, ...). Each builds a canvas tree laid out for 1920x1080 that already
 //! works in Play through button actions, `UiPauseMenu` and audio-bus sliders.
+//! Also used by the project templates, so it compiles without the editor.
+#![cfg_attr(not(feature = "editor"), allow(dead_code))]
 
 use citrus_core::{
     Component, UiAction, UiAlign, UiButton, UiCanvas, UiFillDirection, UiPanel, UiPauseMenu, UiProgressBar,

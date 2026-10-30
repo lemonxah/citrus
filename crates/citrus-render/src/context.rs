@@ -4,7 +4,7 @@ use std::ffi::{CStr, c_char, c_void};
 
 use anyhow::{Context as _, Result, bail};
 use ash::vk::Handle as _;
-use ash::{ext, khr, vk};
+use ash::{amd, ext, khr, nv, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
@@ -39,6 +39,70 @@ pub struct GpuContext {
     // Consumed by the bake's BLAS/TLAS builders (next phase).
     #[allow(dead_code)]
     pub accel: Option<khr::acceleration_structure::Device>,
+    /// GPU checkpoints (NVIDIA): named markers in the command stream, read
+    /// back after a device loss to say which pass the GPU was in.
+    checkpoints: Option<nv::device_diagnostic_checkpoints::Device>,
+    /// The same on AMD: marker ids the GPU writes into a host-visible buffer
+    /// as it starts and finishes each marked point.
+    markers: Option<MarkerBuffer>,
+    /// The driver's own fault report after a loss (cross-vendor).
+    fault: Option<ext::device_fault::Device>,
+    lost_reported: std::sync::atomic::AtomicBool,
+}
+
+/// `VK_AMD_buffer_marker` target: word 0 = last marker the GPU started,
+/// word 1 = last one everything before has finished.
+struct MarkerBuffer {
+    loader: amd::buffer_marker::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *const u32,
+    names: std::sync::Mutex<Vec<&'static CStr>>,
+}
+
+// The mapping is host-coherent memory only ever read after the GPU has gone.
+unsafe impl Send for MarkerBuffer {}
+unsafe impl Sync for MarkerBuffer {}
+
+impl MarkerBuffer {
+    fn new(instance: &ash::Instance, pd: vk::PhysicalDevice, device: &ash::Device) -> Option<Self> {
+        let buffer = unsafe {
+            device.create_buffer(&vk::BufferCreateInfo::default().size(8).usage(vk::BufferUsageFlags::TRANSFER_DST), None)
+        }
+        .ok()?;
+        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let props = unsafe { instance.get_physical_device_memory_properties(pd) };
+        let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let Some(ty) = (0..props.memory_type_count)
+            .find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
+        else {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return None;
+        };
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None) }.ok()?;
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }.ok()?;
+        let mapped = unsafe { device.map_memory(memory, 0, 8, vk::MemoryMapFlags::empty()) }.ok()? as *mut u32;
+        unsafe { std::ptr::write_bytes(mapped, 0, 2) };
+        Some(Self { loader: amd::buffer_marker::Device::new(instance, device), buffer, memory, mapped, names: std::sync::Mutex::new(Vec::new()) })
+    }
+
+    /// Marker id for a name (1-based; 0 = nothing yet).
+    fn id(&self, name: &'static CStr) -> u32 {
+        let mut names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        let i = names.iter().position(|n| std::ptr::eq(*n, name)).unwrap_or_else(|| {
+            names.push(name);
+            names.len() - 1
+        });
+        i as u32 + 1
+    }
+
+    fn name(&self, id: u32) -> String {
+        let names = self.names.lock().unwrap_or_else(|e| e.into_inner());
+        match id {
+            0 => "(none)".into(),
+            i => names.get(i as usize - 1).map_or("?".into(), |n| n.to_string_lossy().into_owned()),
+        }
+    }
 }
 
 impl GpuContext {
@@ -174,7 +238,22 @@ impl GpuContext {
             khr::ray_query::NAME,
             khr::deferred_host_operations::NAME,
         ];
-        let has_rt = device_supports(&instance, physical_device, &rt_exts)?;
+        let mut has_rt = device_supports(&instance, physical_device, &rt_exts)?;
+        // Ray-traced hit shading samples every material texture through one
+        // runtime-sized array (descriptor indexing). VK_KHR_acceleration_structure
+        // requires the extension, so RT devices have it; check the features anyway.
+        if has_rt {
+            let mut q12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut q12);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            let indexing = q12.runtime_descriptor_array == vk::TRUE
+                && q12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+                && q12.descriptor_binding_partially_bound == vk::TRUE;
+            if !indexing {
+                tracing::warn!("GPU lacks descriptor indexing; ray tracing disabled");
+                has_rt = false;
+            }
+        }
 
         let mut device_extensions = vec![khr::swapchain::NAME.as_ptr()];
         if has_rt {
@@ -182,11 +261,34 @@ impl GpuContext {
                 device_extensions.push(e.as_ptr());
             }
         }
+        let has_checkpoints = device_supports(&instance, physical_device, &[nv::device_diagnostic_checkpoints::NAME])?;
+        if has_checkpoints {
+            device_extensions.push(nv::device_diagnostic_checkpoints::NAME.as_ptr());
+        }
+        let has_markers = !has_checkpoints && device_supports(&instance, physical_device, &[amd::buffer_marker::NAME])?;
+        if has_markers {
+            device_extensions.push(amd::buffer_marker::NAME.as_ptr());
+        }
+        // The driver's own fault report (supported on AMD and recent NVIDIA).
+        let has_fault = device_supports(&instance, physical_device, &[ext::device_fault::NAME])? && {
+            let mut f = vk::PhysicalDeviceFaultFeaturesEXT::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            f.device_fault == vk::TRUE
+        };
+        if has_fault {
+            device_extensions.push(ext::device_fault::NAME.as_ptr());
+        }
+        let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
 
         let mut vk13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
-        let mut vk12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
+        let mut vk12 = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .runtime_descriptor_array(true)
+            .shader_sampled_image_array_non_uniform_indexing(true)
+            .descriptor_binding_partially_bound(true);
         let mut as_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
             .acceleration_structure(true);
         let mut rq_features = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
@@ -212,6 +314,9 @@ impl GpuContext {
                 .push_next(&mut vk12)
                 .push_next(&mut as_features)
                 .push_next(&mut rq_features);
+        }
+        if has_fault {
+            device_info = device_info.push_next(&mut fault_features);
         }
         let device = match &xr {
             // xrCreateVulkanDeviceKHR adds the runtime's required device extensions
@@ -251,6 +356,17 @@ impl GpuContext {
             None
         };
 
+        let checkpoints = has_checkpoints.then(|| nv::device_diagnostic_checkpoints::Device::new(&instance, &device));
+        let markers = if has_markers { MarkerBuffer::new(&instance, physical_device, &device) } else { None };
+        let fault = has_fault.then(|| ext::device_fault::Device::new(&instance, &device));
+        if checkpoints.is_some() || markers.is_some() || fault.is_some() {
+            tracing::info!(
+                "GPU crash diagnostics: checkpoints={} markers={} fault report={}",
+                checkpoints.is_some(),
+                markers.is_some(),
+                fault.is_some()
+            );
+        }
         Ok(Self {
             entry,
             instance,
@@ -263,7 +379,94 @@ impl GpuContext {
             queue,
             transfer_queue,
             accel,
+            checkpoints,
+            markers,
+            fault,
+            lost_reported: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Mark where `cb` is in its work; after a device loss
+    /// [`Self::report_device_lost`] names the last marks the GPU reached.
+    pub fn checkpoint(&self, cb: vk::CommandBuffer, marker: &'static CStr) {
+        if let Some(c) = &self.checkpoints {
+            unsafe { c.cmd_set_checkpoint(cb, marker.as_ptr().cast()) };
+        } else if let Some(m) = &self.markers {
+            let id = m.id(marker);
+            unsafe {
+                m.loader.cmd_write_buffer_marker(cb, vk::PipelineStageFlags::TOP_OF_PIPE, m.buffer, 0, id);
+                m.loader.cmd_write_buffer_marker(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, m.buffer, 4, id);
+            }
+        }
+    }
+
+    /// If `err` is a lost device, log (once) the last checkpoints the GPU
+    /// reached on the main queue: the pass that hung or faulted.
+    pub fn report_device_lost(&self, err: &anyhow::Error) {
+        let lost = err.chain().any(|e| e.downcast_ref::<vk::Result>() == Some(&vk::Result::ERROR_DEVICE_LOST))
+            || err.to_string().contains("device has been lost");
+        if !lost || self.lost_reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if let Some(c) = &self.checkpoints {
+            let n = unsafe { c.get_queue_checkpoint_data_len(self.queue) };
+            let mut data = vec![vk::CheckpointDataNV::default(); n];
+            unsafe { c.get_queue_checkpoint_data(self.queue, &mut data) };
+            if data.is_empty() {
+                tracing::error!("GPU device lost; no checkpoints recorded");
+            }
+            for d in &data {
+                // Markers are &'static CStr names set by `checkpoint`.
+                let name = if d.p_checkpoint_marker.is_null() {
+                    "?".into()
+                } else {
+                    unsafe { CStr::from_ptr(d.p_checkpoint_marker.cast()) }.to_string_lossy()
+                };
+                tracing::error!("GPU device lost: last checkpoint at stage {:?}: {name}", d.stage);
+            }
+        } else if let Some(m) = &self.markers {
+            let (started, finished) = unsafe { (std::ptr::read_volatile(m.mapped), std::ptr::read_volatile(m.mapped.add(1))) };
+            tracing::error!(
+                "GPU device lost: last marker started: {}; last finished: {} (the work between them hung or faulted)",
+                m.name(started),
+                m.name(finished)
+            );
+        } else {
+            tracing::error!("GPU device lost (this GPU offers no checkpoints or markers to say where)");
+        }
+        self.log_fault();
+    }
+}
+
+impl GpuContext {
+    /// The driver's fault report (VK_EXT_device_fault): what went wrong and
+    /// at which GPU addresses.
+    fn log_fault(&self) {
+        let Some(f) = &self.fault else { return };
+        let get = f.fp().get_device_fault_info_ext;
+        let mut counts = vk::DeviceFaultCountsEXT::default();
+        if unsafe { get(self.device.handle(), &mut counts, std::ptr::null_mut()) } != vk::Result::SUCCESS {
+            return;
+        }
+        let mut addresses = vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+        let mut vendors = vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+        counts.vendor_binary_size = 0;
+        let mut info = vk::DeviceFaultInfoEXT {
+            p_address_infos: addresses.as_mut_ptr(),
+            p_vendor_infos: vendors.as_mut_ptr(),
+            ..Default::default()
+        };
+        if unsafe { get(self.device.handle(), &mut counts, &mut info) } != vk::Result::SUCCESS {
+            return;
+        }
+        let text = |c: &[std::ffi::c_char]| unsafe { CStr::from_ptr(c.as_ptr()) }.to_string_lossy().into_owned();
+        tracing::error!("GPU fault report: {}", text(&info.description));
+        for a in addresses.iter().take(counts.address_info_count as usize) {
+            tracing::error!("GPU fault address: {:?} at {:#x} (+/- {:#x})", a.address_type, a.reported_address, a.address_precision);
+        }
+        for v in vendors.iter().take(counts.vendor_info_count as usize) {
+            tracing::error!("GPU fault vendor info: {} (code {:#x}, data {:#x})", text(&v.description), v.vendor_fault_code, v.vendor_fault_data);
+        }
     }
 }
 
@@ -271,6 +474,10 @@ impl Drop for GpuContext {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(m) = self.markers.take() {
+                self.device.destroy_buffer(m.buffer, None);
+                self.device.free_memory(m.memory, None);
+            }
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
             if let Some((loader, messenger)) = self.debug.take() {

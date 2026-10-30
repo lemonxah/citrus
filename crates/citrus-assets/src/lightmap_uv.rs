@@ -31,7 +31,7 @@ pub fn uv0_is_lightmappable(vertices: &[Vertex], indices: &[u32]) -> bool {
     let mut area_sum = 0.0f32;
     let mut lo = [f32::INFINITY; 2];
     let mut hi = [f32::NEG_INFINITY; 2];
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         let a = vertices[tri[0] as usize].uv;
         let b = vertices[tri[1] as usize].uv;
         let c = vertices[tri[2] as usize].uv;
@@ -114,7 +114,7 @@ pub fn generate_lightmap_uv(mesh: &MeshData) -> MeshData {
         };
     }
 
-    let tris: Vec<[u32; 3]> = mesh.indices.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let tris: Vec<[u32; 3]> = mesh.indices.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect();
     let normals: Vec<Vec3> = tris.iter().map(|&t| tri_normal(mesh, t)).collect();
 
     // 1. Edge → triangles sharing it (manifold edges have 2). Edge key = the two
@@ -350,7 +350,7 @@ mod tests {
         // of very different sizes (it was wildly uneven in the per-cell version).
         let out = generate_lightmap_uv(&varied_tri_mesh(8));
         let mut ratios = Vec::new();
-        for tri in out.indices.chunks_exact(3) {
+        for tri in out.indices.as_chunks::<3>().0 {
             let uv = [
                 out.vertices[tri[0] as usize].uv1,
                 out.vertices[tri[1] as usize].uv1,
@@ -380,7 +380,7 @@ mod tests {
         let out = generate_lightmap_uv(&varied_tri_mesh(12));
         let boxes: Vec<([f32; 2], [f32; 2])> = out
             .indices
-            .chunks_exact(3)
+            .as_chunks::<3>().0.iter()
             .map(|t| {
                 let uv: Vec<[f32; 2]> = t.iter().map(|&i| out.vertices[i as usize].uv1).collect();
                 let lo = [

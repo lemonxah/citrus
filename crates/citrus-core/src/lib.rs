@@ -15,6 +15,47 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 mod audio_mixer;
+mod cloth;
+mod cloth_mesh;
+pub use cloth_mesh::{MeshCloth, MeshClothRuntime, MeshClothSim, MeshParticle, PinSource};
+mod face;
+mod voice;
+mod water;
+mod water_sim;
+mod water_pipe;
+mod water_ewave;
+mod physics_material;
+pub mod asset_ref;
+mod water_fx;
+mod water_container;
+pub use water_container::{
+    LITRES_PER_M3, WaterContainer, WaterContainerRuntime, held_volume, inside_box, level_for_volume, rim_corners, rim_level, spill_point, surface_polygon,
+    volume_below, wet_lip,
+};
+mod wave_rider;
+pub use wave_rider::{RideMode, RideState, WaveRider};
+pub use water_fx::{GRAVITY, Vortex, WaterSplash, Waterfall, Whirlpool, fall_time, vortex_flow};
+pub use physics_material::{CombineMode, PHYSMAT_EXTENSION, PhysicsMaterial, PhysicsSettings, load_physmat, save_physmat};
+pub use water_sim::{RippleSim, WaterPush};
+pub use water_ewave::{EwaveLayer, EwaveParams, SURFACE_TENSION, dispersive_share, ewave_omega, ewave_supported};
+pub use water_pipe::{
+    CELL_OBSTACLE, CELL_SHORE, CELL_WATER, MAX_SIM_SUBSTEPS, PipeParams, PipeSim, SimField, SimWindow, WaterDisplacer, WaterSimFeed, choose_window,
+    max_sim_dt, pipe_substeps, sim_resolution,
+};
+pub use water::{Buoyancy, FLUID_PRESETS, FluidPreset, GerstnerWave, OutlinePreset, ResolvedWave, RiverPoint, RiverSection, UnderwaterSettings, Water, WaterBody, WaterColumn, WaterLook, WaterRuntime};
+pub use voice::{
+    LipSync, LipSyncMode, LipSyncRuntime, VISEMES, VisemeFrame, VoiceChat, VoiceRange, VoiceRolloff, VoiceTransmit,
+    viseme_index,
+};
+pub use face::{
+    BlendShapes, BlendShapesRuntime, EXPRESSIONS, normalize, FaceFrame, FaceSource, TrackingInputSettings, FaceTracking, FaceTrackingRuntime, ShapeSource,
+    expression_index,
+};
+pub use cloth::{
+    BoneCloth, BoneClothRuntime, BoneClothSim, ClothWind, ClothWindParams, WindSample, WindShape, ClothCollider, ClothColliderRuntime, ClothColliders, ClothConnection,
+    ClothFit, ClothFitPreset, ClothParticle, ClothShape, ClothShapeWorld, ClothTeleport, fit_capsule, max_scale,
+    principal_axis, rigid_frame,
+};
 mod spatial_audio;
 mod gameplay;
 mod ik;
@@ -25,7 +66,8 @@ mod savegame;
 mod ui;
 mod vr;
 pub use ik::{
-    IkTargets, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik, solve_two_bone,
+    HumanoidIk, HumanoidIkRuntime, IkSource, IkTargets, TRACKER_ROLES, TRACKER_SLOTS, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik,
+    solve_two_bone,
 };
 pub use audio_mixer::AudioMixer;
 pub use spatial_audio::{
@@ -38,14 +80,27 @@ pub use ui::{
     UiAction, UiAlign, UiButton, UiButtonState, UiCanvas, UiFillDirection, UiImage, UiPanel, UiPauseMenu,
     UiProgressBar, UiRect, UiRenderMode, UiScaleMode, UiSlider, UiText, UiTextField, UiToggle,
 };
-pub use vr::{Ray, VrRig, pointer_ray, ray_plane};
+pub use vr::{Ray, VrFrame, VrRig, pointer_ray, ray_plane};
+mod net;
+pub use net::{
+    HOST_PEER, InterpolationMode, NetAutoStart, NetEvent, NetObjectState, NetRpc, NetSpawnSource, NetValue, NetVar,
+    NetView, NetWorldOp, NetworkAnimator, NetworkAvatar, NetworkManager, NetworkObject, NetworkVariables,
+    OwnershipMode, PeerInfo, RpcTarget, WORN_AVATAR_VAR, WornAvatar,
+};
+mod kit;
+pub use kit::*;
+mod content;
+pub use content::{
+    AvatarDescriptor, ContentCommand, ContentEvent, ContentInfo, ContentKind, ContentPlacement, ContentRequest,
+};
 pub use input::{
     ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
     MouseAxis, MouseButton, PadAxis, PadButton, RawInput, resolve,
 };
 pub use models::{
-    AlphaModeModel, MatcapBlend, MaterialModel, MaterialTexturePaths, ShaderPropKindUi,
-    ShaderPropUi, ShaderUiInfo, TEXTURE_SLOT_LABELS,
+    AlphaModeModel, MatcapBlend, MaterialModel, MaterialTexturePaths, ShaderCmpUi, ShaderCondUi,
+    ShaderGroupUi, ShaderPresetUi, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo,
+    TEXTURE_SLOT_LABELS,
 };
 
 // ------------------------------------------------------------------ object id
@@ -252,6 +307,35 @@ pub enum ComponentCommand {
     SetShadowResolution(u32),
     /// Send a networked text message (None target = broadcast / public).
     NetMessage { to: Option<u64>, text: String },
+    /// Hand a networked object to another peer (owner or host only).
+    TransferOwnership(ObjectId, u64),
+    /// Spawn on every peer: applied locally right away, then replicated.
+    NetSpawn {
+        source: NetSpawnSource,
+        root_id: ObjectId,
+        translation: Vec3,
+        rotation: Quat,
+        /// Owner peer (0 = host authority).
+        owner: u64,
+    },
+    /// Despawn a networked object on every peer.
+    NetDespawn(ObjectId),
+    /// Write a synced variable (applied locally, then replicated).
+    NetSetVar { id: ObjectId, key: String, value: NetValue },
+    /// Send an RPC / network event.
+    NetRpc {
+        object: Option<ObjectId>,
+        name: String,
+        args: Vec<NetValue>,
+        target: RpcTarget,
+        reliable: bool,
+    },
+    /// Start hosting / join / leave a session.
+    NetHost { port: u16 },
+    NetJoin { address: String },
+    NetDisconnect,
+    /// Host-driven scene switch for every peer.
+    NetLoadScene(String),
     /// Instantiate a `.prefab` (project-relative path). The first root gets
     /// `root_id` so the caller can reference it immediately.
     SpawnPrefab {
@@ -315,31 +399,14 @@ pub enum ComponentCommand {
     SetTimeScale(f32),
     /// Exit the game (stops Play mode in the editor).
     Quit,
-}
-
-/// Read-only networking view handed to components each frame. Filled by the
-/// engine's network system; empty/disconnected in single-player.
-#[derive(Default, Clone)]
-pub struct NetView {
-    pub connected: bool,
-    pub is_server: bool,
-    /// This machine's peer id (0 when offline).
-    pub local_peer: u64,
-    /// Per-object current authority (only objects that are owned appear).
-    pub owners: HashMap<ObjectId, u64>,
-    /// Text messages received this frame: `(from_peer, is_private, text)`.
-    pub messages: Vec<(u64, bool, String)>,
-}
-
-impl NetView {
-    /// Current owner of an object, if any peer holds authority.
-    pub fn owner(&self, id: ObjectId) -> Option<u64> {
-        self.owners.get(&id).copied()
-    }
-    /// Whether the local peer holds authority over an object.
-    pub fn owns(&self, id: ObjectId) -> bool {
-        self.connected && self.owner(id) == Some(self.local_peer)
-    }
+    /// Capture full-body tracker calibration now (the player holds a T-pose).
+    CalibrateTrackers,
+    /// Drop the tracker calibration (back to the default offsets).
+    ClearTrackerCalibration,
+    /// Start (`Some(port)`) or stop (`None`) the OSC face-tracking receiver.
+    SetOscFaceTracking(Option<u16>),
+    /// User-generated content request (load / spawn / enter world / unload).
+    Content(ContentCommand),
 }
 
 /// Per-frame update context handed to components in Play mode. Transform
@@ -351,6 +418,9 @@ pub struct ComponentCtx<'a> {
     pub unscaled_dt: f32,
     /// Seconds since engine start.
     pub time: f32,
+    /// The water clock: shared by every peer in a networked game, so waves
+    /// line up on all clients.
+    pub water_time: f32,
     pub translation: &'a mut Vec3,
     pub rotation: &'a mut Quat,
     pub scale: &'a mut Vec3,
@@ -719,6 +789,7 @@ impl ComponentRegistry {
         registry.register::<VolumeComponent>();
         registry.register::<BoxCollider>();
         registry.register::<SphereCollider>();
+        registry.register::<CapsuleCollider>();
         registry.register::<MeshCollider>();
         registry.register::<Spin>();
         registry.register::<Bob>();
@@ -733,7 +804,27 @@ impl ComponentRegistry {
         registry.register::<Pawn>();
         registry.register::<SpawnPoint>();
         registry.register::<Sync>();
+        registry.register::<NetworkObject>();
+        registry.register::<NetworkVariables>();
+        registry.register::<NetworkAnimator>();
+        registry.register::<NetworkAvatar>();
+        registry.register::<NetworkManager>();
         registry.register::<Animator>();
+        registry.register::<HumanoidIk>();
+        registry.register::<FaceTracking>();
+        registry.register::<BlendShapes>();
+        registry.register::<LipSync>();
+        registry.register::<VoiceChat>();
+        registry.register::<Water>();
+        registry.register::<Buoyancy>();
+        registry.register::<Waterfall>();
+        registry.register::<Whirlpool>();
+        registry.register::<WaterContainer>();
+        registry.register::<WaveRider>();
+        registry.register::<BoneCloth>();
+        registry.register::<ClothColliders>();
+        registry.register::<ClothWind>();
+        registry.register::<MeshCloth>();
         registry.register::<UiCanvas>();
         registry.register::<UiRect>();
         registry.register::<UiPanel>();
@@ -745,6 +836,8 @@ impl ComponentRegistry {
         registry.register::<UiTextField>();
         registry.register::<UiProgressBar>();
         registry.register::<UiPauseMenu>();
+        registry.register::<AvatarDescriptor>();
+        kit::register_kit(&mut registry);
         registry
     }
 
@@ -809,6 +902,26 @@ pub struct CameraComponent {
     /// renders objects whose layer bit is set. Default = all layers.
     #[serde(default = "all_layers_mask")]
     pub culling_mask: u32,
+    /// Render into a texture instead of the screen (CCTV / TV / minimap). A
+    /// material samples it through the texture path `camera:<object id>`. Never
+    /// the main camera.
+    #[serde(default)]
+    pub render_texture: bool,
+    /// Render-texture size in pixels.
+    #[serde(default = "default_render_texture_size")]
+    pub texture_size: [u32; 2],
+    /// Render-texture refreshes per second; 0 = every frame. Screens nobody
+    /// can see are skipped regardless.
+    #[serde(default)]
+    pub update_hz: f32,
+    /// Transient: the inspector's "Create Screen" button (spawns a plane showing
+    /// this camera's feed). Consumed by the engine.
+    #[serde(skip)]
+    pub create_screen: bool,
+}
+
+fn default_render_texture_size() -> [u32; 2] {
+    [512, 512]
 }
 
 impl Default for CameraComponent {
@@ -819,6 +932,10 @@ impl Default for CameraComponent {
             near: 0.1,
             far: 100.0,
             culling_mask: all_layers_mask(),
+            render_texture: false,
+            texture_size: default_render_texture_size(),
+            update_hz: 0.0,
+            create_screen: false,
         }
     }
 }
@@ -1161,14 +1278,18 @@ pub struct LodLevel {
     pub max_distance: f32,
     /// Project-relative model path for this level (empty = keep the base mesh).
     pub model: String,
+    /// With no model: generate this level from the object's own model,
+    /// keeping this share of its triangles (0 or 1 = the base mesh).
+    #[serde(default)]
+    pub keep: f32,
 }
 
 impl Default for LodComponent {
     fn default() -> Self {
         Self {
             levels: vec![
-                LodLevel { max_distance: 15.0, model: String::new() },
-                LodLevel { max_distance: 50.0, model: String::new() },
+                LodLevel { max_distance: 15.0, model: String::new(), keep: 0.0 },
+                LodLevel { max_distance: 50.0, model: String::new(), keep: 0.5 },
             ],
             cull_distance: 0.0,
         }
@@ -1386,6 +1507,11 @@ pub struct ReflectionProbe {
     /// WHERE the box sits (aligned to the room's walls/floor/ceiling).
     #[serde(default)]
     pub box_offset: [f32; 3],
+    /// Capture-point offset from the object position (world-axis meters).
+    /// Moves where the cube is rendered from without moving the object or its
+    /// box (drag the capture handle in the viewport).
+    #[serde(default)]
+    pub capture_offset: [f32; 3],
     /// Keep the box FIXED IN WORLD SPACE while the object moves: `box_offset`
     /// auto-compensates each frame, so dragging the probe repositions only the
     /// capture point inside the room-aligned box. Off = box follows the object.
@@ -1417,10 +1543,28 @@ pub struct ReflectionProbe {
     /// small specific probe wins over a large surrounding one where they overlap.
     #[serde(default)]
     pub importance: i32,
+    /// Realtime mode: fresh cubes per second (0 = every frame).
+    #[serde(default = "default_probe_update_hz")]
+    pub update_hz: f32,
+    /// Realtime mode: spread a capture over 7 frames (one face each, then the
+    /// mip chain) instead of rendering all six faces in one frame. Cheaper per
+    /// frame, but moving objects step in the reflection.
+    #[serde(default)]
+    pub time_slicing: bool,
+    /// Realtime mode: also draw non-static objects into the cube. Off by
+    /// default: box projection maps everything in the cube onto the box walls,
+    /// so a moving object inside the room shows up as a ghost on far surfaces
+    /// (SSR / ray-traced reflections handle moving objects instead).
+    #[serde(default)]
+    pub include_dynamic: bool,
 }
 
 fn default_blend_distance() -> f32 {
     1.0
+}
+
+fn default_probe_update_hz() -> f32 {
+    30.0
 }
 
 impl Default for ReflectionProbe {
@@ -1428,6 +1572,7 @@ impl Default for ReflectionProbe {
         Self {
             size: [10.0, 6.0, 10.0],
             box_offset: [0.0; 3],
+            capture_offset: [0.0; 3],
             lock_box: false,
             last_world_pos: None,
             resolution: 256,
@@ -1435,6 +1580,9 @@ impl Default for ReflectionProbe {
             box_projection: true,
             blend_distance: default_blend_distance(),
             importance: 0,
+            update_hz: default_probe_update_hz(),
+            time_slicing: false,
+            include_dynamic: false,
             mode: ReflectionProbeMode::Realtime,
             bake_now: false,
         }
@@ -1634,6 +1782,9 @@ pub struct BoxCollider {
     pub size: [f32; 3],
     pub is_trigger: bool,
     pub layer: u32,
+    /// Physics material (`.physmat`, project-relative; "" = the body's or project default).
+    #[serde(default)]
+    pub material: String,
 }
 
 impl Default for BoxCollider {
@@ -1643,6 +1794,7 @@ impl Default for BoxCollider {
             size: [1.0; 3],
             is_trigger: false,
             layer: 0,
+            material: String::new(),
         }
     }
 }
@@ -1658,6 +1810,9 @@ pub struct SphereCollider {
     pub radius: f32,
     pub is_trigger: bool,
     pub layer: u32,
+    /// Physics material (`.physmat`, project-relative; "" = the body's or project default).
+    #[serde(default)]
+    pub material: String,
 }
 
 impl Default for SphereCollider {
@@ -1667,6 +1822,7 @@ impl Default for SphereCollider {
             radius: 0.5,
             is_trigger: false,
             layer: 0,
+            material: String::new(),
         }
     }
 }
@@ -1675,20 +1831,108 @@ impl TypedComponent for SphereCollider {
     const NAME: &'static str = "Sphere Collider";
 }
 
+/// Axis a capsule runs along (local).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ColliderAxis {
+    X,
+    #[default]
+    Y,
+    Z,
+}
+
+impl ColliderAxis {
+    pub const ALL: [ColliderAxis; 3] = [ColliderAxis::X, ColliderAxis::Y, ColliderAxis::Z];
+    pub fn label(self) -> &'static str {
+        match self {
+            ColliderAxis::X => "X",
+            ColliderAxis::Y => "Y",
+            ColliderAxis::Z => "Z",
+        }
+    }
+    pub fn vector(self) -> Vec3 {
+        match self {
+            ColliderAxis::X => Vec3::X,
+            ColliderAxis::Y => Vec3::Y,
+            ColliderAxis::Z => Vec3::Z,
+        }
+    }
+}
+
+/// A capsule collision shape: `height` end to end (caps included) along
+/// `direction`, `radius` thick.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapsuleCollider {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub height: f32,
+    pub direction: ColliderAxis,
+    pub is_trigger: bool,
+    pub layer: u32,
+    /// Physics material (`.physmat`, project-relative; "" = the body's or project default).
+    pub material: String,
+}
+
+impl Default for CapsuleCollider {
+    fn default() -> Self {
+        Self { center: [0.0; 3], radius: 0.5, height: 2.0, direction: ColliderAxis::Y, is_trigger: false, layer: 0, material: String::new() }
+    }
+}
+
+impl TypedComponent for CapsuleCollider {
+    const NAME: &'static str = "Capsule Collider";
+}
+
 /// Collision from the object's own mesh (convex hull or exact triangles).
 #[derive(Serialize, Deserialize)]
 pub struct MeshCollider {
+    /// One convex hull even when static (static meshes otherwise collide
+    /// with their exact triangles).
     pub convex: bool,
+    /// Moving bodies: split into convex pieces that follow a concave shape
+    /// (a couch's seat and arms) instead of one hull around it all.
+    #[serde(default)]
+    pub follow_shape: bool,
+    /// How closely hulls and pieces hug the mesh (more corners and pieces
+    /// cost more to build and simulate).
+    #[serde(default)]
+    pub detail: ColliderDetail,
     pub is_trigger: bool,
     pub layer: u32,
+    /// Physics material (`.physmat`, project-relative; "" = the body's or project default).
+    #[serde(default)]
+    pub material: String,
+}
+
+/// Mesh Collider fidelity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ColliderDetail {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl ColliderDetail {
+    pub const ALL: [ColliderDetail; 3] = [Self::Low, Self::Medium, Self::High];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
 }
 
 impl Default for MeshCollider {
     fn default() -> Self {
         Self {
             convex: false,
+            follow_shape: true,
+            detail: ColliderDetail::Medium,
             is_trigger: false,
             layer: 0,
+            material: String::new(),
         }
     }
 }
@@ -1724,23 +1968,34 @@ impl BodyKind {
 #[derive(Serialize, Deserialize)]
 pub struct RigidBody {
     pub kind: BodyKind,
-    /// Mass in kg (Dynamic only; <= 0 falls back to the collider's density).
+    /// Mass in kg (Dynamic only; 0 = from the colliders' volume and the
+    /// physics material's density, else 500 kg/m^3).
     pub mass: f32,
     /// Bounciness 0..1.
     pub restitution: f32,
     pub friction: f32,
     /// Per-body gravity multiplier (0 = floats).
     pub gravity_scale: f32,
+    /// Physics material (`.physmat`, project-relative). When set it replaces
+    /// restitution and friction above, and its colliders inherit it.
+    #[serde(default)]
+    pub material: String,
+    /// Engine-filled in Play: the simulated mass (kg) and collider volume
+    /// (m^3), so the inspector can show the body's real density.
+    #[serde(skip)]
+    pub measured: Option<(f32, f32)>,
 }
 
 impl Default for RigidBody {
     fn default() -> Self {
         Self {
             kind: BodyKind::Dynamic,
-            mass: 1.0,
+            mass: 0.0,
             restitution: 0.0,
             friction: 0.5,
             gravity_scale: 1.0,
+            material: String::new(),
+            measured: None,
         }
     }
 }
@@ -2178,11 +2433,16 @@ impl TypedComponent for CharacterController {
 /// Plays skeletal animation clips on this object's skinned meshes, with
 /// cross-fades. Each animated object gets its own pose, so spawned copies of a
 /// model animate independently. Drive it from gameplay with
-/// `ctx.play_animation(target, "Run", 0.2)`.
+/// `ctx.play_animation(target, "Run", 0.2)`, or give it an Animator Controller
+/// (`.animctrl` state machine) and drive that with parameters
+/// (`ctx.set_animator_trigger(target, "Jump")`). Clips may be imported model
+/// clips or authored `.anim` assets, which can also animate object hierarchies.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Animator {
-    /// Clip or blend tree to play on start (empty = the model's first clip).
+    /// Project-relative `.animctrl` path. Empty = play `clip` / blend trees directly.
+    pub controller: String,
+    /// Clip, `.anim` path or blend tree to play on start (empty = the model's first clip).
     pub clip: String,
     pub speed: f32,
     pub looping: bool,
@@ -2198,12 +2458,78 @@ pub struct Animator {
     pub root_motion: bool,
     /// Skin on the GPU (compute). Off = CPU skinning.
     pub gpu_skinning: bool,
+    /// Parameters fed every frame from movement, physics or another Animator.
+    pub drivers: Vec<ParamDriver>,
     #[serde(skip)]
     pub state: AnimatorState,
 }
 
+/// Where a [`ParamDriver`] reads its value.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DriverSource {
+    /// Horizontal movement speed (m/s) of the source object.
+    #[default]
+    Speed,
+    VerticalSpeed,
+    /// Signed speed along the source object's forward (-Z) axis.
+    ForwardSpeed,
+    /// Signed speed along the source object's right (+X) axis.
+    RightSpeed,
+    /// 1 while the source's Character Controller touches the ground.
+    Grounded,
+    /// A parameter of the source object's Animator.
+    AnimatorParameter,
+}
+
+impl DriverSource {
+    pub const ALL: [DriverSource; 6] = [
+        Self::Speed,
+        Self::VerticalSpeed,
+        Self::ForwardSpeed,
+        Self::RightSpeed,
+        Self::Grounded,
+        Self::AnimatorParameter,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Speed => "Speed",
+            Self::VerticalSpeed => "Vertical speed",
+            Self::ForwardSpeed => "Forward speed",
+            Self::RightSpeed => "Right speed",
+            Self::Grounded => "Grounded",
+            Self::AnimatorParameter => "Animator parameter",
+        }
+    }
+}
+
+/// Links a controller parameter to a live value, so state machines react to
+/// movement or to other state machines without code.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[serde(default)]
+pub struct ParamDriver {
+    pub parameter: String,
+    pub source: DriverSource,
+    /// Source object (unset = this object).
+    pub object: ObjectRef,
+    /// For `AnimatorParameter`: the source Animator's parameter name.
+    pub source_parameter: String,
+    pub scale: f32,
+}
+
+impl Default for ParamDriver {
+    fn default() -> Self {
+        Self {
+            parameter: String::new(),
+            source: DriverSource::Speed,
+            object: ObjectRef::NONE,
+            source_parameter: String::new(),
+            scale: 1.0,
+        }
+    }
+}
+
 /// Mixes clips by one (1D) or two (2D) float parameters.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct BlendTree {
     pub name: String,
@@ -2213,7 +2539,7 @@ pub struct BlendTree {
     pub motions: Vec<BlendMotion>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct BlendMotion {
     pub clip: String,
@@ -2317,11 +2643,68 @@ pub struct AnimatorState {
     pub root_delta: Vec3,
     /// Root position (skeleton space) last frame, for root-motion deltas.
     pub last_root: Option<Vec3>,
+    /// Controller playback per layer (filled in by the engine).
+    pub layers: Vec<LayerPlayback>,
+    /// Controller path `layers` was initialised for.
+    pub controller_ready: Option<String>,
+    /// `play_state` requests waiting for the next evaluation.
+    pub requests: Vec<StateRequest>,
+    /// Controller state changes `(layer, from, to)` since the engine last delivered them.
+    pub state_changes: Vec<(usize, String, String)>,
+}
+
+/// Playback of one controller layer.
+#[derive(Clone, Default, Debug)]
+pub struct LayerPlayback {
+    /// Current state index and name.
+    pub state: usize,
+    pub state_name: String,
+    /// Seconds into the current state (speed applied).
+    pub time: f32,
+    /// `time` over the state's length (keeps growing past 1 while looping).
+    pub normalized_time: f32,
+    /// State being faded out and its time.
+    pub previous: Option<(usize, f32)>,
+    pub fade_elapsed: f32,
+    pub fade_duration: f32,
+    /// Transition currently blending (index into the layer's transitions).
+    pub transition: Option<usize>,
+}
+
+impl LayerPlayback {
+    pub fn in_transition(&self) -> bool {
+        self.previous.is_some() && self.fade_duration > 0.0
+    }
+    /// 0..1 progress of the active cross-fade (1 when none).
+    pub fn transition_progress(&self) -> f32 {
+        if self.in_transition() { (self.fade_elapsed / self.fade_duration).clamp(0.0, 1.0) } else { 1.0 }
+    }
+}
+
+/// A forced state switch (`play_state`). `layer` None = the first layer with
+/// a state of that name.
+#[derive(Clone, Debug)]
+pub struct StateRequest {
+    pub layer: Option<usize>,
+    pub state: String,
+    pub fade: f32,
+}
+
+/// Broadcast when an Animator Controller layer enters a new state
+/// (readable via `ctx.events::<AnimatorStateChanged>()`).
+#[derive(Clone, Debug)]
+pub struct AnimatorStateChanged {
+    pub object: ObjectId,
+    pub layer: usize,
+    pub from: String,
+    pub to: String,
 }
 
 impl Default for Animator {
     fn default() -> Self {
         Self {
+            controller: String::new(),
+            drivers: Vec::new(),
             clip: String::new(),
             speed: 1.0,
             looping: true,
@@ -2337,8 +2720,13 @@ impl Default for Animator {
 
 impl Animator {
     /// Switch to `clip`, cross-fading over `fade` seconds. A no-op when that
-    /// clip is already playing.
+    /// clip is already playing. With a controller this forces the state of
+    /// that name instead (see [`Animator::play_state`]).
     pub fn play(&mut self, clip: &str, fade: f32) {
+        if !self.controller.is_empty() {
+            self.play_state(clip, fade);
+            return;
+        }
         let s = &mut self.state;
         s.started = true;
         if s.playing && s.current.as_deref() == Some(clip) {
@@ -2363,6 +2751,59 @@ impl Animator {
 
     pub fn get_float(&self, name: &str) -> f32 {
         self.state.params.get(name).copied().unwrap_or(0.0)
+    }
+
+    pub fn set_int(&mut self, name: &str, value: i32) {
+        self.set_float(name, value as f32);
+    }
+
+    pub fn get_int(&self, name: &str) -> i32 {
+        self.get_float(name).round() as i32
+    }
+
+    pub fn set_bool(&mut self, name: &str, value: bool) {
+        self.set_float(name, if value { 1.0 } else { 0.0 });
+    }
+
+    pub fn get_bool(&self, name: &str) -> bool {
+        self.get_float(name) > 0.5
+    }
+
+    /// Set a trigger: stays set until a transition consumes it.
+    pub fn set_trigger(&mut self, name: &str) {
+        self.set_float(name, 1.0);
+    }
+
+    pub fn reset_trigger(&mut self, name: &str) {
+        self.set_float(name, 0.0);
+    }
+
+    /// Force a controller state by name (on the first layer that has it),
+    /// cross-fading over `fade` seconds.
+    pub fn play_state(&mut self, state: &str, fade: f32) {
+        self.state.requests.push(StateRequest { layer: None, state: state.to_owned(), fade });
+    }
+
+    pub fn play_state_on_layer(&mut self, layer: usize, state: &str, fade: f32) {
+        self.state.requests.push(StateRequest { layer: Some(layer), state: state.to_owned(), fade });
+    }
+
+    /// Current controller state of a layer.
+    pub fn current_state(&self, layer: usize) -> Option<&str> {
+        self.state.layers.get(layer).map(|l| l.state_name.as_str())
+    }
+
+    pub fn is_in_state(&self, layer: usize, state: &str) -> bool {
+        self.current_state(layer) == Some(state)
+    }
+
+    pub fn is_in_transition(&self, layer: usize) -> bool {
+        self.state.layers.get(layer).is_some_and(|l| l.in_transition())
+    }
+
+    /// Normalized time of a layer's current state (1.0 = one full pass).
+    pub fn state_normalized_time(&self, layer: usize) -> f32 {
+        self.state.layers.get(layer).map(|l| l.normalized_time).unwrap_or(0.0)
     }
 
     /// Freeze on the current frame.

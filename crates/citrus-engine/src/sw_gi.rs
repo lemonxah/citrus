@@ -106,7 +106,9 @@ fn emitter_light(insts: &[SdfInstance], emitters: &[Emitter], p: Vec3, n: Vec3, 
         if ndl <= 0.0 {
             continue;
         }
-        let reach = dist - em.radius - eps;
+        // Stop clearly short of the sphere (estimated radius) so the emitter's
+        // own surface never reads as an occluder.
+        let reach = (dist - em.radius * 1.25 - 0.02).max(eps * 2.0);
         if occluded(insts, p + n * (eps * 2.0), l, reach, eps) {
             continue;
         }
@@ -374,7 +376,9 @@ fn probe_sh(
             continue;
         }
         let l = dir / dist;
-        let reach = dist - em.radius - eps;
+        // Stop clearly short of the sphere (estimated radius) so the emitter's
+        // own surface never reads as an occluder.
+        let reach = (dist - em.radius * 1.25 - 0.02).max(eps * 2.0);
         if occluded(insts, origin, l, reach, eps) {
             continue;
         }
@@ -389,6 +393,7 @@ fn probe_sh(
         coeffs: [pack(sh0), pack(sh1), pack(sh2), pack(sh3)],
         dist: [d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt],
         dist2: [q0 * wgt, q1 * wgt, q2 * wgt, q3 * wgt],
+        offset: [0.0; 3],
     }
 }
 
@@ -656,16 +661,16 @@ pub fn flux_distance_moments(
     positions: &[Vec3],
     occ: &SceneOccupancy,
 ) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    // Distances are clamped to this, so no ray needs to march further.
+    const MAX_MOMENT_DIST: f32 = 8.0;
     let dirs = fib_sphere(16);
     let wgt = (4.0 * PI) / dirs.len() as f32;
-    let max_dist = occ.span();
-    let mut dist = Vec::with_capacity(positions.len());
-    let mut dist2 = Vec::with_capacity(positions.len());
-    for &p in positions {
+    let max_dist = occ.span().min(MAX_MOMENT_DIST);
+    let probe = |p: Vec3| {
         let (mut d0, mut d1, mut d2, mut d3) = (0.0f32, 0.0, 0.0, 0.0);
         let (mut q0, mut q1, mut q2, mut q3) = (0.0f32, 0.0, 0.0, 0.0);
         for &d in &dirs {
-            let fd = occ.ray_distance(p, d, max_dist).min(8.0);
+            let fd = occ.ray_distance(p, d, max_dist).min(MAX_MOMENT_DIST);
             d0 += fd * 0.282095;
             d1 += fd * (0.488603 * d.y);
             d2 += fd * (0.488603 * d.z);
@@ -676,10 +681,23 @@ pub fn flux_distance_moments(
             q2 += fd2 * (0.488603 * d.z);
             q3 += fd2 * (0.488603 * d.x);
         }
-        dist.push([d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt]);
-        dist2.push([q0 * wgt, q1 * wgt, q2 * wgt, q3 * wgt]);
-    }
-    (dist, dist2)
+        ([d0 * wgt, d1 * wgt, d2 * wgt, d3 * wgt], [q0 * wgt, q1 * wgt, q2 * wgt, q3 * wgt])
+    };
+    // Probes are independent: split them across the CPU cores.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    let chunk = positions.len().div_ceil(threads).max(256);
+    let mut out = vec![([0.0f32; 4], [0.0f32; 4]); positions.len()];
+    std::thread::scope(|scope| {
+        for (src, dst) in positions.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            let probe = &probe;
+            scope.spawn(move || {
+                for (p, o) in src.iter().zip(dst) {
+                    *o = probe(*p);
+                }
+            });
+        }
+    });
+    out.into_iter().unzip()
 }
 
 /// Build a `ProbeSh` from a radiance accumulator plus precomputed distance moments
@@ -691,6 +709,7 @@ pub fn acc_to_probe_moments(s: &[Vec3; 4], dist: [f32; 4], dist2: [f32; 4]) -> P
         coeffs: [p(s[0]), p(s[1]), p(s[2]), p(s[3])],
         dist,
         dist2,
+        offset: [0.0; 3],
     }
 }
 
@@ -925,6 +944,7 @@ pub fn acc_to_probe(s: &[Vec3; 4]) -> ProbeSh {
         coeffs: [p(s[0]), p(s[1]), p(s[2]), p(s[3])],
         dist: [0.0; 4],
         dist2: [0.0; 4],
+        offset: [0.0; 3],
     }
 }
 
@@ -970,6 +990,7 @@ pub fn lower_compute_priority() {
 /// March every probe and return SH-L1 radiance coefficients (same layout as the
 /// ray-query probe bake). Parallelized across CPU cores; each probe is
 /// independent. `scene_size` sizes the march epsilon and reach.
+#[allow(clippy::too_many_arguments)]
 pub fn march_probes(
     insts: &[SdfInstance],
     lights: &[BakeLight],
@@ -999,7 +1020,7 @@ pub fn march_probes(
                 lower_compute_priority();
                 for (k, &origin) in pchunk.iter().enumerate() {
                     ochunk[k] = probe_sh(
-                        insts, lights, &emitters, origin, sky, eps, max_dist, samples, bounces,
+                        insts, lights, emitters, origin, sky, eps, max_dist, samples, bounces,
                         base + k, seed,
                     );
                 }
@@ -1190,7 +1211,7 @@ mod tests {
         // read closer than the overall mean (the rest escapes to max_dist).
         let mean = out[0].dist[0] * 0.282095;
         assert!(mean > 0.0 && mean.is_finite(), "mean probe distance {mean}");
-        let down = out[0].dist[0] * 0.282095 + 0.488603 * out[0].dist[1] * (-1.0);
+        let down = out[0].dist[0] * 0.282095 + -(0.488603 * out[0].dist[1]);
         assert!(
             down < mean,
             "downward seen-distance ({down}) should be nearer than mean ({mean})"
@@ -1214,8 +1235,8 @@ mod tests {
         // A single hot probe at the center spreads outward; the center drops and
         // a neighbour rises.
         let mut spike = vec![ProbeSh::default(); n];
-        let center = (1 * 3 + 1) * 3 + 1;
-        let neighbor = (1 * 3 + 1) * 3 + 0;
+        let center = (3 + 1) * 3 + 1;
+        let neighbor = (3 + 1) * 3;
         spike[center].coeffs[0][0] = 1.0;
         blur_probe_grid(&mut spike, counts, 1);
         assert!(spike[center].coeffs[0][0] < 1.0, "spike center should fall");

@@ -5,3 +5,5 @@ target
 **/*.spv
 .citrus_texcache
 **/.citrus_texcache
+target-win
+target-android

@@ -20,16 +20,25 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 const float PI = 3.14159265359;
 
-struct Vertex { vec3 position; vec3 normal; vec2 uv; vec4 color; vec4 tangent; vec2 uv1; };
+struct Vertex { vec3 position; vec3 normal; vec2 uv; vec4 color; vec4 tangent; vec2 uv1;
+    // Skinning lanes: unused here, but part of the 104-byte engine Vertex, so the
+    // array stride matches (without them every fetch past vertex 0 was wrong).
+    uvec4 joints; vec4 weights; };
 layout(buffer_reference, scalar) readonly buffer Vertices { Vertex v[]; };
 layout(buffer_reference, scalar) readonly buffer Indices { uint i[]; };
-struct Instance { uint64_t vtx_addr; uint64_t idx_addr; vec4 albedo; vec4 emission; };
+// Mirrors GpuInstance in rt_reflect.rs (176 bytes); only the GI lanes are read.
+struct Instance {
+    uint64_t vtx_addr; uint64_t idx_addr; vec4 albedo; vec4 emission;
+    vec4 base; vec4 emission_raw; ivec4 textures;
+    vec4 albedo_st; vec4 normal_st; vec4 orm_st; vec4 emission_st; vec4 params;
+};
 struct Light { vec4 pos_kind; vec4 dir_range; vec4 color; vec4 spot; };
 struct Emitter { vec4 center_radius; vec4 emission; };
-struct ScreenProbe { vec4 c[4]; };
+// c[4].x = emitter visibility bitmask (uint bits), read by the integrate.
+struct ScreenProbe { vec4 c[5]; };
 // World SH radiance cache (DDGI volume), matching screen_gi.comp's `Probe`:
 // c[0..3] = SH-L1 radiance (rgb) + distance moment (w); c[4] = dist² SH.
-struct Probe { vec4 c[5]; };
+struct Probe { vec4 c[6]; };
 struct GiProbeVolume { mat4 world_to_local; vec4 size_base; vec4 counts; };
 const int MAX_GI_VOLUMES = 4;
 
@@ -65,11 +74,14 @@ layout(set = 0, binding = 10, scalar) readonly buffer Probes { Probe probes[]; }
 uint hash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
 float rnd(inout uint s) { s = hash(s); return float(s) * (1.0 / 4294967296.0); }
 
+// TLAS instance masks (rt_reflect.rs): water is left out of the GI gather.
+const uint RT_MASK_SOLID = 0x01u;
+
 bool rq_occluded(vec3 o, vec3 d, float dist) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, tlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-        0xFF, o, 1e-3, d, dist - 2e-3);
+        RT_MASK_SOLID, o, 1e-3, d, dist - 2e-3);
     while (rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
@@ -96,9 +108,11 @@ vec3 direct_light(vec3 p, vec3 n) {
             }
         }
         float ndl = max(dot(n, tl), 0.0);
-        if (ndl <= 0.0 || atten <= 0.0) continue;
+        vec3 c = l.color.rgb * (ndl * atten);
+        // No shadow ray for a light that can't visibly light this point.
+        if (max(c.r, max(c.g, c.b)) < 1e-3) continue;
         if (rq_occluded(p + n * 1e-3, tl, dist)) continue;
-        sum += l.color.rgb * (ndl * atten);
+        sum += c;
     }
     return sum;
 }
@@ -108,6 +122,25 @@ float sphere_solid_angle(float r, float d) {
     float s = min(r / d, 0.999);
     return 2.0 * PI * (1.0 - sqrt(1.0 - s * s));
 }
+// Where a shadow ray toward an emitter sphere stops. The sphere radius is an
+// estimate and a tessellated sphere's faces sit inside it, so stopping exactly
+// at `dist - r` grazed the emitter's own triangles on some frames (flicker as it
+// moved); stop clearly short of its surface instead.
+float emitter_shadow_len(float dist, float r) {
+    return max(dist - r * 1.25 - 0.02, 1e-2);
+}
+
+// A gather ray that lands on an emitter: its light is already added by the
+// analytic emitter term, so the hit's own emission is dropped (no double count).
+bool on_emitter(vec3 hp) {
+    for (uint i = 0u; i < pc.counts.w; ++i) {
+        vec3 c = emitters.data[i].center_radius.xyz;
+        float r = max(emitters.data[i].center_radius.w, 1e-3);
+        if (length(hp - c) < r * 1.5 + 0.05) return true;
+    }
+    return false;
+}
+
 vec3 emitter_light(vec3 p, vec3 n) {
     vec3 sum = vec3(0.0);
     for (uint i = 0u; i < pc.counts.w; ++i) {
@@ -119,7 +152,7 @@ vec3 emitter_light(vec3 p, vec3 n) {
         if (ndl <= 0.0) continue;
         // Shadow ray to just before the sphere surface: skip if a solid occluder
         // (e.g. the couch) blocks the emitter, so its light can't leak through.
-        if (rq_occluded(p + n * 1e-3, l, max(dist - r, 1e-2))) continue;
+        if (rq_occluded(p + n * 1e-3, l, emitter_shadow_len(dist, r))) continue;
         sum += emitters.data[i].emission.rgb * (ndl * sphere_solid_angle(r, max(dist, r * 1.001)));
     }
     return sum;
@@ -155,7 +188,7 @@ vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
         vec3 t = (local + size * 0.5) / size;
         if (any(lessThan(t, vec3(0.0))) || any(greaterThan(t, vec3(1.0)))) continue;
         ivec3 cnt = ivec3(v.counts.xyz + 0.5);
-        vec3 center = -v.world_to_local[3].xyz;
+        vec3 center = -(transpose(mat3(v.world_to_local)) * v.world_to_local[3].xyz); // volume origin (rotation-aware)
         vec3 cell = size / max(vec3(cnt - 1), vec3(1.0));
         vec3 g = clamp(t, vec3(0.0), vec3(1.0)) * vec3(cnt - 1);
         ivec3 g0 = ivec3(floor(g));
@@ -171,7 +204,7 @@ vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
             float w = tw.x * tw.y * tw.z;
             uint idx = uint(v.size_base.w) + uint(gc.x + gc.y * cnt.x + gc.z * cnt.x * cnt.y);
             vec3 gn = vec3(gc) / max(vec3(cnt - 1), vec3(1.0));
-            vec3 ppos = center + (gn - 0.5) * size;
+            vec3 ppos = center + transpose(mat3(v.world_to_local)) * ((gn - 0.5) * size) + probes[idx].c[5].xyz;
             vec3 to_frag = world_pos - ppos;
             float pd = length(to_frag);
             vec3 dir = pd > 1e-5 ? to_frag / pd : n;
@@ -204,10 +237,11 @@ vec3 cache_irradiance(vec3 world_pos, vec3 n, out float coverage) {
 // Incoming radiance along one gather ray: closest TLAS hit → emission + albedo ·
 // cached outgoing radiance (the surface-cache model, matching the software gather)
 // where a probe volume covers the hit, else albedo/π · (direct + emitter) as a
-// single-bounce fallback. Sky on miss.
-vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist) {
+// single-bounce fallback. Sky on miss. A back-face hit (the ray started inside or
+// leaked through geometry) returns 0 and bumps `backs`.
+vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist, inout uint backs) {
     rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, ro, 1e-3, rd, max_dist);
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, RT_MASK_SOLID, ro, 1e-3, rd, max_dist);
     while (rayQueryProceedEXT(rq)) {}
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
         return pc.sky.rgb;
@@ -219,77 +253,68 @@ vec3 rq_incoming(vec3 ro, vec3 rd, float max_dist) {
     Indices idx = Indices(inst.idx_addr);
     Vertices vtx = Vertices(inst.vtx_addr);
     uint i0 = idx.i[prim * 3], i1 = idx.i[prim * 3 + 1], i2 = idx.i[prim * 3 + 2];
+    Vertex v0 = vtx.v[i0], v1 = vtx.v[i1], v2 = vtx.v[i2];
+    mat3 m = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true));
+    vec3 gn = m * cross(v1.position - v0.position, v2.position - v0.position);
+    gn = dot(gn, gn) > 1e-20 ? normalize(gn) : -rd;
+    if (dot(gn, rd) > 0.0) {
+        backs++;
+        return vec3(0.0);
+    }
     float w = 1.0 - bc.x - bc.y;
-    vec3 on = normalize(vtx.v[i0].normal * w + vtx.v[i1].normal * bc.x + vtx.v[i2].normal * bc.y);
-    mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-    vec3 hn = normalize(mat3(o2w) * on);
-    if (dot(hn, rd) > 0.0) hn = -hn;
+    vec3 on = v0.normal * w + v1.normal * bc.x + v2.normal * bc.y;
+    vec3 hn = dot(on, on) > 1e-12 ? normalize(m * on) : gn;
+    if (dot(hn, rd) > 0.0) hn = gn;
     vec3 hp = ro + rd * tt;
-    float metal = clamp(inst.albedo.w, 0.0, 1.0);
+    float metal = clamp(inst.params.x, 0.0, 1.0);
     vec3 albedo = inst.albedo.rgb * (1.0 - metal);
+    // Mixed lighting (probe_info.y): static surfaces' emission is in the bake.
+    bool mixed = pc.probe_info.y > 0.5;
+    vec3 emission = (on_emitter(hp) || (mixed && inst.emission.w > 0.5)) ? vec3(0.0) : inst.emission.rgb;
     // Surface-cache hit: read converged multi-bounce outgoing radiance from the
-    // world SH cache (albedo · E/PI), with a near-field fade so a contact hit a
-    // voxel or two away doesn't pool light. Matches screen_gi.comp's cached path.
+    // world SH cache (albedo · E/PI). RT hits are exact, so only a ~2 cm contact
+    // fade (the SDF path's voxel-scale fade darkened real creases here).
     float cov;
     vec3 cached = cache_irradiance(hp, hn, cov);
-    if (cov > 0.0) {
-        vec3 ext = pc.gdf_max.xyz - pc.gdf_min.xyz;
-        float vox = max(ext.x, max(ext.y, ext.z)) * (1.0 / 128.0);
-        float occ = smoothstep(vox * 1.5, vox * 6.0, tt);
-        return inst.emission.rgb + albedo * cached * occ;
+    if (cov > 0.0 && !mixed) {
+        return emission + albedo * cached * smoothstep(0.0, 0.02, tt);
     }
-    // No cache coverage: analytic single-bounce shade.
-    return inst.emission.rgb + (albedo / PI) * (direct_light(hp, hn) + emitter_light(hp, hn));
-}
-
-vec3 world_from_depth(vec2 uv, float depth) {
-    vec2 ndc = uv * 2.0 - 1.0;
-    if (pc.misc.w != 0u) ndc.y = -ndc.y;
-    vec4 wp = pc.inv_view_proj * vec4(ndc, depth, 1.0);
-    return wp.xyz / wp.w;
+    // No cache coverage: analytic single-bounce shade. Shadow rays start off the
+    // geometric normal, scaled with hit distance (no terminator self-shadowing).
+    vec3 sp = hp + gn * max(1e-3, tt * 1e-3);
+    return emission + (albedo / PI) * (direct_light(sp, hn) + emitter_light(sp, hn));
 }
 
 void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
     uint sw = pc.misc.y, sh = pc.misc.z;
     if (px.x >= sw || px.y >= sh) return;
-    vec2 uv = (vec2(px) + 0.5) / vec2(sw, sh);
-    float depth = texture(u_depth, uv).r;
-    if (depth >= 1.0) {
+    uint pidx = px.y * sw + px.x;
+    vec3 p, n;
+    if (!flux_probe_surface(u_depth, px, uvec2(sw, sh), pc.inv_view_proj, pc.misc.w != 0u, p, n)) {
         imageStore(u_out, ivec2(px), vec4(0.0));
-        uint pidx = px.y * sw + px.x;
         sh_out[pidx].c[0] = vec4(0.0); sh_out[pidx].c[1] = vec4(0.0);
         sh_out[pidx].c[2] = vec4(0.0); sh_out[pidx].c[3] = vec4(0.0);
+        sh_out[pidx].c[4] = vec4(0.0);
         return;
     }
-    vec3 p = world_from_depth(uv, depth);
-    vec2 texel = 1.0 / vec2(sw, sh);
-    float dl = texture(u_depth, uv - vec2(texel.x, 0.0)).r;
-    float dr = texture(u_depth, uv + vec2(texel.x, 0.0)).r;
-    float dd = texture(u_depth, uv - vec2(0.0, texel.y)).r;
-    float du = texture(u_depth, uv + vec2(0.0, texel.y)).r;
-    vec3 dpx = (abs(dl - depth) < abs(dr - depth))
-        ? p - world_from_depth(uv - vec2(texel.x, 0.0), dl)
-        : world_from_depth(uv + vec2(texel.x, 0.0), dr) - p;
-    vec3 dpy = (abs(dd - depth) < abs(du - depth))
-        ? p - world_from_depth(uv - vec2(0.0, texel.y), dd)
-        : world_from_depth(uv + vec2(0.0, texel.y), du) - p;
-    vec3 n = normalize(cross(dpx, dpy));
     if (dot(n, pc.cam.xyz - p) < 0.0) n = -n;
+    float cam_dist = length(p - pc.cam.xyz);
 
     float max_dist = pc.march.y > 0.0 ? pc.march.y : 1e16;
     uint samples = max(pc.counts.x, 1u);
     uint rng = hash(px.x * 1973u + px.y * 9277u + pc.misc.x * 26699u);
-    vec3 origin = p + n * max(pc.march.x * 2.0, 1e-3);
+    vec3 origin = p + n * flux_probe_offset(cam_dist, textureSize(u_depth, 0).y);
     float fclamp = max(pc.march.w, 0.5);
     vec2 cp = vec2(rnd(rng), rnd(rng));
 
     vec3 irr = vec3(0.0);
     vec3 sh0 = vec3(0.0), sh1 = vec3(0.0), sh2 = vec3(0.0), sh3 = vec3(0.0);
+    uint backs = 0u;
     for (uint i = 0u; i < samples; ++i) {
         vec2 u = fract(hammersley(i, samples) + cp);
         vec3 d = cosine_hemisphere_dir(n, u);
-        vec3 L = firefly_clamp(rq_incoming(origin, d, max_dist), fclamp);
+        vec3 L = firefly_clamp(rq_incoming(origin, d, max_dist, backs), fclamp);
         irr += L;
         float cw = PI / max(dot(d, n), 0.2);
         sh0 += L * ( 0.282095        * cw);
@@ -297,33 +322,32 @@ void main() {
         sh2 += L * ( 0.488603 * d.z  * cw);
         sh3 += L * (-0.488603 * d.x  * cw);
     }
+    // Mostly back faces: the probe sits inside or against geometry (a crease
+    // the offset couldn't clear). Mark it invalid so filters skip it.
+    bool probe_ok = backs * 4u <= samples;
     float inv_n = 1.0 / float(samples);
-    sh0 *= inv_n * pc.sky.w; sh1 *= inv_n * pc.sky.w;
-    sh2 *= inv_n * pc.sky.w; sh3 *= inv_n * pc.sky.w;
-    for (uint e = 0u; e < pc.counts.w; ++e) {
+    // Emitter direct light is shaded per pixel by the integrate, from each
+    // pixel's own position and normal (a probe-res term blurred by the denoise
+    // changed with the view). The probe only records which emitters it sees.
+    uint vis_mask = 0u;
+    for (uint e = 0u; e < min(pc.counts.w, 32u); ++e) {
         vec3 ec = emitters.data[e].center_radius.xyz;
         float er = max(emitters.data[e].center_radius.w, 1e-3);
         vec3 ed = ec - origin; float edist = length(ed);
         vec3 el = edist > 1e-4 ? ed / edist : n;
-        // Occlusion: skip emitters hidden behind solid geometry so their
-        // directional SH doesn't leak through (e.g. the sphere behind the couch).
-        if (rq_occluded(origin + n * 1e-3, el, max(edist - er, 1e-2))) continue;
-        vec3 Eem = emitters.data[e].emission.rgb * sphere_solid_angle(er, max(edist, er * 1.001));
-        sh0 += Eem * ( 0.282095);
-        sh1 += Eem * (-0.488603 * el.y);
-        sh2 += Eem * ( 0.488603 * el.z);
-        sh3 += Eem * (-0.488603 * el.x);
+        if (dot(n, el) + 0.3 <= 0.0) continue;
+        if (rq_occluded(origin + n * 1e-3, el, emitter_shadow_len(edist, er))) continue;
+        vis_mask |= 1u << e;
     }
-    irr *= inv_n;
-    irr += emitter_light(origin, n) / PI;
-    irr *= pc.sky.w;
+    sh0 *= inv_n * pc.sky.w; sh1 *= inv_n * pc.sky.w;
+    sh2 *= inv_n * pc.sky.w; sh3 *= inv_n * pc.sky.w;
+    irr = irr * inv_n * pc.sky.w;
 
-    float cam_dist = length(p - pc.cam.xyz);
     float alpha = clamp(pc.march.z, 0.02, 1.0);
     vec4 pclip = pc.prev_view_proj * vec4(p, 1.0);
     // alpha 1 = no usable history (first frame / resized targets): skip the
     // blend entirely, since NaN history survives even a weight of 0.
-    if (alpha < 0.999 && pclip.w > 0.0001) {
+    if (probe_ok && alpha < 0.999 && pclip.w > 0.0001) {
         vec2 pn = pclip.xy / pclip.w;
         if (pc.misc.w != 0u) pn.y = -pn.y;
         vec2 puv = pn * 0.5 + 0.5;
@@ -332,25 +356,52 @@ void main() {
             float prev_dist = length(p - pc.prev_cam.xyz);
             bool h_ok = !any(isnan(h)) && !any(isinf(h));
             if (h_ok && abs(h.a - prev_dist) < max(prev_dist * 0.08, 0.1)) {
-                irr = mix(h.rgb, irr, alpha);
-                ivec2 pp = clamp(ivec2(puv * vec2(sw, sh)), ivec2(0), ivec2(sw, sh) - 1);
-                uint pj = uint(pp.y) * sw + uint(pp.x);
-                vec3 p0 = sh_prev[pj].c[0].rgb, p1 = sh_prev[pj].c[1].rgb;
-                vec3 p2 = sh_prev[pj].c[2].rgb, p3 = sh_prev[pj].c[3].rgb;
-                vec3 psum = p0 + p1 + p2 + p3;
-                if (!any(isnan(psum)) && !any(isinf(psum))) {
-                    sh0 = mix(p0, sh0, alpha);
-                    sh1 = mix(p1, sh1, alpha);
-                    sh2 = mix(p2, sh2, alpha);
-                    sh3 = mix(p3, sh3, alpha);
+                // Relative firefly clamp against the converged history (as the
+                // software gather): an outlier can't pump the accumulator.
+                vec3 LW = vec3(0.2126, 0.7152, 0.0722);
+                float h_luma = dot(h.rgb, LW);
+                float i_luma = dot(irr, LW);
+                float ratio = mix(2.5, 4.0, clamp(h_luma / 0.5, 0.0, 1.0));
+                float max_luma = h_luma * ratio + 0.03;
+                float clamp_k = i_luma > max_luma ? max_luma / max(i_luma, 1e-4) : 1.0;
+                irr = mix(h.rgb, irr * clamp_k, alpha);
+                // SH history: bilinear over the 4 previous probes, each tap kept
+                // only if it was on this surface (distance + normal), so the SH
+                // doesn't snap between probes or bleed across edges in motion.
+                vec2 g = puv * vec2(sw, sh) - 0.5;
+                ivec2 g0 = ivec2(floor(g));
+                vec2 f = g - vec2(g0);
+                vec3 h0 = vec3(0.0), h1 = vec3(0.0), h2 = vec3(0.0), h3 = vec3(0.0);
+                float hw = 0.0;
+                for (int k = 0; k < 4; ++k) {
+                    ivec2 o = ivec2(k & 1, k >> 1);
+                    ivec2 q = clamp(g0 + o, ivec2(0), ivec2(sw, sh) - 1);
+                    ScreenProbe sp = sh_prev[uint(q.y) * sw + uint(q.x)];
+                    float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+                    vec3 pn3 = vec3(sp.c[1].w, sp.c[2].w, sp.c[3].w);
+                    bool same = abs(sp.c[0].w - prev_dist) < max(prev_dist * 0.08, 0.1) && dot(pn3, n) > 0.8;
+                    vec3 ps = sp.c[0].rgb + sp.c[1].rgb + sp.c[2].rgb + sp.c[3].rgb;
+                    if (!same || any(isnan(ps)) || any(isinf(ps))) continue;
+                    h0 += sp.c[0].rgb * bw; h1 += sp.c[1].rgb * bw;
+                    h2 += sp.c[2].rgb * bw; h3 += sp.c[3].rgb * bw;
+                    hw += bw;
+                }
+                if (hw > 1e-3) {
+                    float ih = 1.0 / hw;
+                    sh0 = mix(h0 * ih, sh0 * clamp_k, alpha);
+                    sh1 = mix(h1 * ih, sh1 * clamp_k, alpha);
+                    sh2 = mix(h2 * ih, sh2 * clamp_k, alpha);
+                    sh3 = mix(h3 * ih, sh3 * clamp_k, alpha);
                 }
             }
         }
     }
-    uint pidx = px.y * sw + px.x;
-    sh_out[pidx].c[0] = vec4(sh0, cam_dist);
+    float out_dist = probe_ok ? cam_dist : 0.0;
+    sh_out[pidx].c[0] = vec4(sh0, out_dist);
     sh_out[pidx].c[1] = vec4(sh1, n.x);
     sh_out[pidx].c[2] = vec4(sh2, n.y);
     sh_out[pidx].c[3] = vec4(sh3, n.z);
-    imageStore(u_out, ivec2(px), vec4(irr, cam_dist));
+    // c[4].yzw = the probe's world position (plane-aware integrate weights).
+    sh_out[pidx].c[4] = vec4(uintBitsToFloat(vis_mask), p);
+    imageStore(u_out, ivec2(px), vec4(irr, out_dist));
 }

@@ -36,20 +36,136 @@ fn flux_voxel_static_hash(
         n.hash(&mut h);
     }
     for l in lights {
+        // Everything that changes a light's contribution: rotating a spot or
+        // retyping a light must rebuild the base too.
+        (l.kind as u8).hash(&mut h);
         for v in [
             l.position.x,
             l.position.y,
             l.position.z,
+            l.direction.x,
+            l.direction.y,
+            l.direction.z,
             l.color[0],
             l.color[1],
             l.color[2],
             l.range,
+            l.spot_inner_deg,
+            l.spot_outer_deg,
+            l.radius,
         ] {
             v.to_bits().hash(&mut h);
         }
     }
     h.finish()
 }
+
+/// Everything a FluxVoxel static-base rebuild needs, owned so it can run on a
+/// worker thread.
+struct FluxVoxelInputs {
+    /// Build-time baked base (accumulator, positions, volume metas) when it
+    /// matches the live volume layout.
+    baked: Option<BakedBase>,
+    volumes: Vec<(glam::Vec3, glam::Vec3, [u32; 3])>,
+    static_lights: Vec<citrus_render::BakeLight>,
+    occ: Option<crate::sw_gi::SceneOccupancy>,
+    propagate: bool,
+}
+
+/// A rebuilt FluxVoxel static base (all volumes concatenated).
+#[derive(Default)]
+struct FluxVoxelBase {
+    static_: Vec<[glam::Vec3; 4]>,
+    positions: Vec<glam::Vec3>,
+    meta: Vec<VolUpload>,
+    dist: Vec<[f32; 4]>,
+    dist2: Vec<[f32; 4]>,
+}
+
+/// Rebuild the FluxVoxel static base: seed from the bake when present, else
+/// relocate + inject the static lights, propagate, blur, and compute the DDGI
+/// distance moments per volume.
+fn build_flux_voxel_base(inputs: FluxVoxelInputs) -> FluxVoxelBase {
+    const PROP_ITERS: u32 = 3;
+    const PROP_GAIN: f32 = 0.12;
+    let start = std::time::Instant::now();
+    let mut out = FluxVoxelBase::default();
+    if let Some((acc, positions, meta)) = inputs.baked {
+        // Moments for the disk-baked base too, so its voxel light occludes.
+        if let Some(o) = &inputs.occ {
+            let (d, d2) = crate::sw_gi::flux_distance_moments(&positions, o);
+            out.dist = d;
+            out.dist2 = d2;
+        }
+        out.static_ = acc;
+        out.positions = positions;
+        out.meta = meta;
+    } else {
+        let mut base = 0u32;
+        for (center, size, counts) in &inputs.volumes {
+            let mut positions =
+                crate::sw_gi::flux_volume_positions(*center, *size, *counts);
+            // Probe relocation: nudge probes out of solid geometry so they
+            // inject from open space. We do NOT zero trapped probes — that
+            // punched dark holes into the field (interior probes DO carry
+            // light, and the DDGI moments already prevent leaks at sample
+            // time), which showed as darker blobs inside the couch.
+            if let Some(o) = &inputs.occ {
+                let _ = crate::sw_gi::relocate_probes(&mut positions, o);
+            }
+            let mut acc = vec![[glam::Vec3::ZERO; 4]; positions.len()];
+            crate::sw_gi::flux_inject(&mut acc, &positions, &inputs.static_lights);
+            // Propagate the STATIC base now (cached) instead of per frame:
+            // static lights + emissive (the dominant lighting) carry the
+            // bounce; dynamic movers stay direct-only for speed.
+            if inputs.propagate {
+                crate::sw_gi::flux_propagate(&mut acc, *counts, PROP_ITERS, PROP_GAIN);
+            }
+            // Smooth the cached base so a static-only scene (no movers, the
+            // per-frame early-out) is also a soft gradient, not blobby.
+            crate::sw_gi::blur_acc(&mut acc, *counts, 2);
+            // DDGI distance moments for this volume's probes (cached).
+            let (mut d, mut d2) = match &inputs.occ {
+                Some(o) => crate::sw_gi::flux_distance_moments(&positions, o),
+                None => (
+                    vec![[0.0f32; 4]; positions.len()],
+                    vec![[0.0f32; 4]; positions.len()],
+                ),
+            };
+            // Smooth the moments across the grid too — otherwise the per-probe
+            // distance variation makes the Chebyshev draw the grid as fixed
+            // dots on surfaces. Softens the shadow edge slightly; removes dots.
+            crate::sw_gi::blur_moments(&mut d, *counts, 2);
+            crate::sw_gi::blur_moments(&mut d2, *counts, 2);
+            let n = positions.len() as u32;
+            out.static_.extend(acc);
+            out.positions.extend(positions);
+            out.dist.append(&mut d);
+            out.dist2.append(&mut d2);
+            out.meta.push((
+                glam::Mat4::from_translation(-*center),
+                size.to_array(),
+                *counts,
+                base,
+            ));
+            base += n;
+        }
+    }
+    tracing::debug!(
+        target: "frame_stats",
+        "FluxVoxel static base rebuilt: {} probes in {:.2} ms",
+        out.positions.len(),
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    out
+}
+
+/// A build-time baked base: accumulator, probe positions, volume metas.
+type BakedBase = (Vec<[glam::Vec3; 4]>, Vec<glam::Vec3>, Vec<VolUpload>);
+/// A CPU march in flight: its thread, volume layout, counts and cascade.
+type MarchJob = (std::thread::JoinHandle<Vec<citrus_render::ProbeSh>>, Vec<VolUpload>, [usize; 3], usize);
+/// A finished march: probes, volume layout, counts and cascade.
+type MarchResult = (Vec<citrus_render::ProbeSh>, Vec<VolUpload>, [usize; 3], usize);
 
 #[derive(Default)]
 pub struct RealtimeGiState {
@@ -102,12 +218,7 @@ pub struct RealtimeGiState {
     /// Play mode don't hitch the frame). Carries the volume layout to upload
     /// with the result.
     /// In-flight CPU march (cascade `usize`) on a background thread.
-    job: Option<(
-        std::thread::JoinHandle<Vec<citrus_render::ProbeSh>>,
-        Vec<VolUpload>,
-        [usize; 3],
-        usize,
-    )>,
+    job: Option<MarchJob>,
     /// Volume layout, counts, and cascade index for an in-flight async GPU march
     /// (collected via `gi_march_poll` next frame, so it never blocks the frame).
     gpu_pending: Option<(Vec<VolUpload>, [usize; 3], usize)>,
@@ -117,6 +228,9 @@ pub struct RealtimeGiState {
     /// World position per FluxVoxel probe (parallel to `flux_voxel_static`), so dynamic
     /// FluxVoxel Lights can be mixed into the baked base each frame.
     flux_voxel_positions: Vec<glam::Vec3>,
+    /// Per-probe offset of `flux_voxel_positions` from the grid (relocation),
+    /// uploaded so the shaders' visibility test uses the moved probe.
+    flux_voxel_offsets: Vec<glam::Vec3>,
     /// FluxVoxel volume metas to upload with the probes (world_to_local, size,
     /// counts, base offset).
     flux_voxel_meta: Vec<VolUpload>,
@@ -133,9 +247,20 @@ pub struct RealtimeGiState {
     /// occlude voxel light leak-free, free per frame. Empty / zero = occlusion off.
     flux_voxel_dist: Vec<[f32; 4]>,
     flux_voxel_dist2: Vec<[f32; 4]>,
+    /// Background static-base rebuild in flight: its target hash + worker.
+    flux_voxel_job: Option<(u64, std::thread::JoinHandle<FluxVoxelBase>)>,
 }
 
 impl RealtimeGiState {
+    fn apply_flux_voxel_base(&mut self, base: FluxVoxelBase) {
+        self.flux_voxel_static = base.static_;
+        self.flux_voxel_positions = base.positions;
+        self.flux_voxel_meta = base.meta;
+        self.flux_voxel_dist = base.dist;
+        self.flux_voxel_dist2 = base.dist2;
+        self.flux_voxel_offsets.clear();
+    }
+
     /// Force the next trace even if the input hash is unchanged. Use after an
     /// edit that affects bounce light but may not be captured by the hash
     /// (e.g. a material reassignment or a non-hashed property change).
@@ -160,8 +285,12 @@ impl RealtimeGiState {
         let view_pos = renderer.last_view_pos();
         let volumes = scene.flux_voxel_volumes_view(view_pos);
         if volumes.is_empty() {
-            renderer.set_baked_probes(&[], &[]);
-            self.flux_voxel_hash = 0;
+            // Once (not every frame: `set_baked_probes` idles the device): fall
+            // back to the bake's probes, or none. u64::MAX marks "cleared".
+            if self.flux_voxel_hash != u64::MAX {
+                crate::runtime::upload_probes(renderer, scene.baked.as_ref());
+                self.flux_voxel_hash = u64::MAX;
+            }
             return;
         }
         let lights = scene.flux_voxel_lights();
@@ -178,8 +307,6 @@ impl RealtimeGiState {
         // hash so flipping one reseeds the base.
         let occlusion_on = scene.environment.realtime_gi.voxel_ddgi_occlusion;
         let propagate = scene.environment.realtime_gi.voxel_propagation;
-        const PROP_ITERS: u32 = 3;
-        const PROP_GAIN: f32 = 0.12;
 
         // Prefer the BUILD-TIME baked static base (multi-bounce voxels persisted to
         // .lightdata): seed the static SH straight from disk so runtime does zero
@@ -223,78 +350,45 @@ impl RealtimeGiState {
         if propagate {
             h = h.rotate_left(3) ^ 0x9F17;
         }
-        let rebuilt = h != self.flux_voxel_hash;
-        if rebuilt {
-            self.flux_voxel_hash = h;
-            self.flux_voxel_static.clear();
-            self.flux_voxel_positions.clear();
-            self.flux_voxel_meta.clear();
-            self.flux_voxel_dist.clear();
-            self.flux_voxel_dist2.clear();
+        // A finished background rebuild replaces the base.
+        let mut rebuilt = false;
+        if self.flux_voxel_job.as_ref().is_some_and(|(_, j)| j.is_finished()) {
+            let (job_hash, job) = self.flux_voxel_job.take().unwrap();
+            match job.join() {
+                Ok(base) => {
+                    self.apply_flux_voxel_base(base);
+                    self.flux_voxel_hash = job_hash;
+                    rebuilt = true;
+                }
+                Err(_) => tracing::error!("FluxVoxel static rebuild panicked"),
+            }
+        }
+        if h != self.flux_voxel_hash && self.flux_voxel_job.is_none() {
             // Build the occupancy grid ONCE here (cached path); used for relocation +
             // the DDGI distance moments. Injection itself is always the cheap analytic
             // (non-occluded) path — the shader's Chebyshev does the occlusion from the
             // moments, so DDGI costs ~zero per frame (no per-probe DDA anywhere).
-            let occ = if occlusion_on { scene.flux_occupancy() } else { None };
-            if let Some((acc, positions, meta)) = baked {
-                // Moments for the disk-baked base too, so its voxel light occludes.
-                if let Some(o) = &occ {
-                    let (d, d2) = crate::sw_gi::flux_distance_moments(&positions, o);
-                    self.flux_voxel_dist = d;
-                    self.flux_voxel_dist2 = d2;
-                }
-                self.flux_voxel_static = acc;
-                self.flux_voxel_positions = positions;
-                self.flux_voxel_meta = meta;
+            let inputs = FluxVoxelInputs {
+                baked,
+                volumes: volumes.clone(),
+                static_lights: static_lights.clone(),
+                occ: if occlusion_on { scene.flux_occupancy() } else { None },
+                propagate,
+            };
+            if self.flux_voxel_static.is_empty() {
+                // Nothing to show yet: build now so the first frame is lit.
+                self.apply_flux_voxel_base(build_flux_voxel_base(inputs));
+                self.flux_voxel_hash = h;
+                rebuilt = true;
             } else {
-                let mut base = 0u32;
-                for (center, size, counts) in &volumes {
-                    let mut positions =
-                        crate::sw_gi::flux_volume_positions(*center, *size, *counts);
-                    // Probe relocation: nudge probes out of solid geometry so they
-                    // inject from open space. We do NOT zero trapped probes — that
-                    // punched dark holes into the field (interior probes DO carry
-                    // light, and the DDGI moments already prevent leaks at sample
-                    // time), which showed as darker blobs inside the couch.
-                    if let Some(o) = &occ {
-                        let _ = crate::sw_gi::relocate_probes(&mut positions, o);
-                    }
-                    let mut acc = vec![[glam::Vec3::ZERO; 4]; positions.len()];
-                    crate::sw_gi::flux_inject(&mut acc, &positions, &static_lights);
-                    // Propagate the STATIC base now (cached) instead of per frame:
-                    // static lights + emissive (the dominant lighting) carry the
-                    // bounce; dynamic movers stay direct-only for speed.
-                    if propagate {
-                        crate::sw_gi::flux_propagate(&mut acc, *counts, PROP_ITERS, PROP_GAIN);
-                    }
-                    // Smooth the cached base so a static-only scene (no movers, the
-                    // per-frame early-out) is also a soft gradient, not blobby.
-                    crate::sw_gi::blur_acc(&mut acc, *counts, 2);
-                    // DDGI distance moments for this volume's probes (cached).
-                    let (mut d, mut d2) = match &occ {
-                        Some(o) => crate::sw_gi::flux_distance_moments(&positions, o),
-                        None => (
-                            vec![[0.0f32; 4]; positions.len()],
-                            vec![[0.0f32; 4]; positions.len()],
-                        ),
-                    };
-                    // Smooth the moments across the grid too — otherwise the per-probe
-                    // distance variation makes the Chebyshev draw the grid as fixed
-                    // dots on surfaces. Softens the shadow edge slightly; removes dots.
-                    crate::sw_gi::blur_moments(&mut d, *counts, 2);
-                    crate::sw_gi::blur_moments(&mut d2, *counts, 2);
-                    let n = positions.len() as u32;
-                    self.flux_voxel_static.extend(acc);
-                    self.flux_voxel_positions.extend(positions);
-                    self.flux_voxel_dist.append(&mut d);
-                    self.flux_voxel_dist2.append(&mut d2);
-                    self.flux_voxel_meta.push((
-                        glam::Mat4::from_translation(-*center),
-                        size.to_array(),
-                        *counts,
-                        base,
-                    ));
-                    base += n;
+                // Clipmap steps and static-light edits rebuild off the main
+                // thread; the current base keeps rendering until the new one lands.
+                let job = std::thread::Builder::new()
+                    .name("fluxvoxel-rebuild".into())
+                    .spawn(move || build_flux_voxel_base(inputs));
+                match job {
+                    Ok(j) => self.flux_voxel_job = Some((h, j)),
+                    Err(e) => tracing::error!("FluxVoxel rebuild thread: {e}"),
                 }
             }
         }
@@ -329,15 +423,32 @@ impl RealtimeGiState {
         // so independent of the dynamic lights) when present. The shader's Chebyshev
         // uses them to occlude voxel light leak-free — free per frame.
         let have_moments = self.flux_voxel_dist.len() == acc.len();
+        if self.flux_voxel_offsets.len() != self.flux_voxel_positions.len() {
+            // Grid positions per volume (as the shaders compute them) vs. where
+            // relocation put each probe.
+            self.flux_voxel_offsets.clear();
+            for (w2l, size, counts, base) in &self.flux_voxel_meta {
+                let center = -w2l.w_axis.truncate();
+                let grid = crate::sw_gi::flux_volume_positions(center, glam::Vec3::from(*size), *counts);
+                for (k, g) in grid.iter().enumerate() {
+                    let p = self.flux_voxel_positions.get(*base as usize + k).copied().unwrap_or(*g);
+                    self.flux_voxel_offsets.push(p - *g);
+                }
+            }
+        }
         let probes: Vec<citrus_render::ProbeSh> = acc
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                if have_moments {
+                let mut p = if have_moments {
                     crate::sw_gi::acc_to_probe_moments(s, self.flux_voxel_dist[i], self.flux_voxel_dist2[i])
                 } else {
                     crate::sw_gi::acc_to_probe(s)
+                };
+                if let Some(o) = self.flux_voxel_offsets.get(i) {
+                    p.offset = o.to_array();
                 }
+                p
             })
             .collect();
         // Per frame, only the SH payload changes (the volume layout is fixed
@@ -366,7 +477,9 @@ impl RealtimeGiState {
         // The GDF + emitter feed Flux samples must refresh every frame so moving
         // emitters track without lag (the field is no longer user-facing).
         gi.update_interval = 0.0;
-        let on = gi.enabled && scene.baked.is_none();
+        // Flux runs with a bake loaded too: it replaces the lightmaps while on
+        // (`LoadedScene::lightmaps_in_use`), so the bake never has to be cleared.
+        let on = gi.enabled;
         // Always drain a finished async GPU march (even when off, so toggling GI
         // off mid-flight can't wedge a re-enable; the in-flight march is freed).
         let gpu_fresh = if renderer.gi_marching() {
@@ -374,6 +487,30 @@ impl RealtimeGiState {
         } else {
             None
         };
+        // Push the Flux trace params AND the reflection settings (Environment tab)
+        // every frame, before any early return: the reflection mode / SSR live in
+        // the same struct, and only pushing it on the Flux/FluxRT GI-on path left
+        // the renderer on its default (SSR on) for FluxVoxel or GI off, whatever
+        // the Reflections setting said. Cheap; a changed setting re-traces.
+        renderer.set_flux_settings(citrus_render::FluxSettings {
+            samples: gi.quality.samples(),
+            bounces: gi.bounces.clamp(1, 4),
+            march_distance: gi.march_distance.max(0.0),
+            firefly_clamp: gi.firefly_clamp.max(0.5),
+            smoothing: gi.smoothing.clamp(0.0, 1.0),
+            intensity: gi.intensity.max(0.0),
+            ssr_enabled: gi.reflection_mode == 1 && gi.ssr_enabled,
+            ssr_intensity: gi.ssr_intensity.max(0.0),
+            ssr_max_distance: gi.ssr_max_distance.max(0.0),
+            ssr_roughness_cutoff: gi.ssr_roughness_cutoff.clamp(0.0, 1.0),
+            reflection_mode: gi.reflection_mode.min(2) as u32,
+            rt_samples: gi.rt_samples.clamp(1, 16),
+            mixed_lighting: scene.baked.is_some(),
+            rt_bounces: gi.rt_bounces.clamp(1, 4),
+            // The existing "Ray Query" GI mode selects the hardware trace backend
+            // (screen_gi_rt); falls back to software when the device lacks it.
+            rt_trace: gi.mode == citrus_assets::GiMode::FluxRT,
+        });
         // FluxVoxel backend: fill the probe grid from the FluxVolume voxels and skip
         // the Flux march entirely. No GDF is built, so the screen-space gather stays
         // off and the forward shader samples THESE probes directly (desktop preview
@@ -390,7 +527,8 @@ impl RealtimeGiState {
                 self.update_flux_voxel(renderer, scene);
                 self.active = true;
             } else if self.active {
-                renderer.set_baked_probes(&[], &[]);
+                // Back to the bake's probes (or none).
+                crate::runtime::upload_probes(renderer, scene.baked.as_ref());
                 self.flux_voxel_hash = 0;
                 self.active = false;
             }
@@ -403,7 +541,8 @@ impl RealtimeGiState {
             // GI left the camera-gated trace running (the FPS cliff on move).
             renderer.set_gi_enabled(false);
             if self.active {
-                renderer.set_baked_probes(&[], &[]);
+                // Back to the bake's probes (or none).
+                crate::runtime::upload_probes(renderer, scene.baked.as_ref());
                 self.accum.clear();
                 self.target.clear();
                 self.counts = [0; 3];
@@ -417,24 +556,6 @@ impl RealtimeGiState {
         }
         // GI is on: allow the screen-space gather (gated also on a built GDF).
         renderer.set_gi_enabled(true);
-        // Push the runtime Flux trace params (Environment tab → Flux GI). Cheap;
-        // a changed setting re-traces. Quality preset → samples/probe.
-        renderer.set_flux_settings(citrus_render::FluxSettings {
-            samples: gi.quality.samples(),
-            bounces: gi.bounces.clamp(1, 4),
-            march_distance: gi.march_distance.max(0.0),
-            firefly_clamp: gi.firefly_clamp.max(0.5),
-            smoothing: gi.smoothing.clamp(0.0, 1.0),
-            intensity: gi.intensity.max(0.0),
-            ssr_enabled: gi.ssr_enabled,
-            ssr_intensity: gi.ssr_intensity.max(0.0),
-            ssr_max_distance: gi.ssr_max_distance.max(0.0),
-            ssr_roughness_cutoff: gi.ssr_roughness_cutoff.clamp(0.0, 1.0),
-            reflection_mode: gi.reflection_mode.min(2) as u32,
-            // The existing "Ray Query" GI mode selects the hardware trace backend
-            // (screen_gi_rt); falls back to software when the device lacks it.
-            rt_trace: gi.mode == citrus_assets::GiMode::FluxRT,
-        });
         // Hardware (ray-query) mode needs RT cores; software (SDF) runs anywhere.
         if gi.mode == citrus_assets::GiMode::FluxRT && !renderer.supports_baking() {
             return;
@@ -442,8 +563,7 @@ impl RealtimeGiState {
 
         // 1) Collect a finished async march, if any (CPU thread or GPU). The
         // tuple carries which cascade was traced (round-robin amortization).
-        let mut fresh: Option<(Vec<citrus_render::ProbeSh>, Vec<VolUpload>, [usize; 3], usize)> =
-            None;
+        let mut fresh: Option<MarchResult> = None;
         if let Some((handle, _, _, _)) = &self.job
             && handle.is_finished()
         {
@@ -468,7 +588,9 @@ impl RealtimeGiState {
             // emitter/light would block every frame, so floor it to ~10 Hz so a
             // continuously animated GI input can't tank the framerate. Static
             // scenes settle and stop tracing regardless of mode.
-            let interval_floor = if gi.mode == citrus_assets::GiMode::FluxRT {
+            let interval_floor = if gi.mode == citrus_assets::GiMode::FluxRT
+                && (gi.probe_fallback != citrus_assets::ProbeFallback::Off || vr_active)
+            {
                 0.1
             } else {
                 0.0
@@ -514,7 +636,11 @@ impl RealtimeGiState {
                     };
                     let cend = (cbase + cn).min(gather.probes.len());
                     let cascade_probes = gather.probes[cbase..cend].to_vec();
-                    if gi.mode == citrus_assets::GiMode::Flux {
+                    // Flux and FluxRT share the screen-gather inputs (GDF bounds,
+                    // emitters); they differ only in how the world-probe fallback
+                    // is traced (software march vs. hardware bake).
+                    let software = gi.mode == citrus_assets::GiMode::Flux;
+                    if gi.mode != citrus_assets::GiMode::FluxVoxel {
                         let (insts, scene_size) = scene.software_gi_inputs(&gather);
                         // GDF bounds/dims over the coarsest cascade (full-scene box).
                         let coarsest = gather.probe_volumes.last().unwrap();
@@ -597,12 +723,16 @@ impl RealtimeGiState {
                             // Emissive instances → sphere area-lights for NEE, so
                             // their GI fill is sampled directly (smooth) instead of
                             // via blotchy random ray hits.
-                            let emitters: Vec<_> = crate::sw_gi::emitter_spheres(&insts)
+                            // Mixed lighting: static emitters are in the bake,
+                            // so only moving ones light through Flux.
+                            let mixed = scene.baked.is_some();
+                            let live: Vec<_> = insts.iter().filter(|i| !(mixed && i.static_geometry)).cloned().collect();
+                            let emitters: Vec<_> = crate::sw_gi::emitter_spheres(&live)
                                 .into_iter()
                                 .map(|(center, radius, emission)| citrus_render::GpuGiEmitter {
                                     center,
                                     radius,
-                                    emission,
+                                    emission: emission.map(|v| v * gi.emissive_boost.max(0.0)),
                                 })
                                 .collect();
                             // Feed the same emitter spheres to the screen-space GI
@@ -638,7 +768,7 @@ impl RealtimeGiState {
                             // Submit asynchronously; the result is collected by
                             // the poll in step 1 next frame, so the (potentially
                             // heavy) march never blocks the frame.
-                            if run_probes && renderer.gi_march_begin(&march) {
+                            if software && run_probes && renderer.gi_march_begin(&march) {
                                 let (vols, counts) = pending.take().unwrap();
                                 self.gpu_pending = Some((vols, counts, k));
                             }
@@ -647,7 +777,8 @@ impl RealtimeGiState {
                         // Also gated: Off = Flux-only, no world-probe fallback.
                         let run_probes =
                             gi.probe_fallback != citrus_assets::ProbeFallback::Off || vr_active;
-                        if run_probes
+                        if software
+                            && run_probes
                             && let Some((vols, counts)) = pending.take()
                         {
                             let lights = gather.lights.clone();
@@ -662,7 +793,14 @@ impl RealtimeGiState {
                             });
                             self.job = Some((handle, vols, counts, k));
                         }
-                    } else {
+                    }
+                    // FluxRT world-probe fallback (in-game camera / VR only, like
+                    // the software march): hardware bake, synchronous, so it
+                    // stays off unless that fallback is actually needed.
+                    if !software
+                        && (gi.probe_fallback != citrus_assets::ProbeFallback::Off || vr_active)
+                    {
+                        let vols = vol_uploads(&gather);
                         // Hardware ray-query: synchronous (RayQuery uses a single
                         // cascade, so this traces the whole grid; software is the
                         // amortized realtime path).
@@ -800,11 +938,10 @@ impl RealtimeGiState {
             }
         }
         // Skip the upload once fully converged + static (nothing to push).
-        if max_delta > 1e-5 {
-            if !renderer.update_probe_sh(&self.accum) {
+        if max_delta > 1e-5
+            && !renderer.update_probe_sh(&self.accum) {
                 renderer.set_baked_probes(&self.accum, &self.target_vols);
             }
-        }
         self.active = true;
     }
 }

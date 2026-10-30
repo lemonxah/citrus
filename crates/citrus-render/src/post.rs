@@ -15,6 +15,8 @@ use bytemuck::{Pod, Zeroable};
 use gpu_allocator::vulkan::{Allocation, Allocator};
 
 use crate::PostFx;
+use crate::bloom::{BloomChain, BloomPass};
+use crate::underwater::Wobble;
 
 const FULLSCREEN_VERT_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
@@ -31,7 +33,8 @@ struct PostPush {
     p2: [f32; 4], // vignette enabled, intensity, smoothness, _
     p3: [f32; 4], // vignette color rgb, _
     p4: [f32; 4], // bloom enabled, threshold, intensity, radius
-    p5: [f32; 4], // CA enabled, CA intensity, _, _
+    p5: [f32; 4], // CA enabled, CA intensity, wobble, time
+    p6: [f32; 4], // waterline (see `underwater::Wobble`)
 }
 
 struct HdrTarget {
@@ -49,6 +52,9 @@ pub(crate) struct PostPass {
     sets: Vec<vk::DescriptorSet>,
     targets: Vec<HdrTarget>,
     extent: vk::Extent2D,
+    bloom: BloomPass,
+    /// Bloom chain for the swapchain path (the viewport / preview own theirs).
+    chain: Option<BloomChain>,
 }
 
 impl PostPass {
@@ -63,7 +69,8 @@ impl PostPass {
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            // Compute too: the bloom prefilter reads post source sets.
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE)];
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&set_bindings),
@@ -73,7 +80,8 @@ impl PostPass {
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(std::mem::size_of::<PostPush>() as u32)];
-        let layouts = [set_layout];
+        // Set 0 = HDR source, set 1 = bloom (level 0 of a BloomChain).
+        let layouts = [set_layout, set_layout];
         let pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -136,8 +144,11 @@ impl PostPass {
             sets: Vec::new(),
             targets: Vec::new(),
             extent,
+            bloom: BloomPass::new(device, set_layout)?,
+            chain: None,
         };
         pass.create_targets(device, allocator, extent, frames)?;
+        pass.chain = Some(pass.new_bloom_chain(device, allocator, extent)?);
         Ok(pass)
     }
 
@@ -221,7 +232,8 @@ impl PostPass {
                 device,
                 allocator,
                 HDR_FORMAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                // TRANSFER_SRC: the water's opaque scene copy.
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
                 extent,
                 "scene hdr",
             )?;
@@ -273,21 +285,59 @@ impl PostPass {
         frame: usize,
         extent: vk::Extent2D,
         post: &PostFx,
+        wobble: Option<Wobble>,
     ) {
-        self.record_set(device, cb, self.sets[frame], extent, post);
+        let bloom = self.chain.as_ref().unwrap().output_set();
+        self.record_set(device, cb, self.sets[frame], bloom, extent, post, wobble);
+    }
+
+    /// The swapchain path's own source set for `frame` (its HDR target).
+    pub fn frame_set(&self, frame: usize) -> vk::DescriptorSet {
+        self.sets[frame]
+    }
+
+    /// The swapchain path's bloom chain.
+    pub fn chain(&self) -> &BloomChain {
+        self.chain.as_ref().unwrap()
+    }
+
+    pub fn new_bloom_chain(
+        &self,
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        extent: vk::Extent2D,
+    ) -> Result<BloomChain> {
+        self.bloom.new_chain(device, allocator, extent, self.set_layout, self.sampler)
+    }
+
+    /// Build `chain`'s bloom from `src_set` (a post source set). Record outside a
+    /// render pass, before the post pass that samples it.
+    pub fn record_bloom(
+        &self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        chain: &BloomChain,
+        src_set: vk::DescriptorSet,
+        post: &PostFx,
+    ) {
+        self.bloom.record(device, cb, chain, src_set, post);
     }
 
     /// Run the post pass sampling an externally-provided descriptor set (binding
     /// 0 = the HDR source). Used by the editor viewport, which owns its own HDR
     /// target + set.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_set(
         &self,
         device: &ash::Device,
         cb: vk::CommandBuffer,
         set: vk::DescriptorSet,
+        bloom_set: vk::DescriptorSet,
         extent: vk::Extent2D,
         post: &PostFx,
+        wobble: Option<Wobble>,
     ) {
+        let w = wobble.unwrap_or(Wobble { strength: 0.0, blur: 0.0, time: 0.0, line: [0.0; 3] });
         let push = PostPush {
             p0: [post.tonemap as f32, post.exposure, post.grade_exposure, post.contrast],
             p1: [
@@ -309,7 +359,8 @@ impl PostPass {
                 post.bloom_intensity,
                 post.bloom_radius,
             ],
-            p5: [if post.ca_enabled { 1.0 } else { 0.0 }, post.ca_intensity, 0.0, 0.0],
+            p5: [if post.ca_enabled { 1.0 } else { 0.0 }, post.ca_intensity, w.strength, w.time],
+            p6: [w.line[0], w.line[1], w.line[2], w.blur],
         };
         unsafe {
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
@@ -335,7 +386,7 @@ impl PostPass {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
                 0,
-                &[set],
+                &[set, bloom_set],
                 &[],
             );
             device.cmd_push_constants(
@@ -357,6 +408,10 @@ impl PostPass {
     ) -> Result<()> {
         let frames = self.targets.len();
         self.destroy_targets(device, allocator);
+        if let Some(mut c) = self.chain.take() {
+            c.destroy(device, allocator);
+        }
+        self.chain = Some(self.new_bloom_chain(device, allocator, extent)?);
         unsafe {
             device.reset_descriptor_pool(self.pool, vk::DescriptorPoolResetFlags::empty())?;
         }
@@ -378,6 +433,10 @@ impl PostPass {
 
     pub fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
         self.destroy_targets(device, allocator);
+        if let Some(mut c) = self.chain.take() {
+            c.destroy(device, allocator);
+        }
+        self.bloom.destroy(device);
         unsafe {
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_sampler(self.sampler, None);

@@ -132,7 +132,13 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   GI" timer only covers the trace's CPU prep; the actual march cost is GPU work (read via
   `VK_QUERY_TYPE_TIMESTAMP`, see `RenderStats`). **Zero per-frame cost when closed**: GPU
   timestamp queries + readback and all history bookkeeping are skipped unless the window is open.
-- [done] Camera preview tab (renders scene from the main camera to an offscreen target)
+- [done] Camera preview tab (renders scene from the main camera to an offscreen target). Renders linear HDR
+  and runs the post pass (bloom, grading, tonemap, vignette) with the post profile resolved at the preview
+  camera, so it matches the game.
+- [done] Play mode: the Scene tab (renamed from Viewport) keeps the free editor camera while playing; the game
+  shows in the Camera tab (gameplay pointer, screen rays, game UI and cursor lock follow that tab). The
+  transport camera button makes the Scene view follow the game camera instead (off by default). Flying the
+  Scene camera (right mouse) doesn't feed mouse/keys to the game.
 - [done] **Startup splash** (`splash.rs`): a borderless CPU-drawn window (softbuffer) shown
   before the Vulkan renderer exists, with a scaled background + bottom status line (ab_glyph).
   Shows the embedded `assets/splash.png` **instantly** as a placeholder while the animated
@@ -417,6 +423,10 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   emission, and their GI bounce never persist into the `.reflprobe` (Unity baked-probe
   semantics). Known gap: dynamic casters can still shadow the static capture via the shared
   shadow atlas.
+- [done] **Realtime probe Update Rate, whole-cube captures, moving objects excluded**:
+  - **Update Rate** (Hz, default 30, 0 = every frame) replaces the fixed 0.2 s pacing that made realtime reflections step about 4 times a second.
+  - All six faces and the mip chain now render in the frame a capture starts, each face with its own UBO and descriptor set. **Time Slicing** brings back one face per frame.
+  - **Moving Objects** (off by default): non-static objects stay out of realtime captures, with lighting still live. Box projection paints everything in a cube onto the box walls, so an orb inside the room showed up as a ghost on the far floor edge. SSR and ray-traced reflections show moving objects instead.
 - [done] **Reflection-probe math reference + debug views**: `REFLECTION_PROBES_MATH.md` documents
   the full cubemap/parallax/split-sum math (Vulkan face table, `R=reflect(-V,N)`, Lagarde box
   projection, Karis split-sum, Vulkan capture-orientation pitfalls, a bug→symptom checklist) with
@@ -559,8 +569,27 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   saturation/temperature/tint), vignette.** ACES moved out of hardcode into the profile.
   An in-editor **`.postfx` profile editor** (select the asset → sliders for tonemap, color
   grading, vignette, bloom, chromatic aberration; saves + live-invalidates the cache).
-  [todo] Chromatic aberration + bloom rendering (need an offscreen-HDR fullscreen pass; the
-  settings are authorable now but only apply once that pass lands).
+  [done] Volumes override per effect (Unity-style): an effect a Volume profile leaves disabled no longer
+  replaces the scene's global post settings (Environment > Post), and tonemap / exposure only override when
+  the profile's Tonemap box is ticked (`Tonemap::enabled`, off for existing profiles). Previously any global
+  volume at weight 1 replaced every global setting, including the enable toggles, so a profile with bloom off
+  silently disabled the Environment's bloom, grading and exposure. The global settings are now the base
+  (`blend_over`); an effect enabled only in a volume fades in from neutral by weight.
+- [done] Hierarchy Add menu and Object menu have a Volume submenu (Post FX Volume (Box), Post FX Volume
+  (Global), Light Probe Volume, Reflection Probe, Flux Volume). A new Post FX Volume gets its own
+  `postfx/Post FX Volume.postfx` profile (all effects off) so it works as soon as an effect is enabled.
+- [done] Post FX Volume editor support: its own hierarchy icon + type colour (indigo), a viewport billboard
+  (own toggle + size in the billboard widgets menu), and for box volumes a resizable box gizmo like the
+  reflection probe's, with an outer shell at the blend distance (where the effect starts fading in). The
+  Environment > Post panel lists which volumes currently override which effects. Box weighting now uses the
+  object's full transform (rotated / scaled box, world-unit fade), matching what the gizmo draws.
+  [done] Bloom is a mip-chain (`bloom.comp`, `bloom.rs`): prefilter (13-tap + Karis average, exposure,
+  soft-knee threshold) into half resolution, downsample to the bottom level, then tent-upsample back
+  blending each level by the profile's radius (scatter). The post pass adds level 0 x intensity. Each
+  post target (game swapchain, editor Scene view, camera preview) owns a chain. Replaces the old 48-tap
+  ring average, which was dominated by dark taps and showed almost no glow from small emitters.
+  The editor Scene view's skybox was inline-tonemapped into the HDR target (double tonemap vs the game);
+  it now renders linear like the game path.
 
 ### Editor
 - [done] Play / Pause / Stop. Pause freezes components/physics/audio on a play clock that
@@ -575,6 +604,11 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Transform gizmos: move (W) / rotate (R) / scale (E), pivot/center + global/local,
   snap (grid + 15deg rotation), fat hit areas with orbit priority, hover emphasis
 - [done] Camera-relative axis flipping + orientation cross on move/scale gizmos
+- [done] Scene tree keyboard navigation while the tree has focus (last click inside it): Up / Down move
+  the selection through visible rows, Right expands or steps into the first child, Left collapses or steps
+  to the parent; the row scrolls into view.
+- [done] Add component popup keeps a fixed size (320 px list) so filtering can't shrink it and flip it
+  below the button.
 - [done] Scene tree: nested hierarchy, drag-to-reparent, connector lines, Alt-click cascade,
   F2 inline rename of the selected object, Ctrl+D duplicates the selected object (whole
   subtree; shares meshes/materials, fresh ids, not undoable like delete)
@@ -650,6 +684,181 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   viewport and the game path now resolve against the scene pass's own stored depth. Also: the
   viewport target is recreated at frame start and tracks its own GI freshness, and screen GI /
   SSR reject non-finite history.
+- [done] SSR hit test is a depth-span overlap: a hit needs the ray's depth range over the step to overlap the
+  surface's front + an assumed thickness (3% of depth, 5-25 cm). Fixes long grazing steps smearing small
+  objects along the ray (the old "behind by < max(step, ...)" test) and rays passing far behind an object
+  whose front faces the camera. Jitter is now interleaved-gradient noise at half a step.
+- [done] Ray-traced reflection quality (Environment > Reflections, Ray-traced): Rays per pixel (1/2/4/8/16;
+  rough surfaces sample their GGX lobe on a per-pixel rotated Hammersley set, stable frame to frame) and
+  Bounces (1-4; each hit continues along its mirror direction weighted by Fresnel, so mirrors / metals show
+  real reflections instead of their env fallback). Max distance now caps the primary rays. Hits read their
+  baked lightmap (uv1 + layer) when lightmaps are in use, direct light matches the forward falloff and spot
+  cone and skips baked lights on lightmapped hits, and the Scene view's misses fall back to the sky (its env
+  intensity lane was 0, so misses were black).
+- [done] Flux review fixes (2026-10-30):
+  - FluxRT now actually runs: it shares the GDF bounds + emitter feed with Flux (previously only the Flux branch
+    fed them, so FluxRT used stale data or never traced), and the editor Scene view + camera preview pass the TLAS
+    (they always fell back to the software march). The synchronous hardware probe re-bake only runs when the
+    world-probe fallback / VR needs it, and the 10 Hz cadence floor applies only then.
+  - Crease stripes / flicker: probes sit on the closest real surface texel of their tile (a bilinear depth at the
+    tile corner sat off the surface in creases), normals come from +-1 full-res pixel, the ray offset scales with
+    the pixel footprint (a fixed 4 cm pushed rays through thin gaps); back-face hits return 0 and a probe with >25%
+    back-face hits is marked invalid; the integrate has a normal edge-stop, uses the pixel's own distance, and
+    takes its magnitude from the denoised gather with the SH as a clamped direction ratio (the SH estimator's
+    grazing clamp biased creases dark; the denoise pass was otherwise unused); SH history is bilinear over the 4
+    previous probes with per-tap distance/normal validation and the relative firefly clamp (both gathers).
+  - Synchronization: GI image overwrites wait for the previous frame's reads (WAR), probe SH updates are copied in
+    the frame command buffer from per-frame staging (no CPU writes into a buffer in-flight frames read).
+  - Correctness: RT GI reads metallic from the instance params (was always 0), TLAS custom index = shading record
+    index (instances without a BLAS shifted every later one), the software gather zeroes sky probes' SH (stale SH
+    ghosted), emitter SH scales with Intensity, hit shadow rays start off the geometric normal, RT hits drop the
+    SDF near-field fade (darkened exact creases), probe volumes use rotation-aware centres and FluxVoxel uploads
+    each relocated probe's offset so the Chebyshev test uses the real probe position, the FluxVoxel static hash
+    covers light direction / spot angles / kind, and the SDF generator uses angle-weighted pseudo-normals (correct
+    sign at edges and vertices) and a BVH + worker threads (~200x faster).
+  - Performance: per-frame TLAS slots rebuilt on the GPU inside the frame command buffer (no device idle, no CPU
+    wait), RT scene list + texture views built once per frame, GI trace descriptor pools / buffers reused per frame
+    slot, emitter shadow rays shared between the SH and scalar terms, FluxVoxel no-volume fallback uploads once,
+    clipmap scrolls in quarter-extent steps.
+- [done] HDR pipeline: pipeline variants carry their pass's color format (`PipelineKey::color_format`, set per
+  pass), so HDR / capture / planar / VR passes no longer render with swapchain-format pipelines; reflection
+  captures, the skybox environment cube and planar mirrors are RGBA16F linear HDR (no inline tonemap, grading or
+  vignette baked into reflections); the env cube is built in float from EXR (f16), Radiance .hdr (now loaded as
+  float) and sRGB-decoded LDR skies; `.reflprobe` v2 stores RGBA16F (v1 still loads); VR eyes render HDR + bloom +
+  post into the XR image with the UI overlay after tonemapping; egui pipelines declare no depth.
+- [done] Render pipeline performance review fixes: realtime reflection captures record into the frame command
+  buffer with persistent targets and per-face frustum culling, finish with a GPU mip chain + copy into the live
+  env (no CPU waits, no per-capture allocation) and are paced to ~5 Hz; VR eyes submit without CPU waits (slot
+  ring) and use the sorted draw order; shadow views cull casters per view and cache layers whose view + casters
+  + mesh deformation are unchanged; draws sort by a precomputed state key with material set / vertex buffer
+  binds deduplicated; looking at empty sky draws nothing (the old fallback drew everything); planar passes,
+  the GI depth prepass and the camera preview are frustum culled; per-frame world transform / active caches feed
+  lights, post volumes, probes and audio; capture lights are gathered only while a capture runs; the dead SSR
+  colour-history images and the editor swapchain depth were removed; bloom level transitions are batched; the
+  forward GI denoise computes its tap rays incrementally.
+  Later in the same pass: the G-buffer is A2B10G10R10 (octahedral normal in rg, roughness / reflectivity
+  split over b + a, decoded with texelFetch), and the main pass reuses the GI depth prepass (prepass on the
+  standard vertex shader with `invariant gl_Position`, main pass EQUAL test, no depth writes).
+- [done] GPU instancing: scene draws read their model matrix from an instance-rate vertex stream
+  (`standard.vert` / `outline.vert` locations 8-11; the shadow pass keeps push constants). Each
+  `record_scene_draws` call appends its matrices to an `InstanceRing` (one per frame slot, one per VR eye slot,
+  reset after that submission's fence) and consecutive draws sharing pipeline, material, mesh and per-object
+  push data are one instanced draw. Custom-shader materials draw singly (their fragment code may read
+  `pc.model`). `RenderStats::instanced_draws`. Strategy template: 33 objects in 9 draw calls.
+- [done] TLAS refit: the per-frame RT TLAS is built with `ALLOW_UPDATE` and refit in place when only
+  transforms moved (same instances and BLASes), with a full rebuild every 120 refits.
+- [done] Skinned mesh culling bounds follow the pose: each skinned mesh keeps per-joint bind-space vertex
+  boxes; `update_skinning` moves them by the frame's palette and the union becomes the draw's bounds
+  (Animator copies and the shared IK / clip path). Test: `posed_bounds_follow_the_joints`.
+- [done] Emissive Boost (Environment > Realtime GI > Advanced, `RealtimeGi::emissive_boost`, default 1 =
+  physical): scales the light emissive objects throw into Flux / FluxRT (NEE emitter spheres) and FluxVoxel
+  (on top of its built-in x8 gain) without changing their on-screen brightness.
+- [done] **Dock tabs always reachable**:
+  - **Labels shrink to fit:** when a panel's tabs don't fit, the widest labels shrink to an equal share with an ellipsis, and hovering shows the full name. This replaces egui_dock's scroll, which slid tabs under the panel edge.
+  - **Scene toolbar space reserved:** the Lit / gizmo / Perspective toolbar's width is kept clear in the Scene view's strip.
+  - **Close buttons:** every tab keeps its close X; closed panels reopen from the Windows menu.
+- [done] **Game-path GPU zones**: the Scene, Reflections and Post timestamp zones were only stamped in the editor viewport path, so game builds always reported them as 0 and about 0.2–0.3 ms of every frame went unaccounted. They are now stamped in `render()`'s game path too. FluxRT benchmark frame: GI 0.44 ms, scene 0.20, post 0.015, shadows 0.01.
+- [done] **Forward light loop skips lights behind the surface** (N·L <= 0) before the BRDF and shadow-map lookups.
+- [done] **Per-draw light culling (main camera pass)**:
+  - **How it works:** each built-in draw gets a 128-bit mask of the lights whose range reaches its bounding sphere. Instanced runs get the union of their draws' masks. `standard.frag` loops only the set bits.
+  - **Where the mask lives:** it rides in `pc.model`'s first column, which built-in shaders no longer read because the model matrix comes from the instance stream. Custom shaders keep the real model matrix.
+  - **Other passes:** reflection captures, planar mirrors, camera preview and VR light every draw, as before.
+  - **Result:** pixel-identical output. Neutral in the couch test scene, where one floor draw is reached by every light; it helps scenes with many local lights.
+- [done] **FluxVoxel: floor GI, no probe grid**:
+  - **Floor fade:** probe coverage used to fade to ambient over the outer 20% of the volume, so a floor resting on the bottom face got about 2% of its GI and showed only probe dots. The outermost volume now has full coverage inside its box and fades over one probe cell outside it, as in DDGI. Both `sample_probes` and `sample_irradiance_smooth` do this.
+  - **Backface step:** probes behind the shaded surface (such as the layer just under a floor) are dropped by a step across the surface plane.
+  - **Linear weights:** the smooth sampler uses trilinear weights; smootherstep made each probe a plateau, which read as a grid.
+  - **Moving emitters per pixel:** moving emitters are no longer injected into the 0.5 m grid. They travel in the light array as kind 3 lights, and `standard.frag` (plus `citrus_gi` in custom shaders) evaluates the grid's own injection kernel per pixel as indirect light. Static emitters stay in the cached, propagated grid.
+- [done] **HUD preview on the Camera tab**: while editing, the game UI previews over the Scene view when the Game UI filter is on (where it can be edited), and otherwise over the Camera tab, which shows what the game will.
+- [done] **Per-pixel emitter light in Flux / FluxRT**:
+  - **Problem:** the gathers used to add each emissive sphere's direct light at probe resolution, then the screen-space denoise blurred it. Its world-space footprint changed with camera angle and distance, so rotating the camera changed how the couch was lit.
+  - **Fix:** the gathers now store only a per-probe emitter visibility bitmask (`ScreenProbe.c[4]`, 80-byte probes). `flux_integrate.comp` shades each emitter per pixel from the pixel's own position and normal, with visibility blended over the 3x3 nearest probes on the same surface.
+  - **Result:** the light is identical from every view and has no temporal lag behind a moving emitter.
+  - **Test view:** `CITRUS_VIEW_MODE=2` (indirect) / `6` (realtime Flux GI only) on the game runtime, for test captures.
+- [done] Multiple reflection probes with two-probe blending:
+  - **Selection:** `LoadedScene::active_reflection_probes` ranks every probe for the camera (contains the camera, importance, smaller box, nearer). The best two go to renderer slots 0 (binding 7) and 1 (binding 9, its own env cube). Their boxes are in the frame UBO (`refl2_*`, `refl_blend`).
+  - **Blending in `standard.frag`:** per pixel, each probe's influence ramps across its blend-distance shell inside its box. Where both boxes overlap, the higher importance, then smaller, probe wins; outside both, slot 0 is used. With a single probe the shader path is unchanged.
+  - **Slot management (`refl_slots.rs`, game runtime and editor):**
+    - baked probes upload their own cube
+    - realtime probes, and baked probes without a cube yet, capture live into their slot (`request_reflection_capture_slot`); refreshes alternate between the two slots
+    - two probes trading places swap slots (`swap_reflection_slots`) instead of reloading
+  - **`.reflprobe` v3** stores one cube per probe id. v1/v2 single-cube files still load and serve any baked probe without its own entry.
+  - **Baking:** Bake Reflections bakes every probe in turn; Bake This Probe updates that probe's entry.
+  - **Tests:** v3 round-trip and the legacy fallback. On the GPU, a second 4x-intensity probe over part of the room brightens reflections there with a ramp across its 1 m blend shell; a single-probe scene renders identically to before.
+  - **SSR / RT:** the SSR resolve (binding 5) and RT reflections (binding 11) apply the same two-probe blend (`shaders/probe_blend.glsl`), so they replace exactly the environment the forward pass added; verified on the GPU in both modes.
+  - **Custom shaders:** the GLSL / HLSL preamble's `citrus_env` blends both probes the same way.
+- [done] HDR verified end to end (2026-10-30): with 8x emissive orbs and bloom off, lowering exposure by 3 EV darkens the couch region from 106 to 20.5 (green, sRGB), while the orbs keep their colour (core 140/205/147 to 39/91/37: blown-out cyan at 0 EV, true green at -3 EV). Radiance above 1 survives to the tonemapper. Note: a Volume profile overrides tonemap / exposure only with `tonemap.enabled: true`.
+- [done] Flux trace GPU zones: gather / denoise / integrate timestamps (`RenderStats::gpu_gi_*_ms`, profiler,
+  `CITRUS_FRAME_STATS` log). Flux software gather 1.34 -> 0.87 ms: lights below 1e-3 unshadowed contribution skip
+  their shadow march, 4-tap tetrahedral hit normal, shadow rays clipped to the GDF box (directional lights).
+  FluxRT gather skips negligible lights too (0.29 -> 0.27 ms).
+- [done] FluxVoxel static rebuild 68 -> 5 ms (DDGI moment rays stop at their 8 m clamp instead of the scene
+  diagonal; probes split across threads) and asynchronous after the first build (worker thread, the previous
+  base renders until the new one lands), so camera-clipmap steps and static-light edits no longer hitch.
+- [done] Frame timing in game builds: `CITRUS_FRAME_STATS=1` turns vsync off, records the GPU timestamp zones
+  without the profiler window, and logs the mean frame interval, GPU zones and draw calls every 240 frames.
+  Before / after numbers for this pass are in ENGINE_REVIEW_2026-10-30.md §1.3a.
+- [done] Mixed lighting: Flux / FluxRT run with a bake loaded and ADD to it. The gather then carries only what
+  the bake can't hold (`FluxSettings::mixed_lighting`, `probe_info.y` in the gathers): moving emitters (static
+  emitters are dropped from the NEE list), realtime lights (baked lights filtered out), no sky, no world-SH cache,
+  and static surfaces' emission skipped (RT instance `emission.w` = static). The forward pass adds it on top of
+  the lightmap for lightmapped surfaces and on top of the baked probes for dynamic objects (`debug.z` = 2).
+  Turning realtime GI off returns to the bake alone (its probes are re-uploaded instead of cleared). Previously
+  any bake paused Flux entirely, so a moving emitter never lit baked surfaces.
+- [done] Emitter GI fixes (FluxRT, Flux, CPU march): shadow rays toward an emitter sphere stopped exactly at its
+  estimated radius and grazed the emitter's own (tessellated) surface on some frames, so its light flickered on
+  nearby surfaces as it moved; they now stop clearly short of it. FluxRT gather rays that hit an emitter no
+  longer add its emission on top of the analytic emitter term (double counting).
+- [done] Editor gizmos for physics and navigation (selected object): Rigid Body diamond coloured by body kind;
+  Character Controller capsule + step-height ring; Physics Joint anchor handle (drag to move the anchor), hinge
+  axis + limit arc, slider axis + limit ticks, ball rings, spring / rope rest-length circle, and a dashed line to
+  the connected body; NavMesh Surface resizable bake box; Nav Agent stopping ring and, in Play, its planned path
+  with a destination cross (red when unreachable). New `GizmoSpec::Lines` (local or world space) for plugins.
+- [done] Ray-traced reflection hits are textured: every renderer texture is in a bindless table (rt_reflect
+  binding 9, 4096 entries, descriptor indexing: runtime arrays, non-uniform indexing, partially bound) and each
+  TLAS instance carries its albedo / normal / ORM / emission texture indices, tiling-offset and metallic /
+  roughness / normal strength (176-byte instance record). The hit samples them at the interpolated UV with a
+  ray-cone mip (pixel footprint grown over the path and by roughness, against the hit triangle's texel
+  density), applies the normal map through the vertex tangent, and shades diffuse x (direct + env fill) plus
+  a metal/fresnel env specular. Textures past the table fall back to base x mean albedo. Also fixed: the RT
+  and bake shaders read 72-byte vertices from the 104-byte engine vertex (every fetch past vertex 0 wrong).
+- [done] SSR streak / ghost reduction (`ssr_resolve.frag`): back-face rejection at the hit (G-buffer normal
+  facing along the ray = the ray passed behind it; this stretched small objects into streaks), thickness
+  scaled to depth (3%, 5-35 cm, never below the step's depth travel) instead of a 1 m minimum, rays heading
+  toward the camera faded out, and a decisive confidence curve with a narrower screen-edge fade so a pixel
+  shows SSR or the probe rather than a half-transparent double image.
+- [done] Screen-space reflections ran no matter what Environment > Reflections said: the reflection mode /
+  SSR settings ride in `FluxSettings`, which `realtime_gi.rs` only pushed on the Flux/FluxRT GI-on path. With
+  the FluxVoxel backend or GI off the renderer kept its default (mode 1 = SSR on), so emissive orbs left SSR
+  streaks on mirrors and floors even with Reflection Probes selected. Now pushed every frame before any early
+  return (and SSR only when the mode is SSR).
+- [done] Crash selecting objects with plugin components in a release editor (free(): invalid pointer in
+  egui ViewportState drop): plugins were always built in the dev profile, and egui's structs change layout
+  with `debug_assertions` / `accesskit`. Plugins now build with the editor's profile (`--release` when the
+  editor is release, loaded from the matching target dir) and, when the editor binary came from the same
+  workspace, in the same cargo invocation as it so feature unification yields the identical egui build.
+- [done] Reflection probe capture feedback: surfaces inside the cube capture sampled the env cube, which
+  in that pass is the probe's own previous capture, so every Realtime recapture (and a Bake that followed
+  one) fed reflections back in (a glossy floor's reflection of an emissive ball became a second, streaked
+  copy in mirrors). The capture UBO marks `refl_center.w = -1`; standard.frag then uses diffuse GI instead
+  of the cube for specular (no reflections of reflections, like Unity's default bounce count).
+- [done] Double reflections of emissives (sharp ball + smeared streak on a chrome cube): the FluxVoxel
+  specular-from-volume term was ADDED on top of the probe / planar reflection. It is now a fallback, only
+  where no probe zone or planar mirror covers the fragment.
+- [done] Reflection Probe capture point: `capture_offset` (world-axis, like `box_offset`) moves where the
+  cube is rendered from without moving the object or its box. Pink viewport handle (new
+  `GizmoSpec::Handle` / `GizmoEdit::Handle`, dragged in the camera plane, dashed line to the box centre,
+  clamped inside the box) + "Capture Offset" inspector row.
+- [done] Inspector minimum width (352 px): `clamp_leaf_width` pushes its dock split back after each frame
+  (egui_dock has no per-leaf minimum).
+- [done] Probe reflections sparkled on curved mirrors (chrome sphere on a 2048 cube): mirror-smooth
+  surfaces always sampled mip 0. The env lookup now uses max(roughness LOD, `textureQueryLod` of the raw
+  reflection vector), measured before box projection so box edges don't add seams.
+- [done] Reflection capture + planar mirrors shaded every surface with its normal reversed: both passes
+  mirror the on-screen winding (cube faces use a positive-height viewport, planar uses a reflected camera)
+  and compensated with no-cull, so `gl_FrontFacing` was false on outward faces and standard.frag flipped
+  N. New `PipelineKey::mirrored` (clockwise front face, normal culling) for those passes; proven by
+  `refl_capture_tests::mirrored_passes_reverse_winding` (main CCW-front, capture and planar reversed).
 - [done] Viewport resize crash (SIGSEGV in egui_ash_renderer::cmd_draw): a replaced viewport target freed its
   egui descriptor set while the frame being drawn (built before the resize) still referenced its texture id.
   Replaced targets are now retired for FRAMES_IN_FLIGHT + 1 frames, then unregistered from egui and freed.
@@ -781,6 +990,31 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] **Animation**: blend trees (1D / 2D, phase-synced), animation events
   (`on_animation_event` + `AnimationEvent`), root motion (through the Character Controller),
   **GPU skinning** (compute pass writing the vertex buffer; CPU fallback per Animator).
+- [done] **Animator Controllers + clip authoring** (2026-10-30): `.animctrl` assets
+  (`citrus_assets::AnimatorController`: Float / Int / Bool / Trigger parameters; layers with
+  weight, Override / Additive blending and bone / path masks; per-layer state machines with
+  clip, `.anim` or blend-tree states, speed parameters, on-enter / on-exit events, Any State,
+  default state, transitions with conditions, exit time, duration, offset, interruptible).
+  Runtime in `citrus-engine/src/anim_graph.rs` (rig + masked TRS poses, trigger consumption,
+  Any State priority, cross-fades, layer composition, root motion on the base layer) hooked
+  into `update_skinning` for skinned models and `PlaySession::animate_objects` for plain object
+  hierarchies. `Animator.controller` (empty = old clip path), `Animator.drivers` (parameters
+  fed from movement / ground check / another Animator), `AnimatorStateChanged` events, code API
+  (`set_animator_int/bool/trigger`, `play_animator_state`, `animator_state`, ...). `.anim`
+  clips (`citrus_assets::AnimClip`: tracks by relative object path or bone name, Position /
+  Rotation / Scale / Light Intensity, Step / Linear / Cubic keys, clip events). Editor:
+  **Animator Controller** tab (graph canvas with pan / zoom, drag states, Shift-drag or
+  Make Transition, right-click create / default / duplicate / delete, Layers + Parameters
+  panel with live values while playing, state / transition / layer inspector, live state
+  highlight + transition progress, autosave) and **Animation** tab (ruler + playhead scrub,
+  track list with Add Property for children and bones, key diamonds with select / drag /
+  delete / copy / paste / per-key curve, Record from gizmo / Inspector edits, edit-mode
+  preview playback, length / loop / FPS, clip events). Files: icons, Create -> New Animator
+  Controller / New Animation Clip, selecting the file opens its tab; Animator inspector has
+  the Controller field + Open.
+- [todo] Animation follow-ups: curve (tangent) editor, sub-state machines, transition
+  interruption sources, humanoid retargeting, bone preview / record for skinned models in edit
+  mode (bone tracks are keyed by value), material colour tracks.
 - [done] **Physics joints** (`Joint`: fixed / hinge / ball / slider / spring / rope, limits,
   motors, `ctx.set_joint_motor`).
 - [done] **Navigation**: height-aware navmesh baked from colliders (slope, step, clearance,
@@ -1140,7 +1374,20 @@ Integration
 - [todo] Editor/runtime tooling: a local "host + N clients" test harness, a net-stats
   overlay (ping, bandwidth, packet loss), and lag simulation for testing.
 
-### 2H. Render-to-texture cameras (camera output as a material input) [todo]
+### 2H. Render-to-texture cameras (camera output as a material input) [partial]
+
+Landed (2026-10-30):
+- **Camera component:** Render Texture toggle plus Texture Size (`CameraComponent::render_texture`, `texture_size`). A render-texture camera is never the main camera.
+- **Materials:** sample the camera through the texture path `camera:<object id>`. No file-format change; it works in albedo / emission and resolves via `Renderer::camera_target`.
+- **Renderer:** one linear HDR target per camera (max 8), registered as a normal texture with its own depth and per-frame set-0 copies (binding 0 = its UBO; bindings 1-9 copied from the frame set). Recorded every frame before the main pass, frustum-culled to that camera. The main pass tonemaps the screen like any other emissive surface.
+- **Recursion guard:** materials that sample any camera target are skipped inside the camera passes, so a screen never draws itself or another screen.
+- **Editor:** the camera inspector's Create Screen button writes an emissive `<camera> screen.material` and spawns a plane facing the view, sized to the texture aspect.
+- **Verified:** a camera at the side of the room shows its live, upright view on a floor screen while the main view is unchanged. Test: `camera_texture_paths_name_a_camera_and_never_the_main_view`.
+- **Update Rate (Hz, 0 = every frame):** throttles a camera's refreshes, and a camera whose screen isn't in the main camera's view isn't rendered at all. Verified: moving the screen out of view drops the pass (GPU 0.359 to 0.326 ms for a 512x288 target).
+- **Resizing:** changing Texture Size resizes the live target in place (same texture handle; materials using it are re-pointed).
+- **Still open:**
+  - screens inside screens
+  - the mirror / portal variants
 Let a `Camera` render the scene from its viewpoint into an offscreen texture that a
 material can sample, so a plane + that material becomes an in-world screen: a CCTV
 monitor, a TV showing a moveable camera, a mirror, a portal, a minimap, or
@@ -1197,6 +1444,30 @@ possession (2A: the moveable camera can be a possessed pawn). HDR targets feed t
 existing tonemap/bloom path.
 
 ### 2I. Build & bundle (game export) [in progress]
+
+- [done] **Build targets (2026-10-30)**: `BuildTarget::{Host, Windows}`. Project Settings has a
+  Target dropdown, the File menu has **Build Game for Windows**, and the CLI takes
+  `citrus --build <dir> --target windows`. From Linux / macOS it cross-compiles with
+  `cargo xwin rustc --target x86_64-pc-windows-msvc`, after checking for cargo-xwin and the
+  rustup target. Output goes to `build-windows/` (exe, `phonon.dll` plus Steam Audio licence
+  files, assets). Verified: the FPS template builds and runs under Wine (RTX 4080, Steam Audio,
+  HUD). Players need the VC++ 2015-2022 runtime. The GNU target is unsupported (audionimbus-sys
+  whitelist).
+- [partial] **Android build (2026-10-30)**: the engine and a game build and link for
+  `aarch64-linux-android` (NDK r29; winit `android-native-activity` on Android; plugin `.so`
+  on Android). `citrus_engine::run_game_android(app, config, register)` is the `android_main`
+  entry. **APK packaging:** `tools/android/build_apk.sh <game-crate> <assets> <out.apk> [package]`
+  builds the cdylib (`examples/android-game` shows `android_main`), bundles the assets with a
+  `citrus_assets.txt` list, writes a NativeActivity manifest (Vulkan 1.3 required, arm64-v8a),
+  then `aapt2` / `zipalign` / `apksigner` with a debug key kept next to the APK. On first run
+  `citrus_engine::android_assets_root(&app)` extracts the assets to internal storage (again only
+  when the list changes). Verified: the FPS template packs into a 6.7 MB APK that `aapt2 dump
+  badging` and `apksigner verify` accept, exporting `ANativeActivity_onCreate` + `android_main`.
+  **Not yet:** a Vulkan 1.1 fallback (Quest 2), ASTC textures. **Never run on a device:** the
+  library links the system's minimal `libstdc++.so` (the texture compressor's build script), which
+  only a device run can confirm.
+- [done] **Background builds**: Build Game runs as a status-bar task instead of blocking the
+  editor; one build at a time, and the result lands in the Project Settings status line.
 Turn a project into a standalone, runnable game: compile the runtime with the project's
 components linked in, collect every asset the game needs, and emit a `build/` folder with
 an executable a player can double-click. No editor, no toolchain assumptions on the
@@ -1378,7 +1649,22 @@ physics engine (#26) --+                              |
 - [todo] VR rendering (OpenXR) + VR editing
 - [todo] Slang custom-shader frontend (phase 2)
 - [todo] Networking, content pipeline, VRM avatars (milestones M3-M7)
-- [todo] Occlusion culling, mipmaps, MSAA/TAA, multi-select gizmo, JFA outline
+- [todo] Mipmaps, MSAA/TAA, multi-select gizmo, JFA outline
+- [done] Baked occlusion culling (`occlusion.rs`, Occlusion tab): the static geometry's bounds split into view
+  cells (cell size setting, capped at 32k cells); per cell, sample points (dropped when inside geometry) shoot
+  Low/Medium/High (256/1024/4096) rays in all directions and then aim rays at surface points of every object
+  still hidden, against a CPU BVH, on low-priority worker threads with progress + cancel. Per-cell bitsets are
+  saved as `<scene>.occlusion` and loaded with the scene (editor, play-mode switches, shipped game). Static
+  objects not visible from the culling camera's cell skip the main camera pass (`DrawCmd::occluded`; still in
+  shadows, probes and captures); dynamic objects and objects added after the bake are never culled; outside
+  the baked bounds nothing is culled. The editor Scene view is now frustum culled too. Visualization: cull the
+  Scene view, preview from the game camera (fly around and see what that camera's cell draws), show the
+  bounds + current cell, and per-cell stats (visible / total).
+- [done] Per-scene baked data on every scene load / switch (editor open, play-mode switches, Stop restore,
+  shipped game): `.lightmap` + `.lightdata` (lightmaps, probes), `.audiobake`, `.occlusion`, and the baked
+  `.reflprobe` cube, read on the loader thread and applied in the post-load steps. The shipped game never
+  loaded `.reflprobe` before (Baked-mode probes reflected only the sky); it now does, and captures live once
+  when the scene has no baked cube.
 
 ## Gameplay / engine subsystems (ENGINE_FEATURE_CHECKLIST, 2026-06-19)
 
@@ -1452,3 +1738,568 @@ per-feature "what's done / what's left" table.
   specular term (now gated to smooth metals). The diffuse emissive bounce is injected ~8× into
   the voxel volume (`EMISSIVE_GI_GAIN`) with an 8 m reach, so floor/couch/props get a visible
   VIEW-INDEPENDENT colored pool (chrome/mirror specular deferred per request).
+
+## User-generated content packages (.citruspak, 2026-10-30)
+
+Worlds, avatars and props built in the editor load into a running game without
+recompiling it (VRChat-style). Full design + safety model: [docs/user-content.md](docs/user-content.md).
+
+- [done] **`.citruspak` format** (`citrus-assets/src/package.rs`) — zip with `manifest.ron`
+  (kind World/Avatar/Prop, name/author/version, engine format version, SHA-256 content hash
+  over the file table, required components, stats, thumbnail), `files/` (entry `.scene` + every
+  referenced asset, baked sidecars), `texcache/` (BC import-cache blobs re-bound on extract).
+- [done] **Builder** — Tools > Build Content Package (World = open scene, Avatar/Prop =
+  selected hierarchy): transitive dependency scan of every RON string (incl. component data),
+  glTF/FBX externals, model `.meta`/`.lmuv`, scene sidecars; built-in vs plugin vs unknown
+  component validation; limits; Analyse / Build report.
+- [done] **Avatar Descriptor** component — eye point (camera placement), humanoid bone-map
+  overrides (`HumanoidRig::map_with_overrides`), body capsule for the Character Controller.
+- [done] **ContentManager** (`citrus-engine/src/content.rs`) in the runtime + editor Play mode:
+  path / content id / `http://` (pluggable `ContentFetcher` for HTTPS) on a worker thread,
+  validate → extract into a hash-keyed cache (`ContentCache`, source index, LRU prune) →
+  decode + transfer-queue upload; worlds switch through `SceneFlow::switch_to_loaded`, props /
+  avatars append with fresh ids, avatars attach to the player; unload by origin.
+- [done] **Gameplay API** — `ctx.load_content`, `spawn_content`, `spawn_avatar`, `enter_world`,
+  `unload_content`, `ContentEvent` (Progress / Loaded / Spawned / WorldEntered / Failed /
+  Unloaded) via `ctx.content_events()`.
+- [done] **Safety** — data only (whitelisted file types, no `.spv`, shader `#include` rejected),
+  per-file SHA-256 + content hash, path sanitizing (outside-package refs blanked, glTF URIs
+  confined), per-kind resource limits checked on claims, entry sizes and measured data
+  (triangles / texture memory before upload), BC blob validation, unknown components dropped.
+- [done] **F8 developer overlay** in built games (`GameConfig::content_overlay` /
+  `CITRUS_CONTENT_OVERLAY=1`): inbox folders → Spawn / Wear / Enter, loaded list → Unload.
+- [todo] Free GPU meshes/textures per package on unload (today: at the next world switch);
+  replicate avatar content ids over the network; sandboxed WASM scripting for content logic.
+
+## Custom shader system v2 + Citrus Toon (2026-10-30)
+
+- [done] **Property declarations v2** (`citrus-assets/src/shader_props.rs`): `// @property name
+  "Label" Type = default` with Range, Float, Int, IntRange, Toggle, Enum, Color(HDR), Color3,
+  Vector2/3/4, Texture2D (white/black/normal/gray, `@linear`); `@feature` / `@foldout` / `@header`
+  groups, `@show_if(expr)` conditions, `@tooltip`, `@preset`. v1 `//! prop` pragmas still work.
+- [done] **Per-material std140 block + texture properties**: generated layout and GLSL/HLSL
+  declarations, uploaded to a new pipeline set 2 (binding 0 UBO, bindings 1..20 textures);
+  values saved by name (`custom`, `textures.shader`), old files load unchanged.
+- [done] **Inspector**: presets, foldouts with feature checkboxes, conditional visibility,
+  sliders / drags / enum combos / HDR colour pickers / vectors / texture slots with drop +
+  tiling/offset, property filter, variant badge, fixed material texture slots, compile errors.
+- [done] **HLSL custom shaders** (`.hlsl`, `citrus_frag(CitrusInput)`, auto-combined samplers,
+  `packoffset` cbuffer) and shaders from any project folder; hot reload remaps values by name.
+- [done] **Keyword variants** (shader_feature model): `@keyword` properties are specialization
+  constants; the pipeline key includes the material's keyword set (lazy, cached pipelines).
+  Game builds bake the keyword sets their materials use into frozen-constant SPIR-V sidecars.
+- [done] **Per-material inverted-hull outline** (`OUTLINE` + `outline_color` + `outline_width`).
+- [done] **Citrus Toon** (`shaders/citrus_toon.frag`): Poiyomi-style lighting modes, shadow
+  layers, rim, 2 matcaps, toon / anisotropic / GGX specular, reflections, 2 emission slots,
+  dissolve, glitter, decal, detail maps, UV tile discard, vertex colour, alpha options,
+  parallax; Simple / Medium / Heavy presets. Out of scope list in `docs/shaders.md`.
+- [fixed] Custom-shader preamble matched an old frame layout (16 lights, 4-coefficient probes),
+  so custom shaders read shadows/probe GI from wrong offsets; now mirrors `FrameUbo`.
+
+## Built-in networking layer (2026-10-30)
+
+Extends 2G. API and model: `docs/networking.md`.
+
+- [done] **Transport**: UDP (or in-memory `MemHub` for tests) with an unreliable channel and a
+  reliable ordered channel (seq numbers, batched acks, RTT-based resend, fragmentation past the
+  1200-byte MTU). HELLO / WELCOME / REJECT handshake with protocol check and max players, 0.5 s
+  pings (RTT), timeout, clean BYE. Fixes the old 512-byte receive buffer that truncated voice.
+- [done] **Sessions**: host / join by address, LAN discovery (`LanBrowser`, UDP 47777), player
+  list with names / ids / ping, `PeerJoined` / `PeerLeft` / `Connected` / `Disconnected` events,
+  `ctx.net_host` / `net_join` / `net_disconnect`, `Network Manager` component (limits, player
+  prefab per peer at Spawn Points, dedicated host, auto start), `CITRUS_NAME`.
+- [done] **Editor Network window** rebuilt on the widget kit: name / address, Host / Join, LAN
+  list, status chip, players with ping, traffic, networked objects with who simulates them;
+  connections stay alive while editing; Stop clears replicated state.
+- [done] **Object sync**: `Network Object` (ownership Takeover / Request / Host only; transform,
+  scale, rigid body, parent and active sync; snap / interpolate / extrapolate with snapshot
+  buffers and clock-offset estimation; per-object send rate, still thresholds, field deltas with
+  1 s keyframes, quantized 24-bit positions and 32-bit rotations, relevancy distance, despawn on
+  owner leave). Host-authoritative: unowned objects are simulated by the host; the host drops
+  writes from non-owners. `Sync` maps onto it unchanged.
+- [done] **Ownership**: request / release / transfer, `OwnershipChanged` / `OwnershipRequested` /
+  `OwnershipDenied` events, owners released (or despawned) when they leave.
+- [done] **Rigid body hand-over**: non-authority peers make networked dynamic bodies kinematic;
+  regaining authority restores dynamics with the last velocity.
+- [done] **Networked spawning**: `ctx.net_spawn` / `net_spawn_server` / `net_clone` /
+  `net_despawn` with deterministic child ids and intra-prefab reference remapping; late joiners
+  get spawns, owners, parents, active states, variables, last transforms and animator params.
+- [done] **Synced variables**: `Network Variables` (typed key / values, owner-write or anyone),
+  `ctx.set_net_var` / `net_var` / `net_var_changes`, `VarChanged` events.
+- [done] **RPCs**: `ctx.rpc` / `rpc_unreliable` / `rpc_self` / `send_rpc` to All / Others / Server
+  / Owner / Peer, received via `ctx.rpcs()` / `rpcs_named` / `rpcs_for_self`; offline loopback.
+- [done] **Animator and avatar sync**: `Network Animator` (parameters), `Network Avatar` (head /
+  hands / hips / feet poses, optional drive from the local VR rig, replicated `TrackerTargets`).
+- [done] **Scene switch for everyone**: `ctx.net_load_scene` (late joiners follow).
+- [done] Inspectors for all five components (relevancy sphere gizmo, live owner / authority
+  readout during Play).
+- [done] Tests: in-memory and UDP loopback sessions (join / leave / timeout / full, ownership
+  modes, reliability under 30% loss + fragmentation, variables, RPC targets, spawn + late join,
+  owner leave) and two- / three-peer scene tests (transform convergence, ownership moving
+  authority, animator / avatar sync, pawn possession, spawn + vars + RPC + late join + despawn).
+- [todo] NAT traversal / relay, host migration, client prediction + reconciliation, lag
+  compensation, compact network ids, per-avatar IK for remote humanoids, encryption.
+
+## Project templates + gameplay kit (2026-10-30)
+
+New Project offers starter games; each is built from reusable built-in components and plays in
+the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src/templates/`,
+`crates/citrus-core/src/kit/`, inspectors in `crates/citrus-editor/src/kit_ui.rs`.
+
+- [done] **Template registry** (`templates::TEMPLATES`: id, name, description, Desktop / VR
+  category, card icon, feature list). `scaffold_project(parent, name, template)` writes the
+  cargo workspace as before plus the template's scenes, material palette, prefabs, input
+  bindings (project.citrus) and sample assets copied from the checkout (sky texture, the helmet
+  model); a missing asset is skipped. CLI: `citrus --new-project <parent> <name> [template]`.
+- [done] **Empty**: the previous starter scene (default).
+- [done] **First Person Shooter**: walled arena with cover, ramp and platform, physics crates,
+  target range; FPS controller (mouse look, WASD, jump, sprint, crouch), hitscan rifle with
+  reload, muzzle flash and impact particles, health with regen, crosshair / health / ammo /
+  score HUD, Escape pause menu (Resume / Settings / Restart / Quit). Target dummy prefab.
+- [done] **Third Person Shooter**: same arena; capsule character, over-the-shoulder camera on a
+  boom that pulls in at walls, aim (right mouse) zooms in and strafes, weapon, HUD, pause.
+- [done] **Top-down click to move**: follow camera with wheel zoom, NavMesh Surface (characters
+  on their own layer so they don't block the bake), click marker, a lever that opens a gate
+  (rebakes the navmesh) and a lamp switch.
+- [done] **Strategy (RTS)**: RTS camera (edge / WASD pan, wheel zoom, Q / E rotate, bounds),
+  eight units with selection rings, box and click selection (Shift adds), right-click moves in
+  grid formation with a move marker, Gold / Wood resource bar with income and a selected-count
+  readout. Unit prefab.
+- [done] **VR Shooter**: VR Player rig (head camera + hands), pistol and blaster that snap into
+  the hand and fire on the trigger, throwable balls, teleport arc + smooth move + snap turn,
+  targets, wrist HUD (score / ammo) as a world-space canvas, instructions board.
+- [done] **VR Social**: room with lights, planar-reflection mirror, avatar body that follows the
+  head (head shell, torso), world-space welcome board with working buttons, four `player` spawn
+  points (picked by peer id), synced grabbables (`Sync` + `Grabbable`, ownership requested on
+  grab), Voice push-to-talk binding.
+- [done] **Gameplay kit components** (registered built-ins with inspectors and gizmos): Health,
+  Hitscan Weapon, Target Dummy, First / Third Person Controller, Follow Camera, Click To Move,
+  Interactable, RTS Camera, RTS Selection, Selectable, Resource Store, HUD Binding, VR Player,
+  Grabbable, VR Avatar.
+- [done] **VR for gameplay**: `ScreenInfo::vr` (`VrFrame`) carries the headset / controller state
+  to components in the runtime and editor Play; in editor Play a VR Player drives the headset
+  rig. Without a headset the VR Player simulates one (mouse look, WASD, look-and-press-Grab,
+  left mouse = trigger, T = teleport).
+- [done] **Editor Play input**: while the viewport shows the game camera, right mouse and the
+  wheel go to the game (RTS orders, zoom) instead of the fly camera.
+- [done] New Project dialog: template cards with Desktop / VR filter (see editor-ui-guide).
+- [done] Tests: every template scaffolds, its scenes / project / prefabs load and every component
+  deserializes with all object references resolving; headless weapon damage through physics,
+  HUD binding, FPS movement; unit tests for formation / selection rect / camera pose / edge pan /
+  boom / teleport arc / spread / health / reload math.
+- [done] **Crouch collision**: First Person Controller `crouch_height` shrinks the character
+  capsule while crouched (feet stay planted) and only stands up with headroom (five upward
+  rays); physics reshapes the capsule when the Character Controller changes at runtime. Test:
+  `crouch_shrinks_the_capsule_and_waits_for_headroom`.
+- [done] **Prefab references survive instancing**: `Prefab::instantiate` / `instantiate_rooted`
+  give fresh ids and rewrite references between prefab objects in component data (editor drop,
+  `ctx.spawn_prefab`, network spawns). Template prefabs keep their ids so this works (spawned
+  RTS units get their selection ring).
+- [done] **VR Social networked avatars**: a Network Manager (session "VR Social", spawn tag
+  `player`) spawns `prefabs/net_avatar.prefab` per player. Network Avatar gained **Follow
+  Local Player** (the owner's copy sits on the scene's VR Player rig and copies its head / hand
+  poses, VR or desktop fallback) and **Hidden For Owner** (its own visuals are disabled locally),
+  so peers see head, hands and torso without the owner seeing a double. Test:
+  `vr_social_avatar_prefab_mirrors_the_local_player_for_others`.
+- [todo] VR left trigger is not read by citrus-xr yet.
+
+## Bone cloth + cloth colliders (2026-10-30)
+- [done] **Bone Cloth** (`citrus_core::cloth`): position-based secondary motion for joint chains
+  (hair, tails, ears, bone-rigged skirts). Pick root joints; every joint below simulates, with an
+  optional virtual tail so the last bone swings. Connection modes: independent chains, or
+  neighbouring chains linked as a loop / open strip (a root with several children is sorted
+  around its axis into a ring). Gravity, damping, stiffness toward the animated pose (root / tip),
+  angle limit, link stiffness, blend with the animation. Collision with per-particle radius
+  (root / tip), friction and edge collision (segments between particles, so colliders can't slip
+  through). World inertia, max speed (faster locomotion carried rigidly), teleport distance /
+  angle with Reset or Keep shape. Fixed-rate sub-stepping (Frequency, Iterations). Runs in the
+  skinning pass for Animator models (CPU and GPU skinning) and shared / full-body-IK avatars,
+  in edit mode and Play.
+- [done] **Cloth Colliders**: spheres, tapered capsules (separate start / end radius) and planes,
+  each following a joint (or the object). Bone Cloth uses the object's colliders (all, or a
+  ticked subset) plus colliders on other listed objects.
+- [done] **Auto-fit capsules**: presets Body (hips, legs, arms) / Legs / Arms / Selected bones.
+  Each bone's capsule runs from the joint to the child its vertices lie toward (principal axis
+  when there is none) with radii from a coverage quantile of the bind-pose vertices it dominates,
+  extrapolated to the ends; Inset grows or shrinks every radius. Refitting replaces only
+  auto-fitted colliders; editing one by hand keeps it.
+- [done] **Gizmos**: collider wireframes (selected one highlighted, with start / end handles and
+  radius handles), and the live simulated chains, chain links and particle radii.
+- Tests: `citrus-core` cloth (hanging, stiffness, sphere / edge collision, teleport, inertia,
+  ring links, capsule fit, collider frames), `citrus-engine`
+  `auto_fit_wraps_the_thigh_and_cloth_slides_off_it`.
+- [done] **Wind Zones** (`Wind Zone`: global / sphere / box, strength, turbulence, gust
+  frequency, gizmo) push Bone Cloth and Mesh Cloth (`wind` scale on each) and raise wind seas on
+  Water.
+- [done] **Mesh Cloth** (`citrus_core::cloth_mesh`): a skinned submesh simulated from its own
+  triangles: seam welding, optional particle spacing (reduction), stretch / bending /
+  keep-shape / tether constraints, pins from a vertex colour channel, bones or the top of the
+  mesh, collision with Cloth Colliders, self-collision (spatial hash), inertia and teleport like
+  Bone Cloth, rebuilt normals; CPU skinning path. Inspector and particle gizmo.
+- [done] **VRM spring bones**: `.vrm` imports as a model; `VRM.secondaryAnimation` (0.x) and
+  `VRMC_springBone` (1.0) become Bone Cloth chains and Cloth Colliders on the skinned object
+  when the model is added to a scene.
+- [todo] In-editor pin painting for Mesh Cloth, distance culling of cloth, GPU cloth.
+
+## Full-body tracking, remote IK, networked avatars (2026-10-30)
+- [done] **Tracker roles**: `TrackerTargets` covers head, hands, hips, feet, chest, elbows and
+  knees (`TRACKER_SLOTS` = 11, `slots` / `from_slots` / `transformed`); citrus-xr binds the Vive
+  tracker chest / elbow / knee roles next to waist and feet.
+- [done] **Full-body solver** (`humanoid::solve_body`, VR-avatar style): pelvis from the hip
+  tracker or estimated under the head (turned by its yaw), spine bent toward the chest and head
+  and twisted with the head, shoulders turning toward reaching hands, two-bone arms / legs with
+  elbow / knee trackers or body-relative bend goals, tracker rotation on head / hands / feet /
+  chest, and without foot trackers planted feet (world space) that step when the body moves or
+  turns away. Works on top of the Animator pose with a weight. `HumanoidRig` gained chest, neck
+  and shoulders (also bone-map roles).
+- [done] **Calibration**: T-pose capture lines the avatar up under the headset; uncalibrated play
+  uses a default calibration (ideal headset / controller poses) so head and hand rotations map
+  sensibly. `ctx.calibrate_trackers()` / `ctx.clear_tracker_calibration()`; the runtime now
+  applies calibration like the editor.
+- [done] **`Humanoid IK` component**: source Auto / Local trackers / Network / Objects, tracking
+  root, weight, spine twist, shoulder rotation, foot planting and step tuning; per-object skinned
+  instance (no Animator needed); Avatar Descriptor bone maps apply. Inspector and a gizmo of the
+  live targets.
+- [done] **Remote humanoid IK**: the avatar packet carries all 11 roles (protocol 3); owners send
+  their calibrated targets; remote copies pose their Humanoid IK from them.
+- [done] **Networked UGC avatars**: wearing a package sets the player's Network Avatar `wearing`
+  (content id + URL), replicated as the `citrus.avatar` synced variable with late-join catch-up;
+  peers load and wear it. Worn avatars get Humanoid IK on their skinned parts automatically.
+- Tests: `three_point_tracking_reaches_head_and_hands_and_crouches_on_planted_feet`,
+  `foot_and_hip_trackers_drive_the_legs_and_knee_trackers_aim_them`,
+  `planted_feet_hold_then_step_after_the_body`, `default_calibration_maps_an_ideal_headset_onto_the_head_bone`,
+  `humanoid_ik_picks_network_targets_for_remote_avatars_and_local_ones_otherwise`,
+  `worn_avatar_package_reaches_peers_and_late_joiners`, `remote_players_announced_avatar_is_requested_once`,
+  plus chest / knee replication in the network convergence test.
+- [done] Command palette: the list no longer stays at the height of an earlier search.
+- [todo] Avatar scaling to the player's height, finger tracking, a calibration UI in the VR
+  Player kit, legacy global IK path (humanoids without Humanoid IK) to retire.
+
+## Face tracking, SlimeVR, voice v2, lip sync, render fixes (2026-10-30)
+- [done] **Blendshapes**: glTF morph targets (names from `extras.targetNames`) and FBX blend
+  shapes (ufbx channels remapped onto triangle corners) import as sparse offsets; skinned
+  objects with Face Tracking / Blend Shapes / Lip Sync apply them before CPU skinning.
+- [done] **Face tracking** (`citrus_core::face`): Unified Expressions frame (102 base shapes,
+  blended shapes, ARKit and VRM aliases, gaze), `XR_FB_face_tracking2` mapping, OSC parameter
+  decoding (v2 / FT/v2 / combined signed parameters). Headset read directly in citrus-xr
+  (`face_weights`, `eye_gaze`); opt-in OSC receiver (`face_input.rs`). `Face Tracking`
+  component (source Auto / Local / Network, smoothing, eye bones, mappings, live matched list),
+  `Blend Shapes` (sliders). Faces replicate (P_FACE). Worn avatars get Face Tracking and Lip Sync.
+- [done] **SlimeVR direct** (`slimevr.rs`): connects to the server's driver bridge socket
+  (`SlimeVRDriver`, protocol 2, schema read from the installed server), announces the headset
+  and controllers, streams their poses and fills body tracker slots by role. No SteamVR needed.
+- [done] **Voice v2**: Opus via runtime-loaded libopus (PCM fallback), adaptive jitter buffer
+  (RFC 3550 jitter, 40 to 300 ms target, FEC recovery, concealment, quiet-frame catch-up),
+  stereo positioning at the speaker's head, `Voice Chat` component (proximity / global, rolloff,
+  voice activity / push to talk / always, gain, bitrate). Protocol 4.
+- [done] **Lip sync**: per-frame viseme analysis (loudness gate, formant peaks, fricative
+  energy, onsets) of the local mic and of every voice as it plays; `Lip Sync` component (when
+  untracked / always / off, gain, smoothing, face-shape fallback).
+- [done] **Command palette** keeps its height after a search; **bloom** drops NaN / Inf samples
+  and the standard shader never writes them; **sphere-light specular** (5 cm source radius,
+  sun angular size) keeps mirror highlights finite.
+- [done] **Flux emitter shadows** are a world-space distance-field cone trace per pixel instead
+  of per-probe visibility bits (the shadow under an emitter no longer slides with the camera).
+- Tests: face (names, OSC, FB mapping, wire form), face_drive (tracking + authored + lip sync),
+  face_input (OSC parsing, receiver), slimevr (messages, framing, live socket), voice_codec
+  (Opus round trip), viseme (vowels / silence / hiss), voice jitter buffer (buffering, jitter
+  growth, reordering, concealment, late drops), face replication in the network test.
+- [todo] Flux: probe placement jitter + plane-aware integrate weights (review notes); HTC
+  facial tracking; OSCQuery advertising for VRCFaceTracking auto-discovery; GPU morph path;
+  HRTF voice through Steam Audio.
+
+## Smaller scenes, generated LODs, VRM models (2026-10-30)
+- [done] **Compact scene files**: a material still exactly as its model / primitive imported it
+  saves as `material: Model` (no inline copy; 80 % of a typical scene file was these). Model
+  instances save as their root plus changes: untouched parts that nothing references are left
+  out and rebuilt from the model on load with stable ids, deleted parts are listed
+  (`model.removed`), edited parts stay as entries tagged `model_part`. Older scenes load as before
+  and shrink on their next save. Geometry was never stored in `.scene` files; the large files
+  next to a scene are the bakes (see BC6H in OUTSTANDING_FEATURES).
+- [done] **Generated LODs**: `citrus_assets::simplify` (quadric-error edge collapse, borders and
+  UV seams locked, flip-safe, attributes and skin weights kept). A LOD Group level with no model
+  and a Keep percentage builds its meshes from the object's own model at load.
+- Tests: `pristine_parts_drop_out_and_come_back`, `edited_materials_and_components_keep_a_part_stored`,
+  simplify (sphere halves keeping its silhouette, flat grid collapses with its border locked),
+  VRM spring parsing.
+
+## Water system, multi-select editing, grouping, asset cook (2026-10-30)
+- [done] **Water bodies** (`Water`): Ocean (endless), Lake (rectangle or drawn polygon), River
+  (spline points with width, depth and flow speed; the surface follows the points' heights, waves
+  calm toward the banks). `column()`, `height_at()`, `flow_at()`; inspector with point lists and
+  draggable point gizmos.
+- [done] **Waves**: Gerstner sets plus a wind sea from Wind Zones that builds over time, limited by
+  fetch and depth; depth-aware dispersion (`omega = sqrt(g k tanh(k d))`).
+- [done] **Water physics**: `Buoyancy` (per-point lift centred slabs, drag, angular drag,
+  current and river flow), `ctx.water_surface(p)`.
+- [done] **Interactive surface** (`RippleSim`): a height-field wave simulation in a window that
+  follows the listener; floating bodies push it (falling in, wakes), it absorbs at its border and
+  adds to `height_at` so bodies ride each other's wakes.
+- [done] **Water rendering** (`FEAT_WATER`, `water_render.rs`): Gerstner displacement and normals
+  in the standard shaders from the frame UBO (`water_bodies[4]`, play clock), flow-mapped ripples,
+  Fresnel reflection over env / probes / planar, refraction and depth absorption from an opaque
+  colour + depth copy taken mid-pass only on frames that draw water, shore and crest foam; meshes
+  per body type (camera-following ocean grid, lake grid / polygon, river ribbon). VR eyes and
+  preview cameras get waves without refraction.
+- [todo] Water: sample the ripple field in the shader (GPU upload), shoreline depth bake (wave
+  damping near shore), underwater fog / waterline / caustics, river bend mitering, freeing old
+  water meshes, planar reflections on water.
+- [done] **Multi-object editing**: fields that differ across the selection show an em dash (header
+  name, per-axis transform, component fields matched by label); typed transform values set that
+  axis on every selected object; component edits copy only the changed fields (they used to
+  overwrite whole components); header active / static / layer / name apply to all. Gizmos, light
+  cones and billboard highlights draw for every selected object.
+- [done] **Group Into Empty** (Scene tree context menu): selected objects move under a new
+  "Group" empty at their centre, under their shared parent, world transforms kept.
+- [done] **Asset cook**: builds ship only what scenes, prefabs, `resources/` and paths named in
+  `src/` reach (dependencies traced through every asset), with a size report.
+- [done] **Capsule Collider** (X / Y / Z axis, height includes the caps) and Create / Add menu
+  entries for Capsule and Mesh colliders, Water and a Floating Cube.
+- [done] **Physics materials** (`.physmat`): friction and bounciness with combine modes (Average /
+  Minimum / Multiply / Maximum), density (mass for bodies with Mass 0), buoyancy and water-drag
+  multipliers, contact offset; presets (wood, metal, rubber, ice, stone, foam). Slots on Rigid
+  Body and every collider (collider overrides body overrides project default). File browser
+  "New Physics Material" and a file inspector.
+- [done] **Project Settings > Physics**: gravity, default physics material, contact stiffness (Hz)
+  and damping, solver iterations; used by editor Play and built games. Stiffness is solver-wide
+  (rapier has no per-contact softness).
+- [done] **Water reacts to every body**: dynamic Rigid Bodies float by Archimedes from their real
+  density (mass over collider volume, or the physics material's density) scaled by the material's
+  buoyancy and water drag; `Buoyancy` became an optional override. Any body crossing the surface
+  pushes ripples; solid colliders through the surface (posts, walls, sunken boxes) block the
+  ripple field so waves reflect off them, and water flowing past them sheds alternating eddies at
+  the Strouhal frequency plus a bow push; fast entries raise splash events.
+- [done] **Water effects** (`water_fx.rs`, one CPU particle pool, single draw): splashes (crown
+  spray, foam, mist on hard hits), wake foam and spray from bodies moving through water, foam
+  advected by current and vortices. Ripples are the height-field simulation only (no ring
+  sprites): bodies and landing waterfall streaks push it, in Play and in the editor (so plunge
+  pools churn while authoring).
+- [done] **Waterfall** component and builder gizmo (lip handles, exit-speed handle, free-fall arcs):
+  a sheet of velocity-stretched streaks poured off the lip lands on water or the ground below
+  and bursts into spray and mist, foaming the surface; its plunge pool swirls (vortex fed to floating bodies).
+  **Whirlpool** component (radius, strength, pull, direction). Create > Water menu entries.
+  Runs in the editor, so waterfalls preview while authoring.
+- [done] **River path builder** (Water > River > Edit Path): click to add points on the surface
+  under the cursor (mesh raycast, plane fallback), Shift+Click inserts into the nearest segment,
+  Ctrl+Click adds upstream, clicking the centre line splits a segment in place; preview point
+  with connection lines and hint bar; drag points and width handles; Delete removes the selected
+  point; Esc / deselect exits; inspector rows sync with the viewport selection; undoable.
+- [done] **Asset slots**: every inspector file slot (physics materials, post profiles, animator
+  controllers / clips, audio clips, prefabs, sounds) has a browse list of matching project files
+  and, where a template exists, a [+] that creates a new asset and assigns it; Active Material and
+  skybox slots got browse buttons too.
+- [done] **Wave Rider** component: objects ride the water without a physics body (Float at a draft
+  within reach of the surface, or Suspended at their own depth with orbital motion decaying as
+  e^(-k depth)); per-wave footprint filtering by size, weight damps the horizontal swing, tilt with
+  the surface, Stokes drift past a steepness threshold (owner moves the anchor); engine-filled
+  `state` (on_surface, in_water, depth, surface height, offset). Offsets are draw-only
+  (`render_world_transforms`), so the synced transform stays the anchor.
+- [done] **Shared water clock** for multiplayer: `NetSession::shared_clock` (host clock, RTT
+  corrected), `PlaySession::water_time` follows it smoothly; physics, rendering, effects, riders
+  and `ctx.water_time` / `ctx.water_surface` all use it.
+- [done] Inspector: Add Component focuses its search (cleared each opening); Mesh & Material is a
+  collapsible section, closed by default.
+- [done] Sliders use the bright accent for the filled track and knob (`widgets::slider`); the
+  Project Settings gear is a proper cog.
+- [done] Water in RT reflections (water BLAS rebuilt in-frame when its mesh changes, instance masks
+  keep it out of shadows / GI, water hit shading with waves and ripple normals) and the ripple
+  field rendered on the surface (RGBA16F height + slope texture per water, uploaded without
+  stalls, vertex height + per-pixel normal).
+- [done] **Smooth rivers**: a centripetal Catmull-Rom curve through the river points
+  (`Water::river_path`, cached until the points change) drives the surface mesh, the physics
+  column (height, depth, flow down the slope, bank distance) and the editor gizmo and builder.
+- [done] **Underwater** (`underwater.frag`, `UnderwaterSettings` on Water): view fog toward the
+  water colour by scene depth with red absorbed first, darkening with depth, soft caustics on
+  up-facing surfaces, screen wobble, a per-pixel near-plane waterline; Scene view, Camera tab,
+  built game and VR eyes. Listener under water muffles every voice (two-pole low-pass sliding
+  18 kHz to 500 Hz plus a duck, 0.2 s fade) and loops the water's selectable underwater sound.
+  Inspector "Underwater" section (sound, volume, muffle, fog density, distortion, caustics).
+- [todo] Underwater: no Snell's window from below; caustics only while the camera is under; the
+  post wobble's mask is still a flat line at the camera.
+- [done] RT reflections trace the moving water: a compute pass writes the displaced surface (Gerstner
+  sum, ripple field, bank calming) into per-frame-slot buffers and the water BLAS is refit each
+  frame (full rebuild only when the mesh changes); runs only for water while RT reflections are on.
+- [todo] Wind sea state is per client (builds from local history). The wave sum is duplicated in
+  standard_common.glsl, rt_reflect.comp and water_displace.comp; keep them in sync.
+- [done] **Mesh Collider shapes**: static = exact triangles; moving bodies = one hull simplified to
+  64 corners (farthest-point sampled); "Follow shape" splits a concave mesh into up to 12 pieces of
+  24 corners each (skipped when the mesh is already ~convex); Convex = a hull even when static.
+  Shapes are cached on the scene; the green gizmo draws only fold and border edges (no face
+  diagonals). The collider's material slot is labelled Physics Material.
+- [done] Underwater view follows the waves: the pass gets the camera's water body (waves,
+  transform, rest surface, clock) in a small uniform block and evaluates the Gerstner surface per
+  pixel for the waterline, the fog's surface cut and depth darkening.
+- [done] Adding a Rigid Body in the inspector adds a collider when the object has none (a Mesh
+  Collider on mesh objects, else a Box Collider).
+- [done] Box / Sphere / Capsule Colliders added in the inspector fit the object's mesh bounds
+  (its own meshes and its children's, in its local space); flat meshes get a thin slab under the
+  surface; capsules pick the longest axis.
+- [done] Asset slots holding a physics material or a post FX profile show an "Edit <name>"
+  toggle under the field that opens that asset's full editor inline (saved to the file; volumes
+  update next frame), via `InspectCtx::asset_editor`.
+- [done] Buoyancy stability: lift capped at 6x a body's weight plus extra heave damping for very
+  light floats (a 1 kg couch-sized body bobs instead of launching); Rigid Body mass defaults to 0
+  = Auto (collider volume x physics material density, 500 kg/m3 without one), shown as "Auto".
+- [done] **Asset references by id** (`citrus_core::asset_ref`): slots store `@<id>` from the
+  asset's `.meta` sidecar (created on first assignment), resolved through a per-project index of
+  the sidecars (rescanned on a miss), so renames and moves keep every reference. The file browser
+  hides `.meta` files and carries them along on rename / move / delete; copies get fresh ids.
+  Plain paths in older files still resolve. Loaders resolve refs (physics materials, post
+  profiles, audio, animator controllers / clips, prefabs, particle and UI textures, material
+  textures, material files, skybox); the build cook follows refs and ships their sidecars
+  (and now ships `.physmat`).
+- [done] **Asset slot chips**: every asset slot (component slots, the object's material slot,
+  material texture slots) is a read-only chip with the file's icon and name; click shows and
+  highlights the file in the file browser, double-click opens it in the inspector; drop, browse
+  and [+] new still assign.
+- [todo] Skybox image slots in Environment still show paths (browse works; not chips yet).
+- [done] **GPU shallow-water simulation** (`water_sim.comp`, `citrus-render/src/water_sim.rs`,
+  CPU reference `citrus-core/src/water_pipe.rs`): virtual-pipe model per interactive Water (up to
+  4), 256^2 default, fp32 state (column height, 4 outflow pipes, velocity, per-cell rest depth /
+  base flow / water-shore-obstacle). Window covers small bodies whole (shores reflect, pools
+  slosh) or follows the camera with an absorbing border (toroidal storage, only new cells reset).
+  CFL substeps, wave speed from min(depth, Wave depth cap 3 m), mass kept. Bodies displace their
+  submerged volume (bows, troughs, rings) and drag water by their relative speed; waterfall
+  impacts and wakes add dents and mass; fixed colliders are obstacles; rivers carry disturbances
+  and pile up against rocks. Writes the ripple texture (height, gradient, flow speed) directly,
+  so raster, RT reflections and RT displacement show it; async readback (1-2 frames late, no
+  waits) feeds `height_at` / `flow_at` (buoyancy, riders, foam, `ctx.water_surface`) and drags
+  floating bodies with moving water. CPU wave-equation fallback without a renderer. Inspector
+  "Simulation" section. Idle water stops stepping.
+- [done] **Dispersive deep-water layer** (eWave, `water_fft.comp`, CPU reference `water_ewave.rs`):
+  height + velocity potential on the pipe sim's window, Stockham FFT row/column passes, exact
+  energy-preserving per-mode rotation with w^2 = (g k + s k^3) tanh(k d) (capillary term), sponge
+  / shore masking, long-wave handover to the pipe sim in shallow water, strength by depth
+  (`dispersive_share`), "Dispersion" inspector field. Impacts become wave trains (short waves
+  trail long ones), moving bodies leave ~19.5 deg Kelvin wakes; orbital velocity reaches
+  `flow_at`. Power-of-two resolutions only.
+- [done] Caustics on every surface under water, seen from above too (forward pass, per-body
+  transform + extent + strength in `GpuWater`); the underwater pass no longer adds its own.
+- [done] Underwater blur (post pass disk blur below the waterline, "Blur" setting) and denser
+  default fog with a light floor so murk reads as haze in dim scenes.
+- [done] Splashes are displacement: a fast entry (> 2.5 m/s down after 0.2 s clear of the water)
+  punches a cavity into the simulation, which throws the crown and rings; only hard hits
+  (> 4 m/s) add a few droplets; splashes and wakes no longer spawn white foam blobs. Bodies held
+  in place (static, kinematic, editor) displace against the rest level, so passing waves don't
+  pump rings out of them.
+- [todo] Water simulation: foam from flow speed / convergence; terrain heightfield bed (beaches,
+  shallows, shoaling); half-resolution readback; release old ripple textures; GPU smoke test of
+  barriers and descriptors; per-object Cast Shadows (bulb meshes); authored UCX_ collision.
+- [done] Mesh Collider **Detail** (Low / Medium / High): hull corners 64 / 128 / 256, Follow-shape
+  pieces 8 / 16 / 32 of 24 / 48 / 96 corners. Ball-shaped meshes (any tessellation) become an
+  exact sphere. Adding a Rigid Body to a primitive or a ball-shaped mesh adds its exact collider
+  (Sphere, Capsule, Box for cubes and planes) instead of a Mesh Collider.
+- [done] Water simulation in the editor (not playing): Rigid Bodies and characters crossing a
+  GPU-simulated water displace it from their collider bounds, moving at the speed they're dragged
+  (`editor_water.rs`), so dragging a body through water pushes waves and sloshes pools.
+- [done] Selecting an object in the viewport reveals it in the hierarchy: collapsed parents above
+  it expand and its row scrolls into view.
+- [done] Transform gizmo: Shift moves / rotates at half speed for fine placement; Ctrl (or Snap)
+  snaps moves onto absolute grid lines (only the axes being moved; small steps accumulate until
+  they cross a line), rotations / scales to their steps.
+- [done] Saving the scene during Play (or paused) is refused with a status message; play-time
+  changes are never written.
+- [done] Rigid Body mass is an explicit Auto / Set choice (Set notes it overrides the material's
+  density); in Play the inspector shows the simulated mass, collider volume, resulting density and
+  whether it floats or sinks.
+- [done] Transform Scale link toggle (lock icon): while linked, editing one axis scales the others
+  by the same ratio; the toggle is remembered.
+- [done] Water look fixes: still water idles flat (the following sim window now starts new cells level
+  around bodies instead of collapsing a mound into rings; heavy resting bodies use the rest level;
+  wakes ignore the sim's own sloshing); graded ocean grid (>= 192 quads, 0.25 m at the centre)
+  shifted by whole cells; per-vertex spacing band-limits Gerstner waves and the ripple field
+  (ripple texture now has GPU-built mips) so the mesh stays smooth and detail lives in per-pixel
+  normals; RT displacement uses the same band limit; thickness-based opacity fade softens the
+  waterline; normal-variance roughness removes specular sparkle.
+- [done] **Physical caustics**: 1/|det(I + k Hessian)| from the Gerstner and simulated surfaces along
+  the refracted sun direction (set-0 binding 10 holds each body's ripple texture); visible from
+  above and below; Caustics 1 = physical (default).
+- [done] **Physical refraction**: Snell's law through the per-pixel normal, followed down the water
+  thickness with two depth refinements, screen-edge and total-internal-reflection fallbacks;
+  Refraction 1 = physical (default). Older scenes keep their saved 0.03 (set it to 1).
+- [done] GPU crash diagnostics: markers at every profiler zone begin/end plus skinning, texture
+  uploads, water simulation, underwater, RT / SSR reflections and bloom. NVIDIA:
+  VK_NV_device_diagnostic_checkpoints (last checkpoint per pipeline stage). AMD: VK_AMD_buffer_marker
+  into a host-coherent buffer (last marker started vs finished). Plus VK_EXT_device_fault where
+  supported (driver fault description, faulting addresses, vendor codes). All logged once on a lost
+  device (render, skybox install); startup logs which are available.
+- [done] Waterfalls render as a solid sheet: a double-sided lit, alpha-blended ribbon along the fall
+  arc (widening with spread, breaking up at the sides and toward the plunge) with procedural streak
+  colour/normal maps scrolling at the water's speed; the sheet particles are no longer drawn and
+  only drive the landing splash and pool displacement. Water objects get their own hierarchy
+  type and wave icon.
+- [done] Water foam: two-layer contact foam (dense band against whatever the water touches, patchy
+  lace out to Foam width, lapping in and out), whitewater where the simulated flow runs fast, crest
+  foam; all drawn as a cellular bubble network (jittered-cell edges at two scales) carried by the
+  flow with a flow-map cross-fade. Foam and fine ripples advect with the world-space flow the vertex
+  shader decodes.
+- [done] Box gizmo resize (water, colliders, volumes, probes): dragging a face moves only that face,
+  the opposite one stays fixed in the world (the object shifts when its box is centred on it); hold
+  Alt during the drag to resize both sides about the centre. Whitewater foam is depth-relative
+  (Froude number) so shallow sloshing stays clear.
+- [done] Foam amount per water (Look > Foam, 0 = off) scales every foam layer. Waterfall plunges
+  and whirlpools foam on the surface itself (churned spots, thick in the middle, lacing out and
+  carried outward) instead of floating foam sprites; mist is thinner.
+- [done] Pool water body: shaped like a lake (rectangle or polygon), switching to it applies a
+  still, clear, pool-blue look with no waves, wind sea or foam. Steam (0 = off) rises off warm
+  water (hot tubs, hot springs) and drifts with the wind.
+- [done] Caustics per light: every light refracted through a surface focuses on what lies under it
+  (point lights by their own direction, not only the sun), and baked / Mixed lights on lightmapped
+  floors add the caustics as a change to their baked light. Project caustics (on for pools,
+  Projection strength, 1 = physical): lights under the surface throw the moving pattern out onto
+  walls and ceilings, along the refracted path and with the Fresnel loss at grazing angles.
+- [done] Waterfall sheets and spray draw after every water surface (fixed render queue), and
+  transparent draws sort by their bounds' world centre: world-space meshes all sorted as the origin,
+  so the sheet blinked in and out as the camera moved.
+- [done] Bodies moving through water make a wake, not ripple rings: the water under a body is
+  dragged only by the share of the column it fills (and slower), so it no longer shoves a bulge
+  ahead (the bow is now about a real hull's v^2/2g); body footprints are softened over
+  neighbouring cells and round ones rise gently at the rim, so sliding across the grid no longer
+  fires a ring per cell; a moving body starts dispersive waves at 35% (drops and pushes keep full
+  strength). Editor drags smooth the body's speed (0.1 s) and cap it at 4 m/s.
+- [done] Bodies in the water block the dispersive ripples (by draft, full past 8 cm), so ripples
+  reflect off a floating couch or boat instead of running underneath; long waves still pass under.
+- [done] Wake vs ripples: a body's push on the dispersive layer is spread over Ripple smoothing
+  (default 0.06 s; it moved once a frame and kicked grid-sized ripples all round it at frame
+  rate), the blocking under it follows the same smoothed footprint (so what it pushes in ahead and
+  lets go behind cancel instead of piling up energy), and the finest grid waves are damped by
+  Fine ripple damping (default 6/s, was a fixed 1.5): about 7x less grid-scale roughness for the
+  same wake. Water inspector: Wake ripples, Ripple smoothing, Fine ripple damping.
+- [done] Fluid viscosity (Pa s) and templates: Water, Sea water, Hot spring (steams), Swamp, Oil,
+  Syrup, Honey, Mud set density, viscosity and the look (colour, clarity, roughness, ripples, foam,
+  refraction) as a starting point. Viscosity damps waves at 2 nu k^2 (thick fluids keep only long,
+  slow waves), slows flow over the bed (3 nu / h^2), and drags bodies by the sphere drag curve
+  (Stokes drag in thick fluids, form drag in thin), with Stokes rotational drag; what floats is
+  set by density alone.
+- [done] Water and colliders: every static object (its colliders, or its render mesh without any)
+  and every still collider through the surface is a wall the simulated water reflects off, in the
+  editor and in Play (`WaterWalls`); closed shapes fill their cells, triangle meshes (open pool
+  walls) mark where they cross the surface. Moving bodies push the water; a collider without a
+  Rigid Body pushes it while being moved (dragged in the editor, animated in Play) and is a wall
+  again once it stops. Only objects whose layer collides with the water's (Layers matrix) count,
+  for walls, pushes, buoyancy and drag.
+- [done] Inside a body's footprint the water is drawn flattened (no free surface there, only the
+  pressure under it), so a bobbing sphere no longer has water poking up through it; the readback
+  that lifts the body keeps the real value.
+- [done] Bodies fill at most the water column under them: a ball resting on a couch in shallow
+  water (together thicker than the water is deep) raised a standing spike, since the empty column
+  under them could never let the extra head drain.
+- [done] Collider physics materials are an opt-in override on objects with a Rigid Body
+  ("Override material"; the body's material otherwise); static colliders keep a plain material slot.
+- [done] Lake / Pool outlines: Shape presets fitted to Size (Rectangle, Circle, Oval, Rounded),
+  Smooth outline (closed curve through the points, for springs and kidney pools), Add point
+  splits the longest edge; drag the points in the viewport to fit a pool mesh or spring.
+- [done] **Water Container** component (carryable water): an inner box with the +Y face open holds a
+  level of water that sloshes with the container's motion and spills over the lowest rim as a
+  stream of drops; drops landing in another container's opening fill it, in a lake push its
+  surface. Dipping the opening under a water surface scoops to the outside level; waterfall
+  streaks into it fill it. The water's mass rides on the Rigid Body at its centre of mass, so a
+  fuller floating bucket sits lower (containers count their hull plus hollow in buoyancy).
+  Create > Water > Bucket spawns an open bucket mesh, wall colliders, Rigid Body, container and
+  Grabbable. Gameplay: `ctx.container_water(id)`, `ctx.fill_container(id, litres)`,
+  `ctx.pour_container(id, litres)`.
+- [todo] Separate static / dynamic friction (rapier has one coefficient; needs a contact hook).
+- Tests: water bodies, wind sea, ripple ring / follow, floating / sinking / current, packed GPU
+  waves vs physics, water meshes, RON field merge / mixed detection, grouping, asset cook,
+  capsule rest height, material bounce, density mass and buoyancy scale, `.physmat` round trip.
+

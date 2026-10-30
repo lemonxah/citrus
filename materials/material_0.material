@@ -5,6 +5,7 @@
         base_color: (1.0, 1.0, 1.0, 1.0),
         emission_color: (0.0, 0.0, 0.0),
         emission_intensity: 1.0,
+        emission_map_mean: (1.0, 1.0, 1.0),
         metallic: 0.0,
         roughness: 1.0,
         toon_steps: 3.0,
@@ -19,7 +20,7 @@
         base_scroll: (0.0, 0.0),
         emission_scroll: (0.0, 0.0),
         emission_pulse: 0.0,
-        matcap_strength: (0.0, 0.0, 0.0),
+        matcap_strength: (0.95, 0.0, 0.0),
         matcap_blend: (0.0, 0.0, 0.0),
         albedo_tiling: (1.0, 1.0),
         albedo_offset: (0.0, 0.0),
@@ -33,6 +34,8 @@
         roughness_invert: false,
         metallic_invert: false,
         displacement_scale: 0.0,
+        reflection_intensity: 1.0,
+        screen_reflections: true,
     ),
     features: (
         toon: false,
@@ -40,6 +43,7 @@
         emission: false,
         alpha_mode: Opaque,
         double_sided: false,
+        water: false,
     ),
     render_queue: Some(2000),
     textures: (

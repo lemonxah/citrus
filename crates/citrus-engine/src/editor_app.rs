@@ -6,6 +6,8 @@ use crate::{audio, bundle, crash, gizmo, icon, log_capture, lsp, plugins, scene}
 
 #[path = "audio_bake.rs"]
 mod audio_bake;
+#[path = "occlusion_bake.rs"]
+mod occlusion_bake;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -67,6 +69,8 @@ pub fn run(config: AppConfig) -> Result<()> {
         xr: None,
         xr_session: None,
         vr_targets: citrus_core::TrackerTargets::default(),
+        face_input: crate::face_input::FaceInput::default(),
+        slimevr: None,
         vr_rig: citrus_core::VrRig::default(),
         xr_stereo_ready: false,
         vr_grab_anchor: None,
@@ -109,6 +113,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         file_browser: FileBrowser::new(project_root.clone()),
         selection: Selection::None,
         multi_objects: Vec::new(),
+        multi_edit: MultiEdit::default(),
         multi_files: Vec::new(),
         refl_bake_pending: None,
         file_material: None,
@@ -124,6 +129,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         orbit_armed: false,
         camera_tab_visible: false,
         viewport_visible: true,
+        vp_strip_width: 0.0,
         audio: audio::AudioEngine::new(),
         actions: Vec::new(),
         undo_stack: UndoStack::default(),
@@ -141,15 +147,25 @@ pub fn run(config: AppConfig) -> Result<()> {
         play_origin_scene: None,
         play_snapshot: None,
         play_session: None,
-        play_game_camera: true,
+        play_game_camera: false,
+        occlusion_ui: OcclusionUi::default(),
+        camera_rect: egui::Rect::NOTHING,
         post_load: None,
         flow: crate::scene_loader::SceneFlow::default(),
+        content: crate::content::ContentManager::new(project_root.join(".citrus_content")),
+        content_builder: Default::default(),
         game_ui: crate::game_ui::GameUi::default(),
         ui_editor: Default::default(),
+        anim_ctrl_tab: Default::default(),
+        anim_clip_tab: Default::default(),
         ui_rect_editor: Default::default(),
         game_ui_frame: crate::game_ui::UiFrame::default(),
         world_ui: crate::game_ui::WorldUi::default(),
         particles: crate::particles::ParticleRenderer::default(),
+        water: crate::water_render::WaterRenderer::default(),
+        water_fx: crate::water_fx::WaterFx::default(),
+        carry_fx: crate::water_carry::CarryFx::default(),
+        editor_water: crate::editor_water::EditorWater::default(),
         nav_preview: Vec::new(),
         world_ui_draws: Vec::new(),
         world_ui_prev: (false, false),
@@ -179,6 +195,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         net: None,
         voice: None,
         net_addr: "127.0.0.1:9000".to_string(),
+        net_ui: crate::net_window::NetWindowState::default(),
         show_bindings: false,
         show_network: false,
         show_layers: false,
@@ -204,7 +221,11 @@ pub fn run(config: AppConfig) -> Result<()> {
         quit_after_frame: false,
         new_project_parent: String::new(),
         new_project_name: "my-game".into(),
+        new_project_template: crate::templates::DEFAULT_TEMPLATE.into(),
+        new_project_filter: None,
         build_status: None,
+        building_game: false,
+        build_target: bundle::BuildTarget::Host,
         log_filter: LogFilter::default(),
         handle_drag: None,
         stats: Stats::default(),
@@ -212,6 +233,9 @@ pub fn run(config: AppConfig) -> Result<()> {
         start: Instant::now(),
         last_frame: Instant::now(),
         rt_gi: crate::realtime_gi::RealtimeGiState::default(),
+        refl_slots: crate::refl_slots::ReflectionSlots::default(),
+        refl_bake_queue: Vec::new(),
+        refl_bake_current: None,
         selected_material_slot: 0,
         frame_timings: FrameTimings::default(),
         gi_debug: 0,
@@ -295,7 +319,7 @@ enum LspRequestKind {
 /// Extensions the code editor opens (scene/material files have dedicated
 /// inspectors).
 const CODE_EXTENSIONS: &[&str] = &[
-    "rs", "frag", "vert", "glsl", "slang", "toml", "ron", "md", "txt", "json", "citrus",
+    "rs", "frag", "hlsl", "vert", "glsl", "slang", "toml", "ron", "md", "txt", "json", "citrus",
 ];
 
 /// Scratch state for a `.material` file opened in the Inspector.
@@ -384,6 +408,7 @@ enum EditorAction {
     CreateScene(PathBuf),
     CreateShader(PathBuf),
     CreatePostFx(PathBuf),
+    CreatePhysMat(PathBuf),
     CreateFolder(PathBuf),
     PickAt(egui::Pos2),
     AssignMaterialAt(egui::Pos2, PathBuf),
@@ -454,12 +479,23 @@ enum EditorAction {
     Spawn(citrus_assets::ObjectSource),
     SpawnLight(citrus_core::LightKind),
     SpawnProbeVolume,
-    SpawnPostFxVolume,
+    /// Post FX Volume; true = global, false = local box.
+    SpawnPostFxVolume(bool),
     SpawnReflectionProbe,
+    /// Spawn a plane in front of the view showing render-texture camera `usize`.
+    CreateCameraScreen(usize),
     SpawnFluxVolume,
     SpawnAudioSource,
     SpawnBoxCollider,
     SpawnSphereCollider,
+    SpawnCapsuleCollider,
+    SpawnWater,
+    SpawnFloatingCube,
+    SpawnBucket,
+    SpawnWaterfall,
+    SpawnWhirlpool,
+    /// Add a Mesh Collider to every selected object that draws a mesh.
+    AddMeshCollider,
     /// (child, new parent, before-sibling) reorder/move.
     MoveObject(usize, Option<usize>, Option<usize>),
     DeleteObject(usize),
@@ -470,6 +506,9 @@ enum EditorAction {
     ObjectToggled,
     /// Bake Steam Audio reverb + pathing for the scene's Audio Probe Volumes.
     BakeAudio,
+    /// Bake / clear the scene's occlusion-culling data.
+    BakeOcclusion,
+    ClearOcclusion,
     /// Point the editor camera along a direction, keeping its focus point.
     SnapView(Vec3),
     /// Build a ready-made UI layout (Main Menu, HUD, ...) as a new canvas.
@@ -489,6 +528,8 @@ enum EditorAction {
     ClearSkyboxFaces,
     /// Re-parent an object (None = unparent).
     SetParent(usize, Option<usize>),
+    /// Put these objects under a new Empty at their centre.
+    GroupIntoEmpty(Vec<usize>),
     /// Enter / leave Play mode (components run while playing).
     TogglePlay,
     /// Create the starter plugin crate under plugins/.
@@ -510,11 +551,11 @@ enum EditorAction {
     /// the model's meshes that need them; `false` reverts to the model's own uv0.
     SetLightmapUvGen(String, bool),
     /// Scaffold a new project under `parent/<name>` and switch to it.
-    NewProject { parent: PathBuf, name: String },
+    NewProject { parent: PathBuf, name: String, template: String },
     /// Open (switch to) an existing project folder.
     OpenProject(PathBuf),
-    /// Compile the current project into a standalone `build/` executable.
-    BuildGame,
+    /// Compile the current project into a standalone executable for a target.
+    BuildGame(bundle::BuildTarget),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -534,6 +575,12 @@ enum Tab {
     Log,
     /// Visual editor for UI canvases (layout, templates).
     UiEditor,
+    /// Animator Controller state-machine graph editor.
+    AnimController,
+    /// Animation clip (keyframe timeline) editor.
+    AnimClip,
+    /// Occlusion culling: bake settings, Bake / Clear, visualization.
+    Occlusion,
     /// Independent code/shader editor tab (can be opened many times, dragged, closed).
     Code(PathBuf),
 }
@@ -550,7 +597,7 @@ fn default_layout() -> DockState<Tab> {
     let [viewport, _right] = tree.split_right(
         NodeIndex::root(),
         1.0 - citrus_editor::theme::W_INSPECTOR / 1600.0,
-        vec![Tab::Inspector, Tab::Environment, Tab::Baker],
+        vec![Tab::Inspector, Tab::Environment, Tab::Baker, Tab::Occlusion],
     );
     let [viewport, _left] =
         tree.split_left(viewport, citrus_editor::theme::W_HIERARCHY / (1600.0 - citrus_editor::theme::W_INSPECTOR), vec![Tab::Scene]);
@@ -565,6 +612,24 @@ const LOG_WARN: egui::Color32 = citrus_editor::theme::STATUS_WARN_FG;
 const LOG_INFO: egui::Color32 = citrus_editor::theme::STATUS_INFO;
 const LOG_DEBUG: egui::Color32 = citrus_editor::theme::TEXT_MUTED;
 const LOG_TRACE: egui::Color32 = citrus_editor::theme::TEXT_DIM;
+
+/// Occlusion tab state (bake settings + visualization toggles).
+struct OcclusionUi {
+    settings: crate::occlusion::OcclusionSettings,
+    /// Cull the Scene view with the baked data.
+    cull_scene: bool,
+    /// Cull from the game camera's position instead of the Scene camera, so
+    /// flying around shows exactly what the game camera's cell draws.
+    preview_game: bool,
+    /// Draw the baked cell bounds and the culling camera's cell.
+    show_cells: bool,
+}
+
+impl Default for OcclusionUi {
+    fn default() -> Self {
+        Self { settings: Default::default(), cull_scene: true, preview_game: false, show_cells: false }
+    }
+}
 
 /// Log segmented filter (spec §7.2).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -593,15 +658,11 @@ enum GizmoDragKind {
     BoxFace {
         axis: usize,
         sign: f32,
-        /// Box centered on the object (resize moves the OBJECT) vs. its own
-        /// local center (resize moves that center, e.g. a collider).
-        object_anchored: bool,
         start_size: Vec3,
         start_center: Vec3,
-        /// Object world translation at drag start (for object-anchored boxes).
+        /// Object world translation and transform at drag start.
         start_origin_world: Vec3,
-        /// Unit outward direction of the dragged face, world space.
-        world_axis: Vec3,
+        start_world: glam::Mat4,
         /// World scale along `axis` (component size → world meters).
         scale_a: f32,
         /// Screen pixels per 1 world-meter along `world_axis`.
@@ -611,6 +672,17 @@ enum GizmoDragKind {
         start_radius: f32,
         /// Screen pixels per 1 world-meter along the radial (camera-right) dir.
         screen_axis: egui::Vec2,
+    },
+    /// Point handle dragged in the camera-facing plane.
+    Handle {
+        start_local: Vec3,
+        /// World camera right / up, and their screen pixels per world meter.
+        right: Vec3,
+        up: Vec3,
+        screen_right: egui::Vec2,
+        screen_up: egui::Vec2,
+        /// Object world matrix inverse (world delta -> local delta).
+        inv_world: glam::Mat4,
     },
 }
 
@@ -696,6 +768,7 @@ struct WidgetFilter {
     reflection_probes: WidgetSetting,
     audio: WidgetSetting,
     ui_canvases: WidgetSetting,
+    post_volumes: WidgetSetting,
     /// The selected object's grey orientation cross (own toggle, separate from the
     /// transform handles). Hidden when the master toggle is off too.
     cross: bool,
@@ -714,6 +787,7 @@ impl Default for WidgetFilter {
             reflection_probes: WidgetSetting::default(),
             audio: WidgetSetting::default(),
             ui_canvases: WidgetSetting::default(),
+            post_volumes: WidgetSetting::default(),
             cross: true,
             game_ui: true,
         }
@@ -732,6 +806,10 @@ struct EngineApp {
     /// avatar-IK application step — humanoid bone mapping).
     #[allow(dead_code)]
     vr_targets: citrus_core::TrackerTargets,
+    /// Face tracking input (headset always; the OSC receiver only during Play).
+    face_input: crate::face_input::FaceInput,
+    /// SlimeVR server connection (full-body trackers), when enabled.
+    slimevr: Option<crate::slimevr::SlimeVr>,
     /// VR play-space rig (fly / scale / drag locomotion); identity until driven.
     vr_rig: citrus_core::VrRig,
     /// True once the per-eye XR swapchains have been created (`setup_stereo`).
@@ -777,6 +855,9 @@ struct EngineApp {
     /// holds >1 and contains the anchor, the inspector shows shared components/
     /// values and edits apply to all; otherwise selection is single (`selection`).
     multi_objects: Vec<usize>,
+    /// Values typed into the Inspector this frame for a multi-selection, set
+    /// on every selected object by `propagate_multi_edit`.
+    multi_edit: MultiEdit,
     /// Full multi-selection of files in the browser (ctrl/shift). The anchor is
     /// `Selection::File`. Used for batch operations and grid highlighting.
     multi_files: Vec<PathBuf>,
@@ -809,9 +890,12 @@ struct EngineApp {
     /// tab is hidden.
     camera_tab_visible: bool,
     /// Set each frame iff the Viewport tab was visible; gates the main scene draws
-    /// + viewport Flux trace so they're skipped when the viewport is hidden (e.g.
-    /// only the Camera tab is shown).
+    /// and the viewport Flux trace so they're skipped when the viewport is hidden
+    /// (e.g. only the Camera tab is shown).
     viewport_visible: bool,
+    /// Width of the toolbar drawn over the right of the Scene view's tab strip
+    /// (last frame), kept clear when fitting that leaf's tabs.
+    vp_strip_width: f32,
     /// Audio playback (None if no output device). Drives AudioSource sounds
     /// in Play mode.
     audio: Option<audio::AudioEngine>,
@@ -846,12 +930,21 @@ struct EngineApp {
     /// While playing, render the viewport from the scene's active camera (the
     /// game's view) instead of the editor fly camera. Toolbar toggle.
     play_game_camera: bool,
+    occlusion_ui: OcclusionUi,
+    /// Screen rect of the Camera tab's image (the game view while playing).
+    camera_rect: egui::Rect,
     /// Skybox / baked lighting still to apply after a background scene load.
     post_load: Option<crate::scene_loader::PostLoad>,
     /// Play-mode scene streaming (preloads, carried objects, additive scenes).
     flow: crate::scene_loader::SceneFlow,
+    /// Play-mode user content (ctx.load_content / spawn_avatar / enter_world).
+    content: crate::content::ContentManager,
+    /// Tools > Build Content Package window.
+    content_builder: crate::content::builder::BuildWindow,
     game_ui: crate::game_ui::GameUi,
     ui_editor: crate::ui_editor::UiEditorTab,
+    anim_ctrl_tab: crate::anim_controller_editor::AnimControllerTab,
+    anim_clip_tab: crate::anim_clip_editor::AnimClipTab,
     /// Move / resize handles for screen UI in the viewport overlay.
     ui_rect_editor: crate::ui_edit::UiRectEditor,
     /// UI clicks / hover since the last play tick.
@@ -859,6 +952,10 @@ struct EngineApp {
     world_ui: crate::game_ui::WorldUi,
     /// Particle simulation + buffers (previews while editing).
     particles: crate::particles::ParticleRenderer,
+    water: crate::water_render::WaterRenderer,
+    water_fx: crate::water_fx::WaterFx,
+    carry_fx: crate::water_carry::CarryFx,
+    editor_water: crate::editor_water::EditorWater,
     /// Baked navmesh overlay (mesh, material, bounds center, radius).
     nav_preview: Vec<(citrus_render::MeshHandle, citrus_render::MaterialHandle, Vec3, f32)>,
     world_ui_draws: Vec<citrus_render::WorldUiDraw>,
@@ -926,9 +1023,11 @@ struct EngineApp {
     /// Active networking session (2G) when hosting/joined from the Network panel.
     net: Option<crate::net::NetSession>,
     /// Voice comms (task 8), created lazily once networking is active.
-    voice: Option<crate::voice::VoiceChat>,
+    voice: Option<crate::voice::VoiceSystem>,
     /// Address entered in the Network panel for Join.
     net_addr: String,
+    /// Network window extras (player name, LAN browser).
+    net_ui: crate::net_window::NetWindowState,
     /// Bindings editor window open.
     show_bindings: bool,
     /// Network panel open.
@@ -1008,6 +1107,9 @@ struct EngineApp {
     show_new_project: bool,
     new_project_parent: String,
     new_project_name: String,
+    /// Template id picked in the New Project dialog, and its category filter (None = all).
+    new_project_template: String,
+    new_project_filter: Option<crate::templates::TemplateCategory>,
     /// Open Project dialog open + the folder path being entered.
     show_open_project: bool,
     open_project_path: String,
@@ -1015,6 +1117,10 @@ struct EngineApp {
     lightmap_preview: bool,
     /// Last Build Game result message (shown in the settings/log).
     build_status: Option<String>,
+    /// A game build task is running (one at a time).
+    building_game: bool,
+    /// Target picked in Project Settings.
+    build_target: bundle::BuildTarget,
     /// Scene has unsaved edits since the last save/load (drives the exit prompt).
     scene_dirty: bool,
     /// Close requested with unsaved edits: the Save/Discard/Cancel dialog is up.
@@ -1038,6 +1144,12 @@ struct EngineApp {
     /// throttle timer.
     /// Realtime-GI driver (continuous probe re-trace from the realtime lights).
     rt_gi: crate::realtime_gi::RealtimeGiState,
+    /// The two reflection probes' cubes (renderer slots 0 / 1).
+    refl_slots: crate::refl_slots::ReflectionSlots,
+    /// Reflection probes still to bake: (probe id, capture point, resolution).
+    refl_bake_queue: Vec<(u128, glam::Vec3, u32)>,
+    /// Probe whose static capture is being baked right now.
+    refl_bake_current: Option<u128>,
     /// Which material slot of the selected object the inspector edits (for
     /// multi-material meshes). Clamped to the object's slot count.
     selected_material_slot: usize,
@@ -1229,7 +1341,7 @@ fn draw_combined_graph(ui: &mut egui::Ui, h: &ProfHistory) {
         let y = plot.bottom() - f * plot.height();
         p.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            egui::Stroke::new(1.0, grid),
+            egui::Stroke::new(1.0_f32, grid),
         );
         let val = gmax * f;
         let txt = if unit.is_empty() {
@@ -1259,7 +1371,7 @@ fn draw_combined_graph(ui: &mut egui::Ui, h: &ProfHistory) {
         let x = plot.right() - f * plot.width();
         p.line_segment(
             [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
-            egui::Stroke::new(1.0, grid),
+            egui::Stroke::new(1.0_f32, grid),
         );
         let label = if k == 0 {
             "now".to_string()
@@ -1315,7 +1427,7 @@ fn draw_combined_graph(ui: &mut egui::Ui, h: &ProfHistory) {
         } else {
             m.color
         };
-        let width = if hovered == Some(mi) { 2.5 } else { 1.3 };
+        let width = if hovered == Some(mi) { 2.5_f32 } else { 1.3_f32 };
         let pts: Vec<egui::Pos2> = m
             .series
             .data
@@ -1334,7 +1446,7 @@ fn draw_combined_graph(ui: &mut egui::Ui, h: &ProfHistory) {
         let y = y_of(v);
         p.line_segment(
             [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
         );
         p.circle_filled(egui::pos2(x, y), 3.5, m.color);
         let ago = (n - 1 - hover_i) as f32 * Series::BUCKET;
@@ -1542,8 +1654,11 @@ impl EngineApp {
         // animation in the meantime.
         let (tx, rx) = std::sync::mpsc::channel();
         let win = window.clone();
+        // Handles are read here, on the main thread (Windows forbids reading
+        // them from the worker).
+        let handles = citrus_render::WindowHandles::of(&window)?;
         std::thread::spawn(move || {
-            let _ = tx.send(Renderer::new(win));
+            let _ = tx.send(Renderer::new_with_handles(win, handles, None));
         });
         self.renderer_rx = Some(rx);
         self.pending_window = Some(window);
@@ -1773,6 +1888,9 @@ impl EngineApp {
     fn reset_render_caches(&mut self) {
         self.world_ui = crate::game_ui::WorldUi::default();
         self.particles = crate::particles::ParticleRenderer::default();
+        self.water = crate::water_render::WaterRenderer::default();
+        self.water_fx = crate::water_fx::WaterFx::default();
+        self.carry_fx = crate::water_carry::CarryFx::default();
         self.nav_preview.clear();
     }
 
@@ -1793,8 +1911,9 @@ impl EngineApp {
             self.upload_baked_probes();
             return;
         }
+        let faces = std::mem::take(&mut post.reflection);
         self.post_load = None;
-        self.setup_reflections();
+        self.setup_reflections_with(Some(faces));
         self.tasks.notify("Scene loaded", crate::tasks::NotifyLevel::Info);
     }
 
@@ -1832,29 +1951,18 @@ impl EngineApp {
     /// Reflection env after a load: a Baked-mode probe loads its sidecar, a
     /// Realtime probe captures live.
     fn setup_reflections(&mut self) {
-        let t2 = Instant::now();
+        self.setup_reflections_with(None);
+    }
 
-        // Reflection env: a Baked-mode probe loads its `.reflprobe` sidecar; a
-        // Realtime-mode probe (the default) always captures live, so the on-disk
-        // sidecar can never go stale relative to the scene or to engine/capture
-        // fixes. (Previously any existing sidecar was loaded regardless of mode,
-        // so a stale capture masked every later fix until a manual re-bake.)
-        let use_baked = self.scene.has_baked_reflection_probe();
-        if use_baked && self.load_reflection_bake() {
-            self.set_load_status("Loading reflection probe…");
-        } else if let Some(center) = self
-            .scene
-            .active_reflection_probe(glam::Vec3::ZERO)
-            .map(|p| (glam::Vec3::from(p.capture), p.resolution))
-        {
-            if self.renderer.is_some() {
-                self.set_load_status("Capturing reflections…");
-                if let Some(r) = self.renderer.as_mut() {
-                    r.request_reflection_capture(center.0, center.1);
-                }
-            }
+    /// [`setup_reflections`] with the baked cubes already read by the scene
+    /// loader (None reads the sidecar here). Baked probes upload their cubes and
+    /// realtime ones capture live, from `refl_slots.update` each frame.
+    fn setup_reflections_with(&mut self, set: Option<crate::refl_slots::ReflProbeSet>) {
+        let set = set.unwrap_or_else(|| crate::refl_slots::read_reflprobes(&self.bake_base_path().with_extension("reflprobe")));
+        if self.scene.active_reflection_probe(glam::Vec3::ZERO).is_some() {
+            self.set_load_status("Loading reflection probes…");
         }
-        tracing::info!("after_scene_loaded: reflection {:?}", t2.elapsed());
+        self.refl_slots.set_baked(set);
     }
 
     fn set_looking(&mut self, looking: bool) {
@@ -1937,16 +2045,57 @@ impl EngineApp {
         self.scene.main_camera_view_proj(aspect)
     }
 
+    /// Position occlusion culling is evaluated from this frame: the game camera
+    /// when previewing it (or when the Scene view follows it in play), else the
+    /// Scene camera. None turns culling off.
+    fn occlusion_camera(&self) -> Option<Vec3> {
+        if !self.occlusion_ui.cull_scene || self.scene.occlusion.is_none() {
+            return None;
+        }
+        let game = self.occlusion_ui.preview_game || (self.playing && self.play_game_camera);
+        if game {
+            self.scene.main_camera_view_proj(1.0).map(|(_, _, p)| p)
+        } else {
+            Some(self.camera.position)
+        }
+    }
+
+    /// Where the game is shown while playing: the Camera tab when it's on
+    /// screen, else the Scene view when it follows the game camera. None means
+    /// the game isn't visible (the Scene view is free-flying).
+    fn game_rect(&self) -> Option<egui::Rect> {
+        if !self.playing {
+            return None;
+        }
+        if self.camera_tab_visible && self.camera_rect.is_positive() {
+            Some(self.camera_rect)
+        } else if self.play_game_camera && self.viewport_visible {
+            Some(self.viewport_rect)
+        } else {
+            None
+        }
+    }
+
+    fn cursor_in_game(&self) -> bool {
+        let (Some((x, y)), Some(rect)) = (self.last_cursor, self.game_rect()) else {
+            return false;
+        };
+        let ppp = self.egui_ctx.pixels_per_point();
+        rect.contains(egui::pos2(x as f32 / ppp, y as f32 / ppp))
+    }
+
     /// Game view size / pointer / camera for gameplay (`ctx.screen_ray`, UI).
     fn game_screen_info(&mut self) -> citrus_core::ScreenInfo {
         let ppp = self.egui_ctx.pixels_per_point();
-        let rect = self.viewport_rect;
+        let in_camera_tab = self.playing && self.camera_tab_visible && self.camera_rect.is_positive();
+        let rect = self.game_rect().unwrap_or(self.viewport_rect);
         if !rect.is_finite() || rect.width() < 1.0 || rect.height() < 1.0 {
             return citrus_core::ScreenInfo::default();
         }
         let size = glam::Vec2::new(rect.width() * ppp, rect.height() * ppp);
         let aspect = rect.width() / rect.height();
-        let (view, proj) = match self.game_view(aspect) {
+        let game_cam = if in_camera_tab { self.scene.main_camera_view_proj(aspect) } else { self.game_view(aspect) };
+        let (view, proj) = match game_cam {
             Some((v, p, _)) => (v, p),
             None => (self.camera.view(), self.camera.proj(aspect)),
         };
@@ -1964,6 +2113,7 @@ impl EngineApp {
             ui_submits: std::mem::take(&mut self.game_ui_frame.submits),
             ui_text_editing: self.game_ui_frame.text_editing,
             ui_cancel: std::mem::take(&mut self.game_ui_frame.cancel),
+            vr: crate::runtime::vr_frame(self.xr_session.as_ref(), &self.vr_targets),
         }
     }
 
@@ -2187,6 +2337,22 @@ impl EngineApp {
         if let Some(renderer) = self.renderer.as_mut() {
             self.particles
                 .update(renderer, &mut self.scene, &self.project_root, view.inverse(), dt);
+            if let Some(s) = self.play_session.as_mut() {
+                s.set_shared_clock(self.net.as_ref().and_then(|n| n.shared_clock()));
+            }
+            let play_time = self.play_session.as_ref().map(|s| s.water_time());
+            // Not playing: bodies dragged in the editor still push the water.
+            if !self.playing {
+                self.editor_water.feed(&mut self.scene, dt);
+            } else {
+                self.editor_water.reset();
+            }
+            self.water.update(renderer, &mut self.scene, view.inverse().w_axis.truncate(), play_time, dt);
+            let net = self.net.as_ref();
+            let owns = |id: citrus_core::ObjectId| net.is_none_or(|n| !n.is_connected() || n.has_authority_raw(id.raw()));
+            self.scene.update_wave_riders(self.water.time(), dt, self.playing, &owns);
+            self.water_fx.update(renderer, &mut self.scene, view.inverse(), play_time, dt);
+            self.carry_fx.update(renderer, &mut self.scene, view.inverse(), play_time.is_some(), dt, &mut self.water_fx.sim.particles);
             self.scene.prepare_lods(renderer, &self.project_root);
         }
         self.scene.lod_camera = Some(view.inverse().w_axis.truncate());
@@ -2252,6 +2418,7 @@ impl EngineApp {
                 lightmap_size: 0,
                 static_geometry: false,
                 planar_index: -1,
+                occluded: false,
             });
         }
     }
@@ -2484,11 +2651,10 @@ impl EngineApp {
                 let lw = self.vr_rig.stage_to_world(lp);
                 let rw = self.vr_rig.stage_to_world(rp);
                 let dist = (lw - rw).length();
-                if let Some(prev) = self.vr_prev_hand_dist {
-                    if prev > 1e-3 && dist > 1e-3 {
+                if let Some(prev) = self.vr_prev_hand_dist
+                    && prev > 1e-3 && dist > 1e-3 {
                         self.vr_rig.scale_about((lw + rw) * 0.5, prev / dist);
                     }
-                }
                 self.vr_prev_hand_dist = Some(dist);
             }
         } else {
@@ -2577,22 +2743,19 @@ impl EngineApp {
                 }
             } else {
                 // Object mode: pick on press, then drag the selection along the ray.
-                if trigger_edge {
-                    if let Some(idx) = self.scene.pick(ray.origin, ray.dir) {
+                if trigger_edge
+                    && let Some(idx) = self.scene.pick(ray.origin, ray.dir) {
                         self.select_object(Some(idx));
                         let obj_pos = self.scene.world_transform(idx).w_axis.truncate();
                         self.vr_move_dist = (obj_pos - ray.origin).length();
                     }
-                }
-                if input.right_trigger {
-                    if let Selection::Object(idx) = self.selection {
-                        if idx < self.scene.objects.len() {
+                if input.right_trigger
+                    && let Selection::Object(idx) = self.selection
+                        && idx < self.scene.objects.len() {
                             let target = ray.origin + ray.dir * self.vr_move_dist;
                             let id = self.scene.objects[idx].id;
                             self.scene.set_local_transform(id, Some(target), None, None);
                         }
-                    }
-                }
             }
         }
         self.vr_prev_trigger = input.right_trigger;
@@ -2644,12 +2807,11 @@ impl EngineApp {
             }
             VrAction::ResetRig => self.vr_rig = citrus_core::VrRig::default(),
             VrAction::DeleteSelected => {
-                if let Selection::Object(idx) = self.selection {
-                    if idx < self.scene.objects.len() {
+                if let Selection::Object(idx) = self.selection
+                    && idx < self.scene.objects.len() {
                         self.scene.remove_object(idx);
                         self.selection = Selection::None;
                     }
-                }
             }
         }
     }
@@ -2746,7 +2908,7 @@ impl EngineApp {
                 EditorAction::Spawn(_)
                     | EditorAction::SpawnLight(_)
                     | EditorAction::SpawnProbeVolume
-                    | EditorAction::SpawnPostFxVolume
+                    | EditorAction::SpawnPostFxVolume(_)
                     | EditorAction::SpawnAudioSource
                     | EditorAction::SpawnBoxCollider
                     | EditorAction::SpawnSphereCollider
@@ -2882,6 +3044,13 @@ impl EngineApp {
                         Err(e) => tracing::error!("creating postfx: {e:#}"),
                     }
                 }
+                EditorAction::CreatePhysMat(dir) => {
+                    let path = unique_path(&dir, "new_physics_material", citrus_core::PHYSMAT_EXTENSION);
+                    match citrus_core::save_physmat(&path, &citrus_core::PhysicsMaterial::default()) {
+                        Ok(()) => self.actions.push(EditorAction::SelectFile(path)),
+                        Err(e) => tracing::error!("creating physics material: {e}"),
+                    }
+                }
                 EditorAction::CreateFolder(dir) => {
                     let path = unique_path(&dir, "new_folder", "");
                     if let Err(e) = std::fs::create_dir_all(&path) {
@@ -2889,39 +3058,23 @@ impl EngineApp {
                     }
                 }
                 EditorAction::RecaptureReflections => {
-                    // Realtime probe refresh: re-render the active probe's cubemap
-                    // from the current scene (same path as the on-load capture).
-                    let probe = self
-                        .scene
-                        .active_reflection_probe(glam::Vec3::ZERO)
-                        .map(|p| (glam::Vec3::from(p.capture), p.resolution));
-                    match (probe, self.renderer.as_mut()) {
-                        (Some((center, res)), Some(r)) => {
-                            r.request_reflection_capture(center, res);
-                            self.set_status("Recapturing reflection probes…", false);
-                        }
-                        _ => self.set_status(
-                            "No Reflection Probe in the scene — add one to an object first.",
-                            false,
-                        ),
+                    // Reload / re-render both active probes' cubes from the
+                    // current scene (same path as the on-load capture).
+                    if self.scene.active_reflection_probe(glam::Vec3::ZERO).is_some() {
+                        self.refl_slots.reset();
+                        self.set_status("Recapturing reflection probes…", false);
+                    } else {
+                        self.set_status("No Reflection Probe in the scene — add one to an object first.", false);
                     }
                 }
                 EditorAction::BakeReflections => {
-                    let probe = self
-                        .scene
-                        .active_reflection_probe(glam::Vec3::ZERO)
-                        .map(|p| (glam::Vec3::from(p.capture), p.resolution));
-                    match (probe, self.renderer.as_mut()) {
-                        (Some((center, res)), Some(r)) => {
-                            r.request_reflection_capture_static(center, res);
-                            // Capture lands next render frame; read it back after.
-                            self.refl_bake_pending = Some(2);
-                            self.set_status("Baking reflection probe…", true);
-                        }
-                        _ => self.set_status(
-                            "No Reflection Probe in the scene — add one to an object first.",
-                            false,
-                        ),
+                    // Every probe in the scene gets its own baked cube.
+                    let probes = self.scene.reflection_probe_captures();
+                    if probes.is_empty() {
+                        self.set_status("No Reflection Probe in the scene — add one to an object first.", false);
+                    } else {
+                        self.set_status(format!("Baking {} reflection probe(s)…", probes.len()), true);
+                        self.refl_bake_queue = probes;
                     }
                 }
                 EditorAction::PickAt(pos) => {
@@ -3386,6 +3539,65 @@ impl EngineApp {
                         Err(e) => tracing::error!("spawning reflection probe: {e:#}"),
                     }
                 }
+                EditorAction::CreateCameraScreen(camera) => {
+                    let Some(cam) = self.scene.objects.get(camera).and_then(|o| {
+                        o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::CameraComponent>())
+                    }) else {
+                        continue;
+                    };
+                    let size = cam.texture_size;
+                    let id = self.scene.objects[camera].id;
+                    let name = self.scene.objects[camera].name.clone();
+                    // An emissive material showing the feed: black base so scene
+                    // lighting doesn't wash the picture out.
+                    let path = unique_path(&self.project_root.join("materials"), &format!("{} screen", name.trim()), "material");
+                    let mut file = citrus_assets::MaterialFile {
+                        name: path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        shader: "standard".into(),
+                        params: Default::default(),
+                        features: Default::default(),
+                        render_queue: None,
+                        textures: Default::default(),
+                        custom: Default::default(),
+                    };
+                    file.params.base_color = [0.0, 0.0, 0.0, 1.0];
+                    file.params.emission_color = [1.0, 1.0, 1.0];
+                    file.params.emission_intensity = 1.0;
+                    file.params.roughness = 0.35;
+                    file.features.emission = true;
+                    file.textures.emission = Some(PathBuf::from(format!("camera:{id}")));
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if let Err(e) = citrus_assets::save_material_file(&path, &file) {
+                        tracing::error!("creating screen material: {e:#}");
+                        continue;
+                    }
+                    // A plane facing the view, sized to the texture's aspect.
+                    let forward = self.camera.forward();
+                    let position = self.camera.position + forward * 3.0;
+                    let normal = -forward;
+                    let right = Vec3::Y.cross(normal).normalize_or(Vec3::X);
+                    let down = normal.cross(right);
+                    let rotation = glam::Quat::from_mat3(&glam::Mat3::from_cols(right, normal, down));
+                    let aspect = size[0].max(1) as f32 / size[1].max(1) as f32;
+                    match self.scene.spawn(
+                        renderer!(),
+                        citrus_assets::ObjectSource::Primitive { shape: citrus_assets::PrimitiveShape::Plane },
+                        format!("{} Screen", name.trim()),
+                        position,
+                    ) {
+                        Ok(index) => {
+                            self.scene.objects[index].rotation = rotation;
+                            self.scene.objects[index].scale = Vec3::new(0.8 * aspect, 1.0, 0.8);
+                            let rel = PathBuf::from(crate::scene::relative_to(&path, &self.project_root));
+                            self.scene.assign_material(renderer!(), &mut self.shaders, index, 0, &rel, &self.project_root);
+                            self.scene_dirty = true;
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning screen: {e:#}"),
+                    }
+                }
                 EditorAction::SpawnFluxVolume => {
                     let mut p = self.camera.position + self.camera.forward() * 4.0;
                     p.y = p.y.max(1.5);
@@ -3404,7 +3616,7 @@ impl EngineApp {
                         Err(e) => tracing::error!("spawning flux volume: {e:#}"),
                     }
                 }
-                EditorAction::SpawnPostFxVolume => {
+                EditorAction::SpawnPostFxVolume(global) => {
                     let p = self.camera.position + self.camera.forward() * 4.0;
                     match self.scene.spawn(
                         renderer!(),
@@ -3413,10 +3625,32 @@ impl EngineApp {
                         p,
                     ) {
                         Ok(index) => {
-                            self.scene.objects[index]
-                                .components
-                                .push(Box::new(citrus_core::VolumeComponent::default()));
+                            // A fresh profile so the volume works straight away
+                            // (all effects off: it overrides nothing until enabled).
+                            let dir = self.project_root.join("postfx");
+                            let mut n = 1;
+                            let path = loop {
+                                let name = if n == 1 { "Post FX Volume.postfx".to_owned() } else { format!("Post FX Volume ({n}).postfx") };
+                                let p = dir.join(name);
+                                if !p.exists() {
+                                    break p;
+                                }
+                                n += 1;
+                            };
+                            let mut volume = citrus_core::VolumeComponent { global, ..Default::default() };
+                            match citrus_assets::save_postfx(&path, &citrus_assets::PostFxProfile::default()) {
+                                Ok(()) => {
+                                    volume.profile = path
+                                        .strip_prefix(&self.project_root)
+                                        .unwrap_or(&path)
+                                        .to_string_lossy()
+                                        .replace('\\', "/");
+                                }
+                                Err(e) => tracing::error!("creating post fx profile: {e:#}"),
+                            }
+                            self.scene.objects[index].components.push(Box::new(volume));
                             self.select_object(Some(index));
+                            self.scene_dirty = true;
                         }
                         Err(e) => tracing::error!("spawning post fx volume: {e:#}"),
                     }
@@ -3472,8 +3706,125 @@ impl EngineApp {
                         Err(e) => tracing::error!("spawning sphere collider: {e:#}"),
                     }
                 }
+                EditorAction::SpawnCapsuleCollider => {
+                    let p = self.camera.position + self.camera.forward() * 3.0;
+                    match self.scene.spawn(renderer!(), citrus_assets::ObjectSource::Empty, "Capsule Collider".to_owned(), p) {
+                        Ok(index) => {
+                            self.scene.objects[index].components.push(Box::new(citrus_core::CapsuleCollider::default()));
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning capsule collider: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnWater => {
+                    // In front of the camera, surface at ground level.
+                    let ahead = self.camera.position + self.camera.forward() * 8.0;
+                    let p = Vec3::new(ahead.x, 0.0, ahead.z);
+                    match self.scene.spawn(renderer!(), citrus_assets::ObjectSource::Empty, "Water".to_owned(), p) {
+                        Ok(index) => {
+                            self.scene.objects[index].components.push(Box::new(citrus_core::Water::default()));
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning water: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnFloatingCube => {
+                    let p = self.camera.position + self.camera.forward() * 5.0 + Vec3::Y * 2.0;
+                    let source = citrus_assets::ObjectSource::Primitive { shape: citrus_assets::PrimitiveShape::Cube };
+                    match self.scene.spawn(renderer!(), source, "Floating Cube".to_owned(), p) {
+                        Ok(index) => {
+                            let c = &mut self.scene.objects[index].components;
+                            c.push(Box::new(citrus_core::BoxCollider::default()));
+                            // Half the density of water: floats half under.
+                            c.push(Box::new(citrus_core::RigidBody { mass: 500.0, ..Default::default() }));
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning floating cube: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnBucket => {
+                    let p = self.camera.position + self.camera.forward() * 2.0;
+                    let source = citrus_assets::ObjectSource::Primitive { shape: citrus_assets::PrimitiveShape::Bucket };
+                    match self.scene.spawn(renderer!(), source, "Bucket".to_owned(), p) {
+                        Ok(index) => {
+                            let o = &mut self.scene.objects[index];
+                            // About 19 L inside; 5 kg, so it floats empty and
+                            // goes under when brimful.
+                            o.scale = Vec3::new(0.28, 0.3, 0.28);
+                            let (w, f) = (citrus_assets::BUCKET_WALL, citrus_assets::BUCKET_FLOOR);
+                            let wall = |center: [f32; 3], size: [f32; 3]| -> Box<dyn citrus_core::Component> {
+                                Box::new(citrus_core::BoxCollider { center, size, ..Default::default() })
+                            };
+                            let (side, inner) = (0.5 - w * 0.5, 1.0 - 2.0 * w);
+                            o.components.push(wall([side, 0.0, 0.0], [w, 1.0, 1.0]));
+                            o.components.push(wall([-side, 0.0, 0.0], [w, 1.0, 1.0]));
+                            o.components.push(wall([0.0, 0.0, side], [inner, 1.0, w]));
+                            o.components.push(wall([0.0, 0.0, -side], [inner, 1.0, w]));
+                            o.components.push(wall([0.0, -0.5 + f * 0.5, 0.0], [inner, f, inner]));
+                            o.components.push(Box::new(citrus_core::RigidBody { mass: 5.0, ..Default::default() }));
+                            o.components.push(Box::new(citrus_core::WaterContainer::default()));
+                            o.components.push(Box::new(citrus_core::Grabbable::default()));
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning bucket: {e:#}"),
+                    }
+                }
+                EditorAction::SpawnWaterfall | EditorAction::SpawnWhirlpool => {
+                    let fall = matches!(action, EditorAction::SpawnWaterfall);
+                    let fwd = self.camera.forward();
+                    let ahead = self.camera.position + fwd * 8.0;
+                    let p = if fall { Vec3::new(ahead.x, 4.0, ahead.z) } else { Vec3::new(ahead.x, 0.0, ahead.z) };
+                    let name = if fall { "Waterfall" } else { "Whirlpool" };
+                    match self.scene.spawn(renderer!(), citrus_assets::ObjectSource::Empty, name.to_owned(), p) {
+                        Ok(index) => {
+                            let o = &mut self.scene.objects[index];
+                            if fall {
+                                // Pour toward the camera.
+                                let back = Vec3::new(-fwd.x, 0.0, -fwd.z).normalize_or(Vec3::Z);
+                                o.rotation = glam::Quat::from_rotation_arc(Vec3::Z, back);
+                                o.components.push(Box::new(citrus_core::Waterfall::default()));
+                            } else {
+                                o.components.push(Box::new(citrus_core::Whirlpool::default()));
+                            }
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning {name}: {e:#}"),
+                    }
+                }
+                EditorAction::AddMeshCollider => {
+                    let targets: Vec<usize> = match self.selection {
+                        Selection::Object(i) if self.multi_objects.len() > 1 && self.multi_objects.contains(&i) => self.multi_objects.clone(),
+                        Selection::Object(i) => vec![i],
+                        _ => Vec::new(),
+                    };
+                    let mut added = 0;
+                    let count = self.scene.objects.len();
+                    for i in targets.into_iter().filter(|&i| i < count) {
+                        let o = &mut self.scene.objects[i];
+                        if o.render.is_some() && !o.components.iter().any(|c| c.as_any().is::<citrus_core::MeshCollider>()) {
+                            o.components.push(Box::new(citrus_core::MeshCollider::default()));
+                            added += 1;
+                        }
+                    }
+                    if added == 0 {
+                        self.set_status("Select one or more mesh objects to add a Mesh Collider to", false);
+                    } else {
+                        self.scene_dirty = true;
+                    }
+                }
                 EditorAction::SetParent(child, parent) => {
                     self.scene.set_parent(child, parent);
+                }
+                EditorAction::GroupIntoEmpty(members) => {
+                    // Structural, like delete and reorder: indices shift, so the
+                    // new group becomes the selection and undo diffing skips it.
+                    if let Some(group) = self.scene.group_into_empty(&members) {
+                        self.selection = Selection::Object(group);
+                        self.multi_objects = vec![group];
+                        self.inspector_lock_target = None;
+                        self.suppress_undo_record = true;
+                        self.scene_dirty = true;
+                    }
                 }
                 EditorAction::MoveObject(child, parent, before) => {
                     let map = self.scene.reorder_object(child, parent, before);
@@ -3512,6 +3863,8 @@ impl EngineApp {
                 EditorAction::SetCanvasMode(index, mode) => self.set_canvas_mode(index, mode),
                 EditorAction::ObjectToggled => {}
                 EditorAction::BakeAudio => self.start_audio_bake(),
+                EditorAction::BakeOcclusion => self.start_occlusion_bake(),
+                EditorAction::ClearOcclusion => self.clear_occlusion(),
                 EditorAction::SnapView(dir) => {
                     let focus = match self.selection {
                         Selection::Object(i) if i < self.scene.objects.len() => self.scene.world_transform(i).w_axis.truncate(),
@@ -3576,6 +3929,7 @@ impl EngineApp {
                     };
                     match result {
                         Ok(()) => {
+                            citrus_core::asset_ref::deleted(&path);
                             tracing::info!("deleted {}", path.display());
                             if self.selection == Selection::File(path.clone()) {
                                 self.selection = Selection::None;
@@ -3695,9 +4049,9 @@ impl EngineApp {
                         );
                     }
                 }
-                EditorAction::NewProject { parent, name } => {
+                EditorAction::NewProject { parent, name, template } => {
                     self.set_status(format!("creating project {name}…"), true);
-                    match bundle::scaffold_project(&parent, &name) {
+                    match bundle::scaffold_project(&parent, &name, &template) {
                         Ok(root) => {
                             tracing::info!("scaffolded project at {}", root.display());
                             self.switch_project(root);
@@ -3719,35 +4073,40 @@ impl EngineApp {
                         );
                     }
                 }
-                EditorAction::BuildGame => {
+                EditorAction::BuildGame(target) => {
+                    if self.building_game {
+                        self.tasks.notify("A game build is already running", crate::tasks::NotifyLevel::Info);
+                        continue;
+                    }
                     // Persist settings first so the build picks up boot_scene.
                     self.save_project();
-                    self.set_status("building game…", true);
+                    self.building_game = true;
+                    self.build_status = Some(format!("building for {}…", target.label()));
                     let project_root = self.project_root.clone();
                     let project = self.project.clone();
-                    let mut lines = Vec::new();
-                    let result = bundle::build_game(&project_root, &project, |msg| {
-                        tracing::info!("build: {msg}");
-                        lines.push(msg);
-                    });
-                    match result {
-                        Ok(exe) => {
-                            let msg = format!("built {}", exe.display());
-                            tracing::info!("{msg}");
-                            self.build_status = Some(msg.clone());
-                            self.set_status(msg, false);
-                        }
-                        Err(e) => {
-                            tracing::error!("build game failed: {e:#}");
-                            self.build_status = Some(format!("build failed: {e}"));
-                            self.set_status("build failed (see Log)", false);
-                        }
-                    }
+                    self.tasks.spawn(
+                        format!("Build game ({})", target.label()),
+                        crate::tasks::TaskKind::BuildGame,
+                        false,
+                        move |_cancel, progress| {
+                            let result = bundle::build_game(&project_root, &project, target, |msg| {
+                                tracing::info!("build: {msg}");
+                                if let Ok(mut p) = progress.lock() {
+                                    *p = crate::tasks::TaskProgress::Fraction { done: 0.0, label: msg };
+                                }
+                            });
+                            Ok(crate::tasks::TaskPayload::GameBuilt(result.map_err(|e| format!("{e:#}"))))
+                        },
+                    );
                 }
+                // While the viewport shows the game, right mouse and the wheel
+                // belong to the game (RTS orders, zoom), not the fly camera.
+                EditorAction::StartLook if self.game_rect() == Some(self.viewport_rect) => {}
                 EditorAction::StartLook => {
                     self.egui_ctx.memory_mut(|m| m.stop_text_input());
                     self.set_looking(true);
                 }
+                EditorAction::Dolly(amount) if self.game_rect() == Some(self.viewport_rect) => self.input.wheel(amount),
                 EditorAction::Dolly(amount) => self.camera.dolly(amount),
                 EditorAction::FocusSelected => {
                     if let Selection::Object(i) = self.selection {
@@ -3756,6 +4115,12 @@ impl EngineApp {
                     }
                 }
                 EditorAction::SaveScene(path) => {
+                    // Play changes the scene (physics, scripts); saving would
+                    // keep play-time positions. Stop first.
+                    if self.playing {
+                        self.set_status("Can't save while playing: stop Play first (changes made in Play aren't kept).", false);
+                        continue;
+                    }
                     let path = path
                         .or_else(|| self.current_scene_path.clone())
                         .unwrap_or_else(|| self.project_root.join(&self.scene_name_input));
@@ -3764,7 +4129,7 @@ impl EngineApp {
                     // `autosave_materials`, or saved via the material editor).
                     // A material with an existing `.material` file serializes as
                     // a file reference; one without stays inline in the scene.
-                    let mut file = self.scene.to_scene_file(&self.project_root, &self.shaders);
+                    let mut file = self.scene.to_compact_scene_file(&self.project_root, &self.shaders);
                     // Persist the current editor viewpoint so the scene reopens
                     // framed the same way.
                     file.editor_camera = Some(citrus_assets::EditorCamera {
@@ -3808,6 +4173,9 @@ impl EngineApp {
         add("Save scene", "File", PaletteCmd::SaveScene);
         add("New scene", "File", PaletteCmd::NewScene);
         add("Build game", "File", PaletteCmd::BuildGame);
+        if !cfg!(windows) {
+            add("Build game for Windows", "File", PaletteCmd::BuildGameWindows);
+        }
         add("Undo", "Edit", PaletteCmd::Undo);
         add("Redo", "Edit", PaletteCmd::Redo);
         add("Duplicate selection", "Edit", PaletteCmd::Duplicate);
@@ -3847,7 +4215,8 @@ impl EngineApp {
             PaletteCmd::TogglePlay => self.actions.push(EditorAction::TogglePlay),
             PaletteCmd::SaveScene => self.actions.push(EditorAction::SaveScene(None)),
             PaletteCmd::NewScene => self.actions.push(EditorAction::NewScene),
-            PaletteCmd::BuildGame => self.actions.push(EditorAction::BuildGame),
+            PaletteCmd::BuildGame => self.actions.push(EditorAction::BuildGame(bundle::BuildTarget::Host)),
+            PaletteCmd::BuildGameWindows => self.actions.push(EditorAction::BuildGame(bundle::BuildTarget::Windows)),
             PaletteCmd::Undo => self.actions.push(EditorAction::Undo),
             PaletteCmd::Redo => self.actions.push(EditorAction::Redo),
             PaletteCmd::Duplicate => {
@@ -3941,10 +4310,19 @@ impl EngineApp {
                     }
                     if ui
                         .button("Build Game")
-                        .on_hover_text("cargo build --release + bundle assets into build/ (blocks the UI)")
+                        .on_hover_text("cargo build --release + bundle assets into build/ (runs in the background)")
                         .clicked()
                     {
-                        self.actions.push(EditorAction::BuildGame);
+                        self.actions.push(EditorAction::BuildGame(bundle::BuildTarget::Host));
+                        ui.close();
+                    }
+                    if !cfg!(windows)
+                        && ui
+                            .button("Build Game for Windows")
+                            .on_hover_text("Cross-compile with cargo-xwin (MSVC) into build-windows/, Steam Audio DLL included")
+                            .clicked()
+                    {
+                        self.actions.push(EditorAction::BuildGame(bundle::BuildTarget::Windows));
                         ui.close();
                     }
                     ui.separator();
@@ -4036,8 +4414,8 @@ impl EngineApp {
                     // Create a reusable .prefab from the selected object subtree
                     // (CHECKLIST T0 #7). Saved next to the scene; instantiate later
                     // via `Prefab::load(..).instantiate(pos)`.
-                    if let Selection::Object(i) = self.selection {
-                        if ui.button("Create Prefab from Selection").clicked() {
+                    if let Selection::Object(i) = self.selection
+                        && ui.button("Create Prefab from Selection").clicked() {
                             if let Some(prefab) =
                                 self.scene.prefab_from_object(i, &self.project_root, &self.shaders)
                             {
@@ -4050,7 +4428,6 @@ impl EngineApp {
                             }
                             ui.close();
                         }
-                    }
                     if ui.button("Create Camera").clicked() {
                         self.actions.push(EditorAction::Spawn(ObjectSource::Camera));
                         ui.close();
@@ -4062,10 +4439,19 @@ impl EngineApp {
                                 ui.close();
                             }
                         }
-                        ui.separator();
-                        if ui.button("Light Probe Volume").clicked() {
-                            self.actions.push(EditorAction::SpawnProbeVolume);
-                            ui.close();
+                    });
+                    ui.menu_button("Create Volume", |ui| {
+                        for (label, action) in [
+                            ("Post FX Volume (Box)", EditorAction::SpawnPostFxVolume(false)),
+                            ("Post FX Volume (Global)", EditorAction::SpawnPostFxVolume(true)),
+                            ("Light Probe Volume", EditorAction::SpawnProbeVolume),
+                            ("Reflection Probe", EditorAction::SpawnReflectionProbe),
+                            ("Flux Volume", EditorAction::SpawnFluxVolume),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.actions.push(action);
+                                ui.close();
+                            }
                         }
                     });
                     if ui.button("Create Audio Source").clicked() {
@@ -4079,6 +4465,36 @@ impl EngineApp {
                         }
                         if ui.button("Sphere Collider").clicked() {
                             self.actions.push(EditorAction::SpawnSphereCollider);
+                            ui.close();
+                        }
+                        if ui.button("Capsule Collider").clicked() {
+                            self.actions.push(EditorAction::SpawnCapsuleCollider);
+                            ui.close();
+                        }
+                        if ui.button("Mesh Collider").on_hover_text("Add a Mesh Collider to the selected mesh objects").clicked() {
+                            self.actions.push(EditorAction::AddMeshCollider);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Create Water", |ui| {
+                        if ui.button("Water").clicked() {
+                            self.actions.push(EditorAction::SpawnWater);
+                            ui.close();
+                        }
+                        if ui.button("Waterfall").clicked() {
+                            self.actions.push(EditorAction::SpawnWaterfall);
+                            ui.close();
+                        }
+                        if ui.button("Whirlpool").clicked() {
+                            self.actions.push(EditorAction::SpawnWhirlpool);
+                            ui.close();
+                        }
+                        if ui.button("Floating Cube").clicked() {
+                            self.actions.push(EditorAction::SpawnFloatingCube);
+                            ui.close();
+                        }
+                        if ui.button("Bucket").on_hover_text("A container you can carry water in").clicked() {
+                            self.actions.push(EditorAction::SpawnBucket);
                             ui.close();
                         }
                     });
@@ -4123,6 +4539,19 @@ impl EngineApp {
                     }
                     if ui.button("Audio Mixer…").clicked() {
                         self.show_mixer = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button("Build Content Package…")
+                        .on_hover_text("Package the scene (World) or the selected hierarchy (Avatar / Prop) as a .citruspak games load at runtime")
+                        .clicked()
+                    {
+                        let kind = if matches!(self.selection, Selection::Object(_)) {
+                            citrus_core::ContentKind::Prop
+                        } else {
+                            citrus_core::ContentKind::World
+                        };
+                        self.content_builder.open_for(kind);
                         ui.close();
                     }
                     ui.separator();
@@ -4223,13 +4652,16 @@ impl EngineApp {
                 top_menu(&mut bar, ui, "Windows", |ui| {
                     ui.label(egui::RichText::new("Open / focus a panel").small().weak());
                     for (tab, label) in [
-                        (Tab::Viewport, "Viewport"),
+                        (Tab::Viewport, "Scene"),
                         (Tab::Camera, "Camera"),
                         (Tab::UiEditor, "UI Editor"),
+                        (Tab::AnimController, "Animator Controller"),
+                        (Tab::AnimClip, "Animation"),
                         (Tab::Scene, "Scene"),
                         (Tab::Inspector, "Inspector"),
                         (Tab::Environment, "Environment"),
                         (Tab::Baker, "FluxBaker"),
+                        (Tab::Occlusion, "Occlusion"),
                         (Tab::Files, "Files"),
                         (Tab::Log, "Log"),
                     ] {
@@ -4281,7 +4713,7 @@ impl EngineApp {
                     && widgets::icon_button_sized(
                         ui,
                         Icon::Camera,
-                        "Game camera (off = free editor camera)",
+                        "Scene follows the game camera (off = free camera; the game shows in the Camera tab)",
                         self.play_game_camera,
                         size,
                     )
@@ -4731,8 +5163,8 @@ impl EngineApp {
                 // can apply it to the scene (live preview).
                 let preview = {
                     let runner = self.bake_job.as_mut().unwrap();
-                    if let Ok(mut p) = runner.progress.lock() {
-                        if let TaskProgress::Bake {
+                    if let Ok(mut p) = runner.progress.lock()
+                        && let TaskProgress::Bake {
                             lightmap_done,
                             phase,
                             ..
@@ -4741,7 +5173,6 @@ impl EngineApp {
                             *lightmap_done = done as u32;
                             *phase = BakePhase::Lightmaps;
                         }
-                    }
                     // Only the main lightmap pass produces lightmaps to preview;
                     // the FluxVoxel pass is probes-only.
                     if runner.phase == BakeRunPhase::Main {
@@ -4775,14 +5206,13 @@ impl EngineApp {
             }
             Ok(citrus_render::BakeStep::Probes) => {
                 let runner = self.bake_job.as_mut().unwrap();
-                if let Ok(mut p) = runner.progress.lock() {
-                    if let TaskProgress::Bake { phase, .. } = &mut *p {
+                if let Ok(mut p) = runner.progress.lock()
+                    && let TaskProgress::Bake { phase, .. } = &mut *p {
                         *phase = match runner.phase {
                             BakeRunPhase::FluxVoxel => BakePhase::FluxVoxel,
                             BakeRunPhase::Main => BakePhase::Probes,
                         };
                     }
-                }
             }
             Ok(citrus_render::BakeStep::Complete) => self.bake_phase_complete(),
         }
@@ -4822,11 +5252,10 @@ impl EngineApp {
                     };
                     match self.renderer.as_ref().map(|r| r.bake_begin(&fin)) {
                         Some(Ok(job)) => {
-                            if let Ok(mut p) = runner.progress.lock() {
-                                if let TaskProgress::Bake { phase, .. } = &mut *p {
+                            if let Ok(mut p) = runner.progress.lock()
+                                && let TaskProgress::Bake { phase, .. } = &mut *p {
                                     *phase = BakePhase::FluxVoxel;
                                 }
-                            }
                             self.bake_job = Some(BakeRunner {
                                 job,
                                 task_id: runner.task_id,
@@ -4928,87 +5357,71 @@ impl EngineApp {
                 break;
             }
         }
-        let Some((i, res)) = req else { return };
-        let center = self.scene.world_transform(i).w_axis.truncate();
-        if let Some(r) = self.renderer.as_mut() {
-            r.request_reflection_capture_static(center, res);
-            self.refl_bake_pending = Some(2);
+        let Some((i, _)) = req else { return };
+        let id = self.scene.objects[i].id.raw();
+        if let Some(p) = self.scene.reflection_probe_captures().into_iter().find(|p| p.0 == id) {
+            self.refl_bake_queue.push(p);
             self.set_status("Baking reflection probe…", true);
         }
     }
 
-    fn save_reflection_bake(&mut self) {
-        let Some(faces) = self.renderer.as_ref().and_then(|r| r.read_reflection_faces()) else {
-            self.set_status("Reflection bake failed (readback)", false);
-            return;
-        };
-        if faces.len() != 6 {
-            return;
-        }
-        let size = faces[0].width;
-        let mut out = Vec::with_capacity(16 + faces.iter().map(|f| f.pixels.len()).sum::<usize>());
-        out.extend_from_slice(b"CITRSRP1");
-        out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&(faces.len() as u32).to_le_bytes());
-        for f in &faces {
-            out.extend_from_slice(&f.pixels);
-        }
-        let path = self.bake_base_path().with_extension("reflprobe");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::write(&path, &out) {
-            Ok(()) => self.set_status("Baked reflection probe", false),
-            Err(e) => {
-                tracing::error!("saving .reflprobe: {e:#}");
-                self.set_status("Reflection bake failed (write)", false);
+    /// The camera inspector's "Create Screen" button.
+    fn poll_camera_screen_requests(&mut self) {
+        for (i, obj) in self.scene.objects.iter_mut().enumerate() {
+            for c in obj.components.iter_mut() {
+                if let Some(cam) = c.as_any_mut().downcast_mut::<citrus_core::CameraComponent>()
+                    && cam.create_screen
+                {
+                    cam.create_screen = false;
+                    self.actions.push(EditorAction::CreateCameraScreen(i));
+                }
             }
         }
     }
 
-    /// Load a `<scene>.reflprobe` sidecar (if present) and upload it as the
-    /// reflection env, skipping the load-time scene recapture. Missing = no-op.
-    fn load_reflection_bake(&mut self) -> bool {
+    /// Start the next queued probe bake: a static capture into slot 0, read
+    /// back and saved by `save_reflection_bake` once it lands.
+    fn step_reflection_bake_queue(&mut self) {
+        if self.refl_bake_pending.is_some() || self.refl_bake_current.is_some() || self.refl_bake_queue.is_empty() {
+            return;
+        }
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        if r.reflection_capture_in_flight() {
+            return;
+        }
+        let (id, center, res) = self.refl_bake_queue.remove(0);
+        r.request_reflection_capture_static(center, res);
+        self.refl_bake_current = Some(id);
+        self.refl_bake_pending = Some(2);
+    }
+
+    fn save_reflection_bake(&mut self) {
+        let Some(id) = self.refl_bake_current.take() else {
+            return;
+        };
+        let Some(faces) = self.renderer.as_ref().and_then(|r| r.read_reflection_faces()) else {
+            self.set_status("Reflection bake failed (readback)", false);
+            return;
+        };
+        let Ok(faces) = <[citrus_render::TextureData; 6]>::try_from(faces) else {
+            return;
+        };
+        // Merge into the scene's sidecar: one cube per probe.
         let path = self.bake_base_path().with_extension("reflprobe");
-        let Ok(bytes) = std::fs::read(&path) else {
-            return false;
-        };
-        if bytes.len() < 16 || &bytes[..8] != b"CITRSRP1" {
-            return false;
+        let mut set = crate::refl_slots::read_reflprobes(&path);
+        set.legacy = None;
+        set.entries.insert(id, faces);
+        if let Err(e) = crate::refl_slots::write_reflprobes(&path, &set) {
+            tracing::error!("saving .reflprobe: {e:#}");
+            self.set_status("Reflection bake failed (write)", false);
+            return;
         }
-        let size = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-        let face_len = (size * size * 4) as usize;
-        if count != 6 || bytes.len() < 16 + face_len * 6 {
-            return false;
-        }
-        let mut faces: Vec<citrus_render::TextureData> = Vec::with_capacity(6);
-        for i in 0..6 {
-            let start = 16 + i * face_len;
-            faces.push(citrus_render::TextureData {
-                width: size,
-                height: size,
-                pixels: bytes[start..start + face_len].to_vec(),
-                srgb: false,
-                hdr: false,
-            });
-        }
-        let arr: [citrus_render::TextureData; 6] = match faces.try_into() {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        match self.renderer.as_mut() {
-            Some(r) => match r.set_reflection_faces(&arr) {
-                Ok(()) => {
-                    tracing::info!("loaded baked reflection probe ({size}px)");
-                    true
-                }
-                Err(e) => {
-                    tracing::error!("uploading baked reflection probe: {e:#}");
-                    false
-                }
-            },
-            None => false,
+        if self.refl_bake_queue.is_empty() {
+            // The bake drew into slot 0: reload both slots from the new cubes.
+            self.refl_slots.set_baked(set);
+            self.set_status("Baked reflection probes", false);
         }
     }
 
@@ -5077,11 +5490,17 @@ impl EngineApp {
         }
         self.play_paused = false;
         self.particles.reset();
+        self.water_fx.reset();
         self.flow = crate::scene_loader::SceneFlow::default();
+        self.content.clear();
         if self.playing {
             self.playing = false;
+            self.face_input.set_osc(None);
             if let Some(session) = self.play_session.take() {
                 self.audio = session.end();
+            }
+            if let Some(net) = self.net.as_mut() {
+                net.reset_world();
             }
             self.game_cursor_wanted = false;
             self.set_game_cursor(false);
@@ -5115,7 +5534,10 @@ impl EngineApp {
             let mut session = crate::play::PlaySession::new(&self.scene, &self.project_root, self.audio.take());
             session.set_mixer(self.project.audio_mixer.clone());
             session.set_spatial_audio(&self.project.spatial_audio);
+            session.set_physics(&self.project.physics, &self.scene);
             self.play_session = Some(session);
+            let ft = self.project.tracking_input;
+            self.face_input.set_osc(ft.osc_enabled.then_some(ft.osc_port));
         }
     }
 
@@ -5185,6 +5607,9 @@ impl EngineApp {
         let mut load = None;
         let mut quit = false;
         for c in commands {
+            let Some(c) = crate::net_sync::route_command(&mut self.net, &self.scene, c) else {
+                continue;
+            };
             match c {
                 ComponentCommand::LoadScene(rel) => load = Some(rel),
                 ComponentCommand::PreloadScene(rel) => {
@@ -5211,16 +5636,6 @@ impl EngineApp {
                         self.flow.kept.remove(&id);
                     }
                 }
-                ComponentCommand::RequestOwnership(id) => {
-                    if let Some(net) = self.net.as_mut() {
-                        net.request_ownership(id);
-                    }
-                }
-                ComponentCommand::ReleaseOwnership(id) => {
-                    if let Some(net) = self.net.as_mut() {
-                        net.release_ownership(id);
-                    }
-                }
                 ComponentCommand::SetResolution(w, h) => {
                     if let Some(window) = self.window.as_ref() {
                         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
@@ -5241,17 +5656,20 @@ impl EngineApp {
                         tracing::warn!("set shadow resolution: {e:#}");
                     }
                 }
-                ComponentCommand::NetMessage { to, text } => {
-                    if let Some(net) = self.net.as_mut() {
-                        net.send_message(to, &text);
-                    }
-                }
                 ComponentCommand::SetCursorLocked(locked) => {
                     self.game_cursor_wanted = locked;
                     self.set_game_cursor(locked);
                 }
                 // In the editor, quitting the game ends Play mode.
                 ComponentCommand::Quit => quit = true,
+                ComponentCommand::CalibrateTrackers => {
+                    if self.scene.calibrate_vr_tpose(&self.vr_targets) {
+                        tracing::info!("VR: captured T-pose calibration");
+                    }
+                }
+                ComponentCommand::ClearTrackerCalibration => self.scene.clear_vr_calibration(),
+                ComponentCommand::SetOscFaceTracking(port) => self.face_input.set_osc(port),
+                ComponentCommand::Content(c) => self.content.queue(c),
                 other => tracing::warn!("unhandled component command {other:?}"),
             }
         }
@@ -5294,8 +5712,15 @@ impl EngineApp {
         };
         match result {
             Ok((rel, scene, post)) => {
+                // Content worlds switch without a LoadScene command; remember
+                // where Play started so Stop returns there.
+                if self.playing && !self.play_scene_switched {
+                    self.play_origin_scene = self.current_scene_path.clone();
+                    self.play_scene_switched = true;
+                }
                 self.reset_render_caches();
                 self.scene = scene;
+                self.content.scene_replaced(&rel);
                 self.scene.ensure_camera_components(&self.components);
                 self.scene.ensure_light_components(&self.components);
                 self.scene.ensure_camera_ids();
@@ -5463,8 +5888,9 @@ impl EngineApp {
                             ui.label(egui::RichText::new(&name).monospace());
                             let mut v = self.project.audio_mixer.volume(&name);
                             ui.spacing_mut().slider_width = 130.0;
-                            if ui
-                                .add(egui::Slider::new(&mut v, 0.0..=1.0).fixed_decimals(2))
+                            if citrus_editor::widgets::slider(
+                                ui,
+                                egui::Slider::new(&mut v, 0.0..=1.0).fixed_decimals(2))
                                 .changed()
                             {
                                 self.project.audio_mixer.set_volume(&name, v);
@@ -5653,75 +6079,10 @@ impl EngineApp {
     /// Network panel (2G): host or join a session, see status, disconnect.
     fn network_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_network;
-        // Defer mutations that conflict with the &self.net borrow in the closure.
-        enum NetAct {
-            None,
-            Host(u16),
-            Join(String),
-            Disconnect,
-        }
-        let mut act = NetAct::None;
-        let addr = &mut self.net_addr;
-        let net = self.net.as_ref();
-        egui::Window::new("Network")
-            .open(&mut open)
-            .resizable(false)
-            .default_width(300.0)
-            .show(ctx, |ui| match net {
-                Some(net) => {
-                    ui.label(format!(
-                        "{} — peer {}",
-                        if net.is_host() { "Hosting" } else { "Client" },
-                        net.local_peer()
-                    ));
-                    ui.label(format!("Peers: {}", net.peer_count()));
-                    if let Some(a) = net.local_addr() {
-                        ui.label(egui::RichText::new(format!("Local: {a}")).weak().small());
-                    }
-                    if ui.button("Disconnect").clicked() {
-                        act = NetAct::Disconnect;
-                    }
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.label("Address");
-                        ui.text_edit_singleline(addr);
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Host").clicked() {
-                            let port = addr
-                                .rsplit(':')
-                                .next()
-                                .and_then(|p| p.parse::<u16>().ok())
-                                .unwrap_or(9000);
-                            act = NetAct::Host(port);
-                        }
-                        if ui.button("Join").clicked() {
-                            act = NetAct::Join(addr.clone());
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "Host binds the port; Join connects to a host. Objects with a \
-                             Sync component replicate while playing.",
-                        )
-                        .weak()
-                        .small(),
-                    );
-                }
-            });
+        let err = crate::net_window::network_window(ctx, &mut open, &mut self.net, &mut self.net_addr, &mut self.net_ui, &self.scene);
         self.show_network = open;
-        match act {
-            NetAct::None => {}
-            NetAct::Disconnect => self.net = None,
-            NetAct::Host(port) => match crate::net::NetSession::host(port) {
-                Ok(s) => self.net = Some(s),
-                Err(e) => self.set_status(format!("Host failed: {e}"), false),
-            },
-            NetAct::Join(a) => match crate::net::NetSession::join(&a) {
-                Ok(s) => self.net = Some(s),
-                Err(e) => self.set_status(format!("Join failed: {e}"), false),
-            },
+        if let Some(e) = err {
+            self.set_status(e, false);
         }
     }
 
@@ -5731,44 +6092,29 @@ impl EngineApp {
         // ---- New Project ----
         let mut open = self.show_new_project;
         let mut do_create = false;
+        let mut cancel = false;
         egui::Window::new("New Project")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("Scaffold a new citrus project (scenes / materials / shaders / src + a starter scene).");
-                ui.add_space(6.0);
-                egui::Grid::new("new-project-grid").num_columns(2).show(ui, |ui| {
-                    ui.label("Parent folder");
-                    ui.text_edit_singleline(&mut self.new_project_parent);
-                    ui.end_row();
-                    ui.label("Project name");
-                    ui.text_edit_singleline(&mut self.new_project_name);
-                    ui.end_row();
-                });
-                ui.add_space(4.0);
-                let target = Path::new(&self.new_project_parent).join(&self.new_project_name);
-                ui.label(egui::RichText::new(format!("-> {}", target.display())).small().weak());
-                ui.add_space(6.0);
-                let valid = !self.new_project_parent.trim().is_empty()
-                    && !self.new_project_name.trim().is_empty()
-                    && Path::new(&self.new_project_parent).is_dir();
-                if !valid {
-                    ui.label(
-                        egui::RichText::new("Pick an existing parent folder and a name.")
-                            .small()
-                            .color(egui::Color32::from_rgb(220, 160, 90)),
-                    );
-                }
-                if ui.add_enabled(valid, egui::Button::new("Create & Open")).clicked() {
-                    do_create = true;
-                }
+                do_create = crate::new_project_ui::new_project_ui(
+                    ui,
+                    crate::new_project_ui::NewProjectState {
+                        parent: &mut self.new_project_parent,
+                        name: &mut self.new_project_name,
+                        template: &mut self.new_project_template,
+                        filter: &mut self.new_project_filter,
+                    },
+                    &mut cancel,
+                );
             });
-        self.show_new_project = open && !do_create;
+        self.show_new_project = open && !do_create && !cancel;
         if do_create {
             self.actions.push(EditorAction::NewProject {
                 parent: PathBuf::from(self.new_project_parent.clone()),
                 name: self.new_project_name.trim().to_string(),
+                template: self.new_project_template.clone(),
             });
         }
 
@@ -5881,16 +6227,58 @@ impl EngineApp {
                         self.actions.push(EditorAction::BakeAudio);
                     }
                 });
+                egui::CollapsingHeader::new("Physics").id_salt("citrus-physics-settings").show(ui, |ui| {
+                    let root = self.project_root.clone();
+                    dirty |= citrus_editor::physics_settings_ui(ui, &mut self.project.physics, || physmat_files(&root));
+                });
+                egui::CollapsingHeader::new("External tracking").id_salt("citrus-external-tracking").show(ui, |ui| {
+                    let ft = &mut self.project.tracking_input;
+                    citrus_editor::widgets::eyebrow(ui, "SlimeVR");
+                    citrus_editor::widgets::property_row(ui, "Connect to server", |ui| dirty |= ui.checkbox(&mut ft.slimevr, "").changed());
+                    let slime = match &self.slimevr {
+                        Some(s) if s.connected() => "Connected".to_owned(),
+                        Some(_) => format!("Waiting for the server at {}", crate::slimevr::socket_path().display()),
+                        None => "Off".to_owned(),
+                    };
+                    ui.label(egui::RichText::new(slime).small().weak());
+                    citrus_editor::widgets::eyebrow(ui, "OSC (Open Sound Control)");
+                    citrus_editor::widgets::property_row(ui, "Receive", |ui| dirty |= ui.checkbox(&mut ft.osc_enabled, "").changed());
+                    citrus_editor::widgets::property_row(ui, "UDP port", |ui| {
+                        dirty |= ui.add(egui::DragValue::new(&mut ft.osc_port).range(1024..=65535)).changed();
+                    });
+                    let status = match self.face_input.osc_port() {
+                        Some(p) => format!("Listening on UDP {p}"),
+                        None => "Not listening (starts with Play when enabled)".to_owned(),
+                    };
+                    ui.label(egui::RichText::new(status).small().weak());
+                    citrus_editor::widgets::info_note(
+                        ui,
+                        "Only for tools that send over OSC (Open Sound Control): VRCFaceTracking, Babble, Steam Link. Headset face and eye tracking from WiVRn or Virtual Desktop is read directly through OpenXR and needs none of this.",
+                    );
+                });
                 ui.separator();
                 if let Some(status) = &self.build_status {
                     ui.label(egui::RichText::new(status).small());
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Target");
+                    egui::ComboBox::from_id_salt("citrus-build-target")
+                        .selected_text(self.build_target.label())
+                        .show_ui(ui, |ui| {
+                            for t in bundle::BuildTarget::ALL {
+                                if t == bundle::BuildTarget::Windows && cfg!(windows) {
+                                    continue;
+                                }
+                                ui.selectable_value(&mut self.build_target, t, t.label());
+                            }
+                        });
+                });
                 if ui
-                    .button("Build Game")
-                    .on_hover_text("cargo build --release + bundle into build/")
+                    .add_enabled(!self.building_game, egui::Button::new("Build Game"))
+                    .on_hover_text("cargo build --release + bundle into build/ (build-windows/ for a Windows cross-build)")
                     .clicked()
                 {
-                    self.actions.push(EditorAction::BuildGame);
+                    self.actions.push(EditorAction::BuildGame(self.build_target));
                 }
             });
         self.show_project_settings = open;
@@ -5949,8 +6337,8 @@ impl EngineApp {
         self.editor_components = citrus_editor::EditorComponents::with_builtins();
         self.plugins = plugins::PluginHost::default();
         self.plugin_build_error = None;
-        if plugins::PluginHost::any_plugins(&root) {
-            if let Err(e) = self.plugins.build_and_load(
+        if plugins::PluginHost::any_plugins(&root)
+            && let Err(e) = self.plugins.build_and_load(
                 &root,
                 &mut self.components,
                 &mut self.editor_components,
@@ -5958,7 +6346,6 @@ impl EngineApp {
                 tracing::error!("building plugins for new project: {e:#}");
                 self.plugin_build_error = Some(format!("{e:#}"));
             }
-        }
 
         self.project = citrus_assets::load_project_file(&root).unwrap_or_default();
         let boot = self
@@ -6301,6 +6688,23 @@ impl EngineApp {
             }
             TaskPayload::Scene(data) => self.apply_loaded_scene(*data),
             TaskPayload::AudioBake { scene_path, bytes } => self.apply_audio_bake(scene_path, bytes),
+            TaskPayload::Occlusion { scene_path, data, secs } => self.apply_occlusion_bake(scene_path, *data, secs),
+            TaskPayload::GameBuilt(result) => {
+                self.building_game = false;
+                match result {
+                    Ok(exe) => {
+                        let msg = format!("built {}", exe.display());
+                        tracing::info!("{msg}");
+                        self.build_status = Some(msg.clone());
+                        self.tasks.notify(msg, NotifyLevel::Info);
+                    }
+                    Err(e) => {
+                        tracing::error!("build game failed: {e}");
+                        self.build_status = Some(format!("build failed: {e}"));
+                        self.tasks.notify("Game build failed (see Log)", NotifyLevel::Warn);
+                    }
+                }
+            }
             TaskPayload::FocusChanges { scene_path, label } => {
                 use crate::tasks::NotifyLevel;
                 if self.scene_dirty {
@@ -6504,6 +6908,8 @@ impl EngineApp {
         }
         self.last_shader_scan = Some(Instant::now());
         self.shader_files = scan_project_files(&self.project_root, "frag");
+        self.shader_files.extend(scan_project_files(&self.project_root, citrus_assets::HLSL_SHADER_EXTENSION));
+        self.shader_files.sort();
         if let Some(renderer) = self.renderer.as_mut() {
             let changed = self.shaders.poll_reload(renderer, &self.project_root);
             if !changed.is_empty() {
@@ -6557,7 +6963,6 @@ impl EngineApp {
         }
         let renderer = self.renderer.as_mut()?;
         let entry = self.shaders.resolve(renderer, &self.project_root, &shader);
-        let defaults = entry.defaults();
         let ui = entry.ui.clone();
         let has_source = entry.source.is_some();
         if has_source {
@@ -6569,9 +6974,8 @@ impl EngineApp {
                 Selection::File(_) => &mut self.file_material.as_mut()?.model,
                 Selection::None => return None,
             };
-            if model.custom_values.len() != defaults.len() {
-                model.custom_values = defaults;
-            }
+            entry.fit_values(&mut model.custom_values);
+            entry.sync_textures(&mut model.textures);
         }
         Some(ui)
     }
@@ -6658,9 +7062,17 @@ impl EngineApp {
             .copied()
             .filter(|&j| j != anchor && j < self.scene.objects.len())
             .collect();
-        let xform_changed = dt != glam::Vec3::ZERO
-            || ds != glam::Vec3::ONE
-            || before.rotation != after.rotation;
+        let typed = std::mem::take(&mut self.multi_edit);
+        let absolute = typed.any();
+        let xform_changed = !absolute && (dt != glam::Vec3::ZERO || ds != glam::Vec3::ONE || before.rotation != after.rotation);
+        // Per component, just the fields this edit changed.
+        let field_edits: Vec<FieldEdit> = changed
+            .iter()
+            .map(|(name, ron)| {
+                let before_ron = before.components.iter().find(|(n, _)| n == name).map(|(_, r)| r.as_str()).unwrap_or("");
+                (name.clone(), crate::ron_fields::changed(before_ron, ron))
+            })
+            .collect();
         let mut entries = Vec::new();
         for j in targets {
             // Snapshot before mutating so the propagated edit is itself undoable
@@ -6672,12 +7084,17 @@ impl EngineApp {
                 o.rotation = (dr * o.rotation).normalize();
                 o.scale *= ds;
             }
+            if absolute {
+                typed.apply(&mut self.scene.objects[j]);
+            }
             if !changed.is_empty() {
                 let mut comps = self.scene.objects[j].save_components();
                 let mut touched = false;
-                for (name, ron) in &changed {
+                for ((name, ron), (_, fields)) in changed.iter().zip(&field_edits) {
                     if let Some(slot) = comps.iter_mut().find(|(n, _)| n == name) {
-                        slot.1 = ron.clone();
+                        // Only the fields that changed, so the others keep their
+                        // own values; whole-component copy when the RON can't be split.
+                        slot.1 = fields.as_ref().and_then(|f| crate::ron_fields::patch(&slot.1, f)).unwrap_or_else(|| ron.clone());
                         touched = true;
                     }
                 }
@@ -6932,11 +7349,13 @@ impl EngineApp {
         };
         let mut mat_written = 0;
         for (mi, m) in scene.materials.iter().enumerate() {
-            let mut textures = citrus_assets::MaterialTextures::default();
-            textures.albedo = m.albedo.and_then(|i| rel(&tex_paths[i]));
-            textures.normal = m.normal.and_then(|i| rel(&tex_paths[i]));
-            textures.orm = m.orm.and_then(|i| rel(&tex_paths[i]));
-            textures.emission = m.emission.and_then(|i| rel(&tex_paths[i]));
+            let textures = citrus_assets::MaterialTextures {
+                albedo: m.albedo.and_then(|i| rel(&tex_paths[i])),
+                normal: m.normal.and_then(|i| rel(&tex_paths[i])),
+                orm: m.orm.and_then(|i| rel(&tex_paths[i])),
+                emission: m.emission.and_then(|i| rel(&tex_paths[i])),
+                ..Default::default()
+            };
             let mf = citrus_assets::MaterialFile {
                 name: m.name.clone(),
                 shader: "standard".into(),
@@ -7199,11 +7618,10 @@ impl EngineApp {
             primitives,
             textures_delta: output.textures_delta,
         };
-        if let Some(r) = self.renderer.as_mut() {
-            if let Err(e) = r.render_profiler(&draw) {
+        if let Some(r) = self.renderer.as_mut()
+            && let Err(e) = r.render_profiler(&draw) {
                 tracing::error!("profiler render: {e:#}");
             }
-        }
         window.request_redraw();
     }
 
@@ -7381,6 +7799,11 @@ impl EngineApp {
         }
 
         let pre_edit = self.capture_edit_snapshot();
+        let selected_object = match self.selection {
+            Selection::Object(i) => Some(i),
+            _ => None,
+        };
+        crate::river_edit::sync(&self.egui_ctx, &self.scene, selected_object, self.playing);
         let shader_info = self.selected_shader_info();
         let can_bake = self.renderer.as_ref().is_some_and(|r| r.supports_baking());
         // Winit-based viewport-hover test: stays correct right after a
@@ -7400,6 +7823,21 @@ impl EngineApp {
             self.bindings_window(ctx);
             self.network_window(ctx);
             self.layers_window(ctx);
+            if self.content_builder.open {
+                let selected = match self.selection {
+                    Selection::Object(i) => Some(i),
+                    _ => None,
+                };
+                let src = crate::content::builder::BuildSource {
+                    scene: &self.scene,
+                    shaders: &self.shaders,
+                    root: &self.project_root,
+                    selected,
+                    scene_path: self.current_scene_path.as_deref(),
+                    registry: &self.components,
+                };
+                self.content_builder.show(ctx, &src);
+            }
             self.lightmap_uv_window(ctx);
             self.busy_overlay(ctx);
             self.bake_modal(ctx);
@@ -7442,12 +7880,18 @@ impl EngineApp {
                 self.scene.models_with_generated_lightmap_uv(&self.project_root);
             let ui_overlay_edit = !self.playing && self.widget_filter.game_ui;
             let active_prev = std::mem::take(&mut self.active_tabs);
+            let fit_labels = fit_tab_labels(ctx, &dock_state, self.vp_strip_width);
+            self.multi_edit = MultiEdit::default();
             let mut tabs = EditorTabs {
+                fit_labels: &fit_labels,
                 camera_visible: &mut self.camera_tab_visible,
+                camera_rect: &mut self.camera_rect,
                 viewport_visible: &mut self.viewport_visible,
+                vp_strip_width: &mut self.vp_strip_width,
                 scene: &mut self.scene,
                 selection: &mut self.selection,
                 multi_objects: &mut self.multi_objects,
+                multi_edit: &mut self.multi_edit,
                 multi_files: &mut self.multi_files,
                 inspector: &mut self.inspector,
                 inspector_lock_target: &mut self.inspector_lock_target,
@@ -7462,6 +7906,9 @@ impl EngineApp {
                 gizmo: &mut self.gizmo,
                 widget_filter: &mut self.widget_filter,
                 ui_editor: &mut self.ui_editor,
+                anim_ctrl_tab: &mut self.anim_ctrl_tab,
+                anim_clip_tab: &mut self.anim_clip_tab,
+                occlusion_ui: &mut self.occlusion_ui,
                 ui_rect_editor: &mut self.ui_rect_editor,
                 active_tabs_prev: &active_prev,
                 playing: self.playing,
@@ -7513,12 +7960,38 @@ impl EngineApp {
             let active_now = std::mem::take(&mut tabs.active_tabs);
             drop(tabs);
             self.active_tabs = active_now;
+            clamp_leaf_width(&mut dock_state, &Tab::Inspector, INSPECTOR_MIN_WIDTH);
             self.dock_state = dock_state;
+            for controller in crate::anim_controller_editor::take_open_requests(
+                ctx,
+                &mut self.anim_ctrl_tab,
+                &mut self.anim_clip_tab,
+                &self.project_root,
+            ) {
+                let tab = if controller { Tab::AnimController } else { Tab::AnimClip };
+                if let Some(loc) = self.dock_state.find_tab(&tab) {
+                    self.dock_state.set_active_tab(loc);
+                } else {
+                    // Open next to the Scene view (wide), not in the focused leaf.
+                    if let Some((surface, node, _)) = self.dock_state.find_tab(&Tab::Viewport) {
+                        self.dock_state.set_focused_node_and_surface((surface, node));
+                    }
+                    self.dock_state.push_to_focused_leaf(tab);
+                }
+            }
 
-            // Game UI over the viewport: interactive while playing, a layout
-            // preview while editing.
-            if self.viewport_visible && (self.playing || self.widget_filter.game_ui) {
-                let rect = self.viewport_rect;
+            // Game UI: interactive while playing; while editing, a layout preview
+            // over the Scene view (where it can be edited, Game UI filter on) or
+            // else over the Camera tab, which shows what the game will.
+            let game_rect = self.game_rect();
+            let overlay_rect = if self.playing {
+                game_rect
+            } else if self.viewport_visible && self.widget_filter.game_ui {
+                Some(self.viewport_rect)
+            } else {
+                (self.camera_tab_visible && self.camera_rect.is_positive()).then_some(self.camera_rect)
+            };
+            if let Some(rect) = overlay_rect {
                 let nav = self.input.ui_nav();
                 let input = (self.playing && !self.game_cursor_locked).then(|| {
                     ctx.input(|i| {
@@ -7616,6 +8089,8 @@ impl EngineApp {
         self.process_actions();
         // Per-probe "Bake This Probe" requests from the inspector button.
         self.poll_probe_bake_requests();
+        self.poll_camera_screen_requests();
+        self.step_reflection_bake_queue();
         // Reflection-probe bake: the capture renders one cube face per frame, so
         // hold the readback until the renderer swaps the finished cube in (plus a
         // short settle countdown), or we'd persist the PRE-capture cube.
@@ -7711,27 +8186,38 @@ impl EngineApp {
             {
                 session.structure_changed();
             }
+            if let Some(renderer) = self.renderer.as_mut() {
+                let content = self.content.update(&mut crate::content::ContentHost {
+                    renderer,
+                    registry: &self.components,
+                    shaders: &mut self.shaders,
+                    root: &self.project_root,
+                    scene: &mut self.scene,
+                    flow: &mut self.flow,
+                });
+                if let Some(session) = self.play_session.as_mut() {
+                    if content.structure_changed {
+                        session.structure_changed();
+                    }
+                    for e in content.events {
+                        session.post_event(e);
+                    }
+                }
+            }
             // Replicate networked objects (2G): owner sends, others apply.
             if let Some(net) = self.net.as_mut() {
                 self.scene.network_sync(net, dt);
             }
-            // Voice comms (task 8): push-to-talk capture + spatial playback.
-            if self.net.is_some() {
-                if self.voice.is_none() {
-                    self.voice = crate::voice::VoiceChat::new();
-                }
-                let transmit = self.input.state().down("Voice");
-                let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
-                if let (Some(voice), Some(net)) = (self.voice.as_mut(), self.net.as_mut()) {
-                    voice.capture_and_send(net, transmit);
-                    let owners = net.owners_snapshot();
-                    let packets = net.take_voice();
-                    let positions = self.scene.peer_voice_positions(&owners);
-                    voice.receive(packets, &positions);
-                    voice.update(listener, 25.0);
-                }
-            }
+            // Voice chat + lip sync (needs a Voice Chat component in the scene).
+            let listener = self.scene.audio_listener().unwrap_or(self.camera.position);
+            let right = self.camera.right();
+            let input = self.input.state();
+            crate::voice::run_frame(&mut self.voice, self.net.as_mut(), &mut self.scene, |a| input.down(a), listener, right);
         } else {
+            // Keep network connections alive (handshakes, pings) while editing.
+            if let Some(net) = self.net.as_mut() {
+                net.pump();
+            }
             // Coalesce undo entries only while a pointer drag is in progress (one
             // slider/handle gesture = one entry); discrete edits each get their own.
             let gesture_active = self.egui_ctx.input(|i| i.pointer.any_down());
@@ -7759,6 +8245,8 @@ impl EngineApp {
         self.update_particles(dt);
         let view_toggle = self.scene.visible_layers;
         self.scene.visible_layers = view_toggle & self.scene.main_camera_culling_mask();
+        self.scene.occlusion_camera = self.occlusion_camera();
+        self.scene.lightmap_preview = self.lightmap_preview;
         self.scene.sync_draws_multi(&selected, 1.0);
         self.scene.visible_layers = view_toggle;
         FrameTimings::ema(
@@ -7770,7 +8258,7 @@ impl EngineApp {
         let env = self.scene.environment.clone();
         // When a bake exists the environment sun is baked, so it leaves the
         // realtime path (like Baked/Mixed lights).
-        let baked = self.scene.baked.is_some();
+        let baked = self.scene.lightmaps_in_use();
         let sun_realtime = env.sun_enabled && !baked;
         let mut lights = Vec::new();
         if sun_realtime {
@@ -7790,9 +8278,6 @@ impl EngineApp {
             });
         }
         lights.extend(self.scene.gather_lights());
-        // Full light set (incl. baked) for the reflection-probe cube capture, so
-        // a baked scene's reflections aren't captured in the dark.
-        let capture_lights = self.scene.gather_lights_all();
         let world_light = LightData {
             direction: Vec3::from(env.sun_direction).normalize_or(Vec3::NEG_Y),
             color: env.sun_color,
@@ -7851,10 +8336,22 @@ impl EngineApp {
                 hips: b.hips,
                 left_foot: b.left_foot,
                 right_foot: b.right_foot,
+                chest: b.chest,
+                left_elbow: b.left_elbow,
+                right_elbow: b.right_elbow,
+                left_knee: b.left_knee,
+                right_knee: b.right_knee,
             };
+            if let Some(slime) = &self.slimevr {
+                slime.feed(&mut self.vr_targets);
+            }
             vr_input = session.input();
         }
-        if self.xr_session.is_some() {
+        // In Play a VR Player owns locomotion: the headset rig follows it.
+        let game_rig = self.playing.then(|| self.scene.vr_player_rig()).flatten();
+        if let Some(rig) = game_rig {
+            self.vr_rig = rig;
+        } else if self.xr_session.is_some() {
             self.update_vr(vr_input, dt);
         }
 
@@ -7865,31 +8362,63 @@ impl EngineApp {
         if let Err(e) = renderer.set_shadow_resolution(shadow_res) {
             tracing::error!("setting shadow resolution: {e:#}");
         }
-        // Realtime-mode probe: keep re-capturing continuously (one face per frame
-        // → a fresh cube every ~7 frames) so dynamic lighting — an emissive orb's
-        // GI glow, moved objects — tracks in reflections instead of freezing at
-        // the scene-load snapshot. Held while a manual bake awaits its readback so
-        // the saved cube is the one the user asked for.
-        if self.refl_bake_pending.is_none() && !renderer.reflection_capture_in_flight() {
-            if let Some(p) = self.scene.active_reflection_probe(glam::Vec3::ZERO) {
-                if p.realtime {
-                    renderer.request_reflection_capture(Vec3::from(p.capture), p.resolution);
-                }
-            }
-        }
         // Feed VR tracker poses into the scene's humanoid IK targets (any source
         // can; IK isn't VR-specific). Remap through the captured T-pose calibration
         // when one exists so each tracker drives its bone naturally. Then advance +
         // CPU-skin (previews in-editor).
+        let face = self.face_input.poll(self.xr_session.as_ref());
+        self.scene.set_local_face(face);
+        if self.project.tracking_input.slimevr != self.slimevr.is_some() {
+            self.slimevr = self.project.tracking_input.slimevr.then(crate::slimevr::SlimeVr::start);
+        }
         let vr_targets = self.scene.vr_apply_calibration(&self.vr_targets);
         self.scene
             .set_ik_targets(self.xr_session.as_ref().map(|_| vr_targets));
+        self.scene.update_water_wind(dt);
         self.scene.update_skinning(renderer, dt);
         // Re-read the game camera after this frame's tick so it isn't a frame behind.
         let (view, proj, cam_pos) = game_view_now.unwrap_or((view, proj, self.camera.position));
-        let postfx = self.scene.effective_postfx(cam_pos, &self.project_root);
+        // Preview first, so the Environment tab's override list reflects the
+        // Scene camera (the main call runs last).
+        let water_t = self.water.time();
+        let preview_postfx = camera_preview.as_ref().map(|c| citrus_render::PostFx {
+            underwater: crate::underwater::view_fx(&self.scene, c.position, water_t),
+            ..self.scene.effective_postfx(c.position, &self.project_root)
+        });
+        // The two reflection probes around the camera (blended per pixel);
+        // realtime ones keep re-capturing so reflections track dynamic lighting,
+        // paused while a bake owns the capture.
+        let baking = self.refl_bake_pending.is_some() || self.refl_bake_current.is_some() || !self.refl_bake_queue.is_empty();
+        let refl = self.refl_slots.update(renderer, self.scene.active_reflection_probes(cam_pos), !baking);
+        let camera_views = self.scene.camera_target_views();
+        for v in &camera_views {
+            if let Err(e) = renderer.resize_camera_target(v.id, v.size[0], v.size[1]) {
+                tracing::error!("resizing render-texture camera: {e:#}");
+            }
+        }
+        let postfx = citrus_render::PostFx {
+            underwater: crate::underwater::view_fx(&self.scene, cam_pos, water_t),
+            ..self.scene.effective_postfx(cam_pos, &self.project_root)
+        };
+        let preview_postfx = preview_postfx.unwrap_or(postfx);
         let planar = self.scene.planar_surfaces();
-        let frame = FrameInput {
+        // Full light set (incl. baked) for the reflection-probe cube capture, so
+        // a baked scene's reflections aren't captured in the dark. Only gathered
+        // while a capture is queued or running (empty = use `lights`).
+        let voxel_emitters = {
+            let gi = &self.scene.environment.realtime_gi;
+            if gi.enabled && gi.mode == citrus_assets::GiMode::FluxVoxel {
+                self.scene.flux_voxel_dynamic_emitters()
+            } else {
+                Vec::new()
+            }
+        };
+        let capture_lights = if renderer.reflection_capture_in_flight() {
+            self.scene.gather_lights_all()
+        } else {
+            Vec::new()
+        };
+        let mut frame = FrameInput {
             clear_color: [0.016, 0.016, 0.024, 1.0],
             camera: CameraData {
                 view,
@@ -7899,11 +8428,14 @@ impl EngineApp {
             light: world_light,
             lights: &lights,
             capture_lights: &capture_lights,
+            voxel_emitters: &voxel_emitters,
             camera_preview,
             draw_skybox: env.skybox_enabled,
             shadow_pcf_texel,
             shadow_distance: env.shadow_distance,
             time: t,
+            water_time: self.water.time(),
+            water: self.water.bodies(),
             draws: &self.scene.draws,
             lightmap_preview: self.lightmap_preview,
             gi_debug: self.gi_debug,
@@ -7912,7 +8444,11 @@ impl EngineApp {
             render_viewport: false,
             viewport_extent,
             postfx,
-            reflection_probe: self.scene.active_reflection_probe(cam_pos),
+            preview_postfx,
+            reflection_probe: refl.0,
+            reflection_probe_b: refl.1,
+            reflection_primary: refl.2,
+            camera_targets: &camera_views,
             planar: &planar,
             fog: self.scene.fog_params(),
             voxel_specular: self.scene.environment.realtime_gi.mode
@@ -7928,6 +8464,7 @@ impl EngineApp {
         let render_t = Instant::now();
         if let Err(e) = renderer.render(&frame) {
             tracing::error!("render failed: {e:#}");
+            renderer.report_device_lost(&e);
             event_loop.exit();
         }
 
@@ -8009,13 +8546,11 @@ impl EngineApp {
                     }),
                 };
                 // Only re-render the UI texture when the menu (some panel) is up.
-                if overlay.is_some_and(|o| o.panels.iter().any(|p| p.is_some())) {
-                    if let Some(egui_draw) = frame.egui.as_ref() {
-                        if let Err(e) = renderer.render_vr_ui(egui_draw) {
+                if overlay.is_some_and(|o| o.panels.iter().any(|p| p.is_some()))
+                    && let Some(egui_draw) = frame.egui.as_ref()
+                        && let Err(e) = renderer.render_vr_ui(egui_draw) {
                             tracing::error!("VR UI render: {e:#}");
                         }
-                    }
-                }
                 let begun = self
                     .xr_session
                     .as_mut()
@@ -8025,6 +8560,8 @@ impl EngineApp {
                     Ok(Some(xr_frame)) => {
                         for eye in &xr_frame.eyes {
                             let world_view = eye.view * world_to_stage;
+                            let eye_pos = world_view.inverse().w_axis.truncate();
+                            frame.postfx.underwater = crate::underwater::view_fx(&self.scene, eye_pos, water_t);
                             if let Err(e) = renderer.render_xr_eye(
                                 eye.image, fmt, eye.width, eye.height, world_view, eye.proj,
                                 &frame, overlay,
@@ -8032,11 +8569,10 @@ impl EngineApp {
                                 tracing::error!("XR eye render: {e:#}");
                             }
                         }
-                        if let Some(session) = self.xr_session.as_mut() {
-                            if let Err(e) = session.end_frame(xr_frame) {
+                        if let Some(session) = self.xr_session.as_mut()
+                            && let Err(e) = session.end_frame(xr_frame) {
                                 tracing::error!("XR end_frame: {e:#}");
                             }
-                        }
                     }
                     Ok(None) => {}
                     Err(e) => tracing::error!("XR begin_frame: {e:#}"),
@@ -8076,13 +8612,17 @@ impl EngineApp {
 
 /// Dock tab renderer; collects actions for post-UI processing.
 struct EditorTabs<'a> {
+    /// Shortened labels for tabs in a leaf too narrow for all of them.
+    fit_labels: &'a HashMap<Tab, String>,
     /// Set true by `camera_ui` when the Camera tab is the visible/active tab.
     camera_visible: &'a mut bool,
     /// Set true by `viewport_ui` when the Viewport tab is the visible/active tab.
     viewport_visible: &'a mut bool,
+    vp_strip_width: &'a mut f32,
     scene: &'a mut LoadedScene,
     selection: &'a mut Selection,
     multi_objects: &'a mut Vec<usize>,
+    multi_edit: &'a mut MultiEdit,
     multi_files: &'a mut Vec<PathBuf>,
     inspector: &'a mut InspectorPanel,
     inspector_lock_target: &'a mut Option<Selection>,
@@ -8099,6 +8639,9 @@ struct EditorTabs<'a> {
     gizmo: &'a mut GizmoState,
     widget_filter: &'a mut WidgetFilter,
     ui_editor: &'a mut crate::ui_editor::UiEditorTab,
+    anim_ctrl_tab: &'a mut crate::anim_controller_editor::AnimControllerTab,
+    anim_clip_tab: &'a mut crate::anim_clip_editor::AnimClipTab,
+    occlusion_ui: &'a mut OcclusionUi,
     ui_rect_editor: &'a mut crate::ui_edit::UiRectEditor,
     playing: bool,
     /// Expanded viewport stats pill (draw calls).
@@ -8128,6 +8671,7 @@ struct EditorTabs<'a> {
     /// Main-camera preview (egui texture + pixel size), if the renderer has
     /// rendered one yet.
     camera_preview: Option<(egui::TextureId, [f32; 2])>,
+    camera_rect: &'a mut egui::Rect,
     /// The editor viewport's offscreen render (RTT), painted to fill the tab.
     viewport_texture: Option<(egui::TextureId, [f32; 2])>,
     /// A camera object is selected → draw its preview as a viewport overlay.
@@ -8152,35 +8696,11 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        match tab {
-            Tab::Viewport => format!("{}  Viewport", ph::CUBE).into(),
-            Tab::Camera => format!("{}  Camera", ph::VIDEO_CAMERA).into(),
-            Tab::UiEditor => format!("{}  UI Editor", ph::LAYOUT).into(),
-            Tab::Scene => "Scene".into(),
-            Tab::Inspector => "Inspector".into(),
-            Tab::Environment => "Environment".into(),
-            Tab::Baker => "FluxBaker".into(),
-            Tab::Files => "Files".into(),
-            Tab::Log => {
-                let warns = log_capture::store().lock().unwrap().entries.iter().filter(|e| e.level == tracing::Level::WARN).count();
-                if warns > 0 { format!("Log  {warns}").into() } else { "Log".into() }
-            }
-            Tab::Code(path) => path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".to_owned())
-                .into(),
-        }
+        self.fit_labels.get(tab).cloned().unwrap_or_else(|| tab_label(tab)).into()
     }
 
     fn clear_background(&self, tab: &Tab) -> bool {
         !matches!(tab, Tab::Viewport)
-    }
-
-    fn closeable(&mut self, tab: &mut Tab) -> bool {
-        // Only code tabs get a per-tab close X; panels stay put (reopen via
-        // the Windows menu).
-        matches!(tab, Tab::Code(_))
     }
 
     fn on_close(&mut self, tab: &mut Tab) -> egui_dock::tab_viewer::OnCloseResponse {
@@ -8192,9 +8712,14 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
     }
 
     fn on_tab_button(&mut self, tab: &mut Tab, response: &egui::Response) {
+        if self.fit_labels.contains_key(tab) {
+            response.clone().on_hover_text(tab_label(tab));
+        }
         if self.active_tabs_prev.contains(tab) {
             let r = response.rect;
-            response.ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("citrus-tab-underline"))).rect_filled(
+            // In the tab's own layer, clipped to its visible part, so windows
+            // cover it and scrolled-off tabs don't show it.
+            response.ctx.layer_painter(response.layer_id).with_clip_rect(response.interact_rect).rect_filled(
                 egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - 2.0), r.right_bottom()),
                 egui::CornerRadius::ZERO,
                 citrus_editor::theme::accent(),
@@ -8207,7 +8732,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
         // Panel padding (spec §2.7) for tabs that don't draw their own header
         // strip or fill edge to edge.
         let mut padded_ui;
-        let ui: &mut egui::Ui = if matches!(tab, Tab::Viewport | Tab::Scene | Tab::UiEditor | Tab::Files | Tab::Code(_)) {
+        let ui: &mut egui::Ui = if matches!(tab, Tab::Viewport | Tab::Scene | Tab::UiEditor | Tab::AnimController | Tab::AnimClip | Tab::Files | Tab::Code(_)) {
             ui
         } else {
             let rect = ui.max_rect().shrink2(egui::vec2(citrus_editor::theme::PAD, 8.0));
@@ -8235,8 +8760,20 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     }
                 }
             }
+            Tab::AnimController | Tab::AnimClip => {
+                let selected = match self.selection {
+                    Selection::Object(i) => Some(*i),
+                    _ => None,
+                };
+                if matches!(tab, Tab::AnimController) {
+                    self.anim_ctrl_tab.ui(ui, self.scene, selected, self.project_root, self.playing);
+                } else {
+                    self.anim_clip_tab.ui(ui, self.scene, selected, self.project_root, self.playing);
+                }
+            }
             Tab::Environment => self.environment_ui(ui),
             Tab::Baker => self.baker_ui(ui),
+            Tab::Occlusion => self.occlusion_tab(ui),
             Tab::Scene => {
                 let rows: Vec<citrus_editor::SceneObjectRow> = self
                     .scene
@@ -8280,6 +8817,9 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 if let Some(index) = response.delete {
                     self.actions.push(EditorAction::DeleteObject(index));
                 }
+                if let Some(members) = response.group {
+                    self.actions.push(EditorAction::GroupIntoEmpty(members));
+                }
                 if let Some((index, name)) = response.rename
                     && index < self.scene.objects.len()
                 {
@@ -8305,7 +8845,11 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                             return;
                         }
                         SpawnKind::PostFxVolume => {
-                            self.actions.push(EditorAction::SpawnPostFxVolume);
+                            self.actions.push(EditorAction::SpawnPostFxVolume(false));
+                            return;
+                        }
+                        SpawnKind::GlobalPostFxVolume => {
+                            self.actions.push(EditorAction::SpawnPostFxVolume(true));
                             return;
                         }
                         SpawnKind::ReflectionProbe => {
@@ -8326,6 +8870,34 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         }
                         SpawnKind::SphereCollider => {
                             self.actions.push(EditorAction::SpawnSphereCollider);
+                            return;
+                        }
+                        SpawnKind::CapsuleCollider => {
+                            self.actions.push(EditorAction::SpawnCapsuleCollider);
+                            return;
+                        }
+                        SpawnKind::MeshCollider => {
+                            self.actions.push(EditorAction::AddMeshCollider);
+                            return;
+                        }
+                        SpawnKind::Water => {
+                            self.actions.push(EditorAction::SpawnWater);
+                            return;
+                        }
+                        SpawnKind::FloatingCube => {
+                            self.actions.push(EditorAction::SpawnFloatingCube);
+                            return;
+                        }
+                        SpawnKind::Bucket => {
+                            self.actions.push(EditorAction::SpawnBucket);
+                            return;
+                        }
+                        SpawnKind::Waterfall => {
+                            self.actions.push(EditorAction::SpawnWaterfall);
+                            return;
+                        }
+                        SpawnKind::Whirlpool => {
+                            self.actions.push(EditorAction::SpawnWhirlpool);
                             return;
                         }
                         SpawnKind::Cube => ObjectSource::Primitive {
@@ -8448,8 +9020,17 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 if let Some(dir) = response.create_shader_in {
                     self.actions.push(EditorAction::CreateShader(dir));
                 }
+                if let Some(dir) = response.create_anim_controller_in {
+                    crate::anim_controller_editor::create_asset(&dir, true, self.project_root, self.anim_ctrl_tab, self.anim_clip_tab);
+                }
+                if let Some(dir) = response.create_anim_clip_in {
+                    crate::anim_controller_editor::create_asset(&dir, false, self.project_root, self.anim_ctrl_tab, self.anim_clip_tab);
+                }
                 if let Some(dir) = response.create_postfx_in {
                     self.actions.push(EditorAction::CreatePostFx(dir));
+                }
+                if let Some(dir) = response.create_physmat_in {
+                    self.actions.push(EditorAction::CreatePhysMat(dir));
                 }
                 if let Some(dir) = response.create_folder_in {
                     self.actions.push(EditorAction::CreateFolder(dir));
@@ -8466,6 +9047,15 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 // Keep the selection and any open .material following
                 // renamed/moved files.
                 for (old, new) in response.moved {
+                    // Sidecar ids follow the file, so slots keep it.
+                    citrus_core::asset_ref::moved(&old, &new);
+                    for m in self.scene.materials.iter_mut() {
+                        if let Some(f) = m.file.as_mut()
+                            && let Ok(rest) = f.strip_prefix(&old)
+                        {
+                            *f = if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) };
+                        }
+                    }
                     if *self.selection == Selection::File(old.clone()) {
                         *self.selection = Selection::File(new.clone());
                     }
@@ -8507,6 +9097,10 @@ impl EditorTabs<'_> {
         self.view.inverse().x_axis.truncate().normalize_or(Vec3::X)
     }
 
+    fn camera_forward(&self) -> Vec3 {
+        (-self.view.inverse().z_axis.truncate()).normalize_or(Vec3::NEG_Z)
+    }
+
     /// Unified component-gizmo interaction: grab a box-face or range-radius
     /// handle (from any component's `gizmos()`), suppress orbit for the gesture,
     /// and write the resize back via `apply_gizmo_edit`. Replaces the per-type
@@ -8533,63 +9127,70 @@ impl EditorTabs<'_> {
                 GizmoDragKind::BoxFace {
                     axis,
                     sign,
-                    object_anchored,
                     start_size,
                     start_center,
                     start_origin_world,
-                    world_axis,
+                    start_world,
                     scale_a,
                     screen_axis,
+                    ..
                 } => {
-                    let (axis, sign, object_anchored) = (*axis, *sign, *object_anchored);
-                    let (start_size, start_center, start_origin_world, world_axis, scale_a) =
-                        (*start_size, *start_center, *start_origin_world, *world_axis, *scale_a);
+                    let (axis, sign) = (*axis, *sign);
+                    let (start_size, start_center, start_origin_world, start_world, scale_a) =
+                        (*start_size, *start_center, *start_origin_world, *start_world, *scale_a);
                     let len2 = screen_axis.length_sq();
-                    let meters_world = if len2 > 1.0e-6 {
-                        delta.dot(*screen_axis) / len2
-                    } else {
-                        0.0
-                    };
-                    let local_delta = if scale_a.abs() > 1.0e-5 {
-                        meters_world / scale_a
-                    } else {
-                        0.0
-                    };
-                    let new_size_a = (start_size[axis] + local_delta).max(0.1);
-                    let applied = new_size_a - start_size[axis];
+                    let meters_world = if len2 > 1.0e-6 { delta.dot(*screen_axis) / len2 } else { 0.0 };
+                    let local_delta = if scale_a.abs() > 1.0e-5 { meters_world / scale_a } else { 0.0 };
+                    // Alt: both sides move about the centre (the grabbed face
+                    // still follows the cursor). Otherwise only the grabbed
+                    // face moves and the opposite one stays put.
+                    let both = response.ctx.input(|i| i.modifiers.alt);
+                    let mut axv = Vec3::ZERO;
+                    axv[axis] = 1.0;
                     let mut new_size = start_size;
-                    new_size[axis] = new_size_a;
-                    let new_half = new_size * 0.5;
-                    if object_anchored {
-                        // Move the object so the opposite face stays put (parent-aware).
-                        let new_origin = start_origin_world + world_axis * (applied * scale_a * 0.5);
-                        let parent_world = self.scene.objects[object]
-                            .parent
-                            .map_or(glam::Mat4::IDENTITY, |p| self.scene.world_transform(p));
-                        let new_translation = parent_world.inverse().transform_point3(new_origin);
-                        if let Some(c) = self.scene.objects[object].components.get_mut(component) {
-                            self.editor_components.apply_gizmo_edit(
-                                c.as_mut(),
-                                citrus_editor::GizmoEdit::Box {
-                                    index: gizmo,
-                                    half_extents: new_half,
-                                    center: start_center,
-                                },
-                            );
-                        }
-                        self.scene.objects[object].translation = new_translation;
+                    let new_center = if both {
+                        new_size[axis] = (start_size[axis] + 2.0 * local_delta).max(0.1);
+                        start_center
                     } else {
-                        let mut axv = Vec3::ZERO;
-                        axv[axis] = sign * (applied * 0.5);
-                        let new_center = start_center + axv;
+                        new_size[axis] = (start_size[axis] + local_delta).max(0.1);
+                        start_center + axv * (sign * (new_size[axis] - start_size[axis]) * 0.5)
+                    };
+                    if let Some(c) = self.scene.objects[object].components.get_mut(component) {
+                        self.editor_components.apply_gizmo_edit(
+                            c.as_mut(),
+                            citrus_editor::GizmoEdit::Box { index: gizmo, half_extents: new_size * 0.5, center: new_center },
+                        );
+                    }
+                    // Where the component now puts its box (some keep it on the
+                    // object's origin): move the object so the opposite face
+                    // ends up where it started.
+                    let mut shift = Vec3::ZERO;
+                    if !both
+                        && let Some(c) = self.scene.objects[object].components.get(component)
+                        && let Some(citrus_editor::GizmoSpec::Box { center, half_extents, .. }) =
+                            self.editor_components.gizmos(c.as_ref()).into_iter().nth(gizmo)
+                    {
+                        let opp_before = start_world.transform_point3(start_center - axv * (sign * start_size[axis] * 0.5));
+                        let opp_after = start_world.transform_point3(center - axv * (sign * half_extents[axis]));
+                        shift = opp_before - opp_after;
+                    }
+                    let parent_world =
+                        self.scene.objects[object].parent.map_or(glam::Mat4::IDENTITY, |p| self.scene.world_transform(p));
+                    self.scene.objects[object].translation = parent_world.inverse().transform_point3(start_origin_world + shift);
+                }
+                GizmoDragKind::Handle { start_local, right, up, screen_right, screen_up, inv_world } => {
+                    // Solve delta = a * screen_right + b * screen_up for the
+                    // world-meter amounts along camera right / up.
+                    let det = screen_right.x * screen_up.y - screen_right.y * screen_up.x;
+                    if det.abs() > 1.0e-6 {
+                        let a = (delta.x * screen_up.y - delta.y * screen_up.x) / det;
+                        let b = (screen_right.x * delta.y - screen_right.y * delta.x) / det;
+                        let world_delta = *right * a + *up * b;
+                        let position = *start_local + inv_world.transform_vector3(world_delta);
                         if let Some(c) = self.scene.objects[object].components.get_mut(component) {
                             self.editor_components.apply_gizmo_edit(
                                 c.as_mut(),
-                                citrus_editor::GizmoEdit::Box {
-                                    index: gizmo,
-                                    half_extents: new_half,
-                                    center: new_center,
-                                },
+                                citrus_editor::GizmoEdit::Handle { index: gizmo, position },
                             );
                         }
                     }
@@ -8631,7 +9232,7 @@ impl EditorTabs<'_> {
             return;
         }
         let Some(press) = cursor else { return };
-        if self.gizmo.pick_preview(press) {
+        if self.gizmo.pick_preview(press) && !crate::river_edit::building(&response.ctx) {
             return; // the move/rotate/scale gizmo owns this press
         }
         let full_rect2 = full_rect;
@@ -8642,12 +9243,7 @@ impl EditorTabs<'_> {
         for (ci, comp) in self.scene.objects[i].components.iter().enumerate() {
             for (gi, spec) in self.editor_components.gizmos(comp.as_ref()).into_iter().enumerate() {
                 match spec {
-                    citrus_editor::GizmoSpec::Box {
-                        center,
-                        half_extents,
-                        object_anchored,
-                        ..
-                    } => {
+                    citrus_editor::GizmoSpec::Box { center, half_extents, .. } => {
                         for axis in 0..3 {
                             for sign in [-1.0f32, 1.0] {
                                 let face_local = center + axes[axis] * (sign * half_extents[axis]);
@@ -8676,11 +9272,10 @@ impl EditorTabs<'_> {
                                             kind: GizmoDragKind::BoxFace {
                                                 axis,
                                                 sign,
-                                                object_anchored,
                                                 start_size: half_extents * 2.0,
                                                 start_center: center,
                                                 start_origin_world: w_trans,
-                                                world_axis,
+                                                start_world: world,
                                                 scale_a: w_scale[axis],
                                                 screen_axis: plus - fs,
                                             },
@@ -8721,7 +9316,45 @@ impl EditorTabs<'_> {
                             ));
                         }
                     }
-                    citrus_editor::GizmoSpec::Points { .. } => {}
+                    citrus_editor::GizmoSpec::Handle { position, .. } => {
+                        let at = world.transform_point3(position);
+                        let Some(hs) = self.world_to_screen(at, full_rect2) else {
+                            continue;
+                        };
+                        let dist = press.distance(hs);
+                        if dist > 12.0 {
+                            continue;
+                        }
+                        let right = self.camera_right();
+                        let up = right.cross(self.camera_forward()).normalize_or(Vec3::Y);
+                        let (Some(r), Some(u)) =
+                            (self.world_to_screen(at + right, full_rect2), self.world_to_screen(at + up, full_rect2))
+                        else {
+                            continue;
+                        };
+                        // Handles win ties against box faces they sit on.
+                        let dist = dist - 4.0;
+                        if best.as_ref().is_none_or(|(d, _)| dist < *d) {
+                            best = Some((
+                                dist,
+                                GizmoDrag {
+                                    object: i,
+                                    component: ci,
+                                    gizmo: gi,
+                                    start_cursor: press,
+                                    kind: GizmoDragKind::Handle {
+                                        start_local: position,
+                                        right,
+                                        up,
+                                        screen_right: r - hs,
+                                        screen_up: u - hs,
+                                        inv_world: world.inverse(),
+                                    },
+                                },
+                            ));
+                        }
+                    }
+                    citrus_editor::GizmoSpec::Points { .. } | citrus_editor::GizmoSpec::Lines { .. } => {}
                 }
             }
         }
@@ -8872,12 +9505,13 @@ impl EditorTabs<'_> {
                     h = avail.y;
                     w = h * aspect;
                 }
-                ui.centered_and_justified(|ui| {
+                let image = ui.centered_and_justified(|ui| {
                     ui.add(
                         egui::Image::new(egui::load::SizedTexture::new(texture, egui::vec2(w, h)))
                             .maintain_aspect_ratio(true),
-                    );
+                    )
                 });
+                *self.camera_rect = egui::Rect::from_center_size(image.inner.rect.center(), egui::vec2(w, h));
             }
             _ => {
                 ui.centered_and_justified(|ui| {
@@ -8892,10 +9526,96 @@ impl EditorTabs<'_> {
         }
     }
 
+    /// Occlusion tab: bake settings, Bake / Clear, and the visualization
+    /// toggles (cull the Scene view, preview from the game camera, cell grid).
+    fn occlusion_tab(&mut self, ui: &mut egui::Ui) {
+        use citrus_editor::{icons::Icon, theme, widgets};
+        use egui::RichText;
+        ui.label(
+            RichText::new("Baked visibility per view cell: static objects hidden behind static geometry skip rendering")
+                .size(theme::SIZE_META)
+                .color(theme::TEXT_MUTED),
+        );
+        ui.add_space(8.0);
+        let occ = &mut *self.occlusion_ui;
+        widgets::eyebrow(ui, "Bake");
+        widgets::property_row(ui, "Cell size", |ui| {
+            ui.add(egui::DragValue::new(&mut occ.settings.cell_size).speed(0.1).range(0.5..=64.0).suffix(" m"))
+                .on_hover_text("View-cell edge length. Smaller cells cull more precisely but take longer to bake and use more memory.");
+        });
+        widgets::property_row(ui, "Quality", |ui| {
+            widgets::segmented(ui, &mut occ.settings.rays, &[(256, "Low"), (1024, "Medium"), (4096, "High")])
+                .on_hover_text("Rays per sample point. Higher finds small or distant gaps more reliably.");
+        });
+        let statics = self.scene.objects.iter().filter(|o| o.static_geometry && o.render.is_some()).count();
+        widgets::info_note(ui, &format!("{statics} static objects occlude and can be culled. Dynamic objects are never occlusion culled."));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if widgets::primary_button(ui, Some(Icon::Grid), "Bake occlusion").clicked() {
+                self.actions.push(EditorAction::BakeOcclusion);
+            }
+            if ui
+                .add_enabled_ui(self.scene.occlusion.is_some(), |ui| widgets::secondary_button(ui, Some(Icon::Trash), "Clear"))
+                .inner
+                .clicked()
+            {
+                self.actions.push(EditorAction::ClearOcclusion);
+            }
+        });
+        widgets::section_gap(ui);
+
+        widgets::eyebrow(ui, "Baked data");
+        match &self.scene.occlusion {
+            None => {
+                ui.label(RichText::new("Not baked").color(theme::TEXT_DIM));
+            }
+            Some(o) => {
+                let mono = theme::mono(theme::SIZE_META);
+                widgets::property_row(ui, "Cells", |ui| {
+                    ui.label(RichText::new(format!("{} ({} x {} x {})", o.cell_count(), o.dims[0], o.dims[1], o.dims[2])).font(mono.clone()));
+                });
+                widgets::property_row(ui, "Cell size", |ui| {
+                    ui.label(RichText::new(format!("{:.2} m", o.cell_size)).font(mono.clone()));
+                });
+                widgets::property_row(ui, "Objects", |ui| {
+                    ui.label(RichText::new(o.objects.len().to_string()).font(mono.clone()));
+                });
+                widgets::property_row(ui, "Size", |ui| {
+                    ui.label(RichText::new(format!("{} KB", o.byte_size().div_ceil(1024))).font(mono.clone()));
+                });
+                let cam = self.scene.occlusion_camera;
+                widgets::property_row(ui, "Camera cell", |ui| match cam.and_then(|c| o.cell_of(c)) {
+                    Some(c) => {
+                        let [x, y, z] = o.cell_coords(c);
+                        ui.label(
+                            RichText::new(format!("({x}, {y}, {z}) · {} / {} visible", o.visible_count(c), o.objects.len()))
+                                .font(mono.clone())
+                                .color(theme::accent()),
+                        );
+                    }
+                    None => {
+                        ui.label(RichText::new("outside baked bounds (no culling)").color(theme::TEXT_DIM));
+                    }
+                });
+            }
+        }
+        widgets::section_gap(ui);
+
+        widgets::eyebrow(ui, "Visualization");
+        let occ = &mut *self.occlusion_ui;
+        ui.checkbox(&mut occ.cull_scene, "Cull the Scene view");
+        ui.add_enabled_ui(occ.cull_scene, |ui| {
+            ui.checkbox(&mut occ.preview_game, "Preview from the game camera")
+                .on_hover_text("Cull from the main camera's position: fly around in the Scene view to see what that camera draws.");
+        });
+        ui.checkbox(&mut occ.show_cells, "Show cells")
+            .on_hover_text("Draw the baked bounds and the culling camera's cell in the Scene view.");
+    }
+
     /// The Environment tab: world sun, ambient, and skybox setup.
     /// "FluxBaker": lighting-bake settings + Bake / Clear actions.
     fn baker_ui(&mut self, ui: &mut egui::Ui) {
-        use egui::{DragValue, RichText, Slider};
+        use egui::{DragValue, RichText};
         ui.label(
             RichText::new("Ray-traced lightmaps + light probes for static geometry")
                 .size(citrus_editor::theme::SIZE_META)
@@ -8951,8 +9671,9 @@ impl EditorTabs<'_> {
                 ui.horizontal(|ui| {
                     citrus_editor::widgets::row_label(ui, "Texel Density")
                         .on_hover_text("Lightmap texels per world meter (Bakery-style)");
-                    ui.add(
-                        Slider::new(&mut bake.texel_density, 1.0..=1024.0)
+                    citrus_editor::widgets::slider(
+                        ui,
+                        egui::Slider::new(&mut bake.texel_density, 1.0..=1024.0)
                             .logarithmic(true)
                             .suffix(" /m"),
                     );
@@ -8969,7 +9690,7 @@ impl EditorTabs<'_> {
                 });
                 ui.horizontal(|ui| {
                     citrus_editor::widgets::row_label(ui, "GPU Throttle");
-                    ui.add(Slider::new(&mut bake.gpu_throttle, 0.0..=2.0).step_by(0.1))
+                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut bake.gpu_throttle, 0.0..=2.0).step_by(0.1))
                         .on_hover_text(
                             "Idle the GPU for this fraction of each bake dispatch so the desktop \
                              stays responsive while baking. 0 = fastest bake (hogs the GPU, can \
@@ -8982,7 +9703,7 @@ impl EditorTabs<'_> {
                 ui.horizontal(|ui| {
                     citrus_editor::widgets::row_label(ui, "Bounces")
                         .on_hover_text("Indirect light bounces (0 = direct + sky only)");
-                    ui.add(Slider::new(&mut bake.bounces, 0..=8));
+                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut bake.bounces, 0..=8));
                 });
                 ui.horizontal(|ui| {
                     citrus_editor::widgets::row_label(ui, "Samples")
@@ -9242,7 +9963,7 @@ impl EditorTabs<'_> {
                             let mode = gi.mode;
                             ui.horizontal(|ui| {
                                 citrus_editor::widgets::row_label(ui, "Intensity");
-                                ui.add(egui::Slider::new(&mut gi.intensity, 0.0..=4.0))
+                                citrus_editor::widgets::slider(ui, egui::Slider::new(&mut gi.intensity, 0.0..=4.0))
                                     .on_hover_text("Indirect bounce strength multiplier.");
                             });
                             if mode.uses_quality() {
@@ -9265,14 +9986,14 @@ impl EditorTabs<'_> {
                             if mode.uses_bounces() {
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Bounces");
-                                    ui.add(egui::Slider::new(&mut gi.bounces, 1..=4)).on_hover_text(
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut gi.bounces, 1..=4)).on_hover_text(
                                         "Indirect bounces per ray (more = softer fill).",
                                     );
                                 });
                             }
                             ui.horizontal(|ui| {
                                 citrus_editor::widgets::row_label(ui, "Smoothing");
-                                ui.add(egui::Slider::new(&mut gi.smoothing, 0.0..=1.0))
+                                citrus_editor::widgets::slider(ui, egui::Slider::new(&mut gi.smoothing, 0.0..=1.0))
                                     .on_hover_text(
                                         "Temporal stability: higher = smoother but more motion lag; \
                                          lower = sharper/more responsive but noisier while moving.",
@@ -9283,7 +10004,8 @@ impl EditorTabs<'_> {
                             if mode.uses_voxel_density() {
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Voxel density");
-                                    ui.add(
+                                    citrus_editor::widgets::slider(
+                                        ui,
                                         egui::Slider::new(&mut gi.voxel_density, 0.25..=4.0)
                                             .suffix(" /m"),
                                     )
@@ -9328,7 +10050,8 @@ impl EditorTabs<'_> {
                                     {
                                         ui.horizontal(|ui| {
                                             citrus_editor::widgets::row_label(ui, "Clipmap extent");
-                                            ui.add(
+                                            citrus_editor::widgets::slider(
+                                                ui,
                                                 egui::Slider::new(
                                                     &mut gi.voxel_clipmap_extent,
                                                     4.0..=64.0,
@@ -9383,7 +10106,8 @@ impl EditorTabs<'_> {
                                     if mode.uses_march_distance() {
                                         ui.horizontal(|ui| {
                                             citrus_editor::widgets::row_label(ui, "March distance");
-                                            ui.add(
+                                            citrus_editor::widgets::slider(
+                                                ui,
                                                 egui::Slider::new(&mut gi.march_distance, 0.0..=500.0)
                                                     .suffix(" m"),
                                             )
@@ -9395,7 +10119,7 @@ impl EditorTabs<'_> {
                                     if mode.uses_samples() {
                                         ui.horizontal(|ui| {
                                             citrus_editor::widgets::row_label(ui, "Firefly clamp");
-                                            ui.add(egui::Slider::new(
+                                            citrus_editor::widgets::slider(ui, egui::Slider::new(
                                                 &mut gi.firefly_clamp,
                                                 0.5..=16.0,
                                             ))
@@ -9404,6 +10128,14 @@ impl EditorTabs<'_> {
                                             );
                                         });
                                     }
+                                    ui.horizontal(|ui| {
+                                        citrus_editor::widgets::row_label(ui, "Emissive boost");
+                                        citrus_editor::widgets::slider(ui, egui::Slider::new(&mut gi.emissive_boost, 0.0..=32.0).logarithmic(true))
+                                            .on_hover_text(
+                                                "How much light emissive objects throw into the GI (their own brightness \
+                                                 is unchanged). 1 = physical; raise for stronger coloured pools.",
+                                            );
+                                    });
                                     ui.horizontal(|ui| {
                                         citrus_editor::widgets::row_label(ui, "Probe fallback");
                                         egui::ComboBox::from_id_salt("citrus-flux-fallback")
@@ -9426,8 +10158,8 @@ impl EditorTabs<'_> {
                             "FluxVoxel runs alongside the bake (baked voxels are its static base) \
                              — these settings are live."
                         } else {
-                            "A bake is loaded, so Flux/FluxRT realtime GI is paused; these settings \
-                             apply when you Clear the bake. (FluxVoxel runs with a bake.)"
+                            "A bake is loaded: Flux/FluxRT run in mixed mode, adding moving \
+                             emitters and realtime lights on top of the lightmaps."
                         };
                         ui.label(RichText::new(note).small().weak());
                     }
@@ -9475,12 +10207,13 @@ impl EditorTabs<'_> {
                             ui.add_enabled_ui(gi.reflection_mode != 0, |ui| {
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Intensity");
-                                    ui.add(egui::Slider::new(&mut gi.ssr_intensity, 0.0..=2.0))
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut gi.ssr_intensity, 0.0..=2.0))
                                         .on_hover_text("Reflection strength multiplier.");
                                 });
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Max distance");
-                                    ui.add(
+                                    citrus_editor::widgets::slider(
+                                        ui,
                                         egui::Slider::new(&mut gi.ssr_max_distance, 1.0..=200.0)
                                             .suffix(" m"),
                                     )
@@ -9488,12 +10221,34 @@ impl EditorTabs<'_> {
                                 });
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Roughness cutoff");
-                                    ui.add(egui::Slider::new(&mut gi.ssr_roughness_cutoff, 0.0..=1.0))
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut gi.ssr_roughness_cutoff, 0.0..=1.0))
                                         .on_hover_text(
-                                            "Surfaces rougher than this skip SSR (the probe / env \
-                                             cube carries them instead).",
+                                            "Surfaces rougher than this skip SSR / ray tracing (the probe / env \
+                                             cube carries them instead). Raise it to ray trace glossier surfaces.",
                                         );
                                 });
+                                if gi.reflection_mode == 2 {
+                                    ui.horizontal(|ui| {
+                                        citrus_editor::widgets::row_label(ui, "Rays per pixel");
+                                        citrus_editor::widgets::segmented(
+                                            ui,
+                                            &mut gi.rt_samples,
+                                            &[(1, "1"), (2, "2"), (4, "4"), (8, "8"), (16, "16")],
+                                        )
+                                        .on_hover_text(
+                                            "Rough surfaces spread these over their glossy lobe: more rays = \
+                                             smoother glossy reflections, at a matching GPU cost.",
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        citrus_editor::widgets::row_label(ui, "Bounces");
+                                        citrus_editor::widgets::segmented(ui, &mut gi.rt_bounces, &[(1, "1"), (2, "2"), (3, "3"), (4, "4")])
+                                            .on_hover_text(
+                                                "Reflections of reflections: 2+ shows mirrors and metals inside \
+                                                 reflections instead of their environment fallback.",
+                                            );
+                                    });
+                                }
                             });
                             citrus_editor::widgets::section_gap(ui);
                             ui.label(RichText::new("Reflection Probes").small().strong());
@@ -9550,7 +10305,8 @@ impl EditorTabs<'_> {
                     });
                     ui.horizontal(|ui| {
                         citrus_editor::widgets::row_label(ui, "Distance");
-                        ui.add(
+                        citrus_editor::widgets::slider(
+                            ui,
                             egui::Slider::new(&mut env.shadow_distance, 5.0..=150.0).suffix(" m"),
                         )
                         .on_hover_text(
@@ -9559,7 +10315,7 @@ impl EditorTabs<'_> {
                     });
                     ui.horizontal(|ui| {
                         citrus_editor::widgets::row_label(ui, "Softness");
-                        ui.add(egui::Slider::new(&mut env.shadow_softness, 0.0..=4.0));
+                        citrus_editor::widgets::slider(ui, egui::Slider::new(&mut env.shadow_softness, 0.0..=4.0));
                     });
                     ui.label(
                         RichText::new(format!(
@@ -9584,20 +10340,20 @@ impl EditorTabs<'_> {
                                 });
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Density");
-                                    ui.add(egui::Slider::new(&mut env.fog_density, 0.0..=0.5).logarithmic(true));
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut env.fog_density, 0.0..=0.5).logarithmic(true));
                                 });
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Start distance");
-                                    ui.add(egui::Slider::new(&mut env.fog_start_distance, 0.0..=100.0).suffix(" m"));
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut env.fog_start_distance, 0.0..=100.0).suffix(" m"));
                                 });
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Height falloff");
-                                    ui.add(egui::Slider::new(&mut env.fog_height_falloff, 0.0..=1.0))
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut env.fog_height_falloff, 0.0..=1.0))
                                         .on_hover_text("Fog thins above the height reference (0 = uniform).");
                                 });
                                 ui.horizontal(|ui| {
                                     citrus_editor::widgets::row_label(ui, "Height ref");
-                                    ui.add(egui::Slider::new(&mut env.fog_height_ref, -50.0..=50.0).suffix(" m"));
+                                    citrus_editor::widgets::slider(ui, egui::Slider::new(&mut env.fog_height_ref, -50.0..=50.0).suffix(" m"));
                                 });
                             });
                         });
@@ -9609,13 +10365,23 @@ impl EditorTabs<'_> {
                         .show(ui, |ui| {
                             ui.label(
                                 RichText::new(
-                                    "Always-applied scene post FX (the global volume). Local Volume \
-                                     components blend on top by priority/weight.",
+                                    "The scene's base post FX. Post FX Volumes blend on top by priority and \
+                                     weight, and each effect a volume enables overrides the same effect here.",
                                 )
                                 .small()
                                 .weak(),
                             );
-                            postfx_editor_ui(ui, &mut env.postfx);
+                            let overrides = &self.scene.postfx_overrides;
+                            if overrides.iter().any(|(_, _, fx)| !fx.is_empty()) {
+                                for (name, weight, fx) in overrides.iter().filter(|(_, _, fx)| !fx.is_empty()) {
+                                    citrus_editor::widgets::info_note(
+                                        ui,
+                                        &format!("Overridden by \"{name}\" ({:.0}%): {}", weight * 100.0, fx.join(", ")),
+                                    );
+                                }
+                            }
+                            let env = &mut self.scene.environment;
+                            postfx_editor_ui(ui, &mut env.postfx, false);
                         });
                 }
 
@@ -9666,7 +10432,7 @@ impl EditorTabs<'_> {
                     ui.painter().rect_stroke(
                         slot.rect,
                         4.0,
-                        egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                        egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -9675,6 +10441,16 @@ impl EditorTabs<'_> {
                 {
                     self.actions.push(EditorAction::SetSkybox((*p).clone()));
                 }
+                ui.horizontal(|ui| {
+                    const IMAGES: [&str; 7] = ["png", "jpg", "jpeg", "bmp", "tga", "hdr", "exr"];
+                    let current = self.scene.skybox.clone().unwrap_or_default();
+                    match citrus_editor::asset_browse_button(ui, "skybox-360", &IMAGES, &current) {
+                        Some(p) if p.is_empty() => self.actions.push(EditorAction::ClearSkybox),
+                        Some(p) => self.actions.push(EditorAction::SetSkybox(self.project_root.join(p))),
+                        None => {}
+                    }
+                    ui.label(RichText::new("Browse images").small().weak());
+                });
                 if self.scene.skybox.is_some() && ui.button("Clear 360° image").clicked() {
                     self.actions.push(EditorAction::ClearSkybox);
                 }
@@ -9706,6 +10482,13 @@ impl EditorTabs<'_> {
                                 .show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
+                                        const IMAGES: [&str; 7] = ["png", "jpg", "jpeg", "bmp", "tga", "hdr", "exr"];
+                                        let current = assigned.clone().unwrap_or_default();
+                                        if let Some(p) = citrus_editor::asset_browse_button(ui, FACE_LABELS[i], &IMAGES, &current)
+                                            && !p.is_empty()
+                                        {
+                                            self.actions.push(EditorAction::SetSkyboxFace(i, self.project_root.join(p)));
+                                        }
                                         ui.label(FACE_LABELS[i]);
                                         match &assigned {
                                             Some(p) => {
@@ -9730,7 +10513,7 @@ impl EditorTabs<'_> {
                                     face.rect,
                                     4.0,
                                     egui::Stroke::new(
-                                        2.0,
+                                        2.0_f32,
                                         ui.visuals().selection.stroke.color,
                                     ),
                                     egui::StrokeKind::Outside,
@@ -9817,6 +10600,10 @@ impl EditorTabs<'_> {
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
         let mut gizmo_changed = false;
+        // Building a river path hides the transform gizmo (clicks lay points).
+        let river_building = !self.playing
+            && matches!(*self.selection, Selection::Object(i) if self.scene.is_active(i))
+            && crate::river_edit::building(ui.ctx());
 
         // Claim a drag for the gizmo the instant it starts on a handle (using
         // the gizmo's own enlarged pick band), so orbit is suppressed for the
@@ -9831,6 +10618,7 @@ impl EditorTabs<'_> {
             *self.orbit_armed =
                 self.pointer_in_viewport && press.is_some_and(|p| rect.contains(p));
             *self.gizmo_drag = !alt
+                && !river_building
                 && matches!(self.selection, Selection::Object(_))
                 && press.is_some_and(|p| self.gizmo.pick_preview(p));
         }
@@ -9884,10 +10672,15 @@ impl EditorTabs<'_> {
             self.gizmo_interaction(&response, cursor, alt);
         }
         let probe_active = self.handle_drag.is_some();
+        let new_handle_drag = response
+            .drag_started_by(egui::PointerButton::Primary)
+            .then(|| self.handle_drag.as_ref().map(|d| (d.object, d.component, d.gizmo)))
+            .flatten();
 
         if !self.orbiting
             && self.widget_filter.enabled
             && !probe_active
+            && !river_building
             && !ui_selected_screen
             && !matches!(self.gizmo.tool, GizmoTool::Select | GizmoTool::Rect)
             && let Selection::Object(i) = *self.selection
@@ -9983,7 +10776,7 @@ impl EditorTabs<'_> {
                 let near_c = corners(near);
                 let far_c = corners(far);
                 let origin = world.transform_point3(Vec3::ZERO);
-                let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(110, 255, 140));
+                let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(110, 255, 140));
                 // Lines are clipped against the editor camera's near plane
                 // in clip space (partially-behind segments draw instead of
                 // vanishing), then against the screen rect; near-plane
@@ -10027,13 +10820,13 @@ impl EditorTabs<'_> {
         // handles + optional blend shell), interior point clouds, and range
         // spheres — each component declares its set via `gizmos()` and they are
         // ALL drawn here uniformly (built-ins and plugins alike).
-        let gizmo_sel = match self.selection {
-            Selection::Object(i) => Some(*i),
-            _ => None,
+        // Every selected object's gizmos, not just the active one's.
+        let gizmo_sels: Vec<usize> = match self.selection {
+            Selection::Object(i) if self.multi_objects.len() > 1 && self.multi_objects.contains(i) => self.multi_objects.clone(),
+            Selection::Object(i) => vec![*i],
+            _ => Vec::new(),
         };
-        if let Some(sel) = gizmo_sel
-            && self.scene.is_active(sel)
-        {
+        for sel in gizmo_sels.into_iter().filter(|&s| s < self.scene.objects.len() && self.scene.is_active(s)) {
             let view_proj = self.proj * self.view;
             let full_rect = *self.viewport_rect;
             let painter = ui.painter();
@@ -10120,6 +10913,40 @@ impl EditorTabs<'_> {
                 }
             };
             let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+            // Mesh Collider: the shape it actually builds (triangles, a hull,
+            // or the convex pieces a moving body gets).
+            if let Some(mc) = self.scene.objects[sel].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::MeshCollider>()) {
+                let moving = self.scene.objects[sel]
+                    .components
+                    .iter()
+                    .find_map(|c| c.as_any().downcast_ref::<citrus_core::RigidBody>())
+                    .is_some_and(|rb| rb.kind != citrus_core::BodyKind::Fixed);
+                if let Some(wire) = crate::physics::mesh_collider_wire_for(self.scene, sel, crate::physics::MeshShapeMode::of(mc, moving)) {
+                    let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(120, 235, 140, 150));
+                    for (a, b) in wire.iter() {
+                        if let (Some(pa), Some(pb)) = (project(world.transform_point3(*a)), project(world.transform_point3(*b))) {
+                            painter.line_segment([pa, pb], stroke);
+                        }
+                    }
+                }
+            }
+            // Joints: a dashed line from the anchor to the connected body.
+            for comp in &self.scene.objects[sel].components {
+                let Some(j) = comp.as_any().downcast_ref::<citrus_core::PhysicsJoint>() else { continue };
+                let Some(id) = j.connected.id() else { continue };
+                let Some(other) = self.scene.objects.iter().position(|o| o.id == id) else { continue };
+                let a = world.transform_point3(Vec3::from(j.anchor));
+                let b = self.scene.world_transform(other).w_axis.truncate();
+                if let (Some(pa), Some(pb)) = (project(a), project(b)) {
+                    painter.extend(egui::Shape::dashed_line(
+                        &[pa, pb],
+                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 200, 90)),
+                        6.0,
+                        4.0,
+                    ));
+                    painter.circle_stroke(pb, 5.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 200, 90)));
+                }
+            }
             for comp in &self.scene.objects[sel].components {
                 for spec in self.editor_components.gizmos(comp.as_ref()) {
                     match spec {
@@ -10130,19 +10957,22 @@ impl EditorTabs<'_> {
                             color,
                             ..
                         } => {
-                            box_edges(center, half_extents, egui::Stroke::new(1.5, color));
-                            if blend > 0.001 {
-                                let inner = Vec3::new(
-                                    (half_extents.x - blend).max(0.0),
-                                    (half_extents.y - blend).max(0.0),
-                                    (half_extents.z - blend).max(0.0),
-                                );
+                            box_edges(center, half_extents, egui::Stroke::new(1.5_f32, color));
+                            if blend.abs() > 0.001 {
+                                // Blend is in world units; the box is drawn in object space.
+                                let scale = Vec3::new(
+                                    world.x_axis.truncate().length(),
+                                    world.y_axis.truncate().length(),
+                                    world.z_axis.truncate().length(),
+                                )
+                                .max(Vec3::splat(1e-4));
+                                let inner = (half_extents - Vec3::splat(blend) / scale).max(Vec3::ZERO);
                                 let dim = egui::Color32::from_rgb(
                                     color.r() / 2,
                                     color.g() / 2,
                                     color.b() / 2,
                                 );
-                                box_edges(center, inner, egui::Stroke::new(1.0, dim));
+                                box_edges(center, inner, egui::Stroke::new(1.0_f32, dim));
                             }
                             let center_screen = project(world.transform_point3(center));
                             for axis in 0..3 {
@@ -10167,6 +10997,29 @@ impl EditorTabs<'_> {
                                 }
                             }
                         }
+                        citrus_editor::GizmoSpec::Handle { position, anchor, color } => {
+                            let (Some(p), a) = (project(world.transform_point3(position)), project(world.transform_point3(anchor)))
+                            else {
+                                continue;
+                            };
+                            if let Some(a) = a {
+                                painter.extend(egui::Shape::dashed_line(&[a, p], egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6)), 4.0, 3.0));
+                            }
+                            let hovered = cursor.is_some_and(|cu| cu.distance(p) <= 12.0);
+                            let r = if hovered { 8.0 } else { 6.5 };
+                            painter.circle(p, r, color.gamma_multiply(0.35), egui::Stroke::new(2.0_f32, color));
+                            painter.circle_filled(p, 2.0, egui::Color32::WHITE);
+                        }
+                        citrus_editor::GizmoSpec::Lines { segments, color, world: in_world } => {
+                            let stroke = egui::Stroke::new(1.5_f32, color);
+                            for (a, b) in segments {
+                                if in_world {
+                                    line(a, b, stroke);
+                                } else {
+                                    line(world.transform_point3(a), world.transform_point3(b), stroke);
+                                }
+                            }
+                        }
                         citrus_editor::GizmoSpec::Points { positions, color } => {
                             for local in positions {
                                 if let Some(p) = project(world.transform_point3(local))
@@ -10182,7 +11035,7 @@ impl EditorTabs<'_> {
                             color,
                         } => {
                             let origin = world.transform_point3(center);
-                            let stroke = egui::Stroke::new(1.5, color);
+                            let stroke = egui::Stroke::new(1.5_f32, color);
                             let circle = |a: Vec3, b: Vec3| {
                                 const SEG: usize = 32;
                                 let mut prev = origin + a * radius;
@@ -10256,7 +11109,12 @@ impl EditorTabs<'_> {
                     .components
                     .iter()
                     .any(|c| c.as_any().downcast_ref::<citrus_core::UiCanvas>().is_some());
-                if !is_light
+                let is_post = object
+                    .components
+                    .iter()
+                    .any(|c| c.as_any().is::<citrus_core::VolumeComponent>());
+                if !is_post
+                    && !is_light
                     && !is_camera
                     && !is_probe
                     && !is_refl_probe
@@ -10279,7 +11137,8 @@ impl EditorTabs<'_> {
                 if !full_rect.contains(screen) {
                     continue;
                 }
-                let selected = matches!(*self.selection, Selection::Object(s) if s == i);
+                let selected = matches!(*self.selection, Selection::Object(s) if s == i)
+                    || (self.multi_objects.len() > 1 && self.multi_objects.contains(&i));
                 // Icon priority: light, probe volume (incl. FluxVolume), reflection
                 // probe, audio, UI canvas, camera.
                 let setting = if is_light {
@@ -10292,6 +11151,8 @@ impl EditorTabs<'_> {
                     self.widget_filter.audio
                 } else if is_canvas {
                     self.widget_filter.ui_canvases
+                } else if is_post {
+                    self.widget_filter.post_volumes
                 } else {
                     self.widget_filter.cameras
                 };
@@ -10310,6 +11171,8 @@ impl EditorTabs<'_> {
                     draw_audio_icon(painter, screen, selected, setting.size);
                 } else if is_canvas {
                     draw_ui_canvas_icon(painter, screen, selected, setting.size);
+                } else if is_post {
+                    draw_post_volume_icon(painter, screen, selected, setting.size);
                 } else {
                     draw_camera_icon(painter, screen, selected, setting.size);
                 }
@@ -10320,18 +11183,23 @@ impl EditorTabs<'_> {
         // Light gizmo for the selected object whenever it carries a Light
         // component (not only dedicated Light objects). Directional/spot show
         // their aim; point/spot show their range; spot shows its cone.
-        if let Selection::Object(i) = *self.selection
-            && self.scene.is_active(i)
-            && let Some(light) = self.scene.objects[i]
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_core::LightComponent>())
-        {
+        let light_sels: Vec<usize> = match *self.selection {
+            Selection::Object(i) if self.multi_objects.len() > 1 && self.multi_objects.contains(&i) => self.multi_objects.clone(),
+            Selection::Object(i) => vec![i],
+            _ => Vec::new(),
+        };
+        for i in light_sels {
+            if i >= self.scene.objects.len() || !self.scene.is_active(i) {
+                continue;
+            }
+            let Some(light) = self.scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::LightComponent>()) else {
+                continue;
+            };
             use citrus_core::LightKind;
             let view_proj = self.proj * self.view;
             let full_rect = *self.viewport_rect;
             let painter = ui.painter();
-            let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 226, 120));
+            let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 226, 120));
             let to_screen = |clip: glam::Vec4| -> egui::Pos2 {
                 let ndc = clip.truncate() / clip.w;
                 egui::pos2(
@@ -10451,7 +11319,7 @@ impl EditorTabs<'_> {
                     painter.line_segment(seg, stroke);
                 }
             };
-            let stroke = egui::Stroke::new(1.4, YELLOW);
+            let stroke = egui::Stroke::new(1.4_f32, YELLOW);
             let obj = &self.scene.objects[i];
 
             // Mesh collider: the mesh's AABB (follows the mesh, not editable).
@@ -10519,7 +11387,7 @@ impl EditorTabs<'_> {
                     full_rect.top() + (1.0 - (ndc.y * 0.5 + 0.5)) * full_rect.height(),
                 )
             };
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150));
             let line = |a: Vec3, b: Vec3| {
                 const W_EPS: f32 = 0.001;
                 let mut ca = view_proj * a.extend(1.0);
@@ -10559,11 +11427,31 @@ impl EditorTabs<'_> {
             self.actions.push(EditorAction::OrbitEnd);
         }
 
+        // The selected river's path editing: handle clicks pick its points and,
+        // while building, clicks lay new ones instead of picking objects.
+        let mut river_click = false;
+        if let Selection::Object(i) = *self.selection
+            && !self.playing
+            && self.widget_filter.enabled
+            && self.scene.is_active(i)
+        {
+            let view = crate::river_edit::View::new(self.view, self.proj, *self.viewport_rect);
+            let new_drag = new_handle_drag.filter(|d| d.0 == i).map(|d| (d.1, d.2));
+            let click = response
+                .clicked()
+                .then(|| response.interact_pointer_pos())
+                .flatten()
+                .filter(|_| !ui_clicked && !self.looking && !self.orbiting);
+            let dragging = response.dragged() || self.handle_drag.is_some();
+            river_click = crate::river_edit::viewport(ui, self.scene, i, &view, cursor, new_drag, click, dragging);
+        }
+
         // Click-to-pick on release-without-drag, unless the gizmo owns the
         // cursor or we're flying.
         let gizmo_busy =
             self.gizmo.is_focused() || cursor.is_some_and(|p| self.gizmo.pick_preview(p));
         if response.clicked()
+            && !river_click
             && !ui_clicked
             && !gizmo_busy
             && !gizmo_changed
@@ -10646,8 +11534,33 @@ impl EditorTabs<'_> {
         use citrus_editor::{icons::Icon, theme, widgets};
         let ctx = ui.ctx().clone();
 
+        // Occlusion visualization: baked bounds + the culling camera's cell.
+        if self.occlusion_ui.show_cells
+            && let Some(o) = &self.scene.occlusion
+        {
+            let painter = ui.painter_at(rect);
+            let wire = |mn: Vec3, mx: Vec3, stroke: egui::Stroke| {
+                let c = |i: usize| Vec3::new(
+                    if i & 1 == 0 { mn.x } else { mx.x },
+                    if i & 2 == 0 { mn.y } else { mx.y },
+                    if i & 4 == 0 { mn.z } else { mx.z },
+                );
+                for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
+                    if let (Some(p), Some(q)) = (self.world_to_screen(c(a), rect), self.world_to_screen(c(b), rect)) {
+                        painter.line_segment([p, q], stroke);
+                    }
+                }
+            };
+            let (bmn, bmx) = o.bounds();
+            wire(bmn, bmx, egui::Stroke::new(1.0_f32, theme::with_alpha(theme::TEXT_MUTED, 0.6)));
+            if let Some(cell) = self.scene.occlusion_camera.and_then(|c| o.cell_of(c)) {
+                let (mn, mx) = o.cell_bounds(cell);
+                wire(mn, mx, egui::Stroke::new(1.5_f32, theme::accent()));
+            }
+        }
+
         // Right side of the viewport tab strip: shading, gizmos, stats, view.
-        egui::Area::new(ui.id().with("vp-strip"))
+        let strip = egui::Area::new(ui.id().with("vp-strip"))
             .order(egui::Order::Middle)
             .pivot(egui::Align2::RIGHT_CENTER)
             .fixed_pos(egui::pos2(rect.right() - 8.0, rect.top() - theme::H_TAB_STRIP * 0.5))
@@ -10699,6 +11612,7 @@ impl EditorTabs<'_> {
                     });
                 });
             });
+        *self.vp_strip_width = strip.response.rect.width() + 16.0;
 
         // Top-left: tools, transform options, playing chip (wraps, keeping
         // 96 px clear for the orientation widget).
@@ -10915,11 +11829,18 @@ impl EditorTabs<'_> {
                     Some(p) => format!("{} · child of {}", kind.label(), p.name),
                     None => kind.label().to_owned(),
                 };
+                let group: Vec<usize> = if self.multi_objects.len() > 1 && self.multi_objects.contains(&index) {
+                    self.multi_objects.iter().copied().filter(|&j| j < self.scene.objects.len()).collect()
+                } else {
+                    vec![index]
+                };
+                let names_mixed = group.iter().any(|&j| self.scene.objects[j].name != self.scene.objects[index].name);
                 let obj = &mut self.scene.objects[index];
-                let mut name = obj.name.clone();
+                let mut name = if names_mixed { String::new() } else { obj.name.clone() };
                 let mut enabled = obj.enabled;
                 let mut static_geometry = obj.static_geometry;
                 let mut layer = obj.layer;
+                let before = (name.clone(), enabled, static_geometry, layer);
                 let hr = self.inspector.object_header(
                     ui,
                     kind,
@@ -10931,10 +11852,23 @@ impl EditorTabs<'_> {
                     &layer_names,
                 );
                 if hr.object_changed {
-                    obj.name = name;
-                    obj.enabled = enabled;
-                    obj.static_geometry = static_geometry;
-                    obj.layer = layer;
+                    // Every selected object takes what changed; a blank name over
+                    // differing names leaves them as they are.
+                    for &j in &group {
+                        let o = &mut self.scene.objects[j];
+                        if name != before.0 && !name.is_empty() {
+                            o.name = name.clone();
+                        }
+                        if enabled != before.1 {
+                            o.enabled = enabled;
+                        }
+                        if static_geometry != before.2 {
+                            o.static_geometry = static_geometry;
+                        }
+                        if layer != before.3 {
+                            o.layer = layer;
+                        }
+                    }
                 }
                 if hr.lock_changed {
                     *self.inspector_lock_target = if self.inspector.locked {
@@ -11072,7 +12006,61 @@ impl EditorTabs<'_> {
                     let object = &self.scene.objects[index];
                     let render = object.render;
                     let (rx, ry, rz) = object.rotation.to_euler(glam::EulerRot::XYZ);
+                    let group: Vec<usize> = if self.multi_objects.len() > 1 && self.multi_objects.contains(&index) {
+                        self.multi_objects.iter().copied().filter(|&j| j < self.scene.objects.len()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let mixed = {
+                        let objs: Vec<&scene::SceneObject> = group.iter().map(|&j| &self.scene.objects[j]).collect();
+                        let axis = |f: &dyn Fn(&scene::SceneObject) -> [f32; 3]| -> [bool; 3] {
+                            let a = f(object);
+                            std::array::from_fn(|k| objs.iter().any(|o| (f(o)[k] - a[k]).abs() > 1e-4))
+                        };
+                        let euler = |o: &scene::SceneObject| {
+                            let (x, y, z) = o.rotation.to_euler(glam::EulerRot::XYZ);
+                            [x.to_degrees(), y.to_degrees(), z.to_degrees()]
+                        };
+                        citrus_editor::MixedInfo {
+                            name: objs.iter().any(|o| o.name != object.name),
+                            enabled: objs.iter().any(|o| o.enabled != object.enabled),
+                            static_geometry: objs.iter().any(|o| o.static_geometry != object.static_geometry),
+                            translation: axis(&|o| o.translation.to_array()),
+                            rotation: axis(&euler),
+                            scale: axis(&|o| o.scale.to_array()),
+                        }
+                    };
+                    // Per component, the fields that differ across the selection
+                    // (shown as an em dash by the component inspectors).
+                    let mixed_components: Vec<(String, Vec<String>)> = if group.is_empty() {
+                        Vec::new()
+                    } else {
+                        object
+                            .components
+                            .iter()
+                            .map(|c| {
+                                let kind = c.type_name();
+                                let rons: Vec<String> = group
+                                    .iter()
+                                    .filter_map(|&j| self.scene.objects[j].components.iter().find(|x| x.type_name() == kind).map(|x| x.save()))
+                                    .collect();
+                                let fields = crate::ron_fields::mixed(&rons).iter().map(|f| citrus_editor::widgets::mixed_key(f)).collect();
+                                (kind.to_owned(), fields)
+                            })
+                            .collect()
+                    };
+                    ui.data_mut(|d| d.insert_temp(egui::Id::new(citrus_editor::MIXED_COMPONENTS_KEY), mixed_components));
+                    // A slot was double-clicked last frame: show that file.
+                    if let Some(abs) = ui.data_mut(|d| d.remove_temp::<String>(egui::Id::new(citrus_editor::OPEN_FILE_KEY))) {
+                        self.actions.push(EditorAction::SelectFile(std::path::PathBuf::from(abs)));
+                    }
+                    let root = self.project_root.to_string_lossy().into_owned();
+                    ui.data_mut(|d| {
+                        d.insert_temp(egui::Id::new(citrus_editor::PROJECT_ROOT_KEY), root);
+                        d.insert_temp(egui::Id::new(citrus_editor::ASSET_TEMPLATES_KEY), asset_templates().to_vec());
+                    });
                     let mut info = ObjectInfoModel {
+                        mixed,
                         name: object.name.clone(),
                         enabled: object.enabled,
                         static_geometry: object.static_geometry,
@@ -11087,6 +12075,7 @@ impl EditorTabs<'_> {
                             let mi = self.scene.mesh_info(r.mesh);
                             (mi.vertices, mi.triangles)
                         }),
+                        material_file: None,
                     };
                     // Material slots for this object (slot 0 + extras). The
                     // inspector edits the selected one.
@@ -11099,8 +12088,8 @@ impl EditorTabs<'_> {
                     if slot_count > 1 {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new("Material Slots").strong());
-                            for s in 0..slot_count {
-                                let mi = slots[s].material;
+                            for (s, slot) in slots.iter().enumerate().take(slot_count) {
+                                let mi = slot.material;
                                 let name = &self.scene.materials[mi].model.name;
                                 let label = format!("{s}: {name}");
                                 if ui
@@ -11114,6 +12103,10 @@ impl EditorTabs<'_> {
                     }
                     let slot = *self.selected_material_slot;
                     let material_index = slots.get(slot).map(|r| r.material);
+                    info.material_file = material_index
+                        .and_then(|m| self.scene.materials.get(m))
+                        .and_then(|e| e.file.as_ref())
+                        .map(|f| relative_to(f, self.project_root));
                     // Object list (id + name) for ObjectRef pickers, built as an
                     // owned Vec before the mutable component borrow so it doesn't
                     // alias scene.objects.
@@ -11133,6 +12126,34 @@ impl EditorTabs<'_> {
                         .unwrap_or(false);
                     // Split borrows: components live on the object, the
                     // material model in the scene's material list.
+                    // Assets assigned to component slots, edited in place.
+                    let root = self.project_root.to_path_buf();
+                    let postfx_edited = std::cell::Cell::new(false);
+                    let asset_editor = |ui: &mut egui::Ui, rel: &std::path::Path| -> Option<bool> {
+                        let path = root.join(rel);
+                        match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+                            Some(citrus_core::PHYSMAT_EXTENSION) => {
+                                let mut m = citrus_core::load_physmat(&path).ok()?;
+                                let changed = citrus_editor::physmat_editor_ui(ui, &mut m);
+                                if changed && let Err(e) = citrus_core::save_physmat(&path, &m) {
+                                    tracing::error!("saving physics material: {e}");
+                                }
+                                Some(changed)
+                            }
+                            Some("postfx") => {
+                                let mut p = citrus_assets::load_postfx(&path).ok()?;
+                                let changed = postfx_editor_ui(ui, &mut p, true);
+                                if changed {
+                                    if let Err(e) = citrus_assets::save_postfx(&path, &p) {
+                                        tracing::error!("saving postfx: {e:#}");
+                                    }
+                                    postfx_edited.set(true);
+                                }
+                                Some(changed)
+                            }
+                            _ => None,
+                        }
+                    };
                     let scene = &mut *self.scene;
                     let components = &mut scene.objects[index].components;
                     let material = if embedded {
@@ -11151,9 +12172,28 @@ impl EditorTabs<'_> {
                             editor_components: self.editor_components,
                             objects: &objects,
                             layer_names: &layer_names,
+                            asset_editor: Some(&asset_editor),
                         },
                         &shader_refs,
                     );
+                    if postfx_edited.get() {
+                        // Volumes pick up the edit next frame.
+                        self.scene.invalidate_postfx_cache();
+                    }
+                    if response.object_changed && self.multi_objects.len() > 1 && self.multi_objects.contains(&index) {
+                        // Typed transform values apply to the whole selection as
+                        // absolute values (propagate_multi_edit sets them).
+                        let o = &self.scene.objects[index];
+                        let (rx, ry, rz) = o.rotation.to_euler(glam::EulerRot::XYZ);
+                        let old = (o.translation.to_array(), [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()], o.scale.to_array());
+                        let t = &info.transform;
+                        let pick = |new: [f32; 3], was: [f32; 3]| -> [Option<f32>; 3] {
+                            std::array::from_fn(|k| ((new[k] - was[k]).abs() > 1e-6).then_some(new[k]))
+                        };
+                        self.multi_edit.translation = pick(t.translation, old.0);
+                        self.multi_edit.rotation_deg = pick(t.rotation_deg, old.1);
+                        self.multi_edit.scale = pick(t.scale, old.2);
+                    }
                     if response.object_changed {
                         let object = &mut self.scene.objects[index];
                         object.name = info.name;
@@ -11214,7 +12254,20 @@ impl EditorTabs<'_> {
                     if let Some(name) = response.add_component
                         && let Some(component) = self.registry.create(name)
                     {
+                        let rigid_body = component.as_any().is::<citrus_core::RigidBody>();
+                        let mut component = component;
+                        if let Some((lo, hi)) = object_bounds(self.scene, index) {
+                            fit_collider(component.as_any_mut(), lo, hi);
+                        }
                         self.scene.objects[index].components.push(component);
+                        if rigid_body {
+                            let bounds = object_bounds(self.scene, index);
+                            let ball = crate::physics::mesh_is_ball(self.scene, index);
+                            ensure_collider(&mut self.scene.objects[index], ball);
+                            if let (Some((lo, hi)), Some(last)) = (bounds, self.scene.objects[index].components.last_mut()) {
+                                fit_collider(last.as_any_mut(), lo, hi);
+                            }
+                        }
                     }
                     if let Some(remove) = response.remove_component
                         && remove < self.scene.objects[index].components.len()
@@ -11269,17 +12322,31 @@ impl EditorTabs<'_> {
                                 self.actions.push(EditorAction::LoadScene(path.clone()));
                             }
                         }
+                        Some("animctrl" | "anim") => {
+                            crate::anim_controller_editor::file_inspector(ui, path, self.project_root, self.anim_ctrl_tab, self.anim_clip_tab);
+                        }
                         Some("postfx") => {
                             ui.heading("Post FX Profile");
                             ui.label(egui::RichText::new(&path_display).small().weak());
                             ui.separator();
                             let mut profile = citrus_assets::load_postfx(path).unwrap_or_default();
-                            if postfx_editor_ui(ui, &mut profile) {
+                            if postfx_editor_ui(ui, &mut profile, true) {
                                 if let Err(e) = citrus_assets::save_postfx(path, &profile) {
                                     tracing::error!("saving postfx: {e:#}");
                                 }
                                 // Volumes pick up the edit live next frame.
                                 self.scene.invalidate_postfx_cache();
+                            }
+                        }
+                        Some("physmat") => {
+                            ui.heading("Physics Material");
+                            ui.label(egui::RichText::new(&path_display).small().weak());
+                            ui.separator();
+                            let mut mat = citrus_core::load_physmat(path).unwrap_or_default();
+                            if citrus_editor::physmat_editor_ui(ui, &mut mat)
+                                && let Err(e) = citrus_core::save_physmat(path, &mat)
+                            {
+                                tracing::error!("saving physics material: {e}");
                             }
                         }
                         Some("prefab") => {
@@ -11400,7 +12467,7 @@ impl EditorTabs<'_> {
 /// Model (.fbx/.gltf) import options editor, backed by the asset's `.meta`.
 /// Returns true when a value changed.
 fn model_import_ui(ui: &mut egui::Ui, m: &mut citrus_assets::ModelImport) -> bool {
-    use egui::{DragValue, Slider};
+    use egui::DragValue;
     let mut changed = false;
     egui::Grid::new("model-import-grid").num_columns(2).show(ui, |ui| {
         ui.label("Scale");
@@ -11420,8 +12487,9 @@ fn model_import_ui(ui: &mut egui::Ui, m: &mut citrus_assets::ModelImport) -> boo
         ui.end_row();
         if m.recalculate_normals {
             ui.label("Smoothing Angle");
-            changed |= ui
-                .add(Slider::new(&mut m.smoothing_angle, 0.0..=180.0).suffix("°"))
+            changed |= citrus_editor::widgets::slider(
+                ui,
+                egui::Slider::new(&mut m.smoothing_angle, 0.0..=180.0).suffix("°"))
                 .changed();
             ui.end_row();
         }
@@ -11431,25 +12499,190 @@ fn model_import_ui(ui: &mut egui::Ui, m: &mut citrus_assets::ModelImport) -> boo
 
 /// Sliders for a `.postfx` profile (the post-processing asset editor). Returns
 /// true when any value changed (caller saves + invalidates the cache).
-fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> bool {
+/// Post FX settings editor. `volume`: editing a Volume profile, where each
+/// effect only overrides the global post settings while it's enabled.
+/// One component's changed fields (None = replace it whole).
+type FieldEdit = (String, Option<Vec<(String, String)>>);
+
+/// A body needs a shape: give an object without a collider a Mesh Collider
+/// (its own mesh), or a Box Collider when it has no mesh.
+fn ensure_collider(object: &mut crate::scene::SceneObject, ball: bool) {
+    let has = object.components.iter().any(|c| {
+        let a = c.as_any();
+        a.is::<citrus_core::BoxCollider>()
+            || a.is::<citrus_core::SphereCollider>()
+            || a.is::<citrus_core::CapsuleCollider>()
+            || a.is::<citrus_core::MeshCollider>()
+            || a.is::<citrus_core::CharacterController>()
+    });
+    if has {
+        return;
+    }
+    // Primitives get their exact shape (a sphere stays perfectly round);
+    // other meshes use their mesh; empties a box.
+    use citrus_assets::{ObjectSource, PrimitiveShape};
+    let collider: Box<dyn citrus_core::Component> = match &object.source {
+        ObjectSource::Primitive { shape: PrimitiveShape::Sphere } => Box::new(citrus_core::SphereCollider::default()),
+        _ if ball => Box::new(citrus_core::SphereCollider::default()),
+        ObjectSource::Primitive { shape: PrimitiveShape::Capsule } => Box::new(citrus_core::CapsuleCollider::default()),
+        ObjectSource::Primitive { shape: PrimitiveShape::Cube | PrimitiveShape::Plane } => Box::new(citrus_core::BoxCollider::default()),
+        _ if object.render.is_some() => Box::new(citrus_core::MeshCollider::default()),
+        _ => Box::new(citrus_core::BoxCollider::default()),
+    };
+    object.components.push(collider);
+}
+
+/// Bounds of an object's meshes and its children's, in its local space.
+fn object_bounds(scene: &crate::scene::LoadedScene, index: usize) -> Option<(Vec3, Vec3)> {
+    let world = scene.world_transforms();
+    let to_local = world[index].inverse();
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    for (j, w) in world.iter().enumerate() {
+        let mut p = Some(j);
+        let mut under = false;
+        while let Some(k) = p {
+            if k == index {
+                under = true;
+                break;
+            }
+            p = scene.objects[k].parent;
+        }
+        if !under {
+            continue;
+        }
+        let m = to_local * *w;
+        for r in scene.objects[j].render_slots() {
+            let (a, b) = scene.mesh_aabb(r.mesh);
+            for c in 0..8 {
+                let corner = Vec3::new(if c & 1 == 0 { a.x } else { b.x }, if c & 2 == 0 { a.y } else { b.y }, if c & 4 == 0 { a.z } else { b.z });
+                let q = m.transform_point3(corner);
+                lo = lo.min(q);
+                hi = hi.max(q);
+            }
+        }
+    }
+    (lo.x <= hi.x).then_some((lo, hi))
+}
+
+/// Size a freshly added Box / Sphere / Capsule Collider to the bounds `lo`..`hi`
+/// (local). A flat mesh (a plane) gets a thin slab under its surface.
+fn fit_collider(component: &mut dyn std::any::Any, lo: Vec3, hi: Vec3) {
+    const MIN: f32 = 0.05;
+    let mut size = hi - lo;
+    let mut center = (lo + hi) * 0.5;
+    for k in 0..3 {
+        if size[k] < MIN {
+            center[k] -= (MIN - size[k]) * 0.5;
+            size[k] = MIN;
+        }
+    }
+    if let Some(b) = component.downcast_mut::<citrus_core::BoxCollider>() {
+        b.center = center.to_array();
+        b.size = size.to_array();
+    } else if let Some(s) = component.downcast_mut::<citrus_core::SphereCollider>() {
+        s.center = center.to_array();
+        s.radius = size.max_element() * 0.5;
+    } else if let Some(c) = component.downcast_mut::<citrus_core::CapsuleCollider>() {
+        let axis = if size.x >= size.y && size.x >= size.z { 0 } else if size.y >= size.z { 1 } else { 2 };
+        c.direction = [citrus_core::ColliderAxis::X, citrus_core::ColliderAxis::Y, citrus_core::ColliderAxis::Z][axis];
+        let across = (0..3).filter(|&k| k != axis).map(|k| size[k]).fold(0.0f32, f32::max) * 0.5;
+        c.center = center.to_array();
+        c.height = size[axis];
+        c.radius = across.min(size[axis] * 0.5);
+    }
+}
+
+/// New-asset recipes for the inspector's asset fields ([+] next to a slot).
+fn asset_templates() -> &'static [citrus_editor::AssetTemplate] {
+    static TEMPLATES: std::sync::OnceLock<Vec<citrus_editor::AssetTemplate>> = std::sync::OnceLock::new();
+    TEMPLATES.get_or_init(|| {
+        fn ron_of<T: serde::Serialize>(v: &T) -> String {
+            ron::ser::to_string_pretty(v, ron::ser::PrettyConfig::default()).unwrap_or_default()
+        }
+        let t = |ext: &str, name: &str, folder: &str, contents: String| citrus_editor::AssetTemplate {
+            ext: ext.into(),
+            name: name.into(),
+            folder: folder.into(),
+            contents,
+        };
+        let mut controller = citrus_assets::AnimatorController::default();
+        controller.layers[0].machine.states.push(citrus_assets::AnimState { name: "Idle".into(), ..Default::default() });
+        controller.layers[0].machine.default_state = "Idle".into();
+        let material = citrus_assets::MaterialFile {
+            name: "New Material".into(),
+            shader: "standard".into(),
+            params: Default::default(),
+            features: Default::default(),
+            render_queue: None,
+            textures: Default::default(),
+            custom: Default::default(),
+        };
+        vec![
+            t("material", "Material", "materials", ron_of(&material)),
+            t(citrus_core::PHYSMAT_EXTENSION, "Physics Material", "physics", ron_of(&citrus_core::PhysicsMaterial::default())),
+            t(citrus_assets::POSTFX_EXTENSION, "Post FX Profile", "postfx", ron_of(&citrus_assets::PostFxProfile::default())),
+            t(citrus_assets::ANIM_CONTROLLER_EXTENSION, "Controller", "animation", ron_of(&controller)),
+            t(citrus_assets::ANIM_CLIP_EXTENSION, "Clip", "animation", ron_of(&citrus_assets::AnimClip::default())),
+        ]
+    })
+}
+
+/// Project-relative paths of every `.physmat` under `root`.
+fn physmat_files(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let path = entry.path();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else if path.extension().is_some_and(|e| e == citrus_core::PHYSMAT_EXTENSION)
+                && let Ok(rel) = path.strip_prefix(root)
+            {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile, volume: bool) -> bool {
     use citrus_assets::TonemapMode;
-    use egui::{DragValue, RichText, Slider};
+    use egui::{DragValue, RichText};
     let mut changed = false;
 
-    ui.label(RichText::new("Tonemap").strong());
-    ui.horizontal(|ui| {
-        ui.label("Mode");
-        egui::ComboBox::from_id_salt("postfx-tonemap")
-            .selected_text(p.tonemap.mode.label())
-            .show_ui(ui, |ui| {
-                for m in TonemapMode::ALL {
-                    changed |= ui.selectable_value(&mut p.tonemap.mode, m, m.label()).changed();
-                }
-            });
-    });
-    ui.horizontal(|ui| {
-        ui.label("Exposure (EV)");
-        changed |= ui.add(Slider::new(&mut p.tonemap.exposure, -8.0..=8.0)).changed();
+    if volume {
+        citrus_editor::widgets::info_note(
+            ui,
+            "Only enabled effects override the scene's global post settings (Environment > Post).",
+        );
+        changed |= ui.checkbox(&mut p.tonemap.enabled, "Tonemap").changed();
+    } else {
+        ui.label(RichText::new("Tonemap").strong());
+    }
+    ui.add_enabled_ui(!volume || p.tonemap.enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            egui::ComboBox::from_id_salt("postfx-tonemap")
+                .selected_text(p.tonemap.mode.label())
+                .show_ui(ui, |ui| {
+                    for m in TonemapMode::ALL {
+                        changed |= ui.selectable_value(&mut p.tonemap.mode, m, m.label()).changed();
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Exposure (EV)");
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut p.tonemap.exposure, -8.0..=8.0)).changed();
+        });
     });
 
     ui.separator();
@@ -11458,23 +12691,23 @@ fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> 
         let g = &mut p.color_grading;
         ui.horizontal(|ui| {
             ui.label("Post Exposure");
-            changed |= ui.add(Slider::new(&mut g.exposure, -4.0..=4.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut g.exposure, -4.0..=4.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Contrast");
-            changed |= ui.add(Slider::new(&mut g.contrast, 0.0..=2.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut g.contrast, 0.0..=2.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Saturation");
-            changed |= ui.add(Slider::new(&mut g.saturation, 0.0..=2.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut g.saturation, 0.0..=2.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Temperature");
-            changed |= ui.add(Slider::new(&mut g.temperature, -1.0..=1.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut g.temperature, -1.0..=1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Tint");
-            changed |= ui.add(Slider::new(&mut g.tint, -1.0..=1.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut g.tint, -1.0..=1.0)).changed();
         });
     });
 
@@ -11484,11 +12717,11 @@ fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> 
         let v = &mut p.vignette;
         ui.horizontal(|ui| {
             ui.label("Intensity");
-            changed |= ui.add(Slider::new(&mut v.intensity, 0.0..=1.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut v.intensity, 0.0..=1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Smoothness");
-            changed |= ui.add(Slider::new(&mut v.smoothness, 0.0..=1.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut v.smoothness, 0.0..=1.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Color");
@@ -11497,7 +12730,7 @@ fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> 
     });
 
     ui.separator();
-    changed |= ui.checkbox(&mut p.bloom.enabled, "Bloom (needs HDR pass)").changed();
+    changed |= ui.checkbox(&mut p.bloom.enabled, "Bloom").changed();
     ui.add_enabled_ui(p.bloom.enabled, |ui| {
         let b = &mut p.bloom;
         ui.horizontal(|ui| {
@@ -11506,11 +12739,11 @@ fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> 
         });
         ui.horizontal(|ui| {
             ui.label("Intensity");
-            changed |= ui.add(Slider::new(&mut b.intensity, 0.0..=3.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut b.intensity, 0.0..=3.0)).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Radius");
-            changed |= ui.add(Slider::new(&mut b.radius, 0.0..=1.0)).changed();
+            changed |= citrus_editor::widgets::slider(ui, egui::Slider::new(&mut b.radius, 0.0..=1.0)).changed();
         });
     });
 
@@ -11521,8 +12754,9 @@ fn postfx_editor_ui(ui: &mut egui::Ui, p: &mut citrus_assets::PostFxProfile) -> 
     ui.add_enabled_ui(p.chromatic_aberration.enabled, |ui| {
         ui.horizontal(|ui| {
             ui.label("Intensity");
-            changed |= ui
-                .add(Slider::new(&mut p.chromatic_aberration.intensity, 0.0..=2.0))
+            changed |= citrus_editor::widgets::slider(
+                ui,
+                egui::Slider::new(&mut p.chromatic_aberration.intensity, 0.0..=2.0))
                 .changed();
         });
     });
@@ -11613,6 +12847,44 @@ fn play_object_state(o: &scene::SceneObject) -> PlayObjectState {
     }
 }
 
+/// Values typed into the Inspector for a multi-selection: each `Some` is set
+/// on every selected object (transform axes as absolute values).
+#[derive(Clone, Copy, Debug, Default)]
+struct MultiEdit {
+    translation: [Option<f32>; 3],
+    rotation_deg: [Option<f32>; 3],
+    scale: [Option<f32>; 3],
+}
+
+impl MultiEdit {
+    fn any(&self) -> bool {
+        self.translation.iter().chain(&self.rotation_deg).chain(&self.scale).any(Option::is_some)
+    }
+
+    fn apply(&self, o: &mut scene::SceneObject) {
+        let mut t = o.translation.to_array();
+        let mut s = o.scale.to_array();
+        let (rx, ry, rz) = o.rotation.to_euler(glam::EulerRot::XYZ);
+        let mut r = [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()];
+        for k in 0..3 {
+            if let Some(v) = self.translation[k] {
+                t[k] = v;
+            }
+            if let Some(v) = self.scale[k] {
+                s[k] = v;
+            }
+            if let Some(v) = self.rotation_deg[k] {
+                r[k] = v;
+            }
+        }
+        o.translation = glam::Vec3::from(t);
+        o.scale = glam::Vec3::from(s);
+        if self.rotation_deg.iter().any(Option::is_some) {
+            o.rotation = glam::Quat::from_euler(glam::EulerRot::XYZ, r[0].to_radians(), r[1].to_radians(), r[2].to_radians());
+        }
+    }
+}
+
 fn object_state(o: &scene::SceneObject) -> ObjectState {
     ObjectState {
         name: o.name.clone(),
@@ -11643,12 +12915,12 @@ fn draw_bulb(painter: &egui::Painter, glass: egui::Pos2, up: egui::Vec2, scale: 
             let d = egui::vec2(a.cos(), a.sin());
             painter.line_segment(
                 [glass + d * (r + 2.0 * scale), glass + d * (r + 5.0 * scale)],
-                egui::Stroke::new(1.5, glass_col),
+                egui::Stroke::new(1.5_f32, glass_col),
             );
         }
     }
     painter.circle_filled(glass, r, glass_col);
-    painter.circle_stroke(glass, r, egui::Stroke::new(1.0, dark));
+    painter.circle_stroke(glass, r, egui::Stroke::new(1.0_f32, dark));
     // Screw base: a small block on the far side of `up`, with a thread line.
     let bc = glass - up * (r + 1.5 * scale);
     let hw = r * 0.55;
@@ -11662,7 +12934,7 @@ fn draw_bulb(painter: &egui::Painter, glass: egui::Pos2, up: egui::Vec2, scale: 
     painter.add(egui::Shape::convex_polygon(base, dark, egui::Stroke::NONE));
     painter.line_segment(
         [bc - right * (hw - 1.0), bc + right * (hw - 1.0)],
-        egui::Stroke::new(1.0, glass_col),
+        egui::Stroke::new(1.0_f32, glass_col),
     );
 }
 
@@ -11774,10 +13046,25 @@ fn draw_reflection_probe_icon(
         r * 0.24,
         egui::Color32::from_rgb(235, 245, 255),
     );
-    painter.circle_stroke(center, r, egui::Stroke::new(1.5, rim));
+    painter.circle_stroke(center, r, egui::Stroke::new(1.5_f32, rim));
 }
 
 /// Draw a speaker icon (cabinet + cone + sound waves) centered at `center`.
+/// Post FX volume billboard: the volume icon on a dark disc.
+fn draw_post_volume_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, scale: f32) {
+    use citrus_editor::theme;
+    let r = 8.5 * scale;
+    painter.circle_filled(center, r, theme::with_alpha(theme::BG_APP, 0.85));
+    let color = if selected { egui::Color32::WHITE } else { theme::TYPE_POSTFX };
+    painter.circle_stroke(center, r, egui::Stroke::new(1.5_f32, theme::TYPE_POSTFX));
+    citrus_editor::icons::paint(
+        painter,
+        egui::Rect::from_center_size(center, egui::vec2(r * 1.25, r * 1.25)),
+        citrus_editor::icons::Icon::PostFxVolume,
+        color,
+    );
+}
+
 /// UI canvas billboard: a small window with a title bar and two buttons.
 fn draw_ui_canvas_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, scale: f32) {
     let body = if selected {
@@ -11788,11 +13075,11 @@ fn draw_ui_canvas_icon(painter: &egui::Painter, center: egui::Pos2, selected: bo
     let dark = egui::Color32::from_rgb(40, 65, 60);
     let frame = egui::Rect::from_center_size(center, egui::vec2(16.0 * scale, 12.0 * scale));
     painter.rect_filled(frame, 1.5 * scale, body);
-    painter.rect_stroke(frame, 1.5 * scale, egui::Stroke::new(1.0, dark), egui::StrokeKind::Inside);
+    painter.rect_stroke(frame, 1.5 * scale, egui::Stroke::new(1.0_f32, dark), egui::StrokeKind::Inside);
     let bar_y = frame.top() + 3.0 * scale;
     painter.line_segment(
         [egui::pos2(frame.left(), bar_y), egui::pos2(frame.right(), bar_y)],
-        egui::Stroke::new(1.0, dark),
+        egui::Stroke::new(1.0_f32, dark),
     );
     for k in 0..2 {
         let y = bar_y + (3.0 + k as f32 * 3.5) * scale;
@@ -11826,9 +13113,9 @@ fn draw_audio_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool, 
     painter.add(egui::Shape::convex_polygon(
         cone,
         body,
-        egui::Stroke::new(1.0, dark),
+        egui::Stroke::new(1.0_f32, dark),
     ));
-    painter.rect_stroke(cab, 1.0 * scale, egui::Stroke::new(1.0, dark), egui::StrokeKind::Inside);
+    painter.rect_stroke(cab, 1.0 * scale, egui::Stroke::new(1.0_f32, dark), egui::StrokeKind::Inside);
     // Sound waves: two arcs to the right (brighter when selected).
     let wave = if selected {
         egui::Color32::from_rgb(150, 220, 255)
@@ -11867,7 +13154,7 @@ fn draw_camera_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool,
     painter.rect_stroke(
         body,
         2.0,
-        egui::Stroke::new(1.0, dark),
+        egui::Stroke::new(1.0_f32, dark),
         egui::StrokeKind::Inside,
     );
     // Lens: a trapezoid jutting to the right (classic video-camera silhouette).
@@ -11882,7 +13169,7 @@ fn draw_camera_icon(painter: &egui::Painter, center: egui::Pos2, selected: bool,
     painter.add(egui::Shape::convex_polygon(
         lens,
         body_col,
-        egui::Stroke::new(1.0, dark),
+        egui::Stroke::new(1.0_f32, dark),
     ));
     // Lens dot on the body front.
     painter.circle_filled(egui::pos2(body.left() + 4.0 * scale, cy), 1.6 * scale, dark);
@@ -12081,7 +13368,7 @@ fn hover_text(result: &serde_json::Value) -> String {
 fn first_changed_asset(root: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
     const EXTS: &[&str] = &[
         "fbx", "gltf", "glb", "obj", "png", "jpg", "jpeg", "tga", "hdr", "material", "frag",
-        "scene", "postfx", "wav", "flac", "mp3",
+        "hlsl", "scene", "postfx", "wav", "flac", "mp3",
     ];
     let entries = std::fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
@@ -12165,7 +13452,8 @@ impl ApplicationHandler for EngineApp {
         if let DeviceEvent::MouseMotion { delta } = event {
             // Feed the binding system (2C) so Play-mode mouselook works; the
             // editor fly-cam still uses look_delta gated on `looking`.
-            if self.playing {
+            // Flying the Scene camera during play doesn't steer the game.
+            if self.playing && !self.looking {
                 self.input.mouse_motion(delta.0, delta.1);
             }
             if self.looking {
@@ -12183,19 +13471,18 @@ impl ApplicationHandler for EngineApp {
     ) {
         // Splash is its own borderless window: just repaint it on request and
         // swallow its events. It's closed after the first editor frame.
-        if let Some(s) = self.splash.as_mut() {
-            if window_id == s.window_id() {
+        if let Some(s) = self.splash.as_mut()
+            && window_id == s.window_id() {
                 if matches!(event, WindowEvent::RedrawRequested) {
                     s.present();
                 }
                 return;
             }
-        }
 
         // Profiler is a separate OS window: route its events here and return so
         // the main-window editor logic below never sees them.
-        if let Some(pw) = self.profiler_window.clone() {
-            if window_id == pw.id() {
+        if let Some(pw) = self.profiler_window.clone()
+            && window_id == pw.id() {
                 if let Some(state) = self.profiler_egui_state.as_mut() {
                     let r = state.on_window_event(&pw, &event);
                     if r.repaint {
@@ -12220,7 +13507,6 @@ impl ApplicationHandler for EngineApp {
                 }
                 return;
             }
-        }
 
         let egui_wants =
             if let (Some(state), Some(window)) = (self.egui_state.as_mut(), self.window.as_ref()) {
@@ -12310,9 +13596,12 @@ impl ApplicationHandler for EngineApp {
                 && !self.code_tab_focused() =>
             {
                 // ...but not while a code editor / text field has focus (there
-                // Escape is the vim Insert -> Normal key, not a deselect).
-                self.selection = Selection::None;
-                self.file_material = None;
+                // Escape is the vim Insert -> Normal key, not a deselect). The
+                // first Escape only ends river path editing.
+                if !crate::river_edit::exit(&self.egui_ctx) {
+                    self.selection = Selection::None;
+                    self.file_material = None;
+                }
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -12331,7 +13620,9 @@ impl ApplicationHandler for EngineApp {
                 ElementState::Pressed if self.playing && self.game_ui_frame.text_editing => {}
                 ElementState::Pressed if !egui_wants => {
                     self.keys.insert(code);
-                    self.input.key(code, true);
+                    if !self.looking {
+                        self.input.key(code, true);
+                    }
                     let ctrl = self.keys.contains(&KeyCode::ControlLeft)
                         || self.keys.contains(&KeyCode::ControlRight);
                     if !self.looking {
@@ -12378,6 +13669,8 @@ impl ApplicationHandler for EngineApp {
                                     Selection::None => {}
                                 }
                             }
+                            // Removes the selected river point (in the Scene view).
+                            KeyCode::Delete if crate::river_edit::building(&self.egui_ctx) => {}
                             KeyCode::Delete => {
                                 // Acts on the current selection: an object in the
                                 // scene, or a file/folder in the browser (same as
@@ -12430,7 +13723,8 @@ impl ApplicationHandler for EngineApp {
                         && self.game_cursor_wanted
                         && !self.game_cursor_locked
                         && button == MouseButton::Left
-                        && self.cursor_in_viewport()
+                        && self.cursor_in_game()
+                        && !self.looking
                         && !self.egui_ctx.is_using_pointer()
                     {
                         self.set_game_cursor(true);
@@ -12600,11 +13894,137 @@ fn object_kind(o: &scene::SceneObject) -> citrus_editor::theme::ObjectKind {
     if has(&|c| c.is::<citrus_core::AudioSource>()) {
         return K::Audio;
     }
+    if has(&|c| c.is::<citrus_core::VolumeComponent>()) {
+        return K::PostFxVolume;
+    }
+    if has(&|c| c.is::<citrus_core::Water>() || c.is::<citrus_core::Waterfall>() || c.is::<citrus_core::Whirlpool>()) {
+        return K::Water;
+    }
     match o.source {
         citrus_assets::ObjectSource::Model { .. } if o.render.is_none() => K::Model,
         citrus_assets::ObjectSource::Model { .. } | citrus_assets::ObjectSource::Primitive { .. } => K::Mesh,
         _ if o.render.is_some() => K::Mesh,
         _ => K::Group,
+    }
+}
+
+/// Narrowest the inspector dock may get before rows start clipping.
+const INSPECTOR_MIN_WIDTH: f32 = 352.0;
+
+/// egui_dock has no per-leaf minimum: after each frame, widen the leaf holding
+/// `tab` back to `min` by moving its nearest horizontal split (dragging the
+/// divider past it just stops there).
+fn tab_label(tab: &Tab) -> String {
+    match tab {
+        Tab::Viewport => format!("{}  Scene", ph::CUBE),
+        Tab::Camera => format!("{}  Camera", ph::VIDEO_CAMERA),
+        Tab::UiEditor => format!("{}  UI Editor", ph::LAYOUT),
+        Tab::AnimController => format!("{}  Animator Controller", ph::FLOW_ARROW),
+        Tab::AnimClip => format!("{}  Animation", ph::FILM_STRIP),
+        Tab::Scene => "Scene".to_owned(),
+        Tab::Inspector => "Inspector".to_owned(),
+        Tab::Environment => "Environment".to_owned(),
+        Tab::Baker => "FluxBaker".to_owned(),
+        Tab::Occlusion => "Occlusion".to_owned(),
+        Tab::Files => "Files".to_owned(),
+        Tab::Log => {
+            let warns = log_capture::store().lock().unwrap().entries.iter().filter(|e| e.level == tracing::Level::WARN).count();
+            if warns > 0 { format!("Log  {warns}") } else { "Log".to_owned() }
+        }
+        Tab::Code(path) => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".to_owned()),
+    }
+}
+
+/// Labels for leaves whose tabs overflow their bar (last frame's width): the
+/// widest labels are cut with an ellipsis to an equal share, so every tab
+/// stays visible instead of egui_dock scrolling them under the edge.
+/// `vp_strip` is the toolbar width over the Scene view's strip, reserved in the
+/// leaf showing that tab.
+fn fit_tab_labels(ctx: &egui::Context, dock: &DockState<Tab>, vp_strip: f32) -> HashMap<Tab, String> {
+    // egui_dock's tab padding (2 x 8 px) and close button (24 px).
+    const PAD: f32 = 16.0;
+    const CLOSE: f32 = 24.0;
+    let font = egui::TextStyle::Button.resolve(&ctx.style());
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
+    let mut out = HashMap::new();
+    for (_, node) in dock.iter_all_nodes() {
+        let egui_dock::Node::Leaf(leaf) = node else { continue };
+        let strip = leaf.tabs.get(leaf.active.0).is_some_and(|t| *t == Tab::Viewport);
+        if leaf.rect.width() < 1.0 || leaf.tabs.len() < 2 {
+            continue;
+        }
+        let avail = (leaf.rect.width() - if strip { vp_strip } else { 0.0 }).max(1.0);
+        let labels: Vec<String> = leaf.tabs.iter().map(tab_label).collect();
+        let widths: Vec<f32> = labels.iter().map(|l| measure(l)).collect();
+        // Every tab has a close X (closed panels reopen from the Windows menu).
+        let chrome = (PAD + CLOSE) * leaf.tabs.len() as f32;
+        if widths.iter().sum::<f32>() + chrome <= avail {
+            continue;
+        }
+        // Water-fill: labels narrower than an equal share keep their width and
+        // hand the rest to the wider ones, which share the remaining cap.
+        let mut budget = (avail - chrome - 1.0).max(0.0);
+        let mut sorted = widths.clone();
+        sorted.sort_by(f32::total_cmp);
+        let mut left = sorted.len();
+        let mut cap = budget / left as f32;
+        for w in sorted {
+            if w > cap {
+                break;
+            }
+            budget -= w;
+            left -= 1;
+            cap = if left > 0 { budget / left as f32 } else { f32::INFINITY };
+        }
+        let ellipsis = measure("\u{2026}");
+        for ((tab, label), w) in leaf.tabs.iter().zip(&labels).zip(&widths) {
+            if *w <= cap {
+                continue;
+            }
+            let mut cut = String::new();
+            for ch in label.chars() {
+                cut.push(ch);
+                // Always keep the first character (the icon, where there is one).
+                if measure(&cut) + ellipsis > cap && cut.chars().count() > 1 {
+                    cut.pop();
+                    break;
+                }
+            }
+            // Too narrow even for one character and the ellipsis: just the icon.
+            let short = if cut.chars().count() == 1 && measure(&cut) + ellipsis > cap {
+                cut
+            } else {
+                format!("{}\u{2026}", cut.trim_end())
+            };
+            out.insert(tab.clone(), short);
+        }
+    }
+    out
+}
+
+fn clamp_leaf_width(dock: &mut DockState<Tab>, tab: &Tab, min: f32) {
+    let Some((surface, node, _)) = dock.find_tab(tab) else {
+        return;
+    };
+    let tree = &mut dock[surface];
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        if let egui_dock::Node::Horizontal(split) = &mut tree[parent] {
+            let w = split.rect.width();
+            if w > min + 120.0 {
+                let right = child == parent.right();
+                let leaf_w = if right { w * (1.0 - split.fraction) } else { w * split.fraction };
+                if leaf_w < min {
+                    split.fraction = if right { 1.0 - min / w } else { min / w };
+                }
+            }
+            return;
+        }
+        child = parent;
     }
 }
 
@@ -12615,6 +14035,7 @@ enum PaletteCmd {
     SaveScene,
     NewScene,
     BuildGame,
+    BuildGameWindows,
     Undo,
     Redo,
     Duplicate,
@@ -12635,14 +14056,17 @@ enum PaletteCmd {
     UiTemplate(crate::ui_templates::UiTemplate),
 }
 
-const PALETTE_TABS: [(Tab, &str); 9] = [
-    (Tab::Viewport, "Viewport"),
+const PALETTE_TABS: [(Tab, &str); 12] = [
+    (Tab::Viewport, "Scene"),
     (Tab::Camera, "Camera"),
     (Tab::UiEditor, "UI Editor"),
+    (Tab::AnimController, "Animator Controller"),
+    (Tab::AnimClip, "Animation"),
     (Tab::Scene, "Scene"),
     (Tab::Inspector, "Inspector"),
     (Tab::Environment, "Environment"),
     (Tab::Baker, "FluxBaker"),
+    (Tab::Occlusion, "Occlusion"),
     (Tab::Files, "Files"),
     (Tab::Log, "Log"),
 ];
@@ -12657,6 +14081,7 @@ fn billboard_menu(ui: &mut egui::Ui, filter: &mut WidgetFilter) {
         ("Reflection Probes", &mut filter.reflection_probes),
         ("Audio Sources", &mut filter.audio),
         ("UI Canvases", &mut filter.ui_canvases),
+        ("Post FX Volumes", &mut filter.post_volumes),
     ] {
         ui.horizontal(|ui| {
             ui.checkbox(&mut setting.visible, label);
@@ -12739,4 +14164,22 @@ fn binding_slot_row(
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod collider_fit_tests {
+    use super::*;
+
+    #[test]
+    fn colliders_fit_the_bounds_and_planes_get_a_slab() {
+        let mut b = citrus_core::BoxCollider::default();
+        fit_collider(&mut b, Vec3::new(-1.0, 0.0, -2.0), Vec3::new(3.0, 1.0, 2.0));
+        assert_eq!((b.center, b.size), ([1.0, 0.5, 0.0], [4.0, 1.0, 4.0]));
+        let mut plane = citrus_core::BoxCollider::default();
+        fit_collider(&mut plane, Vec3::new(-5.0, 0.0, -5.0), Vec3::new(5.0, 0.0, 5.0));
+        assert!(plane.size[1] > 0.0 && plane.center[1] + plane.size[1] * 0.5 <= 1e-6, "slab under the surface: {:?} {:?}", plane.center, plane.size);
+        let mut c = citrus_core::CapsuleCollider::default();
+        fit_collider(&mut c, Vec3::new(-0.3, 0.0, -0.3), Vec3::new(0.3, 2.0, 0.3));
+        assert!(c.direction == citrus_core::ColliderAxis::Y && c.height == 2.0 && (c.radius - 0.3).abs() < 1e-6);
+    }
 }

@@ -315,13 +315,14 @@ impl BakeJob {
             self.gpu_idle_frac,
         );
 
-        if self.lightmap.is_some() && self.cursor < self.units.len() {
+        if let Some(lightmap) = self.lightmap.as_ref()
+            && self.cursor < self.units.len()
+        {
             let (mesh_idx, transform, size) = self.units[self.cursor];
             let mesh = &meshes[mesh_idx];
             let lm = {
                 let tlas = self.tlas.as_ref().unwrap();
                 let gbuffer = self.gbuffer.as_ref().unwrap();
-                let lightmap = self.lightmap.as_ref().unwrap();
                 let input = BakeInput {
                     instances: &[],
                     lights: &[],
@@ -512,7 +513,7 @@ fn host_ssbo(
 }
 
 /// Scratch buffer whose device address is aligned for an AS build.
-fn scratch_buffer(
+pub(crate) fn scratch_buffer(
     device: &ash::Device,
     alloc: &mut Allocator,
     size: u64,
@@ -555,7 +556,7 @@ pub(crate) fn build_blas(
     let geometry = vk::AccelerationStructureGeometryKHR::default()
         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
         .geometry(vk::AccelerationStructureGeometryDataKHR {
-            triangles: triangles,
+            triangles,
         })
         .flags(vk::GeometryFlagsKHR::OPAQUE);
     let geometries = [geometry];
@@ -812,6 +813,7 @@ impl BakeImage {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn image_barrier(
     device: &ash::Device,
     cb: vk::CommandBuffer,
@@ -1325,6 +1327,7 @@ fn dilate_lightmap(pixels: &mut [f32], size: u32, iters: u32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bake_one_lightmap(
     ctx: &GpuContext,
     allocator: &Arc<Mutex<Allocator>>,
@@ -1651,6 +1654,7 @@ struct ProbePush {
     sky_color: [f32; 4],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bake_probes(
     ctx: &GpuContext,
     allocator: &Arc<Mutex<Allocator>>,

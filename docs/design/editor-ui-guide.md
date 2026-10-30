@@ -90,7 +90,7 @@ builds on the previous; the shell (A–B) is what every later panel relies on.
 - [x] Status bar (§9): status dot + Ready/Playing, scene, object count, selection,
   fps/ms in mono on the right
 - [x] Default layout sizes (hierarchy 264, inspector 324, bottom dock 288) and tab
-  order (Viewport, Camera, UI Editor | Inspector, Environment, FluxBaker | Files, Log)
+  order (Scene, Camera, UI Editor | Inspector, Environment, FluxBaker, Occlusion | Files, Log)
 - [x] Command palette (Ctrl K): fuzzy list of editor actions (new)
 - [x] Preferences window: accent presets (§2.3) + custom colour (new)
 
@@ -161,7 +161,10 @@ builds on the previous; the shell (A–B) is what every later panel relies on.
 ### Phase H — windows and modals
 - [x] Shared window frame: bg.panel, line.panel border, 8 px radius, 12 px padding,
   semibold 13 px title
-- [ ] Project Settings, New Project, Open Project, Unsaved changes, Layers, Input
+- [x] New Project: template picker cards (icon tile, name, category, description; accent
+  border when selected), All / Desktop / VR segmented filter, feature info note, location rows,
+  primary Create & Open (`new_project_ui.rs`)
+- [ ] Project Settings, Open Project, Unsaved changes, Layers, Input
   Bindings, Audio Mixer, Network, VR Tools, Controls, Generate Lightmap UVs, Component
   build failed, Background tasks
 - [ ] Busy modal and bake modal cards

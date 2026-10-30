@@ -8,6 +8,7 @@
 //! replacing the previous "duplicate only".
 
 use citrus_assets::SceneEntry;
+use citrus_core::ObjectId;
 use serde::{Deserialize, Serialize};
 
 /// A reusable object template.
@@ -50,19 +51,40 @@ impl Prefab {
     }
 
     /// Clone the prefab into a fresh set of entries ready to add to a scene:
-    /// - **ids cleared** so the engine assigns fresh unique ids on insert (instances
-    ///   never share an id with the prefab or each other),
+    /// - **fresh ids** (instances never share an id with the prefab or each
+    ///   other); object references inside component data that point at other
+    ///   prefab objects are rewritten to the new ids,
     /// - root entries moved to `translation` (the per-instance override). Parent
     ///   indices stay local; the caller offsets them by the scene's current length.
     ///
     /// Returns the new entries (root-relative parent indices preserved).
     pub fn instantiate(&self, translation: [f32; 3]) -> Vec<SceneEntry> {
+        self.instantiate_rooted(translation, None)
+    }
+
+    /// [`instantiate`](Self::instantiate) with a caller-chosen id for the first
+    /// root (e.g. the id `ctx.spawn_prefab` already handed to gameplay code).
+    pub fn instantiate_rooted(&self, translation: [f32; 3], root_id: Option<ObjectId>) -> Vec<SceneEntry> {
+        let first_root = self.entries.iter().position(|e| e.parent.is_none());
+        let new_ids: Vec<String> = (0..self.entries.len())
+            .map(|i| match root_id {
+                Some(id) if Some(i) == first_root => id.to_string(),
+                _ => ObjectId::new().to_string(),
+            })
+            .collect();
         let mut out = self.entries.clone();
         for (i, e) in out.iter_mut().enumerate() {
-            e.id = String::new(); // engine assigns a fresh id on load
+            e.id = new_ids[i].clone();
             if self.entries[i].parent.is_none() {
                 // Per-instance override: place the root(s) at `translation`.
                 e.translation = translation;
+            }
+            for c in &mut e.components {
+                for (old, new) in self.entries.iter().map(|e| e.id.as_str()).zip(&new_ids) {
+                    if !old.is_empty() && c.data.contains(old) {
+                        c.data = c.data.replace(old, new);
+                    }
+                }
             }
         }
         out
@@ -107,6 +129,8 @@ mod tests {
             translation: [0.0, 0.0, 0.0],
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0, 1.0, 1.0],
+            model: None,
+            model_part: None,
         }
     }
 
@@ -116,14 +140,34 @@ mod tests {
     }
 
     #[test]
-    fn instantiate_clears_ids_and_moves_root() {
+    fn instantiate_gives_fresh_ids_and_moves_root() {
         let p = turret();
         let inst = p.instantiate([5.0, 0.0, 2.0]);
+        let again = p.instantiate([5.0, 0.0, 2.0]);
         assert_eq!(inst.len(), 2);
-        assert!(inst.iter().all(|e| e.id.is_empty()), "ids cleared for fresh assignment");
+        assert!(inst.iter().all(|e| !e.id.is_empty() && !e.id.starts_with("orig-")), "fresh ids");
+        assert_ne!(inst[0].id, again[0].id, "instances never share ids");
         assert_eq!(inst[0].translation, [5.0, 0.0, 2.0]); // root moved
         assert_eq!(inst[1].parent, Some(0)); // child parent preserved (local)
         assert_eq!(inst[1].translation, [0.0, 0.0, 0.0]); // child unchanged
+    }
+
+    #[test]
+    fn instantiate_remaps_internal_references() {
+        let gun_id = ObjectId::new().to_string();
+        let mut base = entry("Base", None);
+        base.components.push(citrus_assets::ComponentData {
+            kind: "Turret".into(),
+            data: format!("(barrel: Some(\"{gun_id}\"))"),
+        });
+        let mut gun = entry("Gun", Some(0));
+        gun.id = gun_id.clone();
+        let p = Prefab::new(vec![base, gun]);
+        let root = ObjectId::new();
+        let inst = p.instantiate_rooted([0.0; 3], Some(root));
+        assert_eq!(inst[0].id, root.to_string());
+        assert!(inst[0].components[0].data.contains(&inst[1].id), "reference follows the new id");
+        assert!(!inst[0].components[0].data.contains(&gun_id));
     }
 
     #[test]

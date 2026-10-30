@@ -50,16 +50,13 @@ impl AssetMeta {
 /// Settings keyed by asset kind. Extend with new variants as importers gain
 /// options (textures: sRGB/mips; audio: streaming; etc.).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ImporterSettings {
+    #[default]
     Generic,
     Model(ModelImport),
 }
 
-impl Default for ImporterSettings {
-    fn default() -> Self {
-        Self::Generic
-    }
-}
 
 impl ImporterSettings {
     /// Default settings variant for an asset path's extension.
@@ -70,7 +67,7 @@ impl ImporterSettings {
             .map(|e| e.to_ascii_lowercase())
             .as_deref()
         {
-            Some("fbx" | "glb" | "gltf" | "obj") => Self::Model(ModelImport::default()),
+            Some("fbx" | "glb" | "gltf" | "vrm" | "obj") => Self::Model(ModelImport::default()),
             _ => Self::Generic,
         }
     }

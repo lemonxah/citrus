@@ -9,8 +9,18 @@
 //! here through M5.
 
 mod audio_ui;
+mod cloth_ui;
+mod ik_ui;
+mod face_ui;
+mod water_ui;
+pub use water_ui::{RIVER_PATH_HINT, RiverHandle, RiverPathEdit, river_handle};
+mod physics_ui;
+mod waterfall_ui;
+mod water_container_ui;
+pub use physics_ui::{physics_settings_ui, physmat_editor_ui};
 mod code_editor;
 mod components;
+mod kit_ui;
 pub mod icons;
 pub mod theme;
 pub mod widgets;
@@ -19,6 +29,7 @@ mod file_browser;
 mod inspector;
 mod scene_panel;
 mod sections;
+mod shader_ui;
 
 pub use code_editor::{
     CodeEditor, CodeEditorResponse, CompletionItem, CompletionState, HoverState, ReferenceItem,
@@ -27,8 +38,10 @@ pub use code_editor::{
 // ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
 // citrus-core. Import those directly, not through the editor.
 pub use components::{
-    ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents, Gizmo, GizmoEdit,
-    GizmoSpec, Inspect, InspectCtx, components_ui,
+    ASSET_TEMPLATES_KEY, AssetEditor, AssetTemplate, ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents,
+    Gizmo, GizmoEdit, GizmoSpec, Inspect, InspectCtx, MIXED_COMPONENTS_KEY, OPEN_ANIM_CONTROLLER_KEY,
+    OPEN_FILE_KEY, PING_FILE_KEY, PROJECT_ROOT_KEY, asset_browse_button, asset_chip, asset_new_button, components_ui,
+    resolve_slot,
 };
 pub use audio_ui::{AudioSettingsResponse, audio_settings_ui};
 pub use file_browser::{FileBrowser, FileBrowserResponse};
@@ -47,10 +60,11 @@ pub fn install_icon_font(ctx: &egui::Context) {
 // The egui-free material/shader data models live in citrus-core now; re-export
 // them so existing `citrus_editor::MaterialModel`-style paths keep working.
 pub use citrus_core::{
-    AlphaModeModel, MaterialModel, ShaderPropKindUi, ShaderPropUi, ShaderUiInfo,
+    AlphaModeModel, MaterialModel, ShaderCondUi, ShaderGroupUi, ShaderPresetUi, ShaderPropKindUi,
+    ShaderPropUi, ShaderUiInfo,
 };
 pub use inspector::{
-    CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse, ObjectHeaderResponse,
+    CodeDiagnostic, InspectorContent, InspectorPanel, InspectorResponse, MixedInfo, ObjectHeaderResponse,
     ObjectInfoModel, TransformModel,
 };
 pub use scene_panel::{SceneObjectRow, ScenePanel, ScenePanelResponse, SpawnKind, UiPreset};

@@ -33,6 +33,12 @@ pub struct ProjectFile {
     /// Steam Audio quality, reflections, HRTF and output layout.
     #[serde(default)]
     pub spatial_audio: citrus_core::SpatialAudioSettings,
+    /// OSC face-tracking receiver (off unless enabled).
+    #[serde(default)]
+    pub tracking_input: citrus_core::TrackingInputSettings,
+    /// Gravity, contact stiffness and the default physics material.
+    #[serde(default)]
+    pub physics: citrus_core::PhysicsSettings,
 }
 
 impl Default for ProjectFile {
@@ -45,6 +51,8 @@ impl Default for ProjectFile {
             bindings: citrus_core::Bindings::default(),
             audio_mixer: citrus_core::AudioMixer::default(),
             spatial_audio: citrus_core::SpatialAudioSettings::default(),
+            tracking_input: citrus_core::TrackingInputSettings::default(),
+            physics: citrus_core::PhysicsSettings::default(),
         }
     }
 }

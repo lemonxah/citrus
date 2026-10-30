@@ -135,7 +135,7 @@ impl PluginHost {
             // builds plugins without it, so citrus-editor/egui never link in.
             let output = Command::new("cargo")
                 .current_dir(project_root)
-                .args(["build", "-p", &name, "--features", "editor"])
+                .args(plugin_build_args(project_root, &name))
                 .output()
                 .context("running cargo")?;
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -176,7 +176,7 @@ impl PluginHost {
         editor: &mut EditorComponents,
     ) -> Result<()> {
         let file = dylib_name(name);
-        let built = project_root.join("target/debug").join(&file);
+        let built = project_root.join("target").join(PROFILE_DIR).join(&file);
         // Copy to a unique path: the next `cargo build` overwrites the
         // original, and dlopen caches by path. The filename includes this
         // process's PID so two editor instances open on the same project don't
@@ -225,7 +225,35 @@ impl PluginHost {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// The plugin must be built exactly like the editor that loads it: it shares
+/// egui types with the host, and egui's structs change layout with
+/// `debug_assertions` and with features (`accesskit`). A dev-built plugin in a
+/// release editor corrupted egui's per-frame state (free(): invalid pointer
+/// when its inspector drew).
+const PROFILE_DIR: &str = if cfg!(debug_assertions) { "debug" } else { "release" };
+
+/// `cargo build` arguments for a plugin: the editor's profile, and when the
+/// editor binary was built from this same workspace, that package too, so
+/// cargo unifies features into the identical egui build the editor uses.
+fn plugin_build_args(project_root: &Path, name: &str) -> Vec<String> {
+    let mut args = vec!["build".to_owned()];
+    if !cfg!(debug_assertions) {
+        args.push("--release".to_owned());
+    }
+    args.extend(["-p".to_owned(), name.to_owned()]);
+    let host = std::env::current_exe().ok().filter(|exe| {
+        let target = project_root.join("target");
+        exe.canonicalize().ok().zip(target.canonicalize().ok()).is_some_and(|(e, t)| e.starts_with(t))
+    });
+    if let Some(stem) = host.as_ref().and_then(|exe| exe.file_stem()).map(|s| s.to_string_lossy().into_owned()) {
+        args.extend(["-p".to_owned(), stem, "--features".to_owned(), format!("{name}/editor")]);
+    } else {
+        args.extend(["--features".to_owned(), "editor".to_owned()]);
+    }
+    args
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const DYLIB_EXT: &str = "so";
 #[cfg(target_os = "macos")]
 const DYLIB_EXT: &str = "dylib";

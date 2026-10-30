@@ -99,8 +99,8 @@ fn apply(start: UiRect, grab: Grab, d: Vec2, snap: f32) -> UiRect {
     let d = [d.x, d.y];
     match grab {
         Grab::Move => {
-            for a in 0..2 {
-                r.position[a] = snap_to(start.position[a] + d[a]);
+            for (a, p) in r.position.iter_mut().enumerate() {
+                *p = snap_to(start.position[a] + d[a]);
             }
         }
         Grab::Resize(x, y) => {

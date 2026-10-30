@@ -85,7 +85,15 @@ impl CommandPalette {
                             self.selected = 0;
                         }
                         ui.add_space(6.0);
-                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        // Size from this frame's rows: the scroll area otherwise keeps the
+                        // shorter height of an earlier search.
+                        let rows = shown.len().max(1) as f32;
+                        let height = (rows * (theme::H_TOOLBAR + ui.spacing().item_spacing.y)).min(360.0);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .min_scrolled_height(height)
+                            .max_height(height)
+                            .show(ui, |ui| {
                             if shown.is_empty() {
                                 ui.label(egui::RichText::new("No matching commands").color(theme::TEXT_DIM));
                             }

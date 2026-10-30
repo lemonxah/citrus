@@ -60,6 +60,11 @@ impl Buffer {
             .unwrap_or_default()
     }
 
+    /// The mapped contents of a host-visible buffer.
+    pub fn mapped(&self) -> Option<&[u8]> {
+        self.allocation.as_ref().and_then(|a| a.mapped_slice())
+    }
+
     /// Write into a host-visible buffer.
     pub fn write(&mut self, offset: usize, data: &[u8]) {
         let mapped = self

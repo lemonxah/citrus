@@ -7,7 +7,9 @@
 //! written back, so motion stays smooth at any frame rate.
 //!
 //! Per object: every collider component becomes a collider on one body. The
-//! body kind comes from `RigidBody` (no `RigidBody` = fixed). A
+//! body kind comes from `RigidBody` (no `RigidBody` = fixed). Contact and water
+//! response come from `.physmat` physics materials: the collider's, else the
+//! body's, else the project default. A
 //! `CharacterController` makes a kinematic capsule moved by `move_character`.
 //! Kinematic and fixed bodies follow their scene transform; dynamic bodies own
 //! theirs, unless gameplay writes a new transform (treated as a teleport).
@@ -16,6 +18,7 @@
 //! vectors and rotations cross the boundary component-wise.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 
 use glam::{Mat4, Quat, Vec3};
@@ -24,14 +27,30 @@ use rapier3d::math::{Pose, Rotation, Vector};
 use rapier3d::prelude::*;
 
 use citrus_core::{
-    BodyKind, BoxCollider, CharacterController, JointKind, MeshCollider, ObjectId, PhysicsJoint, RayFilter,
-    RayHit, RigidBody as RbComponent, SphereCollider,
+    BodyKind, BoxCollider, CharacterController, CombineMode, JointKind, MeshCollider, ObjectId, PhysicsJoint,
+    PhysicsMaterial, PhysicsSettings, RayFilter, RayHit, RigidBody as RbComponent, SphereCollider, CapsuleCollider,
+    ColliderAxis,
 };
 
 use crate::scene::LoadedScene;
 
 /// Fixed simulation step (seconds).
 pub const FIXED_DT: f32 = 1.0 / 60.0;
+
+/// Density (kg/m^3) of a body whose mass comes from its colliders when it
+/// has no physics material: floats about half under water.
+pub const DEFAULT_DENSITY: f32 = 500.0;
+
+/// Lift on a body never exceeds this many times its weight, so something far
+/// lighter than the water it displaces bobs up instead of being launched.
+const MAX_LIFT_RATIO: f32 = 6.0;
+
+/// Entry speed (m/s, downward) and time clear of the water before it that
+/// make a splash; slower contact (waves lapping, bobbing) doesn't.
+const SPLASH_SPEED: f32 = 2.5;
+const SPLASH_DRY_SECS: f32 = 0.2;
+/// Relative speed (m/s) at the surface before a body sheds a foam wake.
+const WAKE_SPEED: f32 = 0.6;
 
 /// Joint velocity-motor gain (rapier's acceleration-based "factor"): high so
 /// motors reach their target speed in a few steps; `motor_max_force` caps it.
@@ -51,6 +70,9 @@ struct Body {
     kind: BodyKind,
     character: Option<KinematicCharacterController>,
     capsule: Option<ColliderHandle>,
+    /// Character capsule as built: component (radius, height, center) and the
+    /// object's world scale, so runtime edits (crouch) reshape it.
+    capsule_dims: Option<(f32, f32, [f32; 3], Vec3)>,
     /// World pose after the previous / latest step (dynamic interpolation).
     prev: (Vec3, Quat),
     curr: (Vec3, Quat),
@@ -58,6 +80,203 @@ struct Body {
     /// a mismatch means gameplay moved the object.
     written: (Vec3, Quat),
     grounded: bool,
+    /// The body material's buoyancy and water-drag multipliers.
+    water: (f32, f32),
+    /// Share of it under water last step.
+    wet: f32,
+    /// Seconds it has been clear of the water (splashes need a real entry).
+    dry_for: f32,
+    /// Water a Water Container on it carries: kg and centre (body space).
+    carried: (f32, Vec3),
+    /// Steps left that a fixed body (a collider without a Rigid Body) still
+    /// counts as moving since gameplay or animation last moved it: it then
+    /// pushes the water like a body instead of standing in it as a wall.
+    moving: u32,
+}
+
+/// Steps a moved fixed collider keeps pushing the water before it settles
+/// back into a wall.
+const MOVED_STEPS: u32 = 20;
+
+/// Advance every interactive Water's ripple window by `dt`, centred near
+/// `focus` (world, e.g. the listener) and fed by this step's pushes. Solid
+/// colliders through the surface (from `physics`) reflect the ripples, and
+/// water flowing past them sheds alternating eddies downstream. Water the
+/// GPU simulation owns is only fed: this step's displacers and pushes, and
+/// its obstacle cells now and then.
+pub fn step_ripples(
+    scene: &mut LoadedScene,
+    world: &[Mat4],
+    focus: Vec3,
+    step: &WaterStep,
+    physics: Option<&PhysicsWorld>,
+    t: f32,
+    dt: f32,
+) {
+    // Each water's layer: what its colliders count against.
+    let masks: Vec<u32> = scene.objects.iter().map(|o| scene.layers.collision_mask(o.layer)).collect();
+    for (i, o) in scene.objects.iter_mut().enumerate() {
+        let layers = masks[i];
+        let Some(water) = o.components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Water>()) else { continue };
+        if !water.interactive {
+            water.ripples = None;
+            continue;
+        }
+        let to_local = world[i].inverse();
+        if water.ripples.as_ref().is_some_and(|r| r.gpu) {
+            feed_gpu_sim(water, i, &to_local, step, physics, t);
+            continue;
+        }
+        let (n, size) = (water.ripple_resolution as usize, water.ripple_area);
+        let sim = water.ripples.get_or_insert_with(|| citrus_core::RippleSim::new(n, size));
+        if sim.n != n.clamp(8, 512) || (sim.size - size.max(1.0)).abs() > 1e-3 {
+            *sim = citrus_core::RippleSim::new(n, size);
+        }
+        let local = to_local.transform_point3(focus);
+        sim.follow(glam::Vec2::new(local.x, local.z));
+        if let Some(physics) = physics {
+            sim.set_blocked(physics.ripple_blockers(world[i], sim, layers));
+        }
+        let mut mine: Vec<citrus_core::WaterPush> =
+            step.pushes.iter().chain(&step.fx_pushes).filter(|(w, _)| *w == i).map(|(_, p)| *p).collect();
+        for wake in step.wakes.iter().filter(|w| w.water == i) {
+            mine.extend(wake_pushes(wake, &to_local, t));
+        }
+        let depth = water.depth.max(0.1);
+        let damping = water.ripple_damping;
+        if let Some(sim) = water.ripples.as_mut() {
+            sim.step(dt, depth, damping, &mine);
+        }
+    }
+}
+
+/// Pushes a GPU-simulated water queues between frames.
+const MAX_QUEUED_PUSHES: usize = 256;
+
+/// Hand a GPU-simulated water this step's bodies and pushes (water `i`).
+fn feed_gpu_sim(
+    water: &mut citrus_core::Water,
+    i: usize,
+    to_local: &Mat4,
+    step: &WaterStep,
+    physics: Option<&PhysicsWorld>,
+    t: f32,
+) {
+    let feed = &mut water.sim_feed;
+    if physics.is_some() {
+        feed.displacers = step.displacers.iter().filter(|(w, _)| *w == i).map(|(_, d)| *d).collect();
+    }
+    feed.pushes.extend(step.fx_pushes.iter().filter(|(w, _)| *w == i).map(|(_, p)| *p));
+    // Fixed things in a flow shed eddies; bodies' own wakes come from the
+    // simulation itself.
+    for wake in step.wakes.iter().filter(|w| w.water == i) {
+        feed.pushes.push(wake_pushes(wake, to_local, t)[0]);
+    }
+    let excess = feed.pushes.len().saturating_sub(MAX_QUEUED_PUSHES);
+    feed.pushes.drain(..excess);
+    // Its wall cells come from `WaterWalls` (every static object and still
+    // collider, by layer).
+}
+
+/// A moving collider's footprint in the GPU-simulated water it crosses
+/// (`lo`..`hi` its local bounds, `pose` its offset on `rb`).
+#[allow(clippy::too_many_arguments)]
+fn collider_displacer(
+    waters: &[(usize, Mat4, &citrus_core::Water)],
+    rb: &rapier3d::dynamics::RigidBody,
+    pose: &Pose,
+    lo: Vec3,
+    hi: Vec3,
+    volume: f32,
+    floats: bool,
+    t: f32,
+) -> Option<(usize, citrus_core::WaterDisplacer)> {
+    let to_world = |p: Vec3| gv(rb.position().transform_point(pose.transform_point(rv(p))));
+    let c = (lo + hi) * 0.5;
+    let cw = to_world(c);
+    let (wi, m, water) = waters.iter().find(|(_, m, w)| {
+        w.interactive && w.ripples.as_ref().is_some_and(|r| r.gpu) && {
+            let l = m.inverse().transform_point3(cw);
+            w.covers(glam::Vec2::new(l.x, l.z))
+        }
+    })?;
+    let inv = m.inverse();
+    let corners: [Vec3; 8] = std::array::from_fn(|k| {
+        let s = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+        inv.transform_point3(to_world(s))
+    });
+    let axis = inv.transform_vector3(to_world(c + Vec3::X) - cw);
+    let lc = inv.transform_point3(cw);
+    let xz = glam::Vec2::new(lc.x, lc.z);
+    // Floating bodies ride the waves, so their footprint is measured against
+    // the moving surface; bodies held in place or resting on the bottom
+    // against the rest level, so passing waves don't make them pump rings
+    // into the water.
+    let surface = if rb.is_dynamic() && floats { water.base_surface(xz, t)? } else { water.column(xz)?.surface };
+    let col = water.column(xz)?;
+    let vel = inv.transform_vector3(gv(rb.velocity_at_point(rv(cw))));
+    let rel = glam::Vec2::new(vel.x - col.flow.x, vel.z - col.flow.z);
+    let size = hi - lo;
+    let boxy = volume / (size.x * size.y * size.z).max(1e-6) > 0.8;
+    citrus_core::WaterDisplacer::from_corners(&corners, axis, surface, water.sim_wave_depth.min(col.depth), rel, !boxy).map(|d| (*wi, d))
+}
+
+/// The simulated water's velocity around a body (world): sampled a little
+/// outside its reach, where it isn't dragging the water itself.
+fn ambient_sim_flow(water: &citrus_core::Water, water_world: Mat4, centre: Vec3, reach: f32) -> Vec3 {
+    if water.ripples.as_ref().is_none_or(|r| !r.gpu) {
+        return Vec3::ZERO;
+    }
+    let r = reach.max(0.1) * 1.3;
+    [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z].iter().map(|d| water.sim_flow_at(water_world, centre + *d * r)).sum::<Vec3>() * 0.25
+}
+
+/// Eddies shed behind something the water flows past: alternating sides at
+/// the Strouhal frequency (0.2 U / D), plus a bow push upstream.
+fn wake_pushes(wake: &Wake, to_local: &Mat4, t: f32) -> [citrus_core::WaterPush; 2] {
+    let u = wake.flow.length().max(1e-3);
+    let dir = wake.flow / u;
+    let side = Vec3::new(-dir.z, 0.0, dir.x);
+    let d = wake.radius * 2.0;
+    let phase = (std::f32::consts::TAU * 0.2 * u / d.max(0.05) * t).sin();
+    let eddy = wake.at + dir * wake.radius * 1.4 + side * (wake.radius * 0.6 * phase.signum());
+    let bow = wake.at - dir * wake.radius;
+    let local = |p: Vec3| {
+        let l = to_local.transform_point3(p);
+        glam::Vec2::new(l.x, l.z)
+    };
+    let strength = (u * 0.35).min(2.0);
+    [
+        citrus_core::WaterPush { at: local(eddy), radius: wake.radius * 0.6, strength: strength * phase.abs() },
+        citrus_core::WaterPush { at: local(bow), radius: wake.radius * 0.5, strength: -strength * 0.3 },
+    ]
+}
+
+/// What one water step produced: each Buoyancy body's submerged share and
+/// the pushes bodies gave each Water (by object index).
+#[derive(Default)]
+pub struct WaterStep {
+    pub submerged: Vec<(usize, f32)>,
+    /// Bodies' pushes (the CPU ripples) and landing water's (`water_fx`).
+    pub pushes: Vec<(usize, citrus_core::WaterPush)>,
+    pub fx_pushes: Vec<(usize, citrus_core::WaterPush)>,
+    /// Bodies' footprints in the water (the GPU simulation).
+    pub displacers: Vec<(usize, citrus_core::WaterDisplacer)>,
+    /// Fast entries this step.
+    pub splashes: Vec<citrus_core::WaterSplash>,
+    /// Water moving past something at the surface this step.
+    pub wakes: Vec<Wake>,
+}
+
+/// Water flowing past a body at the surface (world space).
+#[derive(Clone, Copy, Debug)]
+pub struct Wake {
+    pub water: usize,
+    pub water_world: Mat4,
+    pub at: Vec3,
+    /// Water velocity relative to the body (horizontal).
+    pub flow: Vec3,
+    pub radius: f32,
 }
 
 pub struct PhysicsWorld {
@@ -84,6 +303,10 @@ pub struct PhysicsWorld {
     joints: HashMap<ObjectId, (ImpulseJointHandle, JointKind)>,
     /// Static body at the origin that world-anchored joints attach to.
     world_anchor: RigidBodyHandle,
+    /// Project root `.physmat` paths resolve against (None = materials ignored).
+    root: Option<PathBuf>,
+    default_material: String,
+    materials: HashMap<String, Option<PhysicsMaterial>>,
 }
 
 fn rv(v: Vec3) -> Vector {
@@ -109,15 +332,26 @@ fn pose(t: Vec3, r: Quat) -> Pose {
 impl PhysicsWorld {
     /// Build a world from the scene's active collider / rigid-body objects.
     pub fn build(scene: &LoadedScene) -> Self {
+        Self::build_with(scene, None, &PhysicsSettings::default())
+    }
+
+    /// [`Self::build`] with project physics settings, resolving physics
+    /// materials under `root`.
+    pub fn build_with(scene: &LoadedScene, root: Option<&Path>, settings: &PhysicsSettings) -> Self {
         let (collision_tx, collision_rx) = channel();
         let (force_tx, force_rx) = channel();
         let mut rigid_bodies = RigidBodySet::new();
         let world_anchor = rigid_bodies.insert(RigidBodyBuilder::fixed().build());
         let mut world = Self {
             pipeline: PhysicsPipeline::new(),
-            gravity: Vector::new(0.0, -9.81, 0.0),
+            gravity: rv(Vec3::from(settings.gravity)),
             params: IntegrationParameters {
                 dt: FIXED_DT,
+                contact_softness: SpringCoefficients::new(
+                    settings.contact_stiffness.clamp(1.0, 1000.0),
+                    settings.contact_damping.clamp(0.0, 100.0),
+                ),
+                num_solver_iterations: settings.solver_iterations.clamp(1, 32) as usize,
                 ..Default::default()
             },
             islands: IslandManager::new(),
@@ -137,6 +371,9 @@ impl PhysicsWorld {
             dirty: true,
             joints: HashMap::new(),
             world_anchor,
+            root: root.map(Path::to_owned),
+            default_material: settings.default_material.clone(),
+            materials: HashMap::new(),
         };
         world.sync_structure(scene);
         world
@@ -304,6 +541,19 @@ impl PhysicsWorld {
         }
     }
 
+    /// The material at `path` (project-relative), loaded once.
+    fn material(&mut self, path: &str) -> Option<PhysicsMaterial> {
+        let root = self.root.as_ref()?;
+        if path.is_empty() {
+            return None;
+        }
+        *self.materials.entry(path.to_owned()).or_insert_with(|| {
+            citrus_core::load_physmat(citrus_core::asset_ref::resolve_path(root, path))
+                .map_err(|e| tracing::warn!("physics material: {e}"))
+                .ok()
+        })
+    }
+
     fn add_body(&mut self, scene: &LoadedScene, i: usize, world: Mat4) {
         let object = &scene.objects[i];
         let id = object.id;
@@ -343,14 +593,23 @@ impl PhysicsWorld {
             Group::from_bits_truncate(scene.layers.collision_mask(layer)),
             InteractionTestMode::And,
         );
-        let (rest, fric) = rb.map(|r| (r.restitution, r.friction)).unwrap_or((0.0, 0.5));
-        let finish = |b: ColliderBuilder, trigger: bool| {
+        let default_material = self.default_material.clone();
+        let body_material = rb.and_then(|r| self.material(&r.material)).or_else(|| self.material(&default_material));
+        // Without a material the body's own restitution / friction apply.
+        let legacy = rb.map(|r| PhysicsMaterial { bounciness: r.restitution, friction: r.friction, ..Default::default() });
+        let auto_mass = rb.is_none_or(|r| r.mass <= 0.0);
+        let finish = |b: ColliderBuilder, trigger: bool, mat: Option<PhysicsMaterial>| {
+            let m = mat.or(legacy).unwrap_or_default();
             let b = b
-                .restitution(rest)
-                .friction(fric)
+                .restitution(m.bounciness.clamp(0.0, 1.0))
+                .restitution_combine_rule(combine_rule(m.bounce_combine))
+                .friction(m.friction.max(0.0))
+                .friction_combine_rule(combine_rule(m.friction_combine))
+                .contact_skin(m.contact_offset.max(0.0))
                 .collision_groups(groups)
                 .active_events(ActiveEvents::COLLISION_EVENTS)
                 .user_data(id.raw());
+            let b = if auto_mass { b.density(mat.map_or(DEFAULT_DENSITY, |m| m.density).max(1e-3)) } else { b };
             if trigger {
                 b.sensor(true).active_collision_types(ActiveCollisionTypes::all())
             } else {
@@ -360,12 +619,13 @@ impl PhysicsWorld {
 
         let mut controller = None;
         let mut capsule = None;
+        let mut capsule_dims = None;
         if let Some(cc) = character {
+            capsule_dims = Some((cc.radius, cc.height, cc.center, scale));
             let s = scale.max_element().max(1e-3);
             let radius = (cc.radius * s).max(0.01);
-            let half = ((cc.height * s) * 0.5 - radius).max(0.0);
-            let center = Vec3::from(cc.center) * scale;
-            let collider = finish(ColliderBuilder::capsule_y(half, radius).translation(rv(center)), false).build();
+            let (shape, center) = capsule_shape(cc, scale);
+            let collider = finish(ColliderBuilder::new(shape).translation(rv(center)), false, body_material).build();
             let h = self
                 .colliders
                 .insert_with_parent(collider, handle, &mut self.rigid_bodies);
@@ -384,9 +644,10 @@ impl PhysicsWorld {
                 ..Default::default()
             });
         } else {
-            for (shape, trigger) in collider_shapes(scene, i, scale, kind) {
+            for (shape, trigger, material) in collider_shapes(scene, i, scale, kind) {
+                let mat = self.material(material).or(body_material);
                 let h = self.colliders.insert_with_parent(
-                    finish(shape, trigger).build(),
+                    finish(shape, trigger, mat).build(),
                     handle,
                     &mut self.rigid_bodies,
                 );
@@ -400,10 +661,16 @@ impl PhysicsWorld {
                 kind,
                 character: controller,
                 capsule,
+                capsule_dims,
                 prev: (trans, rot),
                 curr: (trans, rot),
                 written: (object.translation, object.rotation),
                 grounded: false,
+                water: body_material.map_or((1.0, 1.0), |m| (m.buoyancy.max(0.0), m.water_drag.max(0.0))),
+                wet: 0.0,
+                dry_for: 0.0,
+                carried: (0.0, Vec3::ZERO),
+                moving: 0,
             },
         );
     }
@@ -425,6 +692,9 @@ impl PhysicsWorld {
             if body.kind == BodyKind::Kinematic && body.character.is_none() {
                 rb.set_next_kinematic_position(pose(t, r));
             } else if moved {
+                if body.kind == BodyKind::Fixed {
+                    body.moving = MOVED_STEPS;
+                }
                 rb.set_position(pose(t, r), true);
                 if body.kind == BodyKind::Kinematic {
                     rb.set_next_kinematic_position(pose(t, r));
@@ -454,6 +724,7 @@ impl PhysicsWorld {
             &self.collector,
         );
         for body in self.bodies.values_mut() {
+            body.moving = body.moving.saturating_sub(1);
             if body.kind != BodyKind::Dynamic {
                 continue;
             }
@@ -519,6 +790,389 @@ impl PhysicsWorld {
         self.rigid_bodies.get_mut(body.handle)
     }
 
+    /// Water forces at time `t` (the clock the water shader animates with):
+    /// every dynamic body floats by Archimedes from its real density (or by a
+    /// Buoyancy component's override), feels drag, current and `vortices`;
+    /// every body crossing the surface pushes ripples, splashes when it hits
+    /// fast and leaves a wake when water moves past it.
+    pub fn apply_water(&mut self, scene: &LoadedScene, world: &[Mat4], t: f32, vortices: &[citrus_core::Vortex]) -> WaterStep {
+        let waters: Vec<(usize, Mat4, &citrus_core::Water)> = scene
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| scene.is_active(*i))
+            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::Water>()).map(|w| (i, world[i], w)))
+            .collect();
+        let mut out = WaterStep::default();
+        if waters.is_empty() {
+            return out;
+        }
+        let g = -self.gravity.y.min(-1e-3);
+        let all_waters = waters;
+        for (i, o) in scene.objects.iter().enumerate() {
+            let Some(body) = self.bodies.get(&o.id) else { continue };
+            // Only waters whose layer collides with this object's.
+            let waters: Vec<(usize, Mat4, &citrus_core::Water)> =
+                all_waters.iter().copied().filter(|(wi, _, _)| layers_meet(scene, *wi, i)).collect();
+            if waters.is_empty() {
+                continue;
+            }
+            let moved_fixed = body.moving > 0;
+            let b = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::Buoyancy>());
+            let (handle, kind, dry_for) = (body.handle, body.kind, body.dry_for);
+            let (lift_scale, drag_scale) = body.water;
+            let Some(rb) = self.rigid_bodies.get(handle) else { continue };
+            // A container displaces its whole hull: the walls plus the hollow
+            // they enclose (the water inside is part of its mass instead).
+            let hull = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::WaterContainer>()).map(|c| {
+                let (s, _, _) = world[i].to_scale_rotation_translation();
+                let (cc, ch) = (Vec3::from(c.center) * s, c.half_m(s));
+                let at = rb.position().transform_point(rv(cc));
+                let solid = rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).any(|col| !col.is_sensor() && col.shape().contains_point(col.position(), at));
+                (cc, ch, if solid { 0.0 } else { 8.0 * ch.x * ch.y * ch.z })
+            });
+            let hollow = hull.map_or(0.0, |h| h.2);
+            // Whether it floats: lighter than the water it can displace (or
+            // lifted past its weight by a Buoyancy override).
+            let floats = match b {
+                Some(b) => b.buoyancy * lift_scale >= 1.0,
+                None => {
+                    let full: f32 = hollow + rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).filter(|c| !c.is_sensor()).map(|c| c.volume()).sum::<f32>();
+                    let density = waters.iter().map(|(_, _, w)| w.density).fold(0.0f32, f32::max);
+                    density * full * lift_scale >= rb.mass()
+                }
+            };
+            // Sample points in world space: authored, else the corners (pulled
+            // in a little) and centre of each collider's bounds.
+            let mut depth = b.map_or(0.0, |b| b.point_depth);
+            let mut volume = 0.0;
+            let mut reach = 0.0f32;
+            let mut points: Vec<Vec3> = b.map(|b| b.points.iter().map(|p| world[i].transform_point3(Vec3::from(*p))).collect()).unwrap_or_default();
+            let custom_points = b.is_some_and(|b| !b.points.is_empty());
+            let (mut hull_lo, mut hull_hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for ch in rb.colliders() {
+                let Some(col) = self.colliders.get(*ch) else { continue };
+                if col.is_sensor() {
+                    continue;
+                }
+                volume += col.volume();
+                let aabb = col.shape().compute_local_aabb();
+                let (lo, hi) = (gv(aabb.mins), gv(aabb.maxs));
+                let (c, h) = ((lo + hi) * 0.5, (hi - lo) * 0.5 * 0.8);
+                reach = reach.max(((hi - lo) * 0.5).length());
+                if depth <= 0.0 {
+                    depth = (hi.y - lo.y) * 0.5;
+                }
+                let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+                if (kind != BodyKind::Fixed || moved_fixed)
+                    && let Some(d) = collider_displacer(&waters, rb, &local, lo, hi, col.volume(), floats, t)
+                {
+                    out.displacers.push(d);
+                }
+                if hull.is_some() {
+                    for k in 0..8 {
+                        let s = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+                        let q = gv(local.transform_point(rv(s)));
+                        hull_lo = hull_lo.min(q);
+                        hull_hi = hull_hi.max(q);
+                    }
+                }
+                if custom_points || hull.is_some() {
+                    continue;
+                }
+                let to_world = |p: Vec3| gv(rb.position().transform_point(local.transform_point(rv(p))));
+                points.push(to_world(c));
+                for k in 0..8 {
+                    let s = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
+                    points.push(to_world(c + s * h));
+                }
+            }
+            // A container samples its hull's bounds as one box.
+            if let Some((cc, ch, _)) = hull {
+                volume += hollow;
+                hull_lo = hull_lo.min(cc - ch);
+                hull_hi = hull_hi.max(cc + ch);
+                if b.is_none_or(|b| b.point_depth <= 0.0) {
+                    depth = (hull_hi.y - hull_lo.y) * 0.5;
+                }
+                if !custom_points {
+                    let (c, h) = ((hull_lo + hull_hi) * 0.5, (hull_hi - hull_lo) * 0.5 * 0.8);
+                    let to_world = |p: Vec3| gv(rb.position().transform_point(rv(p)));
+                    points.push(to_world(c));
+                    for k in 0..8 {
+                        let s = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
+                        points.push(to_world(c + s * h));
+                    }
+                }
+            }
+            if points.is_empty() {
+                continue;
+            }
+            let n = points.len() as f32;
+            let depth = depth.max(0.05);
+            let mass = rb.mass().max(1e-4);
+            let dynamic = kind == BodyKind::Dynamic;
+            let follow_current = b.is_none_or(|b| b.follow_current);
+            let body_drag = b.map_or(1.0, |b| b.drag_scale) * drag_scale;
+            let centre = gv(rb.translation());
+            let body_vel = gv(rb.linvel());
+            let mut forces = Vec::new();
+            let mut submerged = 0.0;
+            let mut drag_k = 0.0f32;
+            let mut ang_k = 0.0f32;
+            // The fluid's own drag, by the volume's equivalent sphere.
+            let diameter = (6.0 * volume / std::f32::consts::PI).cbrt().max(0.01);
+            let area = std::f32::consts::PI * diameter * diameter * 0.25;
+            let mut spin_visc = 0.0f32;
+            let mut surface: Option<(usize, Mat4, f32, Vec3)> = None;
+            for p in &points {
+                let Some((water_index, water_world, water, (h, nrm))) =
+                    waters.iter().find_map(|(wi, m, w)| w.height_at(*m, *p, t).map(|s| (*wi, *m, *w, s)))
+                else {
+                    continue;
+                };
+                // Each point stands for a slab `depth` tall centred on it.
+                let sub = ((h - p.y) / depth + 0.5).clamp(0.0, 1.0);
+                if sub <= 0.0 {
+                    continue;
+                }
+                submerged += sub;
+                // The simulated layer's flow is taken around the body, not
+                // under it, where the body drags the water itself.
+                let mut flow = if follow_current { water.base_flow_at(water_world, *p) } else { Vec3::ZERO };
+                flow += citrus_core::vortex_flow(vortices, *p);
+                // Wakes come from the steady flow only: the simulated layer's
+                // own waves sloshing past a still body would otherwise shed
+                // eddies that stir it further.
+                if surface.is_none() {
+                    surface = Some((water_index, water_world, h, flow));
+                }
+                flow += ambient_sim_flow(water, water_world, centre, reach);
+                let point_vel = gv(rb.velocity_at_point(rv(*p)));
+                let rel = point_vel - flow;
+                if water.interactive {
+                    // Bodies moving through the surface push it: falling in, and a
+                    // wake from horizontal motion.
+                    let push = (-point_vel.y).max(0.0) * 0.5 + Vec3::new(rel.x, 0.0, rel.z).length() * 0.25;
+                    if push > 0.02 && (h - p.y).abs() < depth {
+                        let local = water_world.inverse().transform_point3(*p);
+                        out.pushes.push((
+                            water_index,
+                            citrus_core::WaterPush { at: glam::Vec2::new(local.x, local.z), radius: depth.max(0.2), strength: push * sub },
+                        ));
+                    }
+                }
+                if !dynamic {
+                    continue;
+                }
+                let lift = match b {
+                    Some(b) => b.buoyancy.max(0.0) * mass * g / n,
+                    // Archimedes: the weight of the water this slab displaces.
+                    None => (water.density.max(0.0) * volume).min(mass * MAX_LIFT_RATIO) * g / n,
+                } * lift_scale;
+                // Very light floats get extra heave damping so they settle
+                // instead of bouncing off the surface.
+                let ratio = (water.density.max(0.0) * volume / mass).clamp(1.0, MAX_LIFT_RATIO);
+                let heave = Vec3::new(0.0, -rel.y * ratio.sqrt() * 2.0 * mass * sub / n, 0.0);
+                let drag = -rel * (water.drag * body_drag * mass * sub / n + fluid_drag(water, diameter, area, rel.length(), mass) * body_drag * sub / n) + heave;
+                // Lift along the local surface normal (blended toward up so it
+                // can't push sideways much on steep crests).
+                let up = (Vec3::Y * 0.7 + nrm * 0.3).normalize_or(Vec3::Y);
+                forces.push((up * lift * sub + drag, *p));
+                drag_k += water.angular_drag * sub / n;
+                // Stokes rotational drag, pi mu D^3, for thick fluids.
+                spin_visc += std::f32::consts::PI * water.viscosity.max(0.0) * diameter.powi(3) * sub / n;
+                ang_k += sub / n;
+            }
+            let frac = submerged / n;
+            out.submerged.push((i, frac));
+            if let Some((water_index, water_world, h, flow)) = surface {
+                let at = Vec3::new(centre.x, h, centre.z);
+                let size = reach.max(0.1);
+                // A splash is a real entry: clear of the water for a moment,
+                // then hitting it fast (not a wave lapping at something slow).
+                if dry_for >= SPLASH_DRY_SECS && frac > 0.0 && body_vel.y < -SPLASH_SPEED {
+                    out.splashes.push(citrus_core::WaterSplash { at, velocity: body_vel, size });
+                    // The splash is the water's: punch a cavity the size of
+                    // the body, deeper the harder it hits; the simulation
+                    // throws up the crown and rings.
+                    let local = water_world.inverse().transform_point3(at);
+                    let push = citrus_core::WaterPush { at: glam::Vec2::new(local.x, local.z), radius: size, strength: -body_vel.y * 1.5 };
+                    out.fx_pushes.push((water_index, push));
+                }
+                // Water and body moving past each other at the surface.
+                let rel = Vec3::new(flow.x - body_vel.x, 0.0, flow.z - body_vel.z);
+                if frac < 0.999 && rel.length() > WAKE_SPEED {
+                    out.wakes.push(Wake { water: water_index, water_world, at, flow: rel, radius: size });
+                }
+            }
+            if let Some(body) = self.bodies.get_mut(&o.id) {
+                body.wet = frac;
+                body.dry_for = if frac > 0.0 { 0.0 } else { body.dry_for + FIXED_DT };
+            }
+            if forces.is_empty() {
+                continue;
+            }
+            let Some(rb) = self.rigid_bodies.get(handle) else { continue };
+            let inertia = rb.mass_properties().local_mprops.principal_inertia();
+            let spin = gv(rb.angvel());
+            let Some(rb) = self.rigid_bodies.get_mut(handle) else { continue };
+            for (f, p) in forces {
+                rb.add_force_at_point(rv(f), rv(p), true);
+            }
+            if ang_k > 0.0 {
+                let avg_inertia = (inertia.x + inertia.y + inertia.z) / 3.0;
+                let visc = spin_visc.min(0.9 * avg_inertia / FIXED_DT);
+                rb.add_torque(rv(-spin * (drag_k * avg_inertia + visc)), true);
+            }
+        }
+        out
+    }
+
+    /// Mark the ripple cells of a water body that a solid collider passes
+    /// through at the still surface (local y = 0), so ripples reflect off it.
+    pub fn ripple_blockers(&self, water_world: Mat4, sim: &citrus_core::RippleSim, layers: u32) -> Vec<bool> {
+        self.ripple_blockers_in(water_world, sim.center, sim.size, sim.n, false, layers)
+    }
+
+    /// The same for a window of `n` x `n` cells, `size` wide around `center`
+    /// (local XZ); `fixed_only` leaves out moving bodies (the GPU
+    /// simulation takes those as displacers).
+    pub fn ripple_blockers_in(&self, water_world: Mat4, center: glam::Vec2, size: f32, n: usize, fixed_only: bool, layers: u32) -> Vec<bool> {
+        let cell = size / n.max(1) as f32;
+        let half = size * 0.5;
+        let cell_center = |x: usize, z: usize| center - glam::Vec2::splat(half) + glam::Vec2::new((x as f32 + 0.5) * cell, (z as f32 + 0.5) * cell);
+        let (lo, hi) = (center - glam::Vec2::splat(half), center + glam::Vec2::splat(half));
+        let corners = [(lo.x, lo.y), (hi.x, lo.y), (lo.x, hi.y), (hi.x, hi.y)].map(|(x, z)| water_world.transform_point3(Vec3::new(x, 0.0, z)));
+        let (wlo, whi) = corners.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+        let surface_y = water_world.w_axis.y;
+        let mut mask = vec![false; n * n];
+        let to_local = water_world.inverse();
+        for (h, col) in self.colliders.iter() {
+            if col.is_sensor() {
+                continue;
+            }
+            if fixed_only && col.parent().and_then(|h| self.rigid_bodies.get(h)).is_some_and(|rb| !rb.is_fixed()) {
+                continue;
+            }
+            if col.collision_groups().memberships.bits() & layers == 0 {
+                continue;
+            }
+            // A fixed collider being moved pushes the water instead.
+            if fixed_only
+                && let Some(id) = self.collider_owner.get(&h)
+                && self.bodies.get(id).is_some_and(|b| b.moving > 0)
+            {
+                continue;
+            }
+            let aabb = col.compute_aabb();
+            let (clo, chi) = (gv(aabb.mins), gv(aabb.maxs));
+            if chi.y < surface_y || clo.y > surface_y || chi.x < wlo.x || clo.x > whi.x || chi.z < wlo.z || clo.z > whi.z {
+                continue;
+            }
+            // Cells under the collider's footprint, tested at the surface.
+            let a = to_local.transform_point3(clo);
+            let b = to_local.transform_point3(chi);
+            let (fl, fh) = (a.min(b), a.max(b));
+            let to_cell = |v: f32, c: f32| ((v - c + half) / cell).floor();
+            let (x0, x1) = (to_cell(fl.x, center.x).max(0.0) as usize, (to_cell(fh.x, center.x) + 1.0).clamp(0.0, n as f32) as usize);
+            let (z0, z1) = (to_cell(fl.z, center.y).max(0.0) as usize, (to_cell(fh.z, center.y) + 1.0).clamp(0.0, n as f32) as usize);
+            for z in z0..z1 {
+                for x in x0..x1 {
+                    let c = cell_center(x, z);
+                    let p = water_world.transform_point3(Vec3::new(c.x, 0.0, c.y));
+                    if col.shape().contains_point(col.position(), rv(p)) {
+                        mask[z * n + x] = true;
+                    }
+                }
+            }
+        }
+        mask
+    }
+
+    /// Project gravity (m/s^2).
+    pub fn gravity(&self) -> Vec3 {
+        gv(self.gravity)
+    }
+
+    /// Water carried by a Water Container on a dynamic body: `kg` with its
+    /// centre at `com` (body space, metres), `half` the water's rough extent.
+    /// It adds to the body's own mass (`own_mass` > 0 = the Rigid Body's set
+    /// mass, else what its colliders weigh), so a full bucket floats lower.
+    pub fn set_carried_water(&mut self, id: ObjectId, own_mass: f32, kg: f32, com: Vec3, half: Vec3) {
+        let Some(body) = self.bodies.get_mut(&id) else { return };
+        if body.kind != BodyKind::Dynamic {
+            return;
+        }
+        let (last_kg, last_com) = body.carried;
+        if (last_kg - kg).abs() < 0.01 && last_com.distance(com) < 1e-3 {
+            return;
+        }
+        body.carried = (kg, com);
+        let Some(rb) = self.rigid_bodies.get_mut(body.handle) else { return };
+        let mut extra = MassProperties::default();
+        if own_mass > 0.0 {
+            // What `additional_mass(own_mass)` added: the colliders' mass
+            // distribution scaled to that mass.
+            let mut base: MassProperties = rb
+                .colliders()
+                .iter()
+                .filter_map(|h| self.colliders.get(*h))
+                .filter(|c| c.is_enabled())
+                .map(|c| c.mass_properties().transform_by(c.position_wrt_parent().unwrap_or(&Pose::IDENTITY)))
+                .sum();
+            if base.mass() > 0.0 {
+                base.set_mass(own_mass, true);
+                extra = base;
+            } else {
+                extra = MassProperties::new(Vector::ZERO, own_mass, Vector::splat(own_mass * 0.01));
+            }
+        }
+        if kg > 0.0 {
+            // Water barely turns with its container: a fraction of a solid
+            // block's inertia.
+            let d = half * 2.0;
+            let inertia = Vec3::new(d.y * d.y + d.z * d.z, d.x * d.x + d.z * d.z, d.x * d.x + d.y * d.y) * (kg / 12.0 * 0.3);
+            extra += MassProperties::new(rv(com), kg, rv(inertia));
+        }
+        rb.set_additional_mass_properties(extra, true);
+    }
+
+    /// Cast each segment against the solid colliders: the first hit's point
+    /// and object, per segment.
+    pub fn cast_segments(&self, segments: &[(Vec3, Vec3)]) -> Vec<Option<(Vec3, ObjectId)>> {
+        if segments.is_empty() {
+            return Vec::new();
+        }
+        let qp = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.rigid_bodies,
+            &self.colliders,
+            QueryFilter::default().exclude_sensors(),
+        );
+        segments
+            .iter()
+            .map(|(a, b)| {
+                let d = *b - *a;
+                let len = d.length();
+                if len < 1e-6 {
+                    return None;
+                }
+                let ray = Ray::new(rv(*a), rv(d / len));
+                let (h, toi) = qp.cast_ray(&ray, len, true)?;
+                let c = self.colliders.get(h)?;
+                Some((*a + d / len * toi, ObjectId::from_raw(c.user_data)))
+            })
+            .collect()
+    }
+
+    /// A body's simulated mass (kg) and the volume of its solid colliders (m^3).
+    pub fn mass_and_volume(&self, id: ObjectId) -> Option<(f32, f32)> {
+        let rb = self.rigid_bodies.get(self.bodies.get(&id)?.handle)?;
+        let volume = rb.colliders().iter().filter_map(|h| self.colliders.get(*h)).filter(|c| !c.is_sensor()).map(|c| c.volume()).sum();
+        Some((rb.mass(), volume))
+    }
+
     pub fn add_force(&mut self, id: ObjectId, force: Vec3) {
         if let Some(rb) = self.dynamic_body(id) {
             rb.add_force(rv(force), true);
@@ -540,6 +1194,40 @@ impl PhysicsWorld {
     pub fn set_velocity(&mut self, id: ObjectId, linear: Vec3) {
         if let Some(rb) = self.dynamic_body(id) {
             rb.set_linvel(rv(linear), true);
+        }
+    }
+
+    /// Networking: a dynamic body another peer simulates turns kinematic and
+    /// follows its scene transform; when authority returns it turns dynamic
+    /// again, starting at `vel`.
+    pub fn set_net_driven(&mut self, scene: &LoadedScene, id: ObjectId, driven: bool, vel: Vec3) {
+        let authored_dynamic = scene
+            .index_of(id)
+            .and_then(|i| scene.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<RbComponent>()))
+            .is_some_and(|r| r.kind == BodyKind::Dynamic);
+        let Some(body) = self.bodies.get_mut(&id) else {
+            return;
+        };
+        if !authored_dynamic || body.character.is_some() {
+            return;
+        }
+        let Some(rb) = self.rigid_bodies.get_mut(body.handle) else {
+            return;
+        };
+        match (driven, body.kind) {
+            (true, BodyKind::Dynamic) => {
+                rb.set_body_type(RigidBodyType::KinematicPositionBased, true);
+                body.kind = BodyKind::Kinematic;
+            }
+            (false, BodyKind::Kinematic) => {
+                rb.set_body_type(RigidBodyType::Dynamic, true);
+                rb.set_linvel(rv(vel), true);
+                let pose = (gv(rb.translation()), gq(rb.rotation()));
+                body.prev = pose;
+                body.curr = pose;
+                body.kind = BodyKind::Dynamic;
+            }
+            _ => {}
         }
     }
 
@@ -566,6 +1254,18 @@ impl PhysicsWorld {
         let (Some(controller), Some(capsule)) = (body.character, body.capsule) else {
             return;
         };
+        if let (Some((r0, h0, c0, scale)), Some(cc)) = (
+            body.capsule_dims,
+            scene.objects[index].components.iter().find_map(|c| c.as_any().downcast_ref::<CharacterController>()),
+        ) && (cc.radius, cc.height, cc.center) != (r0, h0, c0)
+        {
+            body.capsule_dims = Some((cc.radius, cc.height, cc.center, scale));
+            let (shape, center) = capsule_shape(cc, scale);
+            if let Some(col) = self.colliders.get_mut(capsule) {
+                col.set_shape(shape);
+                col.set_translation_wrt_parent(rv(center));
+            }
+        }
         let Some(rb) = self.rigid_bodies.get(body.handle) else {
             return;
         };
@@ -602,6 +1302,15 @@ impl PhysicsWorld {
         }
         f
     }
+}
+
+/// A character controller's capsule (scaled by the object's world scale)
+/// and its offset from the body origin.
+fn capsule_shape(cc: &CharacterController, scale: Vec3) -> (SharedShape, Vec3) {
+    let s = scale.max_element().max(1e-3);
+    let radius = (cc.radius * s).max(0.01);
+    let half = ((cc.height * s) * 0.5 - radius).max(0.0);
+    (SharedShape::capsule_y(half, radius), Vec3::from(cc.center) * scale)
 }
 
 impl citrus_core::PhysicsQuery for PhysicsWorld {
@@ -678,14 +1387,91 @@ fn world_to_local(scene: &LoadedScene, i: usize, t: Vec3, r: Quat) -> (Vec3, Qua
 fn is_physics_object(scene: &LoadedScene, i: usize) -> bool {
     scene.objects[i].components.iter().any(|c| {
         let a = c.as_any();
-        a.is::<BoxCollider>() || a.is::<SphereCollider>() || a.is::<MeshCollider>() || a.is::<CharacterController>()
+        a.is::<BoxCollider>()
+            || a.is::<SphereCollider>()
+            || a.is::<CapsuleCollider>()
+            || a.is::<MeshCollider>()
+            || a.is::<CharacterController>()
     })
 }
 
 /// Rapier collider shapes (with object-space offsets baked in) for every
 /// collider component on object `i`, scaled by its world scale. Returns
 /// `(builder, is_trigger)`.
-fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -> Vec<(ColliderBuilder, bool)> {
+fn combine_rule(mode: CombineMode) -> CoefficientCombineRule {
+    match mode {
+        CombineMode::Average => CoefficientCombineRule::Average,
+        CombineMode::Minimum => CoefficientCombineRule::Min,
+        CombineMode::Multiply => CoefficientCombineRule::Multiply,
+        CombineMode::Maximum => CoefficientCombineRule::Max,
+    }
+}
+
+/// Whether objects `a` and `b`'s layers collide (the Layers matrix): water
+/// only moves, lifts and is pushed by what its layer meets.
+pub(crate) fn layers_meet(scene: &LoadedScene, a: usize, b: usize) -> bool {
+    let (la, lb) = (scene.objects[a].layer, scene.objects[b].layer);
+    scene.layers.collision_mask(la) & (1u32 << (lb as u32 & 31)) != 0
+}
+
+/// Drag coefficient (N per m/s) a body of equivalent-sphere `diameter` and
+/// frontal `area` feels moving at `speed` through `water`'s fluid: the
+/// sphere drag curve Cd = 24/Re + 6/(1 + sqrt Re) + 0.4 (White), so thick
+/// fluids give Stokes drag (3 pi mu D v) and thin ones the quadratic form
+/// drag. Capped so one step never more than stops the body.
+fn fluid_drag(water: &citrus_core::Water, diameter: f32, area: f32, speed: f32, mass: f32) -> f32 {
+    let nu = water.kinematic_viscosity().max(1e-7);
+    let re = speed * diameter / nu;
+    let k = 0.5 * water.density.max(0.0) * area * (24.0 * nu / diameter + (6.0 / (1.0 + re.sqrt()) + 0.4) * speed);
+    k.min(0.9 * mass / FIXED_DT)
+}
+
+/// A solid of an object, posed in the world, for the water to test against.
+pub(crate) enum Solid {
+    /// A closed shape: points inside it are solid.
+    Shape(Collider),
+    /// Triangles (world space): solid where they cross a level.
+    Mesh(Vec<Vec3>, Vec<[u32; 3]>),
+}
+
+/// Object `i`'s solids placed at `world`: its collider components (triggers
+/// left out), or for a static object with none, its render mesh. Triangle
+/// meshes stay triangles (they need not be closed); everything else is a
+/// shape to test points against.
+pub(crate) fn world_solids(scene: &LoadedScene, i: usize, world: Mat4) -> Vec<Solid> {
+    let (scale, r, t) = world.to_scale_rotation_translation();
+    let at = pose(t, r);
+    let mut builders: Vec<ColliderBuilder> =
+        collider_shapes(scene, i, scale, BodyKind::Fixed).into_iter().filter(|(_, trigger, _)| !trigger).map(|(b, _, _)| b).collect();
+    if builders.is_empty()
+        && scene.objects[i].static_geometry
+        && let Some(shape) = mesh_collider_shape(scene, i, MeshShapeMode::Exact)
+        && let MeshColliderShape::Triangles(p, tris) = &*shape
+        && let Ok(b) = ColliderBuilder::trimesh(p.iter().map(|v| rv(*v * scale)).collect(), tris.clone())
+    {
+        builders.push(b);
+    }
+    builders
+        .into_iter()
+        .map(|b| {
+            let mut c = b.build();
+            let placed = at * *c.position();
+            c.set_position(placed);
+            match c.shape().as_trimesh() {
+                Some(m) => Solid::Mesh(m.vertices().iter().map(|v| gv(placed.transform_point(*v))).collect(), m.indices().to_vec()),
+                None => Solid::Shape(c),
+            }
+        })
+        .collect()
+}
+
+/// Whether world point `p` is inside `c`.
+pub(crate) fn solid_contains(c: &Collider, p: Vec3) -> bool {
+    c.shape().contains_point(c.position(), rv(p))
+}
+
+/// Each collider component's shape, trigger flag and material path.
+fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -> Vec<(ColliderBuilder, bool, &str)> {
     let obj = &scene.objects[i];
     let mut out = Vec::new();
     for c in &obj.components {
@@ -693,44 +1479,290 @@ fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -
         if let Some(b) = any.downcast_ref::<BoxCollider>() {
             let half = (Vec3::from(b.size) * 0.5 * scale).max(Vec3::splat(1e-3));
             let off = Vec3::from(b.center) * scale;
-            out.push((ColliderBuilder::cuboid(half.x, half.y, half.z).translation(rv(off)), b.is_trigger));
+            out.push((ColliderBuilder::cuboid(half.x, half.y, half.z).translation(rv(off)), b.is_trigger, b.material.as_str()));
         } else if let Some(s) = any.downcast_ref::<SphereCollider>() {
             let r = (s.radius * scale.max_element()).max(1e-3);
             let off = Vec3::from(s.center) * scale;
-            out.push((ColliderBuilder::ball(r).translation(rv(off)), s.is_trigger));
+            out.push((ColliderBuilder::ball(r).translation(rv(off)), s.is_trigger, s.material.as_str()));
+        } else if let Some(c) = any.downcast_ref::<CapsuleCollider>() {
+            // Radius scales with the larger of the two cross axes, length with its own.
+            let (along, across) = match c.direction {
+                ColliderAxis::X => (scale.x, scale.y.max(scale.z)),
+                ColliderAxis::Y => (scale.y, scale.x.max(scale.z)),
+                ColliderAxis::Z => (scale.z, scale.x.max(scale.y)),
+            };
+            let r = (c.radius * across).max(1e-3);
+            let half = ((c.height * along) * 0.5 - r).max(0.0);
+            let off = Vec3::from(c.center) * scale;
+            let shape = match c.direction {
+                ColliderAxis::X => ColliderBuilder::capsule_x(half, r),
+                ColliderAxis::Y => ColliderBuilder::capsule_y(half, r),
+                ColliderAxis::Z => ColliderBuilder::capsule_z(half, r),
+            };
+            out.push((shape.translation(rv(off)), c.is_trigger, c.material.as_str()));
         } else if let Some(m) = any.downcast_ref::<MeshCollider>()
-            && let Some(shape) = mesh_shape(scene, i, scale, m.convex || kind != BodyKind::Fixed)
+            && let Some(shape) = mesh_shape(scene, i, scale, MeshShapeMode::of(m, kind != BodyKind::Fixed))
         {
-            out.push((shape, m.is_trigger));
+            out.push((shape, m.is_trigger, m.material.as_str()));
         }
     }
     out
 }
 
-/// Collider from the object's render meshes: exact triangles for static
-/// geometry, convex hull for moving bodies (rapier can't simulate concave
-/// dynamic meshes). Falls back to the mesh AABB when no CPU geometry exists.
-fn mesh_shape(scene: &LoadedScene, i: usize, scale: Vec3, convex: bool) -> Option<ColliderBuilder> {
+/// What a Mesh Collider becomes, in the object's local space (unscaled).
+#[derive(Debug)]
+pub enum MeshColliderShape {
+    /// The exact triangles (static geometry).
+    Triangles(Vec<Vec3>, Vec<[u32; 3]>),
+    /// Convex pieces: one hull ("Convex"), or a decomposition that follows
+    /// a concave mesh for moving bodies (rapier can't simulate concave
+    /// dynamic meshes).
+    Hulls(Vec<(Vec<Vec3>, Vec<[u32; 3]>)>),
+    /// A mesh that is a ball: an exact sphere (centre, radius).
+    Ball(Vec3, f32),
+}
+
+/// Whether object `i`'s meshes form a ball (see [`ball_of`]).
+pub fn mesh_is_ball(scene: &LoadedScene, i: usize) -> bool {
+    let verts: Vec<Vec3> = scene.objects[i].render_slots().filter_map(|r| scene.mesh_geometry(r.mesh)).flat_map(|(p, _)| p.iter().copied()).collect();
+    ball_of(&verts).is_some()
+}
+
+/// Centre and radius when every vertex sits about the same distance from
+/// the bounds' centre (a sphere mesh, however finely tessellated).
+pub fn ball_of(points: &[Vec3]) -> Option<(Vec3, f32)> {
+    if points.len() < 12 {
+        return None;
+    }
+    let (lo, hi) = points.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+    let size = hi - lo;
+    if size.min_element() < size.max_element() * 0.95 {
+        return None;
+    }
+    let c = (lo + hi) * 0.5;
+    let (near, far) = points.iter().fold((f32::MAX, 0.0f32), |(n, f), p| {
+        let d = p.distance(c);
+        (n.min(d), f.max(d))
+    });
+    (far > 1e-4 && near > far * 0.94).then_some((c, far))
+}
+
+/// How a Mesh Collider turns its mesh into a shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MeshShapeMode {
+    /// The exact triangles (static only).
+    Exact,
+    /// One simplified convex hull.
+    Hull(citrus_core::ColliderDetail),
+    /// Simplified convex pieces that follow a concave shape.
+    Pieces(citrus_core::ColliderDetail),
+}
+
+impl MeshShapeMode {
+    pub fn of(collider: &MeshCollider, moving: bool) -> Self {
+        let d = collider.detail;
+        match (collider.convex, moving, collider.follow_shape) {
+            (true, _, _) => Self::Hull(d),
+            (false, false, _) => Self::Exact,
+            (false, true, true) => Self::Pieces(d),
+            (false, true, false) => Self::Hull(d),
+        }
+    }
+}
+
+/// Corner budget of a whole-mesh hull, and the pieces' count, corners and
+/// voxel resolution, per detail level.
+fn budgets(detail: citrus_core::ColliderDetail) -> (usize, u32, usize, u32) {
+    match detail {
+        citrus_core::ColliderDetail::Low => (64, 8, 24, 48),
+        citrus_core::ColliderDetail::Medium => (128, 16, 48, 64),
+        citrus_core::ColliderDetail::High => (256, 32, 96, 96),
+    }
+}
+
+/// Key for [`LoadedScene::collider_shapes`]: the object's meshes and how
+/// they're turned into a collider.
+pub type ColliderShapeKey = (Vec<usize>, MeshShapeMode);
+
+/// The collision shape object `i`'s Mesh Collider builds from its render
+/// meshes in `mode`. Cached on the scene (decomposing a big mesh is slow).
+/// None when there's no CPU geometry.
+pub fn mesh_collider_shape(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> Option<std::sync::Arc<MeshColliderShape>> {
     let obj = &scene.objects[i];
-    let mut verts: Vec<Vector> = Vec::new();
+    let meshes: Vec<usize> = obj.render_slots().map(|r| r.mesh).collect();
+    let key: ColliderShapeKey = (meshes.clone(), mode);
+    if let Some(s) = scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(s.clone());
+    }
+    let mut verts: Vec<Vec3> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
-    for render in obj.render_slots() {
-        if let Some((pos, idx)) = scene.mesh_geometry(render.mesh) {
+    for m in meshes {
+        if let Some((pos, idx)) = scene.mesh_geometry(m) {
             let base = verts.len() as u32;
-            verts.extend(pos.iter().map(|p| rv(*p * scale)));
+            verts.extend_from_slice(pos);
             tris.extend(idx.as_chunks::<3>().0.iter().map(|t| [base + t[0], base + t[1], base + t[2]]));
         }
     }
-    if !verts.is_empty() {
-        let shape = if convex {
-            ColliderBuilder::convex_hull(&verts)
-        } else {
-            ColliderBuilder::trimesh(verts, tris).ok()
-        };
-        if shape.is_some() {
-            return shape;
+    if verts.is_empty() || tris.is_empty() {
+        return None;
+    }
+    if mode != MeshShapeMode::Exact
+        && let Some((c, r)) = ball_of(&verts)
+    {
+        let shape = std::sync::Arc::new(MeshColliderShape::Ball(c, r));
+        scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).insert(key, shape.clone());
+        return Some(shape);
+    }
+    let shape = match mode {
+        MeshShapeMode::Hull(d) => MeshColliderShape::Hulls(vec![hull_of(&verts, budgets(d).0)?]),
+        MeshShapeMode::Pieces(d) => {
+            let hull = hull_of(&verts, budgets(d).0)?;
+            // Already (nearly) convex, like a ball: one hull is the shape.
+            let parts = if mesh_volume(&verts, &tris) > 0.85 * mesh_volume(&hull.0, &hull.1) { Vec::new() } else { convex_pieces(&verts, &tris, d) };
+            MeshColliderShape::Hulls(if parts.is_empty() { vec![hull] } else { parts })
+        }
+        MeshShapeMode::Exact => MeshColliderShape::Triangles(verts, tris),
+    };
+    let shape = std::sync::Arc::new(shape);
+    scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).insert(key, shape.clone());
+    Some(shape)
+}
+
+
+/// Convex hull of `points` kept to at most `max_points` corners (spread
+/// evenly over the full hull); None for degenerate input (flat or too few
+/// points), which the hull builder can't take.
+fn hull_of(points: &[Vec3], max_points: usize) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    let build = |pts: &[Vec3]| -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+        let pts: Vec<Vector> = pts.iter().map(|p| rv(*p)).collect();
+        let (p, t) = std::panic::catch_unwind(|| rapier3d::parry::transformation::convex_hull(&pts)).ok()?;
+        (p.len() >= 4 && !t.is_empty()).then(|| (p.into_iter().map(gv).collect(), t))
+    };
+    let (p, t) = build(points)?;
+    if p.len() <= max_points {
+        return Some((p, t));
+    }
+    // Farthest-point sampling keeps the extremes, so the hull loses detail
+    // evenly instead of whole corners.
+    let mut keep = vec![0usize];
+    let mut dist: Vec<f32> = p.iter().map(|q| q.distance_squared(p[0])).collect();
+    while keep.len() < max_points {
+        let (far, _) = dist.iter().enumerate().fold((0, -1.0f32), |b, (i, d)| if *d > b.1 { (i, *d) } else { b });
+        keep.push(far);
+        for (i, q) in p.iter().enumerate() {
+            dist[i] = dist[i].min(q.distance_squared(p[far]));
         }
     }
+    let picked: Vec<Vec3> = keep.into_iter().map(|i| p[i]).collect();
+    build(&picked).or(Some((p, t)))
+}
+
+/// Enclosed volume of a closed triangle mesh (0-ish for open ones).
+fn mesh_volume(p: &[Vec3], t: &[[u32; 3]]) -> f32 {
+    t.iter().map(|t| p[t[0] as usize].dot(p[t[1] as usize].cross(p[t[2] as usize]))).sum::<f32>().abs() / 6.0
+}
+
+/// Convex pieces that follow a (possibly concave) mesh. Empty when the
+/// decomposition fails, so the caller can fall back to one hull.
+fn convex_pieces(points: &[Vec3], tris: &[[u32; 3]], detail: citrus_core::ColliderDetail) -> Vec<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    let (_, max_pieces, piece_points, resolution) = budgets(detail);
+    use rapier3d::parry::transformation::vhacd;
+    let pts: Vec<Vector> = points.iter().map(|p| rv(*p)).collect();
+    let params = vhacd::VHACDParameters { resolution, concavity: 0.025, max_convex_hulls: max_pieces, ..Default::default() };
+    // Exact hulls need the voxel-to-triangle map (`true`).
+    let parts = std::panic::catch_unwind(|| vhacd::VHACD::decompose(&params, &pts, tris, true).compute_exact_convex_hulls(&pts, tris))
+        .map_err(|_| tracing::warn!("mesh collider: convex decomposition failed, using one hull"))
+        .unwrap_or_default();
+    parts
+        .into_iter()
+        .filter(|(p, t)| p.len() >= 4 && !t.is_empty())
+        .filter_map(|(p, _)| hull_of(&p.into_iter().map(gv).collect::<Vec<_>>(), piece_points))
+        .collect()
+}
+
+/// Object `i`'s Mesh Collider as wire edges (local space), cached.
+pub fn mesh_collider_wire_for(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> Option<std::sync::Arc<Vec<(Vec3, Vec3)>>> {
+    let meshes: Vec<usize> = scene.objects[i].render_slots().map(|r| r.mesh).collect();
+    let key: ColliderShapeKey = (meshes, mode);
+    if let Some(w) = scene.collider_wires.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(w.clone());
+    }
+    let wire = std::sync::Arc::new(mesh_collider_wire(&*mesh_collider_shape(scene, i, mode)?));
+    scene.collider_wires.lock().unwrap_or_else(|e| e.into_inner()).insert(key, wire.clone());
+    Some(wire)
+}
+
+/// The edges that outline a collider shape (local space): where its surface
+/// folds by more than a few degrees, and open borders, not the diagonals
+/// across flat faces. Capped for display.
+pub fn mesh_collider_wire(shape: &MeshColliderShape) -> Vec<(Vec3, Vec3)> {
+    const MAX_EDGES: usize = 12_000;
+    // cos of the smallest fold that counts as an edge (~15 degrees).
+    const FOLD: f32 = 0.966;
+    let mut out = Vec::new();
+    let mut add = |pts: &[Vec3], tris: &[[u32; 3]]| {
+        let normal = |t: &[u32; 3]| (pts[t[1] as usize] - pts[t[0] as usize]).cross(pts[t[2] as usize] - pts[t[0] as usize]).normalize_or_zero();
+        let mut faces: HashMap<(u32, u32), Vec<Vec3>> = HashMap::new();
+        for t in tris {
+            let n = normal(t);
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                faces.entry((a.min(b), a.max(b))).or_default().push(n);
+            }
+        }
+        for ((a, b), ns) in faces {
+            let fold = ns.len() != 2 || ns[0].dot(ns[1]) < FOLD;
+            if fold && out.len() < MAX_EDGES {
+                out.push((pts[a as usize], pts[b as usize]));
+            }
+        }
+    };
+    match shape {
+        MeshColliderShape::Triangles(p, t) => add(p, t),
+        MeshColliderShape::Hulls(parts) => {
+            for (p, t) in parts {
+                add(p, t);
+            }
+        }
+        MeshColliderShape::Ball(c, r) => {
+            // Three great circles.
+            for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
+                for k in 0..48 {
+                    let (t0, t1) = (k as f32 / 48.0 * std::f32::consts::TAU, (k + 1) as f32 / 48.0 * std::f32::consts::TAU);
+                    out.push((*c + (a * t0.cos() + b * t0.sin()) * *r, *c + (a * t1.cos() + b * t1.sin()) * *r));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Collider from the object's render meshes (see [`mesh_collider_shape`]),
+/// scaled. Falls back to the mesh AABB when no CPU geometry exists.
+fn mesh_shape(scene: &LoadedScene, i: usize, scale: Vec3, mode: MeshShapeMode) -> Option<ColliderBuilder> {
+    if let Some(shape) = mesh_collider_shape(scene, i, mode) {
+        let built = match &*shape {
+            MeshColliderShape::Ball(c, r) => Some(ColliderBuilder::ball((*r * scale.max_element()).max(1e-3)).translation(rv(*c * scale))),
+            MeshColliderShape::Triangles(p, t) => ColliderBuilder::trimesh(p.iter().map(|v| rv(*v * scale)).collect(), t.clone()).ok(),
+            MeshColliderShape::Hulls(parts) => {
+                let pieces: Vec<(Pose, SharedShape)> = parts
+                    .iter()
+                    .filter_map(|(p, _)| {
+                        let pts: Vec<Vector> = p.iter().map(|v| rv(*v * scale)).collect();
+                        SharedShape::convex_hull(&pts).map(|s| (Pose::IDENTITY, s))
+                    })
+                    .collect();
+                match pieces.len() {
+                    0 => None,
+                    1 => Some(ColliderBuilder::new(pieces.into_iter().next().unwrap().1)),
+                    _ => Some(ColliderBuilder::compound(pieces)),
+                }
+            }
+        };
+        if built.is_some() {
+            return built;
+        }
+    }
+    let obj = &scene.objects[i];
     let render = obj.render?;
     let (min, max) = scene.mesh_aabb(render.mesh);
     let half = ((max - min) * 0.5 * scale).max(Vec3::splat(1e-3));
@@ -797,6 +1829,389 @@ mod tests {
             events.extend(pw.take_events());
         }
         events
+    }
+
+    fn run_water(pw: &mut PhysicsWorld, scene: &mut LoadedScene, steps: usize) {
+        for k in 0..steps {
+            pw.sync_structure(scene);
+            let ids = scene.id_index();
+            let world = scene.world_transforms();
+            pw.push_poses(scene, &ids, &world);
+            pw.apply_water(scene, &world, k as f32 * FIXED_DT, &[]);
+            pw.step();
+            pw.reset_forces();
+            pw.write_back(scene, &ids, 1.0);
+        }
+    }
+
+    fn crate_box(scene: &mut LoadedScene, pos: Vec3, buoyancy: f32) -> ObjectId {
+        obj(
+            scene,
+            pos,
+            vec![
+                Box::new(BoxCollider { size: [1.0, 1.0, 1.0], ..Default::default() }),
+                Box::new(RbComponent::default()),
+                Box::new(citrus_core::Buoyancy { buoyancy, ..Default::default() }),
+            ],
+        )
+    }
+
+    fn material_dir(name: &str, mats: &[(&str, PhysicsMaterial)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("citrus-physmat-{name}-{}", std::process::id()));
+        for (file, m) in mats {
+            citrus_core::save_physmat(dir.join(file), m).unwrap();
+        }
+        dir
+    }
+
+    fn peak_after_bounce(material: &str, dir: &Path) -> f32 {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        let ball = obj(
+            &mut scene,
+            Vec3::new(0.0, 3.0, 0.0),
+            vec![Box::new(SphereCollider::default()), Box::new(RbComponent { material: material.into(), ..Default::default() })],
+        );
+        let mut pw = PhysicsWorld::build_with(&scene, Some(dir), &PhysicsSettings::default());
+        let y = |scene: &LoadedScene| scene.world_transform(scene.index_of(ball).unwrap()).w_axis.y;
+        let mut landed = false;
+        let mut peak = f32::MIN;
+        for _ in 0..240 {
+            let before = y(&scene);
+            run(&mut pw, &mut scene, 1);
+            let now = y(&scene);
+            if !landed && now >= before && now < 1.2 {
+                landed = true;
+            }
+            if landed {
+                peak = peak.max(now);
+            }
+        }
+        peak
+    }
+
+    #[test]
+    fn a_bouncy_material_bounces_and_the_body_slot_applies_it() {
+        let rubber = PhysicsMaterial { bounciness: 0.9, bounce_combine: CombineMode::Maximum, ..Default::default() };
+        let dir = material_dir("bounce", &[("rubber.physmat", rubber), ("clay.physmat", PhysicsMaterial::default())]);
+        let bouncy = peak_after_bounce("rubber.physmat", &dir);
+        let dead = peak_after_bounce("clay.physmat", &dir);
+        assert!(bouncy > 2.0, "rubber comes most of the way back up: {bouncy}");
+        assert!(dead < 1.1, "a dead material stays on the floor: {dead}");
+    }
+
+    #[test]
+    fn density_sets_mass_and_buoyancy_scales_lift() {
+        let light = PhysicsMaterial { density: 100.0, buoyancy: 0.25, ..Default::default() };
+        let dir = material_dir("density", &[("light.physmat", light)]);
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), ..Default::default() })]);
+        let id = obj(
+            &mut scene,
+            Vec3::new(0.0, 2.0, 0.0),
+            vec![
+                Box::new(BoxCollider { size: [1.0, 1.0, 1.0], ..Default::default() }),
+                Box::new(RbComponent { mass: 0.0, material: "light.physmat".into(), ..Default::default() }),
+                Box::new(citrus_core::Buoyancy { buoyancy: 2.0, ..Default::default() }),
+            ],
+        );
+        let mut pw = PhysicsWorld::build_with(&scene, Some(&dir), &PhysicsSettings::default());
+        let mass = pw.rigid_bodies[pw.bodies[&id].handle].mass();
+        assert!((mass - 100.0).abs() < 1.0, "1 m3 at 100 kg/m3: {mass}");
+        run_water(&mut pw, &mut scene, 900);
+        let y = scene.world_transform(scene.index_of(id).unwrap()).w_axis.y;
+        assert!(y < -1.0, "2x lift scaled by 0.25 is less than its weight, so it sinks: {y}");
+    }
+
+    #[test]
+    fn any_rigid_body_floats_by_its_density_and_splashes_in() {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), ..Default::default() })]);
+        let body = |mass: f32| -> Vec<Box<dyn Component>> {
+            vec![Box::new(BoxCollider { size: [1.0, 1.0, 1.0], ..Default::default() }), Box::new(RbComponent { mass, ..Default::default() })]
+        };
+        // 1 m3 boxes: half the density of water, and heavier than water.
+        let wood = obj(&mut scene, Vec3::new(0.0, 3.0, 0.0), body(500.0));
+        let iron = obj(&mut scene, Vec3::new(4.0, 3.0, 0.0), body(3000.0));
+        let mut pw = PhysicsWorld::build(&scene);
+        let mut splashes = 0;
+        for k in 0..900 {
+            pw.sync_structure(&scene);
+            let ids = scene.id_index();
+            let world = scene.world_transforms();
+            pw.push_poses(&scene, &ids, &world);
+            splashes += pw.apply_water(&scene, &world, k as f32 * FIXED_DT, &[]).splashes.len();
+            pw.step();
+            pw.reset_forces();
+            pw.write_back(&mut scene, &ids, 1.0);
+        }
+        let y = |id: ObjectId| scene.world_transform(scene.index_of(id).unwrap()).w_axis.y;
+        assert!(y(wood).abs() < 0.15, "half the density of water floats half under: {}", y(wood));
+        assert!(y(iron) < -1.0, "denser than water sinks: {}", y(iron));
+        assert!(splashes >= 2, "both hit the water hard enough to splash: {splashes}");
+    }
+
+    /// A closed box mesh between `lo` and `hi`.
+    fn box_mesh(lo: Vec3, hi: Vec3, base: u32) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+        let v: Vec<Vec3> = (0..8).map(|c| Vec3::new(if c & 1 == 0 { lo.x } else { hi.x }, if c & 2 == 0 { lo.y } else { hi.y }, if c & 4 == 0 { lo.z } else { hi.z })).collect();
+        let quads = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+        let t = quads.iter().flat_map(|q| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]).map(|t: [u32; 3]| t.map(|i| i + base)).collect();
+        (v, t)
+    }
+
+    #[test]
+    fn a_concave_mesh_splits_into_pieces_and_bad_input_falls_back() {
+        // An L: a seat and a back, like a chair.
+        let (mut v, mut t) = box_mesh(Vec3::ZERO, Vec3::new(2.0, 0.5, 1.0), 0);
+        let (v2, t2) = box_mesh(Vec3::new(0.0, 0.5, 0.0), Vec3::new(0.4, 2.0, 1.0), 8);
+        v.extend(v2);
+        t.extend(t2);
+        let parts = convex_pieces(&v, &t, citrus_core::ColliderDetail::Medium);
+        let (hull_points, max_pieces, piece_points, _) = budgets(citrus_core::ColliderDetail::Medium);
+        assert!(parts.len() >= 2, "the seat and back are separate pieces: {}", parts.len());
+        assert!(hull_of(&[Vec3::ZERO, Vec3::X, Vec3::Z], hull_points).is_none(), "a flat triangle has no hull");
+        assert!(hull_of(&v, hull_points).is_some());
+        assert!(parts.len() <= max_pieces as usize && parts.iter().all(|(p, _)| p.len() <= piece_points));
+        // A dense ball's hull is cut down to the corner budget.
+        let ball: Vec<Vec3> = (0..2000).map(|k| {
+            let (a, b) = (k as f32 * 2.399, (k as f32 / 2000.0) * 2.0 - 1.0);
+            let r = (1.0 - b * b).sqrt();
+            Vec3::new(r * a.cos(), b, r * a.sin())
+        }).collect();
+        let (hp, _) = hull_of(&ball, hull_points).unwrap();
+        assert!(hp.len() <= hull_points, "{}", hp.len());
+    }
+
+    #[test]
+    fn ball_meshes_are_spheres_and_boxes_are_not() {
+        let ball: Vec<Vec3> = (0..400).map(|k| {
+            let (a, b) = (k as f32 * 2.399, (k as f32 / 400.0) * 2.0 - 1.0);
+            let r = (1.0 - b * b).sqrt();
+            Vec3::new(1.0 + r * a.cos() * 0.5, b * 0.5, r * a.sin() * 0.5)
+        }).collect();
+        let (c, r) = ball_of(&ball).expect("a ball");
+        assert!(c.distance(Vec3::X) < 0.02 && (r - 0.5).abs() < 0.01);
+        let (v, _) = box_mesh(Vec3::ZERO, Vec3::ONE, 0);
+        assert!(ball_of(&v).is_none());
+    }
+
+    #[test]
+    fn collider_wires_share_edges() {
+        // A flat quad: its four sides, not the diagonal across it.
+        let quad = MeshColliderShape::Triangles(vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y], vec![[0, 1, 2], [0, 2, 3]]);
+        assert_eq!(mesh_collider_wire(&quad).len(), 4);
+        // A box: its 12 edges, not the 6 face diagonals.
+        let (v, t) = box_mesh(Vec3::ZERO, Vec3::ONE, 0);
+        assert_eq!(mesh_collider_wire(&MeshColliderShape::Triangles(v, t)).len(), 12);
+    }
+
+    #[test]
+    fn a_very_light_body_bobs_up_without_being_launched() {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), ..Default::default() })]);
+        let id = obj(
+            &mut scene,
+            Vec3::new(0.0, -0.2, 0.0),
+            vec![Box::new(BoxCollider { size: [2.0, 1.0, 1.0], ..Default::default() }), Box::new(RbComponent { mass: 1.0, ..Default::default() })],
+        );
+        let mut pw = PhysicsWorld::build(&scene);
+        let mut highest = f32::MIN;
+        for k in 0..600 {
+            pw.sync_structure(&scene);
+            let ids = scene.id_index();
+            let world = scene.world_transforms();
+            pw.push_poses(&scene, &ids, &world);
+            pw.apply_water(&scene, &world, k as f32 * FIXED_DT, &[]);
+            pw.step();
+            pw.reset_forces();
+            pw.write_back(&mut scene, &ids, 1.0);
+            highest = highest.max(scene.world_transform(scene.index_of(id).unwrap()).w_axis.y);
+        }
+        let y = scene.world_transform(scene.index_of(id).unwrap()).w_axis.y;
+        assert!(highest < 1.5, "never flung far out: {highest}");
+        assert!(y > 0.0 && y < 0.8, "settles riding high on the surface: {y}");
+    }
+
+    #[test]
+    fn a_post_through_the_surface_blocks_ripples() {
+        let mut scene = LoadedScene::empty();
+        let water = obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), ..Default::default() })]);
+        obj(&mut scene, Vec3::new(1.0, 0.0, 0.0), vec![Box::new(CapsuleCollider { radius: 0.3, height: 4.0, ..Default::default() })]);
+        let pw = PhysicsWorld::build(&scene);
+        let sim = citrus_core::RippleSim::new(64, 16.0);
+        let w = scene.world_transform(scene.index_of(water).unwrap());
+        let mask = pw.ripple_blockers(w, &sim, u32::MAX);
+        let cell_of = |x: f32, z: f32| {
+            let c = ((x + 8.0) / 0.25) as usize;
+            let r = ((z + 8.0) / 0.25) as usize;
+            mask[r * 64 + c]
+        };
+        assert!(cell_of(1.0, 0.0), "the post's cell is solid");
+        assert!(!cell_of(0.0, 0.0) && !cell_of(2.0, 2.0), "open water elsewhere");
+        assert!(mask.iter().filter(|b| **b).count() < 12, "only the post's footprint");
+    }
+
+    #[test]
+    fn a_crate_floats_half_under_and_a_heavy_one_sinks() {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), ..Default::default() })]);
+        let floater = crate_box(&mut scene, Vec3::new(0.0, 2.0, 0.0), 2.0);
+        let sinker = crate_box(&mut scene, Vec3::new(4.0, 2.0, 0.0), 0.5);
+        let mut pw = PhysicsWorld::build(&scene);
+        run_water(&mut pw, &mut scene, 900);
+        let y = |id: ObjectId| scene.world_transform(scene.index_of(id).unwrap()).w_axis.y;
+        assert!(y(floater).abs() < 0.15, "rests with the waterline at its middle: {}", y(floater));
+        assert!(y(sinker) < -1.0, "a body lighter than its weight in lift sinks: {}", y(sinker));
+    }
+
+    /// Height of a 0.5 m ball of `mass` kg dropped at the surface of a fluid
+    /// of `density` and `viscosity` after `secs`.
+    fn ball_in_fluid(density: f32, viscosity: f32, mass: f32, secs: f32) -> f32 {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), density, viscosity, depth: 50.0, ..Default::default() })]);
+        let ball = obj(&mut scene, Vec3::new(0.0, -0.3, 0.0), vec![Box::new(SphereCollider { radius: 0.25, ..Default::default() }), Box::new(RbComponent { mass, ..Default::default() })]);
+        let mut pw = PhysicsWorld::build(&scene);
+        run_water(&mut pw, &mut scene, (secs / FIXED_DT) as usize);
+        scene.world_transform(scene.index_of(ball).unwrap()).w_axis.y
+    }
+
+    #[test]
+    fn thick_fluids_slow_sinking_and_density_sets_what_floats() {
+        // 0.065 m3 ball of 100 kg (1530 kg/m3) sinks in all three; the
+        // thicker the fluid, the slower.
+        let in_water = ball_in_fluid(1000.0, 0.001, 100.0, 1.0);
+        let in_honey = ball_in_fluid(1420.0, 10.0, 100.0, 1.0);
+        let in_mud = ball_in_fluid(1700.0, 50.0, 100.0, 1.0);
+        assert!(in_water < -0.8, "sinks through water: {in_water}");
+        assert!(in_honey > in_water + 0.4 && in_mud > in_honey, "thicker holds it back more: water {in_water}, honey {in_honey}, mud {in_mud}");
+        // 80 kg (1220 kg/m3) sinks in water but floats in honey (1420).
+        assert!(ball_in_fluid(1000.0, 0.001, 80.0, 6.0) < -1.0);
+        assert!(ball_in_fluid(1420.0, 10.0, 80.0, 6.0) > -0.6, "denser fluid holds it up");
+    }
+
+    fn gpu_water(scene: &mut LoadedScene) -> ObjectId {
+        let mut water = citrus_core::Water { waves: Vec::new(), ..Default::default() };
+        water.ripples = Some(citrus_core::RippleSim::gpu_owned(64, 24.0));
+        obj(scene, Vec3::ZERO, vec![Box::new(water)])
+    }
+
+    fn water_mut(scene: &mut LoadedScene, id: ObjectId) -> &mut citrus_core::Water {
+        let i = scene.index_of(id).unwrap();
+        scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Water>()).unwrap()
+    }
+
+    #[test]
+    fn gpu_water_is_fed_bodies_and_fixed_obstacles() {
+        let mut scene = LoadedScene::empty();
+        let water = gpu_water(&mut scene);
+        crate_box(&mut scene, Vec3::new(-2.0, 0.0, 0.0), 2.0);
+        obj(&mut scene, Vec3::new(3.0, 0.0, 0.0), vec![Box::new(CapsuleCollider { radius: 0.3, height: 4.0, ..Default::default() })]);
+        let mut pw = PhysicsWorld::build(&scene);
+        let world = scene.world_transforms();
+        let step = pw.apply_water(&scene, &world, 0.0, &[]);
+        let wi = scene.index_of(water).unwrap();
+        assert_eq!(step.displacers.len(), 1, "the crate, not the fixed post");
+        let (i, d) = step.displacers[0];
+        assert_eq!(i, wi);
+        assert!((d.center - glam::Vec2::new(-2.0, 0.0)).length() < 1e-3);
+        assert!((d.thickness - 0.5).abs() < 0.02 && (d.half.x - 0.5).abs() < 0.02 && !d.round, "{d:?}");
+        let w = water_mut(&mut scene, water);
+        let window = citrus_core::choose_window(w, glam::Vec2::ZERO, None);
+        w.sim_feed.window = Some(window);
+        step_ripples(&mut scene, &world, Vec3::ZERO, &step, Some(&pw), 0.0, FIXED_DT);
+        crate::water_walls::WaterWalls::default().update(&mut scene, &world);
+        let w = water_mut(&mut scene, water);
+        assert_eq!(w.sim_feed.displacers.len(), 1);
+        let (bw, mask) = w.sim_feed.blocked.clone().expect("obstacle cells");
+        assert_eq!(bw, window);
+        let cell_at = |x: f32| {
+            let c = ((glam::Vec2::new(x, 0.0) - window.lo()) / window.cell).floor();
+            mask[c.y as usize * window.n as usize + c.x as usize]
+        };
+        assert!(cell_at(3.0) && !cell_at(-2.0) && !cell_at(0.0), "the post blocks, the floating crate does not");
+        assert!(w.ripples.as_ref().unwrap().gpu, "still owned by the GPU simulation");
+    }
+
+    #[test]
+    fn walls_are_still_colliders_on_layers_the_water_meets() {
+        let mut scene = LoadedScene::empty();
+        let water = gpu_water(&mut scene);
+        let post = obj(&mut scene, Vec3::new(3.0, 0.0, 0.0), vec![Box::new(CapsuleCollider { radius: 0.3, height: 4.0, ..Default::default() })]);
+        let ghost = obj(&mut scene, Vec3::new(-3.0, 0.0, 0.0), vec![Box::new(BoxCollider { size: [1.0, 4.0, 1.0], ..Default::default() })]);
+        // The ghost's layer doesn't collide with the water's.
+        let gi = scene.index_of(ghost).unwrap();
+        scene.objects[gi].layer = 5;
+        scene.layers.collision[0] &= !(1 << 5);
+        scene.layers.collision[5] &= !1;
+        let w = water_mut(&mut scene, water);
+        w.sim_feed.window = Some(citrus_core::choose_window(w, glam::Vec2::ZERO, None));
+        let mut walls = crate::water_walls::WaterWalls::default();
+        let cell_at = |scene: &mut LoadedScene, x: f32| {
+            let w = water_mut(scene, water);
+            let window = w.sim_feed.window.unwrap();
+            let (_, mask) = w.sim_feed.blocked.clone().expect("wall cells");
+            let c = ((glam::Vec2::new(x, 0.0) - window.lo()) / window.cell).floor();
+            mask[c.y as usize * window.n as usize + c.x as usize]
+        };
+        let world = scene.world_transforms();
+        walls.update(&mut scene, &world);
+        assert!(cell_at(&mut scene, 3.0), "the post is a wall");
+        assert!(!cell_at(&mut scene, -3.0), "the ghost's layer passes through the water");
+        // Moved: it pushes the water while moving, a wall again once still.
+        let pi = scene.index_of(post).unwrap();
+        scene.objects[pi].translation.x = 2.0;
+        let world = scene.world_transforms();
+        walls.update(&mut scene, &world);
+        assert!(!cell_at(&mut scene, 2.0), "moving, not a wall yet");
+        for _ in 0..12 {
+            walls.update(&mut scene, &world);
+        }
+        assert!(cell_at(&mut scene, 2.0) && !cell_at(&mut scene, 3.0), "settled where it stopped");
+    }
+
+    #[test]
+    fn simulated_flow_carries_a_floating_body() {
+        let mut scene = LoadedScene::empty();
+        let water = gpu_water(&mut scene);
+        let floater = crate_box(&mut scene, Vec3::ZERO, 2.0);
+        let sim = water_mut(&mut scene, water).ripples.as_mut().unwrap();
+        sim.set_field(64, 24.0, glam::Vec2::ZERO, &vec![[0.0, 1.0, 0.0, 0.0]; 64 * 64]);
+        let mut pw = PhysicsWorld::build(&scene);
+        run_water(&mut pw, &mut scene, 300);
+        let x = scene.world_transform(scene.index_of(floater).unwrap()).w_axis.x;
+        assert!(x > 1.5, "the moving water dragged it along: {x}");
+    }
+
+    #[test]
+    fn current_carries_a_floating_body() {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { waves: Vec::new(), current: [1.0, 0.0, 0.0], ..Default::default() })]);
+        let floater = crate_box(&mut scene, Vec3::new(0.0, 0.0, 0.0), 2.0);
+        let mut pw = PhysicsWorld::build(&scene);
+        run_water(&mut pw, &mut scene, 300);
+        let x = scene.world_transform(scene.index_of(floater).unwrap()).w_axis.x;
+        assert!(x > 1.5, "drifted downstream: {x}");
+    }
+
+    #[test]
+    fn a_capsule_rests_on_the_floor_at_its_radius() {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        let pill = obj(
+            &mut scene,
+            Vec3::new(0.0, 3.0, 0.0),
+            vec![
+                Box::new(CapsuleCollider { direction: ColliderAxis::X, radius: 0.25, height: 2.0, ..Default::default() }),
+                Box::new(RbComponent::default()),
+            ],
+        );
+        let mut pw = PhysicsWorld::build(&scene);
+        run(&mut pw, &mut scene, 240);
+        let y = scene.world_transform(scene.index_of(pill).unwrap()).w_axis.y;
+        assert!((y - (0.5 + 0.25)).abs() < 0.05, "lying on its side on the floor top: {y}");
+        let hit = pw.raycast(Vec3::new(0.9, 5.0, 0.0), Vec3::NEG_Y, 10.0, &RayFilter::default()).unwrap();
+        // The cap starts 0.75 m out; 0.9 m out its top is sqrt(0.25^2 - 0.15^2) = 0.2 above the axis.
+        assert!((hit.point.y - 0.95).abs() < 0.02, "the rounded end is 0.9 m out along X: {}", hit.point.y);
     }
 
     #[test]

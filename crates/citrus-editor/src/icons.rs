@@ -17,6 +17,7 @@ pub enum Icon {
     Folder,
     ReflectionProbe,
     FluxVolume,
+    PostFxVolume,
     UiCanvas,
     UiToggle,
     UiText,
@@ -55,10 +56,11 @@ pub enum Icon {
     Lock,
     LockOpen,
     Kebab,
+    Water,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 47] = [
+    pub const ALL: [Icon; 49] = [
         Icon::Camera,
         Icon::LightDirectional,
         Icon::LightSpot,
@@ -68,6 +70,7 @@ impl Icon {
         Icon::Folder,
         Icon::ReflectionProbe,
         Icon::FluxVolume,
+        Icon::PostFxVolume,
         Icon::UiCanvas,
         Icon::UiToggle,
         Icon::UiText,
@@ -106,6 +109,7 @@ impl Icon {
         Icon::Lock,
         Icon::LockOpen,
         Icon::Kebab,
+        Icon::Water,
     ];
 
     /// SVG path data on the 16×16 grid (the caret uses a 10×10 grid).
@@ -124,13 +128,16 @@ impl Icon {
             Icon::Folder => "M1.5 4.5a1 1 0 0 1 1-1h3.4l1.4 1.5h6.2a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z",
             Icon::ReflectionProbe => "M8 2.5a5.5 5.5 0 1 0 0 11a5.5 5.5 0 1 0 0-11z M2.5 8c0 1.4 2.5 2.4 5.5 2.4s5.5-1 5.5-2.4",
             Icon::FluxVolume => "M2.5 2.5h11v11h-11z M2.5 8h11 M8 2.5v11",
+            // A box with a four-point sparkle: post effects applied inside a volume.
+            Icon::PostFxVolume => "M2.5 2.5h11v11h-11z M8 4.6l.9 2.5 2.5.9-2.5.9-.9 2.5-.9-2.5-2.5-.9 2.5-.9z",
             Icon::UiCanvas => "M2 3h12v10H2z M2 6h12",
             Icon::UiToggle => "M5 4.5h6a3.5 3.5 0 0 1 0 7H5a3.5 3.5 0 0 1 0-7z M11 6.3a1.7 1.7 0 1 0 0 3.4a1.7 1.7 0 1 0 0-3.4z",
             Icon::UiText => "M3 3.5h10 M8 3.5v9 M6 12.5h4",
             Icon::File => "M4 1.5h5.5l3 3v10h-8.5z M9.5 1.5v3h3",
             Icon::FileDoc => "M4 1.5h5.5l3 3v10h-8.5z M9.5 1.5v3h3 M6 8h4.5 M6 10.5h4.5",
+            // An eight-tooth cog with a hub.
             Icon::Gear => {
-                "M8 5.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M3.6 12.4l1.2-1.2M11.2 4.8l1.2-1.2"
+                "M12.57 6.9L14.34 7.15L14.34 8.85L12.57 9.1L12.01 10.46L13.09 11.88L11.88 13.09L10.46 12.01L9.1 12.57L8.85 14.34L7.15 14.34L6.9 12.57L5.54 12.01L4.12 13.09L2.91 11.88L3.99 10.46L3.43 9.1L1.66 8.85L1.66 7.15L3.43 6.9L3.99 5.54L2.91 4.12L4.12 2.91L5.54 3.99L6.9 3.43L7.15 1.66L8.85 1.66L9.1 3.43L10.46 3.99L11.88 2.91L13.09 4.12L12.01 5.54z M8 5.9a2.1 2.1 0 1 0 0 4.2a2.1 2.1 0 1 0 0-4.2z"
             }
             Icon::ToolSelect => "M3.5 2l9 5-4 1.2-1.6 4.3z",
             Icon::ToolMove => {
@@ -168,6 +175,10 @@ impl Icon {
             Icon::Lock => "M4.5 7.5h7v6h-7z M6 7.5V5.5a2 2 0 0 1 4 0v2",
             Icon::LockOpen => "M4.5 7.5h7v6h-7z M6 7.5V5.5a2 2 0 0 1 3.9-.6",
             Icon::Kebab => "",
+            // Three rolling wave lines.
+            Icon::Water => {
+                "M1.5 4.5C3 3.2 4.5 3.2 6 4.5S9 5.8 10.5 4.5 13.5 3.2 14.5 4.2 M1.5 8.5C3 7.2 4.5 7.2 6 8.5S9 9.8 10.5 8.5 13.5 7.2 14.5 8.2 M1.5 12.5C3 11.2 4.5 11.2 6 12.5S9 13.8 10.5 12.5 13.5 11.2 14.5 12.2"
+            }
         }
     }
 
@@ -410,8 +421,8 @@ fn arc(out: &mut Vec<Subpath>, p0: Pos2, rx: f32, ry: f32, rot_deg: f32, large: 
     let cx = cos * cx1 - sin * cy1 + (p0.x + p1.x) * 0.5;
     let cy = sin * cx1 + cos * cy1 + (p0.y + p1.y) * 0.5;
     let angle = |ux: f32, uy: f32, vx: f32, vy: f32| {
-        let a = (ux * vy - uy * vx).atan2(ux * vx + uy * vy);
-        a
+        
+        (ux * vy - uy * vx).atan2(ux * vx + uy * vy)
     };
     let ux = (x1 - cx1) / rx;
     let uy = (y1 - cy1) / ry;

@@ -72,6 +72,9 @@ pub struct GizmoState {
     pub snap: bool,
     /// Grid cell size in meters (translation snap increment).
     pub grid_size: f32,
+    /// During a move: the pivot where the drag began and where it would be
+    /// without snapping (snapping rounds this, so small steps still add up).
+    drag: Option<(Vec3, Vec3)>,
 }
 
 impl GizmoState {
@@ -83,6 +86,7 @@ impl GizmoState {
             local_orientation: false,
             snap: false,
             grid_size: 0.5,
+            drag: None,
         }
     }
 
@@ -96,7 +100,9 @@ impl GizmoState {
 
     /// Update + draw the gizmo for one target. `pivot_local` is the pivot
     /// point in object space (zero = object origin). Returns true when the
-    /// transform was modified this frame.
+    /// transform was modified this frame. Holding Shift moves and rotates at
+    /// half speed for fine placement; Ctrl (or the Snap toggle) snaps moves
+    /// onto the grid and rotations / scales to their steps.
     #[allow(clippy::too_many_arguments)]
     pub fn interact(
         &mut self,
@@ -111,7 +117,12 @@ impl GizmoState {
         dragging: bool,
     ) -> bool {
         let (translation, rotation, scale) = trs;
-        let ctrl = ui.input(|i| i.modifiers.ctrl);
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+        let snap = self.snap || ctrl;
+        let moving = self.tool == GizmoTool::Move;
+        if !dragging {
+            self.drag = None;
+        }
         self.gizmo.update_config(GizmoConfig {
             view_matrix: view.as_dmat4().into(),
             projection_matrix: proj.as_dmat4().into(),
@@ -122,7 +133,8 @@ impl GizmoState {
             } else {
                 GizmoOrientation::Global
             },
-            snapping: self.snap || ctrl,
+            // Moves snap here to absolute grid lines (below), not in steps.
+            snapping: snap && !moving,
             snap_distance: self.grid_size.max(0.001),
             snap_angle: 15f32.to_radians(),
             snap_scale: 0.1,
@@ -188,9 +200,18 @@ impl GizmoState {
         if let Some((_, transforms)) = result
             && let Some(t) = transforms.first()
         {
-            let new_pivot = DVec3::from(t.translation).as_vec3();
-            let new_rotation = DQuat::from(t.rotation).as_quat();
+            let mut new_pivot = DVec3::from(t.translation).as_vec3();
+            let mut new_rotation = DQuat::from(t.rotation).as_quat();
             let new_scale = DVec3::from(t.scale).as_vec3();
+            let factor = if shift { 0.5 } else { 1.0 };
+            if moving {
+                let (start, raw) = self.drag.get_or_insert((pivot_world, pivot_world));
+                *raw += (new_pivot - pivot_world) * factor;
+                new_pivot = if snap { snap_moved(*raw, *start, self.grid_size) } else { *raw };
+            } else if shift {
+                // Half of this frame's turn.
+                new_rotation = (Quat::IDENTITY.slerp(new_rotation * rotation.inverse(), 0.5) * *rotation).normalize();
+            }
 
             // Re-derive the object origin from the edited pivot frame:
             // origin = pivot + R_new * (ratio * (R_old⁻¹ * offset)).
@@ -203,5 +224,26 @@ impl GizmoState {
             return true;
         }
         false
+    }
+}
+
+/// `raw` with every axis that moved since `start` rounded to the grid (axes
+/// the drag isn't moving stay exactly where they were).
+fn snap_moved(raw: Vec3, start: Vec3, grid: f32) -> Vec3 {
+    let g = grid.max(0.001);
+    Vec3::from_array(std::array::from_fn(|k| if (raw[k] - start[k]).abs() > 1e-6 { (raw[k] / g).round() * g } else { start[k] }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapping_rounds_only_the_moved_axes_onto_the_grid() {
+        let start = Vec3::new(0.3, 1.27, -2.0);
+        let raw = Vec3::new(1.12, 1.27, -2.0);
+        assert_eq!(snap_moved(raw, start, 0.5), Vec3::new(1.0, 1.27, -2.0));
+        // Small steps add up in `raw` until they cross a grid line.
+        assert_eq!(snap_moved(start + Vec3::X * 0.1, start, 0.5).x, 0.5);
     }
 }
