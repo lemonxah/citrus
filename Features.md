@@ -1856,7 +1856,17 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 - [done] **VRM spring bones**: `.vrm` imports as a model; `VRM.secondaryAnimation` (0.x) and
   `VRMC_springBone` (1.0) become Bone Cloth chains and Cloth Colliders on the skinned object
   when the model is added to a scene.
-- [todo] In-editor pin painting for Mesh Cloth, distance culling of cloth, GPU cloth.
+- [done] Mesh Cloth pin painting: a Scene-view brush (Paint Pins in the inspector or P; Paint / Erase
+  (Shift) / Smooth (Alt) / Set; radius with [ ] or Ctrl+Scroll, strength, smooth / linear /
+  constant falloff, Mirror X) for per-vertex pin weight and max distance; a heat-map overlay
+  with pinned-vertex dots and max-distance circles; Fill / Clear / Invert / mirror copy /
+  set-by-height; a Simulate toggle for a live preview; one undo step per stroke. Saved compactly
+  (RLE + base64), keyed by vertex count + topology hash and remapped by nearest position when the
+  mesh changes; existing vertex-colour / bone / top pins seed the painting.
+- [done] Mesh Cloth max distance (a per-vertex limit on how far a vertex strays from its animated
+  position) and frame-rate-independent partial pins. Cloth distance culling: Cull distance on
+  Mesh Cloth and Bone Cloth holds the animated pose beyond it from the camera.
+- [todo] GPU cloth; per-bone stiffness painting for Bone Cloth.
 
 ## Full-body tracking, remote IK, networked avatars (2026-10-30)
 - [done] **Tracker roles**: `TrackerTargets` covers head, hands, hips, feet, chest, elbows and
@@ -1889,10 +1899,23 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   `worn_avatar_package_reaches_peers_and_late_joiners`, `remote_players_announced_avatar_is_requested_once`,
   plus chest / knee replication in the network convergence test.
 - [done] Command palette: the list no longer stays at the height of an earlier search.
-- [todo] Avatar scaling to the player's height, finger tracking, a calibration UI in the VR
-  Player kit, legacy global IK path (humanoids without Humanoid IK) to retire.
-
-## Face tracking, SlimeVR, voice v2, lip sync, render fixes (2026-10-30)
+- [done] Avatar scaling to the player's height: standing eye height measured in the headset (a 1 s
+  stand-straight capture, outlier rejection, movement check), arm span from the T-pose, manual
+  height (cm) override and reset, saved per user in `Citrus/body.ron` (shared by every game and the
+  editor). VR Player `avatar_scaling`: Scale avatar (default), Scale player (scales the tracking
+  space; a child avatar keeps its size), Off; optional arm-span reach compensation. Replicated so
+  remote avatars scale to match. API: `ctx.player_height()`, `ctx.avatar_scale()`, `ctx.body()`,
+  `ctx.request_height_calibration()`, `ctx.start_body_calibration()`, `ctx.show_body_menu()`,
+  `ctx.set_player_height_cm()`.
+- [done] Full-body calibration UI in VR: the VR Player's Menu button opens a world-space body panel
+  (laser + trigger or poke): Calibrate (stand straight, T-pose with automatic role assignment,
+  optional floor check), Quick recalibrate (keeps roles), Height, Done; per-device role pickers
+  for runtime trackers (by role path) and SlimeVR trackers (by serial), a live avatar preview with
+  tracker dots. Offsets are solved from the stored T-pose for whichever avatar is worn, at its
+  fitted scale. Editor: Windows > Body Tracking (desktop), VR Tools > Body Calibration (editor VR).
+  Humanoid IK on an avatar worn under a remote player now follows that player's targets; in-game
+  VR UI rays map through the rig. Docs: docs/vr-avatars.md.
+- [todo] Finger tracking; serial-based OpenXR tracker identity (`XR_MNDX_xdev_space`).
 - [done] **Blendshapes**: glTF morph targets (names from `extras.targetNames`) and FBX blend
   shapes (ufbx channels remapped onto triangle corners) import as sparse offsets; skinned
   objects with Face Tracking / Blend Shapes / Lip Sync apply them before CPU skinning.

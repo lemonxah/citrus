@@ -234,6 +234,9 @@ pub struct BodyIkSettings {
     pub step_angle: f32,
     pub step_time: f32,
     pub step_height: f32,
+    /// Hand targets move this much further from the shoulders (arm span
+    /// matching: the avatar's arms over the player's).
+    pub arm_reach: f32,
 }
 
 impl Default for BodyIkSettings {
@@ -247,6 +250,7 @@ impl Default for BodyIkSettings {
             step_angle: 0.8,
             step_time: 0.22,
             step_height: 0.08,
+            arm_reach: 1.0,
         }
     }
 }
@@ -401,6 +405,10 @@ pub fn solve_body(
             }
         }
         let w = world_matrices(skel, locals);
+        let tp = match settings.arm_reach {
+            r if (r - 1.0).abs() > 1e-3 => pos(&w[a]) + (tp - pos(&w[a])) * r,
+            _ => tp,
+        };
         let pole = match elbow {
             Some((ep, _)) => ep,
             None => pos(&w[b]) + (-fwd * 0.4 - up * 0.6 + out * 0.3),
@@ -694,25 +702,40 @@ fn slot_bones(rig: &HumanoidRig) -> [Option<usize>; TRACKER_SLOTS] {
     ]
 }
 
+/// Bone world poses of the rest pose with positions scaled by `scale`
+/// (model units to tracking-space meters).
+fn scaled_rest(skel: &Skeleton, scale: f32) -> Vec<Mat4> {
+    world_matrices(skel, &skel.rest_locals())
+        .iter()
+        .map(|m| {
+            let (_, r, t) = m.to_scale_rotation_translation();
+            Mat4::from_rotation_translation(r, t * scale)
+        })
+        .collect()
+}
+
 /// Capture full-body calibration while the player holds the avatar's rest
-/// pose (a T-pose for imported humanoids). The avatar is lined up under the
-/// player's head, turned to face where the head faces, then each tracker's
-/// offset to its bone is stored. After this, [`targets_from_calibrated`] turns
-/// live tracker poses into bone targets in the trackers' space.
-pub fn calibrate_tpose(skel: &Skeleton, raw: &TrackerPoses) -> BodyCalibration {
-    let rig = HumanoidRig::map(skel);
-    let world = world_matrices(skel, &skel.rest_locals());
+/// pose (a T-pose for imported humanoids). The avatar, at `scale` (model
+/// units to tracking-space meters, see `citrus_core::BodyFit`), is lined up
+/// under the player's head, turned to face where the head faces, then each
+/// tracker's offset to its bone is stored. That offset carries the hip and
+/// foot height differences between the player and the avatar, so standing
+/// up straight puts the avatar's hips and feet at its own rest heights.
+/// After this, [`targets_from_calibrated`] turns live tracker poses into bone
+/// targets in the trackers' space.
+pub fn calibrate_tpose(skel: &Skeleton, rig: &HumanoidRig, raw: &TrackerPoses, scale: f32) -> BodyCalibration {
+    let world = scaled_rest(skel, scale);
     let align = match (raw.0[0], rig.head) {
         (Some(hmd), Some(head)) => {
             let (_, hr, hp) = hmd.to_scale_rotation_translation();
             let look = hr * Vec3::NEG_Z;
-            let yaw = yaw_of(Quat::from_rotation_arc(rest_forward(skel, &rig), Vec3::new(look.x, 0.0, look.z).normalize_or(Vec3::NEG_Z)), rest_forward(skel, &rig));
+            let yaw = yaw_of(Quat::from_rotation_arc(rest_forward(skel, rig), Vec3::new(look.x, 0.0, look.z).normalize_or(Vec3::NEG_Z)), rest_forward(skel, rig));
             let head_at = yaw * pos(&world[head]);
             Mat4::from_rotation_translation(yaw, Vec3::new(hp.x - head_at.x, 0.0, hp.z - head_at.z))
         }
         _ => Mat4::IDENTITY,
     };
-    let bones = slot_bones(&rig);
+    let bones = slot_bones(rig);
     let mut out = BodyCalibration::default();
     for ((slot, bone), t) in out.0.iter_mut().zip(bones).zip(raw.0) {
         if let (Some(b), Some(t)) = (bone, t) {
@@ -725,19 +748,18 @@ pub fn calibrate_tpose(skel: &Skeleton, raw: &TrackerPoses) -> BodyCalibration {
 /// Calibration used before the player calibrates: the offsets an ideal player
 /// would produce in the rest pose (headset at the eyes looking forward,
 /// controllers and trackers aligned with the body), so head and hand rotations
-/// already map sensibly onto the bones.
-pub fn default_calibration(skel: &Skeleton) -> BodyCalibration {
-    let rig = HumanoidRig::map(skel);
-    let world = world_matrices(skel, &skel.rest_locals());
-    let fwd = rest_forward(skel, &rig);
+/// already map sensibly onto the bones. `scale` as in [`calibrate_tpose`].
+pub fn default_calibration(skel: &Skeleton, rig: &HumanoidRig, scale: f32) -> BodyCalibration {
+    let world = scaled_rest(skel, scale);
+    let fwd = rest_forward(skel, rig);
     let facing = Quat::from_rotation_y((-fwd.x).atan2(-fwd.z));
-    let bones = slot_bones(&rig);
+    let bones = slot_bones(rig);
     let mut raw = TrackerPoses::default();
     for (k, (slot, bone)) in raw.0.iter_mut().zip(bones).enumerate() {
         if let Some(b) = bone {
             let mut p = pos(&world[b]);
             if k == 0 {
-                p += fwd * 0.08 + Vec3::Y * 0.07;
+                p += (fwd * 0.08 + Vec3::Y * 0.07) * scale;
             }
             *slot = Some(Mat4::from_rotation_translation(facing, p));
         }
@@ -749,6 +771,45 @@ pub fn default_calibration(skel: &Skeleton) -> BodyCalibration {
         }
     }
     out
+}
+
+/// An avatar's body in its model units, from the rest pose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AvatarMeasure {
+    /// Eye height above the floor (the eye bones, else above the head bone).
+    pub eye_height: f32,
+    /// Wrist-to-wrist distance with the arms straight out.
+    pub arm_span: Option<f32>,
+}
+
+/// Measure a humanoid avatar (`None` without a head bone).
+pub fn measure_avatar(skel: &Skeleton, rig: &HumanoidRig) -> Option<AvatarMeasure> {
+    let rest = world_matrices(skel, &skel.rest_locals());
+    let at = |j: Option<usize>| j.and_then(|j| rest.get(j)).map(pos);
+    let head = at(rig.head)?;
+    let feet: Vec<f32> = [at(rig.l_foot), at(rig.r_foot)].into_iter().flatten().map(|p| p.y).collect();
+    let lowest = feet.iter().copied().reduce(f32::min);
+    // Avatars normally stand on their origin; one rooted at the hips stands on its soles.
+    let floor = match lowest {
+        Some(f) => (f - 0.045 * (head.y - f).max(0.0)).min(0.0),
+        None => 0.0,
+    };
+    let eyes: Vec<Vec3> = [at(rig.l_eye), at(rig.r_eye)].into_iter().flatten().collect();
+    let eye_y = if eyes.is_empty() {
+        head.y + 0.07 * ((head.y - floor) / 1.6)
+    } else {
+        eyes.iter().map(|e| e.y).sum::<f32>() / eyes.len() as f32
+    };
+    let arm = |ua: Option<usize>, la: Option<usize>, ha: Option<usize>| -> Option<(Vec3, f32)> {
+        let (u, l, h) = (at(ua)?, at(la)?, at(ha)?);
+        Some((u, u.distance(l) + l.distance(h)))
+    };
+    let arm_span = match (arm(rig.l_upper_arm, rig.l_lower_arm, rig.l_hand), arm(rig.r_upper_arm, rig.r_lower_arm, rig.r_hand)) {
+        (Some((lu, ll)), Some((ru, rl))) => Some(lu.distance(ru) + ll + rl),
+        _ => None,
+    };
+    let eye_height = eye_y - floor;
+    (eye_height > 1e-4).then_some(AvatarMeasure { eye_height, arm_span })
 }
 
 /// Turn live tracker poses into bone targets using a [`BodyCalibration`].
@@ -799,7 +860,7 @@ mod tests {
         let mut raw = TrackerPoses::default();
         raw.0[3] = Some(Mat4::from_translation(Vec3::new(0.02, 1.0, 0.0)));
         raw.0[1] = Some(Mat4::from_translation(Vec3::new(0.5, 0.03, 0.0)));
-        let cal = calibrate_tpose(&skel, &raw);
+        let cal = calibrate_tpose(&skel, &HumanoidRig::map(&skel), &raw, 1.0);
         // At the calibration pose the targets recover the bone world positions.
         let t = targets_from_calibrated(&cal, &raw);
         assert!((t.hips.unwrap().0 - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-3);
@@ -917,7 +978,7 @@ mod tests {
     #[test]
     fn default_calibration_maps_an_ideal_headset_onto_the_head_bone() {
         let skel = tpose();
-        let cal = default_calibration(&skel);
+        let cal = default_calibration(&skel, &HumanoidRig::map(&skel), 1.0);
         let facing = Quat::from_rotation_y(std::f32::consts::PI);
         let mut raw = TrackerPoses::default();
         raw.0[0] = Some(Mat4::from_rotation_translation(facing, Vec3::new(0.0, 1.72, 0.08)));
@@ -925,6 +986,71 @@ mod tests {
         let (p, r) = t.head.unwrap();
         assert!((p - Vec3::new(0.0, 1.65, 0.0)).length() < 1e-3, "{p}");
         assert!(r.angle_between(Quat::IDENTITY) < 1e-3);
+    }
+
+    #[test]
+    fn measures_eye_height_and_arm_span_from_the_rest_pose() {
+        let skel = tpose();
+        let m = measure_avatar(&skel, &HumanoidRig::map(&skel)).unwrap();
+        assert!((m.eye_height - (1.65 + 0.07 * 1.65 / 1.6)).abs() < 1e-4, "{}", m.eye_height);
+        assert!((m.arm_span.unwrap() - 1.3).abs() < 1e-4, "wrist to wrist, arms straight");
+        // Rooted at the hips (feet below the origin) it still stands on its soles.
+        let mut hip_rooted = tpose();
+        hip_rooted.joints[0].rest_translation = Vec3::ZERO;
+        let h = measure_avatar(&hip_rooted, &HumanoidRig::map(&hip_rooted)).unwrap();
+        assert!((h.eye_height - m.eye_height).abs() < 0.02, "{} vs {}", h.eye_height, m.eye_height);
+        // Eye bones win over the head estimate.
+        let mut eyed = tpose();
+        let head = eyed.joints.iter().position(|j| j.name == "Head").unwrap();
+        eyed.joints.push(joint_at("LeftEye", Some(head), Vec3::new(0.03, 0.09, 0.08)));
+        eyed.joints.push(joint_at("RightEye", Some(head), Vec3::new(-0.03, 0.09, 0.08)));
+        let e = measure_avatar(&eyed, &HumanoidRig::map(&eyed)).unwrap();
+        assert!((e.eye_height - 1.74).abs() < 1e-4);
+    }
+
+    #[test]
+    fn scaled_calibration_fits_a_bigger_player() {
+        let skel = tpose();
+        let rig = HumanoidRig::map(&skel);
+        let s = 1.2;
+        let mut raw = TrackerPoses::default();
+        raw.0[0] = Some(Mat4::from_rotation_translation(Quat::from_rotation_y(std::f32::consts::PI), Vec3::new(0.3, 1.72 * s, 0.1)));
+        raw.0[3] = Some(Mat4::from_translation(Vec3::new(0.32, 1.02 * s, 0.05)));
+        raw.0[4] = Some(Mat4::from_translation(Vec3::new(0.3 + 0.1 * s, 0.1 * s, 0.1)));
+        let cal = calibrate_tpose(&skel, &rig, &raw, s);
+        let t = targets_from_calibrated(&cal, &raw);
+        // At the T-pose the hips and foot targets are the scaled rest bones under the headset.
+        assert!((t.hips.unwrap().0 - Vec3::new(0.3, 1.0 * s, 0.1)).length() < 1e-3, "{}", t.hips.unwrap().0);
+        assert!((t.left_foot.unwrap().0.y - 0.08 * s).abs() < 1e-3);
+        // Standing up on tiptoes lifts them with the trackers.
+        let mut up = raw;
+        for p in up.0.iter_mut().flatten() {
+            *p = Mat4::from_translation(Vec3::Y * 0.05) * *p;
+        }
+        assert!((targets_from_calibrated(&cal, &up).hips.unwrap().0.y - (1.0 * s + 0.05)).abs() < 1e-3);
+        // The default offsets at a scale put an ideal headset on the scaled head bone.
+        let d = default_calibration(&skel, &rig, s);
+        let mut hmd = TrackerPoses::default();
+        hmd.0[0] = Some(Mat4::from_rotation_translation(Quat::from_rotation_y(std::f32::consts::PI), Vec3::new(0.0, (1.65 + 0.07) * s, 0.08 * s)));
+        assert!((targets_from_calibrated(&d, &hmd).head.unwrap().0 - Vec3::new(0.0, 1.65 * s, 0.0)).length() < 1e-3);
+    }
+
+    #[test]
+    fn arm_reach_scales_the_hand_target_from_the_shoulder() {
+        let skel = tpose();
+        let rig = HumanoidRig::map(&skel);
+        let target = Vec3::new(0.75, 1.5, 0.3);
+        let targets = TrackerTargets {
+            head: Some((Vec3::new(0.0, 1.65, 0.0), Quat::IDENTITY)),
+            left_hand: Some((target, Quat::IDENTITY)),
+            ..Default::default()
+        };
+        let settings = BodyIkSettings { arm_reach: 0.7, shoulder_rotation: 0.0, plant_feet: false, ..Default::default() };
+        let mut locals = skel.rest_locals();
+        solve_body(&skel, &rig, &mut locals, &targets, &settings, &mut BodyIkState::default(), Mat4::IDENTITY, 0.0);
+        let (shoulder, hand) = (at(&skel, &locals, "LeftUpperArm"), at(&skel, &locals, "LeftHand"));
+        let want = shoulder + (target - shoulder) * 0.7;
+        assert!(hand.distance(want) < 0.02, "hand {hand} want {want}");
     }
 
     #[test]

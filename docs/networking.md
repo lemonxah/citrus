@@ -469,6 +469,10 @@ to exist for roles you want visible objects for. On other peers `remote` is
 set, and a `Humanoid IK` (source Auto) on the avatar model poses it from the
 replicated `targets`.
 
+The owner's avatar fit rides along as the synced variables
+`citrus.avatar_scale` and `citrus.eye_height`; remote copies scale the avatar
+under the Network Avatar to match (see [vr-avatars.md](vr-avatars.md)).
+
 Face tracking rides along: the owner's face frame (non-zero Unified
 Expressions weights as bytes, plus eye gaze) goes out with the avatar poses and
 remote copies expose it as `face` for their Face Tracking.

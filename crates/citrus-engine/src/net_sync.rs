@@ -462,6 +462,7 @@ fn sync_avatar(
     let rate = av.send_rate;
     let tracked = av.drive_from_vr || av.follow_local_player;
     let scene_face = scene.local_face().cloned();
+    let body = scene.local_body;
     let poses: [Option<(Vec3, Quat)>; citrus_core::TRACKER_SLOTS] = if authority {
         // Every tracker the local player has (calibrated bone targets), else
         // the part objects' poses.
@@ -505,6 +506,28 @@ fn sync_avatar(
         } else {
             s.face_in.get(&raw).map(|(_, f)| f.clone())
         };
+        // The player's avatar scale and height ride on synced variables too.
+        if authority && tracked {
+            av.avatar_scale = body.avatar_scale;
+            av.player_eye_height = body.eye_height;
+            let now = (body.avatar_scale, body.eye_height.unwrap_or(0.0));
+            if av.body_sent.is_none_or(|(a, e)| (a - now.0).abs() > 1e-3 || (e - now.1).abs() > 1e-3) {
+                s.set_var(ObjectId::from_raw(raw), citrus_core::AVATAR_SCALE_VAR, citrus_core::NetValue::Float(now.0));
+                s.set_var(ObjectId::from_raw(raw), citrus_core::PLAYER_EYE_HEIGHT_VAR, citrus_core::NetValue::Float(now.1));
+                av.body_sent = Some(now);
+            }
+        } else if !authority && let Some(vars) = s.world.vars.get(&raw) {
+            let float = |key: &str| {
+                vars.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+                    citrus_core::NetValue::Float(f) => Some(*f),
+                    _ => None,
+                })
+            };
+            if let Some(scale) = float(citrus_core::AVATAR_SCALE_VAR).filter(|f| f.is_finite() && *f > 0.0) {
+                av.avatar_scale = scale;
+            }
+            av.player_eye_height = float(citrus_core::PLAYER_EYE_HEIGHT_VAR).filter(|e| *e > 0.0);
+        }
         // The worn avatar package rides on a synced variable (reliable, with
         // late-join catch-up).
         if authority {
@@ -897,6 +920,8 @@ mod tests {
             ],
         );
         s.objects[remote].translation = Vec3::new(1.0, 0.0, 0.0);
+        // A worn avatar under the remote player's Network Avatar follows it too.
+        let worn = obj(&mut s, ObjectId::new(), Some(remote), true, vec![Box::new(HumanoidIk::default())]);
         let local = obj(&mut s, ObjectId::new(), None, true, vec![Box::new(HumanoidIk::default())]);
         s.objects[local].translation = Vec3::new(5.0, 0.0, 0.0);
         s.set_ik_targets(Some(TrackerTargets { head: Some((Vec3::new(0.0, 1.5, 0.0), Quat::IDENTITY)), ..Default::default() }));
@@ -905,6 +930,7 @@ mod tests {
         let inputs = s.humanoid_ik_inputs(&active, &world);
         let head = |i: usize| inputs[&i].0.head.unwrap().0;
         assert!(head(remote).distance(Vec3::new(0.0, 1.6, 0.0)) < 1e-4, "remote: replicated, in the avatar's space");
+        assert!(head(worn).distance(Vec3::new(0.0, 1.6, 0.0)) < 1e-4, "worn avatar of a remote player: replicated");
         assert!(head(local).distance(Vec3::new(0.0, 1.5, 0.0)) < 1e-4, "local: stage space on the VR Player rig");
     }
 
@@ -1073,9 +1099,12 @@ mod tests {
         let mut face = citrus_core::FaceFrame::default();
         face.set_param("JawOpen", 0.5);
         host.scene.set_local_face(Some(face));
+        // The owner's avatar fit (scale, measured eye height).
+        host.scene.local_body = crate::scene::LocalBody { arm_reach: 1.0, avatar_scale: 1.25, eye_height: Some(1.7) };
         run(&mut [&mut host, &mut client], &registry, 20);
         let av = component::<NetworkAvatar>(&client.scene.objects[rig]).unwrap();
         assert!(av.remote, "the client sees a remote avatar");
+        assert_eq!((av.avatar_scale, av.player_eye_height), (1.25, Some(1.7)), "avatar scale and height replicated");
         let jaw = citrus_core::expression_index("JawOpen").unwrap();
         assert!(av.face.as_ref().is_some_and(|f| (f.weights[jaw] - 0.5).abs() < 0.01), "face replicated");
         assert!(av.targets.chest.is_some_and(|(p, _)| p.distance(chest) < 0.01), "chest tracker replicated");

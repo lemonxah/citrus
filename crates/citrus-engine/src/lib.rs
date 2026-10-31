@@ -17,6 +17,7 @@ mod viseme;
 mod voice_codec;
 mod bundle;
 mod humanoid;
+mod body;
 pub mod audio_mixer;
 pub mod navmesh;
 pub mod particles;
@@ -100,6 +101,8 @@ mod net_window;
 mod new_project_ui;
 #[cfg(feature = "editor")]
 mod river_edit;
+#[cfg(feature = "editor")]
+mod cloth_paint;
 #[cfg(feature = "editor")]
 mod ui_edit;
 #[cfg(feature = "editor")]

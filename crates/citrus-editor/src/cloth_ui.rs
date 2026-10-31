@@ -1,9 +1,10 @@
 //! Inspectors and viewport gizmos for bone cloth (`Bone Cloth`) and its
-//! colliders (`Cloth Colliders`), including the capsule auto-fit controls.
+//! colliders (`Cloth Colliders`), including the capsule auto-fit controls,
+//! and the Mesh Cloth pin painter's panel.
 
 use citrus_core::{
-    BoneCloth, ClothCollider, ClothColliders, ClothConnection, ClothFitPreset, ClothShape, ClothShapeWorld,
-    ClothTeleport, ClothWind, MeshCloth, ObjectRef, PinSource, WindShape,
+    BoneCloth, BrushFalloff, BrushMode, ClothCollider, ClothColliders, ClothConnection, ClothFitPreset, ClothShape,
+    ClothShapeWorld, ClothTeleport, ClothWind, MeshCloth, ObjectId, ObjectRef, PaintChannel, PinSource, WindShape,
 };
 use egui::{DragValue, RichText, Ui};
 use glam::{Mat4, Vec3};
@@ -38,6 +39,14 @@ fn vec3(ui: &mut Ui, label: &str, v: &mut [f32; 3], changed: &mut bool) {
     widgets::property_row(ui, label, |ui| *changed |= widgets::vec3_field(ui, v, 3, 0.005));
 }
 
+/// Cull distance row, with a note while the cloth is culled.
+fn cull_row(ui: &mut Ui, v: &mut f32, culled: bool, changed: &mut bool) {
+    drag(ui, "Cull distance (m)", v, 0.5, 0.0..=10000.0, changed);
+    if *v > 0.0 {
+        note(ui, if culled { "Culled: farther than this from the camera, so it holds the animated pose." } else { "Holds the animated pose beyond this distance from the camera (0 = never)." });
+    }
+}
+
 /// Root-to-tip pair of values on one row.
 fn pair(ui: &mut Ui, label: &str, v: &mut [f32; 2], speed: f64, range: std::ops::RangeInclusive<f32>, changed: &mut bool) {
     widgets::property_row(ui, label, |ui| {
@@ -54,6 +63,166 @@ fn combo<T: Copy + PartialEq>(ui: &mut Ui, id: &str, label: &str, value: &mut T,
             }
         });
     });
+}
+
+/// The Mesh Cloth pin painter's settings, shared between its inspector panel
+/// and the Scene view through egui memory.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClothPaintTool {
+    /// The object being painted (the selection when painting started).
+    pub object: Option<ObjectId>,
+    pub active: bool,
+    pub channel: PaintChannel,
+    pub mode: BrushMode,
+    pub falloff: BrushFalloff,
+    /// Brush radius (world units).
+    pub radius: f32,
+    pub strength: f32,
+    /// What Set paints and Fill fills with.
+    pub value: f32,
+    pub mirror_x: bool,
+    /// Run the cloth while painting (otherwise it holds the animated pose).
+    pub simulate: bool,
+    pub show_distance: bool,
+    /// Share of the mesh height the region buttons take.
+    pub height: f32,
+    /// A stroke is in progress (one undo step).
+    pub stroking: bool,
+}
+
+impl Default for ClothPaintTool {
+    fn default() -> Self {
+        Self {
+            object: None,
+            active: false,
+            channel: PaintChannel::Pin,
+            mode: BrushMode::Paint,
+            falloff: BrushFalloff::Smooth,
+            radius: 0.05,
+            strength: 0.5,
+            value: 1.0,
+            mirror_x: false,
+            simulate: false,
+            show_distance: false,
+            height: 0.15,
+            stroking: false,
+        }
+    }
+}
+
+impl ClothPaintTool {
+    fn id() -> egui::Id {
+        egui::Id::new("citrus-cloth-paint-tool")
+    }
+
+    pub fn get(ctx: &egui::Context) -> Self {
+        ctx.data(|d| d.get_temp(Self::id())).unwrap_or_default()
+    }
+
+    pub fn set(self, ctx: &egui::Context) {
+        ctx.data_mut(|d| d.insert_temp(Self::id(), self));
+    }
+}
+
+pub const CLOTH_PAINT_HINT: &str = "Drag on the cloth to paint. Shift erases, Alt smooths. [ and ] or Ctrl+Scroll resize the brush. \
+    P or Esc leaves painting. Each stroke is one undo step.";
+
+fn channel_label(c: PaintChannel) -> &'static str {
+    match c {
+        PaintChannel::Pin => "Pin weight",
+        PaintChannel::MaxDistance => "Max distance",
+    }
+}
+
+/// The painter's brush settings and whole-mesh operations. Edits the paint
+/// in place; true when it changed.
+fn paint_panel(ui: &mut Ui, mc: &mut MeshCloth, tool: &mut ClothPaintTool) -> bool {
+    let mut changed = false;
+    if widgets::primary_button(ui, Some(Icon::Check), "Done Painting").clicked() {
+        tool.active = false;
+    }
+    note(ui, CLOTH_PAINT_HINT);
+    widgets::property_row(ui, "Channel", |ui| {
+        let opts = [(PaintChannel::Pin, channel_label(PaintChannel::Pin)), (PaintChannel::MaxDistance, channel_label(PaintChannel::MaxDistance))];
+        widgets::segmented(ui, &mut tool.channel, &opts);
+    });
+    widgets::property_row(ui, "Brush", |ui| {
+        let opts = BrushMode::ALL.map(|m| (m, m.label()));
+        widgets::segmented(ui, &mut tool.mode, &opts);
+    });
+    if tool.mode == BrushMode::Set {
+        widgets::property_row(ui, "Value", |ui| widgets::slider(ui, egui::Slider::new(&mut tool.value, 0.0..=1.0)));
+    }
+    widgets::property_row(ui, "Radius (m)", |ui| ui.add(DragValue::new(&mut tool.radius).speed(0.002).range(0.002..=5.0)));
+    widgets::property_row(ui, "Strength", |ui| widgets::slider(ui, egui::Slider::new(&mut tool.strength, 0.0..=1.0)));
+    widgets::property_row(ui, "Falloff", |ui| {
+        let opts = BrushFalloff::ALL.map(|f| (f, f.label()));
+        widgets::segmented(ui, &mut tool.falloff, &opts);
+    });
+    widgets::property_row(ui, "Mirror X", |ui| ui.checkbox(&mut tool.mirror_x, ""));
+    widgets::property_row(ui, "Simulate", |ui| ui.checkbox(&mut tool.simulate, "")).on_hover_text("Run the cloth while painting");
+    if tool.channel == PaintChannel::MaxDistance || !mc.paint.max_distance.is_empty() {
+        widgets::property_row(ui, "Show distance", |ui| ui.checkbox(&mut tool.show_distance, ""));
+    }
+
+    let n = mc.paint.vertex_count as usize;
+    if n == 0 || !mc.paint.matches(mc.runtime.bind.len(), mc.runtime.topology) {
+        note(ui, "Waiting for the cloth to build (the object must be skinned and active).");
+        return changed;
+    }
+    let channel = tool.channel;
+    let mut values = mc.paint.values(channel);
+    let mut edit = false;
+    widgets::eyebrow(ui, "Whole mesh");
+    ui.horizontal_wrapped(|ui| {
+        if widgets::secondary_button(ui, None, "Fill").on_hover_text("Set every vertex to the brush value").clicked() {
+            values.iter_mut().for_each(|v| *v = tool.value);
+            edit = true;
+        }
+        if widgets::secondary_button(ui, None, "Clear").clicked() {
+            values.iter_mut().for_each(|v| *v = 0.0);
+            edit = true;
+        }
+        if widgets::secondary_button(ui, None, "Invert").clicked() {
+            values.iter_mut().for_each(|v| *v = 1.0 - *v);
+            edit = true;
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        let tolerance = (mc.paint.bounds[3] - mc.paint.bounds[0]).abs().max(1e-3) * 0.01;
+        for (label, positive) in [("Mirror +X to -X", true), ("Mirror -X to +X", false)] {
+            if widgets::secondary_button(ui, None, label).on_hover_text("Copy each vertex's value to its mirror across local X").clicked() {
+                mc.paint.set_values(channel, &values);
+                mc.paint.symmetrize(channel, &mc.runtime.bind, positive, tolerance);
+                values = mc.paint.values(channel);
+                edit = true;
+            }
+        }
+    });
+    widgets::property_row(ui, "Height share", |ui| widgets::slider(ui, egui::Slider::new(&mut tool.height, 0.0..=1.0)));
+    ui.horizontal_wrapped(|ui| {
+        for (label, above) in [("Set top", true), ("Set bottom", false)] {
+            if widgets::secondary_button(ui, None, label).on_hover_text("Set that share of the mesh height to the brush value").clicked() {
+                for (v, take) in citrus_core::select_by_height(&mc.runtime.bind, tool.height, above).into_iter().enumerate() {
+                    if take {
+                        values[v] = tool.value;
+                    }
+                }
+                edit = true;
+            }
+        }
+    });
+    if edit {
+        mc.paint.set_values(channel, &values);
+        mc.runtime.retether = true;
+        changed = true;
+    }
+    if !mc.paint.max_distance.is_empty() && widgets::secondary_button(ui, Some(Icon::Trash), "Remove max distance").clicked() {
+        mc.paint.max_distance.set(Vec::new());
+        mc.runtime.retether = true;
+        changed = true;
+    }
+    changed
 }
 
 fn note(ui: &mut Ui, s: &str) {
@@ -416,6 +585,7 @@ impl Inspect for BoneCloth {
         widgets::eyebrow(ui, "Simulation");
         drag(ui, "Frequency (Hz)", &mut self.frequency, 1.0, 10.0..=480.0, &mut changed);
         widgets::property_row(ui, "Iterations", |ui| changed |= ui.add(DragValue::new(&mut self.iterations).range(1..=16)).changed());
+        cull_row(ui, &mut self.cull_distance, self.runtime.culled, &mut changed);
         check(ui, "End tail", &mut self.end_tail, &mut changed);
         if widgets::secondary_button(ui, Some(Icon::Reset), "Reset to pose").clicked() {
             self.runtime.reset_requested = true;
@@ -528,6 +698,46 @@ impl Inspect for MeshCloth {
             }
             PinSource::Bones => bone_list(ui, "citrus-meshcloth-bones", &mut self.pin_bones, &bones, "Add bone", &mut changed),
             PinSource::Top => drag(ui, "Pinned share", &mut self.pin_height, 0.005, 0.0..=1.0, &mut changed),
+            PinSource::Painted => {
+                let pins = self.paint.pins.as_slice();
+                if !pins.is_empty() {
+                    let pinned = pins.iter().filter(|&&b| b >= 128).count();
+                    note(ui, &format!("{pinned} of {} vertices pinned", pins.len()));
+                }
+                let mut limit = false;
+                drag(ui, "Max distance (m)", &mut self.max_distance, 0.002, 0.0..=10.0, &mut limit);
+                if limit {
+                    self.runtime.pins_dirty = true;
+                    changed = true;
+                }
+                note(ui, if self.paint.max_distance.is_empty() {
+                    "Paint the Max distance channel to limit how far vertices stray from their animated position."
+                } else {
+                    "A painted max distance of 1 lets a vertex stray this far from its animated position."
+                });
+            }
+        }
+        if !self.runtime.paint_note.is_empty() {
+            ui.label(RichText::new(&self.runtime.paint_note).size(theme::SIZE_META).color(theme::STATUS_WARN_FG));
+        }
+        let egui_ctx = ui.ctx().clone();
+        let mut tool = ClothPaintTool::get(&egui_ctx);
+        let before = tool;
+        if self.runtime.paint_mode {
+            changed |= paint_panel(ui, self, &mut tool);
+        } else {
+            if widgets::secondary_button(ui, Some(Icon::Target), "Paint Pins")
+                .on_hover_text("Paint pin weights and max distances on the cloth in the Scene view (P)")
+                .clicked()
+            {
+                tool.active = true;
+            }
+            if self.pin != PinSource::Painted {
+                note(ui, "Painting starts from the current pins and switches Pin by to Painted.");
+            }
+        }
+        if tool != before {
+            tool.set(&egui_ctx);
         }
         if widgets::secondary_button(ui, Some(Icon::Reset), "Rebuild").clicked() {
             self.runtime.reset_requested = true;
@@ -598,14 +808,16 @@ impl Inspect for MeshCloth {
         widgets::eyebrow(ui, "Simulation");
         drag(ui, "Frequency (Hz)", &mut self.frequency, 1.0, 10.0..=480.0, &mut changed);
         widgets::property_row(ui, "Iterations", |ui| changed |= ui.add(DragValue::new(&mut self.iterations).range(1..=32)).changed());
+        cull_row(ui, &mut self.cull_distance, self.runtime.culled, &mut changed);
         changed
     }
 }
 
 impl Gizmo for MeshCloth {
-    /// The simulated particles: pinned ones red, free ones as small crosses.
+    /// The simulated particles: pinned ones red, free ones as small crosses
+    /// (hidden while painting, which draws its own overlay).
     fn gizmos(&self) -> Vec<GizmoSpec> {
-        let Some(sim) = &self.runtime.sim else { return Vec::new() };
+        let Some(sim) = self.runtime.sim.as_ref().filter(|_| !self.runtime.paint_mode) else { return Vec::new() };
         let (mut free, mut pinned) = (Vec::new(), Vec::new());
         let step = sim.particles.len().div_ceil(4000).max(1);
         for p in sim.particles.iter().step_by(step) {

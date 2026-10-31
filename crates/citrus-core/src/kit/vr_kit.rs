@@ -207,6 +207,15 @@ pub struct VrPlayer {
     pub grab_right_action: String,
     pub use_left_action: String,
     pub use_right_action: String,
+    /// How the player's avatar is fitted to their measured height.
+    pub avatar_scaling: crate::AvatarScaling,
+    /// Also map the player's arm span onto the avatar's arms (hand reach).
+    pub match_arm_span: bool,
+    /// Opens the body menu (Calibrate / Height / Done) in a headset; empty
+    /// leaves the button to the game.
+    pub body_menu_action: String,
+    #[serde(skip)]
+    pub body_menu_prev: bool,
     #[serde(skip)]
     pub vr_active: bool,
     #[serde(skip)]
@@ -267,6 +276,10 @@ impl Default for VrPlayer {
             grab_right_action: "Grab Right".into(),
             use_left_action: "Use Left".into(),
             use_right_action: "Use Right".into(),
+            avatar_scaling: crate::AvatarScaling::ScaleAvatar,
+            match_arm_span: false,
+            body_menu_action: "Menu".into(),
+            body_menu_prev: false,
             vr_active: false,
             pitch: 0.0,
             held: [None; 2],
@@ -628,6 +641,11 @@ impl TypedComponent for VrPlayer {
         }
         let vr = ctx.screen.vr;
         self.vr_active = vr.active;
+        let menu = vr.active && !self.body_menu_action.is_empty() && vr_button(ctx, &self.body_menu_action, vr.menu);
+        if menu && !self.body_menu_prev {
+            ctx.commands.push(ComponentCommand::Body(crate::BodyCommand::Menu(None)));
+        }
+        self.body_menu_prev = menu;
         if !vr.active && !self.desktop_fallback {
             return;
         }

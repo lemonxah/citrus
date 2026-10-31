@@ -72,7 +72,7 @@ impl Inspect for HumanoidIk {
             drag(ui, "Step time (s)", &mut self.step_time, 0.005, 0.05..=2.0, &mut changed);
             drag(ui, "Step height (m)", &mut self.step_height, 0.002, 0.0..=0.5, &mut changed);
         }
-        note(ui, "Calibrate from gameplay with ctx.calibrate_trackers() while the player holds a T-pose.");
+        note(ui, "Players calibrate from the VR body menu (the Menu button on a VR Player) or gameplay: ctx.start_body_calibration(), or ctx.calibrate_trackers() while they hold a T-pose. The editor's Windows > Body Tracking sets tracker roles.");
         changed
     }
 }

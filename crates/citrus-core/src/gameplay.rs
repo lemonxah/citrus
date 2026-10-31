@@ -61,6 +61,8 @@ pub struct ScreenInfo {
     pub vr: crate::VrFrame,
     /// Live input bindings, device in use and rebind capture state.
     pub controls: crate::ControlsInfo,
+    /// The player's measured body and how their avatar is fitted to it.
+    pub body: crate::BodyInfo,
 }
 
 /// Immediate physics queries, implemented by the engine's physics world.
@@ -759,6 +761,43 @@ impl ComponentCtx<'_> {
 
     pub fn clear_tracker_calibration(&mut self) {
         self.commands.push(ComponentCommand::ClearTrackerCalibration);
+    }
+
+    /// The player's standing height (m, to the top of the head): measured in
+    /// the headset, entered by the player, or a default until then.
+    pub fn player_height(&self) -> f32 {
+        self.screen.body.player_height
+    }
+
+    /// The local avatar's scale over its authored size (1 unless it is
+    /// fitted to the player's height).
+    pub fn avatar_scale(&self) -> f32 {
+        self.screen.body.avatar_scale
+    }
+
+    /// Measured body, fit and calibration state.
+    pub fn body(&self) -> &crate::BodyInfo {
+        &self.screen.body
+    }
+
+    /// Ask the player to stand straight for a moment and measure their height.
+    pub fn request_height_calibration(&mut self) {
+        self.commands.push(ComponentCommand::Body(crate::BodyCommand::MeasureHeight));
+    }
+
+    /// Run the guided full-body calibration (stand straight, T-pose, floor check).
+    pub fn start_body_calibration(&mut self) {
+        self.commands.push(ComponentCommand::Body(crate::BodyCommand::Calibrate));
+    }
+
+    /// Open or close the VR body menu (Calibrate / Height / Done).
+    pub fn show_body_menu(&mut self, open: bool) {
+        self.commands.push(ComponentCommand::Body(crate::BodyCommand::Menu(Some(open))));
+    }
+
+    /// Set the player's height in cm (`None` returns to the measurement).
+    pub fn set_player_height_cm(&mut self, cm: Option<f32>) {
+        self.commands.push(ComponentCommand::Body(crate::BodyCommand::SetHeight(cm)));
     }
 
     /// Start or stop the OSC receiver that takes face tracking from external

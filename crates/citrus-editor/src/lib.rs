@@ -10,6 +10,7 @@
 
 mod audio_ui;
 mod cloth_ui;
+pub use cloth_ui::{CLOTH_PAINT_HINT, ClothPaintTool};
 mod ik_ui;
 mod face_ui;
 mod water_ui;

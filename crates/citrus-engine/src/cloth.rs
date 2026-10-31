@@ -23,10 +23,29 @@ pub(crate) fn has_mesh_cloth(components: &[Box<dyn Component>]) -> bool {
     components.iter().any(|c| c.as_any().is::<citrus_core::MeshCloth>())
 }
 
-/// Pin weight per render vertex for a Mesh Cloth.
-fn mesh_pins(mc: &citrus_core::MeshCloth, skel: &Skeleton, verts: &[citrus_render::Vertex]) -> Vec<f32> {
-    use citrus_core::PinSource;
+/// Whether cloth on an object at `world` is past its cull distance from the
+/// viewer.
+fn culled(cull_distance: f32, world: Mat4, viewer: Option<Vec3>) -> bool {
+    cull_distance > 0.0 && viewer.is_some_and(|eye| (world.w_axis.truncate() - eye).length() > cull_distance)
+}
+
+/// Pin weight per render vertex for a Mesh Cloth. Painted weights are first
+/// fitted to the captured bind mesh (remapped if it changed since painting).
+fn mesh_pins(mc: &mut citrus_core::MeshCloth, skel: &Skeleton, verts: &[citrus_render::Vertex]) -> Vec<f32> {
+    use citrus_core::{PaintFit, PinSource};
     match mc.pin {
+        PinSource::Painted => {
+            match mc.paint.fit(&mc.runtime.bind, &mc.runtime.indices) {
+                PaintFit::Same => mc.runtime.paint_note.clear(),
+                PaintFit::Fresh => mc.runtime.paint_note = "Nothing painted yet: every vertex is free.".into(),
+                PaintFit::Remapped => {
+                    tracing::warn!("Mesh Cloth: the mesh changed since its pins were painted; remapped them by nearest position");
+                    mc.runtime.paint_note =
+                        "The mesh changed since painting: the weights were carried over by nearest position. Check them, then save the scene.".into();
+                }
+            }
+            mc.paint.pin_weights()
+        }
         PinSource::VertexColor => {
             let ch = mc.pin_channel.min(3) as usize;
             verts.iter().map(|v| v.color[ch].clamp(0.0, 1.0)).collect()
@@ -50,9 +69,15 @@ fn mesh_pins(mc: &citrus_core::MeshCloth, skel: &Skeleton, verts: &[citrus_rende
     }
 }
 
+/// Painted max distances in object units, when the cloth uses painted pins.
+fn mesh_limits(mc: &citrus_core::MeshCloth) -> Option<Vec<f32>> {
+    (mc.pin == citrus_core::PinSource::Painted).then(|| mc.paint.limits(mc.max_distance)).flatten()
+}
+
 /// Simulate the Mesh Cloth bound to render slot `slot` on these skinned
 /// vertices (object space, in place). `bind` are the bind-pose vertices
-/// (pins read their colours and weights).
+/// (pins read their colours and weights). Past its cull distance from
+/// `viewer`, or held by the pin painter, the cloth keeps the animated pose.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step_mesh(
     components: &mut [Box<dyn Component>],
@@ -64,6 +89,7 @@ pub(crate) fn step_mesh(
     world: Mat4,
     others: &HashMap<ObjectId, Vec<ClothShapeWorld>>,
     winds: &[citrus_core::WindSample],
+    viewer: Option<Vec3>,
     time: f32,
     dt: f32,
 ) {
@@ -99,16 +125,48 @@ pub(crate) fn step_mesh(
         let stale = mc.runtime.sim.as_ref().is_none_or(|s| s.vertex_count() != positions.len());
         if mc.runtime.reset_requested || stale {
             mc.runtime.reset_requested = false;
+            mc.runtime.bind = bind.iter().map(|v| Vec3::from(v.position)).collect();
+            mc.runtime.indices = indices.to_vec();
+            mc.runtime.topology = citrus_core::topology_hash(bind.len(), indices);
             let pins = mesh_pins(mc, skel, bind);
+            mc.runtime.source_pins = if mc.pin == citrus_core::PinSource::Painted { Vec::new() } else { pins.clone() };
             mc.runtime.sim = citrus_core::MeshClothSim::build(&positions, indices, &pins, mc.particle_spacing, world);
+            let limits = mesh_limits(mc);
+            if let Some(sim) = mc.runtime.sim.as_mut() {
+                sim.set_limits(limits.as_deref());
+            }
+            mc.runtime.pins_dirty = false;
+            mc.runtime.retether = false;
         }
         let Some(mut sim) = mc.runtime.sim.take() else { continue };
-        sim.step(mc, &positions, world, &shapes, winds, time, dt);
-        let mut normals: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.normal)).collect();
-        sim.apply(&mut positions, &mut normals, world);
-        for ((v, p), n) in verts.iter_mut().zip(&positions).zip(&normals) {
-            v.position = p.to_array();
-            v.normal = n.to_array();
+        if mc.runtime.pins_dirty || mc.runtime.retether {
+            if mc.pin == citrus_core::PinSource::Painted && mc.paint.matches(sim.vertex_count(), mc.runtime.topology) {
+                sim.set_pins(&mc.paint.pin_weights(), mc.runtime.retether);
+                sim.set_limits(mesh_limits(mc).as_deref());
+            }
+            mc.runtime.pins_dirty = false;
+            mc.runtime.retether = false;
+        }
+        mc.runtime.culled = culled(mc.cull_distance, world, viewer);
+        if mc.runtime.hold || mc.runtime.culled {
+            // Restart from the animated pose once it runs again.
+            mc.runtime.idle = true;
+        } else {
+            if std::mem::take(&mut mc.runtime.idle) {
+                sim.reset(&positions, world);
+            }
+            sim.step(mc, &positions, world, &shapes, winds, time, dt);
+            let mut normals: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.normal)).collect();
+            sim.apply(&mut positions, &mut normals, world);
+            for ((v, p), n) in verts.iter_mut().zip(&positions).zip(&normals) {
+                v.position = p.to_array();
+                v.normal = n.to_array();
+            }
+        }
+        if mc.runtime.paint_mode {
+            mc.runtime.posed.clone_from(&positions);
+        } else if !mc.runtime.posed.is_empty() {
+            mc.runtime.posed = Vec::new();
         }
         mc.runtime.sim = Some(sim);
     }
@@ -141,6 +199,7 @@ pub(crate) fn step(
     world: Mat4,
     others: &HashMap<ObjectId, Vec<ClothShapeWorld>>,
     winds: &[citrus_core::WindSample],
+    viewer: Option<Vec3>,
     time: f32,
     dt: f32,
 ) {
@@ -201,6 +260,15 @@ pub(crate) fn step(
             cloth.runtime.sim = BoneClothSim::build(cloth, &parents, &cloth.runtime.bones, &models, world);
         }
         let Some(mut sim) = cloth.runtime.sim.take() else { continue };
+        // Past the cull distance the bones keep their animated pose.
+        if culled(cloth.cull_distance, world, viewer) {
+            cloth.runtime.culled = true;
+            cloth.runtime.sim = Some(sim);
+            continue;
+        }
+        if std::mem::take(&mut cloth.runtime.culled) {
+            sim.reset(&models, world);
+        }
         sim.step_in_wind(cloth, &models, world, &shapes, winds, time, dt);
         sim.write_pose(&parents, &models, locals, world, cloth.blend);
         cloth.runtime.sim = Some(sim);
@@ -383,6 +451,118 @@ mod tests {
         out
     }
 
+    /// A flat 6 x 6 quad sheet in the XZ plane skinned to one root bone, with
+    /// its z = 0 edge painted pinned.
+    fn painted_sheet() -> (Skeleton, Vec<citrus_render::Vertex>, Vec<u32>, citrus_core::MeshCloth) {
+        let skel = Skeleton {
+            joints: vec![Joint {
+                name: "Root".into(),
+                parent: None,
+                inverse_bind: Mat4::IDENTITY,
+                rest_translation: Vec3::ZERO,
+                rest_rotation: Quat::IDENTITY,
+                rest_scale: Vec3::ONE,
+            }],
+        };
+        let n = 6u32;
+        let mut verts = Vec::new();
+        for z in 0..=n {
+            for x in 0..=n {
+                verts.push(citrus_render::Vertex {
+                    position: [x as f32 / n as f32, 0.0, z as f32 / n as f32],
+                    joints: [0, 0, 0, 0],
+                    weights: [1.0, 0.0, 0.0, 0.0],
+                    ..Default::default()
+                });
+            }
+        }
+        let mut idx = Vec::new();
+        for z in 0..n {
+            for x in 0..n {
+                let i = z * (n + 1) + x;
+                idx.extend([i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2]);
+            }
+        }
+        let bind: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.position)).collect();
+        let pins: Vec<f32> = bind.iter().map(|p| if p.z < 1e-3 { 1.0 } else { 0.0 }).collect();
+        let mc = citrus_core::MeshCloth {
+            pin: citrus_core::PinSource::Painted,
+            paint: citrus_core::ClothPaint::seed(&bind, &idx, &pins),
+            shape_stiffness: 0.0,
+            ..Default::default()
+        };
+        (skel, verts, idx, mc)
+    }
+
+    fn run_sheet(components: &mut [Box<dyn Component>], skel: &Skeleton, verts: &[citrus_render::Vertex], idx: &[u32], viewer: Option<Vec3>, frames: usize) -> Vec<citrus_render::Vertex> {
+        let mut out = verts.to_vec();
+        for _ in 0..frames {
+            out = verts.to_vec();
+            step_mesh(components, 0, skel, verts, &mut out, idx, Mat4::IDENTITY, &HashMap::new(), &[], viewer, 0.0, 1.0 / 60.0);
+        }
+        out
+    }
+
+    #[test]
+    fn painted_pins_hold_while_free_vertices_fall() {
+        let (skel, verts, idx, mc) = painted_sheet();
+        let mut components: Vec<Box<dyn Component>> = vec![Box::new(mc)];
+        let out = run_sheet(&mut components, &skel, &verts, &idx, None, 240);
+        for (a, b) in verts.iter().zip(&out) {
+            if a.position[2] < 1e-3 {
+                assert!((Vec3::from(a.position) - Vec3::from(b.position)).length() < 1e-4, "pinned vertex stays at its animated position");
+            }
+        }
+        let low = out.iter().map(|v| v.position[1]).fold(f32::MAX, f32::min);
+        assert!(low < -0.5, "free vertices fall: {low}");
+
+        // Painting it all free (live, without a rebuild) drops the pinned edge too.
+        let mc = components[0].as_any_mut().downcast_mut::<citrus_core::MeshCloth>().unwrap();
+        mc.paint.set_values(citrus_core::PaintChannel::Pin, &vec![0.0; verts.len()]);
+        mc.runtime.retether = true;
+        let out = run_sheet(&mut components, &skel, &verts, &idx, None, 60);
+        assert!(out.iter().all(|v| v.position[1] < -0.01), "nothing pinned any more");
+    }
+
+    #[test]
+    fn distant_bone_cloth_keeps_the_animated_pose() {
+        let skel = leg();
+        let cloth = BoneCloth { roots: vec!["Skirt".into()], cull_distance: 5.0, ..Default::default() };
+        let mut components: Vec<Box<dyn Component>> = vec![Box::new(cloth)];
+        let others = HashMap::new();
+        let run = |components: &mut [Box<dyn Component>], viewer: Vec3| {
+            let mut locals = skel.rest_locals();
+            for _ in 0..60 {
+                locals = skel.rest_locals();
+                step(components, &skel, &[], &mut locals, Mat4::from_rotation_x(1.2), &others, &[], Some(viewer), 0.0, 1.0 / 60.0);
+            }
+            locals
+        };
+        let far = run(&mut components, Vec3::new(0.0, 0.0, 40.0));
+        assert_eq!(far, skel.rest_locals(), "culled: bones keep the animated pose");
+        let near = run(&mut components, Vec3::ZERO);
+        assert_ne!(near, skel.rest_locals(), "simulated up close");
+    }
+
+    #[test]
+    fn held_or_distant_cloth_keeps_the_animated_pose() {
+        let (skel, verts, idx, mut mc) = painted_sheet();
+        mc.cull_distance = 10.0;
+        let mut components: Vec<Box<dyn Component>> = vec![Box::new(mc)];
+        let far = Some(Vec3::new(0.0, 0.0, 50.0));
+        let out = run_sheet(&mut components, &skel, &verts, &idx, far, 30);
+        assert!(verts.iter().zip(&out).all(|(a, b)| a.position == b.position), "culled cloth isn't simulated");
+        let mc = components[0].as_any().downcast_ref::<citrus_core::MeshCloth>().unwrap();
+        assert!(mc.runtime.culled);
+        let out = run_sheet(&mut components, &skel, &verts, &idx, Some(Vec3::ONE), 60);
+        assert!(out.iter().any(|v| v.position[1] < -0.1), "simulates again up close");
+
+        let mc = components[0].as_any_mut().downcast_mut::<citrus_core::MeshCloth>().unwrap();
+        mc.runtime.hold = true;
+        let out = run_sheet(&mut components, &skel, &verts, &idx, None, 2);
+        assert!(verts.iter().zip(&out).all(|(a, b)| a.position == b.position), "the painter's hold shows the animated pose");
+    }
+
     #[test]
     fn auto_fit_wraps_the_thigh_and_cloth_slides_off_it() {
         let skel = leg();
@@ -400,7 +580,7 @@ mod tests {
         let others = HashMap::new();
         for _ in 0..240 {
             locals = skel.rest_locals();
-            step(&mut components, &skel, &[&verts], &mut locals, Mat4::IDENTITY, &others, &[], 0.0, 1.0 / 60.0);
+            step(&mut components, &skel, &[&verts], &mut locals, Mat4::IDENTITY, &others, &[], None, 0.0, 1.0 / 60.0);
         }
         let cc = components[0].as_any().downcast_ref::<ClothColliders>().unwrap();
         assert_eq!(cc.colliders.len(), 1, "{}", cc.runtime.fit_report);

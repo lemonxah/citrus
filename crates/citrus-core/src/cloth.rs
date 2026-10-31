@@ -266,6 +266,8 @@ pub struct BoneClothRuntime {
     pub sim: Option<BoneClothSim>,
     /// Set by the inspector; the engine rebuilds the simulation.
     pub reset_requested: bool,
+    /// Beyond the cull distance from the viewer this frame.
+    pub culled: bool,
 }
 
 /// Simulates every joint below each root as a chain of particles and turns
@@ -319,6 +321,9 @@ pub struct BoneCloth {
     pub blend: f32,
     /// How strongly Wind Zones push this cloth (0 = ignores wind).
     pub wind: f32,
+    /// Stop simulating (keep the animated pose) beyond this distance from the
+    /// camera (m, 0 = never).
+    pub cull_distance: f32,
     #[serde(skip)]
     pub runtime: BoneClothRuntime,
 }
@@ -349,6 +354,7 @@ impl Default for BoneCloth {
             end_tail: true,
             blend: 1.0,
             wind: 1.0,
+            cull_distance: 0.0,
             runtime: BoneClothRuntime::default(),
         }
     }

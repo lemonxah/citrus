@@ -68,4 +68,4 @@ The earlier P0/P1 gaps from the June audit are now **done**:
 
 1. Android / Quest 3: on-device validation.
 2. Asset cook (pack shipped files into one archive).
-3. Avatar scaling to the player's height, in-editor pin painting for Mesh Cloth.
+3. In-headset validation of body calibration and avatar scaling; GPU cloth.

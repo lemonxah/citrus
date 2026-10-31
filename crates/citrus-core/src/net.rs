@@ -582,6 +582,16 @@ pub struct NetworkAvatar {
     /// Face tracking: sent by the owner, received on remote copies.
     #[serde(skip)]
     pub face: Option<crate::FaceFrame>,
+    /// The player's avatar scale over its authored size (sent by the owner,
+    /// applied to remote copies of the avatar).
+    #[serde(skip)]
+    pub avatar_scale: f32,
+    /// The player's standing eye height (m), as the owner measured it.
+    #[serde(skip)]
+    pub player_eye_height: Option<f32>,
+    /// What the owner last announced (scale, eye height).
+    #[serde(skip)]
+    pub body_sent: Option<(f32, f32)>,
 }
 
 /// A worn avatar package as replicated: its content id and, when it came from
@@ -594,6 +604,9 @@ pub struct WornAvatar {
 
 /// Synced-variable key a Network Avatar's worn package travels under.
 pub const WORN_AVATAR_VAR: &str = "citrus.avatar";
+/// Synced-variable keys of the player's avatar scale and eye height.
+pub const AVATAR_SCALE_VAR: &str = "citrus.avatar_scale";
+pub const PLAYER_EYE_HEIGHT_VAR: &str = "citrus.eye_height";
 
 impl WornAvatar {
     pub fn encode(&self) -> String {
@@ -632,6 +645,9 @@ impl Default for NetworkAvatar {
             wearing: None,
             wearing_sent: None,
             face: None,
+            avatar_scale: 1.0,
+            player_eye_height: None,
+            body_sent: None,
         }
     }
 }

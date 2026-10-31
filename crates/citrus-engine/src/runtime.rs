@@ -140,6 +140,9 @@ pub fn run_game_android(
     register: impl FnOnce(&mut ComponentRegistry),
 ) -> Result<()> {
     use winit::platform::android::EventLoopBuilderExtAndroid;
+    if let Some(dir) = app.internal_data_path() {
+        crate::input_engine::set_user_config_dir(dir.join("config"));
+    }
     let event_loop = EventLoop::builder().with_android_app(app).build().context("creating event loop")?;
     run_game_on(event_loop, config, register)
 }
@@ -248,6 +251,7 @@ fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnO
         vr_targets: citrus_core::TrackerTargets::default(),
         face_input,
         slimevr,
+        body: crate::body::BodyTracking::load(),
         content: crate::content::ContentManager::with_startup_sources(content_cache, std::env::var("CITRUS_CONTENT").ok()),
         content_overlay: crate::content::ContentOverlay::new(inbox),
         content_overlay_enabled: overlay_enabled,
@@ -385,6 +389,8 @@ struct GameApp {
     face_input: crate::face_input::FaceInput,
     /// SlimeVR server connection (full-body trackers), when enabled.
     slimevr: Option<crate::slimevr::SlimeVr>,
+    /// The player's measured body, tracker roles and calibration.
+    body: crate::body::BodyTracking,
     /// User-generated content packages (ctx.load_content / spawn_avatar / …).
     content: crate::content::ContentManager,
     content_overlay: crate::content::ContentOverlay,
@@ -506,6 +512,8 @@ impl GameApp {
         self.content.scene_replaced(&rel);
         // The renderer was reset: drop caches holding its handles.
         self.world_ui = WorldUi::default();
+        self.body.reset_render();
+        self.body.scene_changed();
         self.particles = crate::particles::ParticleRenderer::default();
         self.water = crate::water_render::WaterRenderer::default();
         self.water_fx = crate::water_fx::WaterFx::default();
@@ -587,12 +595,9 @@ impl GameApp {
                     self.apply_cursor_lock();
                 }
                 ComponentCommand::Quit => event_loop.exit(),
-                ComponentCommand::CalibrateTrackers => {
-                    if self.scene.calibrate_vr_tpose(&self.vr_targets) {
-                        tracing::info!("VR: captured T-pose calibration");
-                    }
-                }
-                ComponentCommand::ClearTrackerCalibration => self.scene.clear_vr_calibration(),
+                ComponentCommand::CalibrateTrackers => self.body.calibrate_now(),
+                ComponentCommand::ClearTrackerCalibration => self.body.clear_calibration(),
+                ComponentCommand::Body(c) => self.body.command(c),
                 ComponentCommand::SetOscFaceTracking(port) => self.face_input.set_osc(port),
                 ComponentCommand::Content(c) => self.content.queue(c),
                 ComponentCommand::Input(c) => self.input.apply(c),
@@ -675,12 +680,14 @@ impl GameApp {
 
     /// Lay out world-space canvases, pointed at by the mouse ray and the right
     /// VR controller (trigger = click).
-    fn update_world_ui(&mut self, renderer: &mut Renderer, view: Mat4, proj: Mat4, width: f32, height: f32) {
+    fn update_world_ui(&mut self, renderer: &mut Renderer, view: Mat4, proj: Mat4, width: f32, height: f32, dt: f32) {
         self.scene.extra_draws.clear();
         let mut rays = Vec::new();
+        let rig = self.scene.vr_player_rig().unwrap_or_else(|| camera_rig(self.last_cam_world, self.vr_targets.head));
         if let Some(session) = self.xr_session.as_ref()
-            && let Some((pos, rot)) = session.body_poses().right_hand
+            && let Some(hand) = self.vr_targets.right_hand
         {
+            let (pos, rot) = rig.stage_pose_to_world(hand);
             let trigger = session.input().right_trigger;
             rays.push(UiRay {
                 origin: pos,
@@ -708,7 +715,8 @@ impl GameApp {
                 });
             }
         }
-        let (draws, frame) = self.world_ui.update(renderer, &mut self.scene, &self.config.assets_root, &rays, None);
+        let (mut draws, frame) = self.world_ui.update(renderer, &mut self.scene, &self.config.assets_root, &rays, None);
+        draws.extend(self.body.panel_frame(renderer, &mut self.scene, &rig, dt));
         self.world_ui_draws = draws;
         self.pending_world_frame = frame;
     }
@@ -813,6 +821,7 @@ impl GameApp {
             ui_cancel: std::mem::take(&mut self.ui_frame.cancel),
             vr,
             controls: self.input.controls_info(),
+            body: self.body.info(),
         };
         let host = match self.play.as_mut() {
             Some(play) => play.tick(
@@ -882,29 +891,23 @@ impl GameApp {
                 return;
             }
             let b = session.body_poses();
-            self.vr_targets = citrus_core::TrackerTargets {
-                head: b.head,
-                left_hand: b.left_hand,
-                right_hand: b.right_hand,
-                hips: b.hips,
-                left_foot: b.left_foot,
-                right_foot: b.right_foot,
-                chest: b.chest,
-                left_elbow: b.left_elbow,
-                right_elbow: b.right_elbow,
-                left_knee: b.left_knee,
-                right_knee: b.right_knee,
-            };
+            let mut devices = crate::body::xr_devices(&b);
             if let Some(slime) = &self.slimevr {
-                slime.feed(&mut self.vr_targets);
+                slime.send_devices(b.head, b.left_hand, b.right_hand);
+                devices.extend(slime.devices());
             }
+            self.vr_targets = self.body.assemble(b.head, b.left_hand, b.right_hand, devices);
         }
 
         // Feed VR tracker poses into the scene's humanoid IK targets (gameplay
-        // could set these too — IK isn't VR-specific). Then advance + CPU-skin.
+        // could set these too — IK isn't VR-specific), through the body
+        // calibration and avatar fit. Then advance + CPU-skin.
         let face = self.face_input.poll(self.xr_session.as_ref());
         self.scene.set_local_face(face);
-        let vr_targets = self.scene.vr_apply_calibration(&self.vr_targets);
+        let tracking = self.xr_session.as_ref().is_some_and(|s| s.running);
+        let triggers = self.xr_session.as_ref().filter(|_| tracking).map(|s| s.input()).map_or([false; 2], |i| [i.left_trigger, i.right_trigger]);
+        let body_frame = crate::body::BodyFrame { dt, tracking, apply: true, triggers };
+        let vr_targets = self.body.update(&mut self.scene, &self.vr_targets, body_frame);
         self.scene
             .set_ik_targets(self.xr_session.as_ref().map(|_| vr_targets));
         self.scene.update_water_wind(dt);
@@ -913,7 +916,7 @@ impl GameApp {
         // Shipped game: the main camera's layer culling mask drives which layers
         // render (editor uses the viewport's own visibility toggle instead).
         self.scene.visible_layers = self.scene.main_camera_culling_mask();
-        self.update_world_ui(&mut renderer, screen_view, screen_proj, win_w, win_h);
+        self.update_world_ui(&mut renderer, screen_view, screen_proj, win_w, win_h, dt);
         let cam = screen_view.inverse();
         self.scene.prepare_lods(&mut renderer, &self.config.assets_root);
         self.scene.lod_camera = Some(cam.w_axis.truncate());

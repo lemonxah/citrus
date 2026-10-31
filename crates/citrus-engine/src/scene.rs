@@ -270,6 +270,43 @@ struct AnimInstance {
 /// Wire edges of a collider shape (local space), shared.
 pub type ColliderWire = std::sync::Arc<Vec<(Vec3, Vec3)>>;
 
+/// A Humanoid IK object as the body fit sees it.
+pub(crate) struct HumanoidAvatar<'a> {
+    pub index: usize,
+    pub skeleton: &'a citrus_assets::Skeleton,
+    pub rig: crate::humanoid::HumanoidRig,
+    /// Driven by this machine's trackers.
+    pub local: bool,
+    /// Its Network Avatar (itself or an ancestor).
+    pub network_avatar: Option<usize>,
+    /// The object its tracking space sits on (the VR Player by default).
+    pub tracking_root: Option<usize>,
+}
+
+/// The local player's body fit as the rest of the scene reads it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LocalBody {
+    /// Hand reach multiplier for local avatars (arm span matching).
+    pub arm_reach: f32,
+    /// Avatar scale over its authored size (replicated to other players).
+    pub avatar_scale: f32,
+    /// Measured standing eye height (m), when known.
+    pub eye_height: Option<f32>,
+}
+
+impl Default for LocalBody {
+    fn default() -> Self {
+        Self { arm_reach: 1.0, avatar_scale: 1.0, eye_height: None }
+    }
+}
+
+/// An IK-posed skeleton in world space.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AvatarPose {
+    pub joints: Vec<Vec3>,
+    pub parents: Vec<Option<usize>>,
+}
+
 pub struct LoadedScene {
     /// Rebuilt every frame from renderable objects.
     pub draws: Vec<DrawCmd>,
@@ -299,15 +336,19 @@ pub struct LoadedScene {
     /// When set, humanoid avatars get terrain foot IK applied on top of their
     /// animated/IK pose each skinning update (feet plant on uneven ground).
     foot_ik: Option<crate::humanoid::FootIkParams>,
-    /// Captured full-body tracker calibration (from a T-pose alignment). When set,
-    /// raw tracker poses are remapped through it before driving IK.
-    vr_calibration: Option<crate::humanoid::BodyCalibration>,
+    /// The local player's body fit, set by the engine's body tracking.
+    pub(crate) local_body: LocalBody,
+    /// Record this object's IK-posed skeleton (the body panel's preview).
+    pub(crate) avatar_preview_for: Option<usize>,
+    pub(crate) avatar_preview: Option<AvatarPose>,
     /// Planted-foot state of each object's Humanoid IK.
     body_ik_state: HashMap<ObjectId, crate::humanoid::BodyIkState>,
     /// This machine's face tracking this frame (headset or OSC).
     local_face: Option<citrus_core::FaceFrame>,
     /// Clock for cloth wind gusts (s).
     cloth_time: f32,
+    /// Where cloth cull distances are measured from (None = the main camera).
+    cloth_viewer: Option<Vec3>,
     /// Lip sync: the local mic's visemes, and remote players' by the object
     /// their peer owns.
     local_visemes: Option<citrus_core::VisemeFrame>,
@@ -509,10 +550,13 @@ impl LoadedScene {
             anim_time: 0.0,
             ik_targets: None,
             foot_ik: None,
-            vr_calibration: None,
+            local_body: LocalBody::default(),
+            avatar_preview_for: None,
+            avatar_preview: None,
             body_ik_state: HashMap::new(),
             local_face: None,
             cloth_time: 0.0,
+            cloth_viewer: None,
             local_visemes: None,
             remote_visemes: HashMap::new(),
             mesh_geometry: Vec::new(),
@@ -1936,9 +1980,10 @@ impl LoadedScene {
         let i = (0..self.objects.len()).find(|&i| {
             active[i] && self.objects[i].components.iter().any(|c| c.as_any().is::<citrus_core::VrPlayer>())
         })?;
-        let (_, rot, origin) = self.world_transform(i).to_scale_rotation_translation();
+        let (scale, rot, origin) = self.world_transform(i).to_scale_rotation_translation();
         let f = rot * Vec3::NEG_Z;
-        Some(citrus_core::VrRig { origin, yaw: (-f.x).atan2(-f.z), scale: 1.0 })
+        let scale = ((scale.x + scale.y + scale.z) / 3.0).max(1e-3);
+        Some(citrus_core::VrRig { origin, yaw: (-f.x).atan2(-f.z), scale })
     }
 
     /// Object index of the "main" camera: the one with the smallest camera id.
@@ -3604,6 +3649,11 @@ impl LoadedScene {
         self.ik_targets = targets;
     }
 
+    /// The eye cloth cull distances are measured from (None = the main camera).
+    pub fn set_cloth_viewer(&mut self, eye: Option<Vec3>) {
+        self.cloth_viewer = eye;
+    }
+
     /// This machine's face tracking for this frame (None = not tracking).
     pub fn set_local_face(&mut self, face: Option<citrus_core::FaceFrame>) {
         self.local_face = face;
@@ -3624,65 +3674,72 @@ impl LoadedScene {
         self.foot_ik.is_some()
     }
 
-    /// The skeleton full-body tracking drives: the model of the local
-    /// player's Humanoid IK object, else the first humanoid in the scene.
-    fn first_humanoid(&self) -> Option<&citrus_assets::Skeleton> {
-        let local = self.objects.iter().find_map(|o| {
-            let ik = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::HumanoidIk>())?;
-            let remote = o
-                .components
-                .iter()
-                .find_map(|c| c.as_any().downcast_ref::<citrus_core::NetworkAvatar>())
-                .is_some_and(|a| a.remote);
-            if remote || matches!(ik.source, citrus_core::IkSource::Network | citrus_core::IkSource::Objects) {
-                return None;
-            }
-            let mesh = o.render_slots().map(|r| r.mesh).find(|m| self.skinned_meshes.iter().any(|sm| sm.mesh_index == *m))?;
-            let sm = self.skinned_meshes.iter().find(|sm| sm.mesh_index == mesh)?;
-            self.skeletons.get(sm.skeleton)
+    /// The Network Avatar an object belongs to: its own, else the nearest
+    /// ancestor's (a worn avatar sits under the player's Network Avatar).
+    pub(crate) fn network_avatar_of(&self, i: usize) -> Option<(usize, &citrus_core::NetworkAvatar)> {
+        std::iter::successors(Some(i), |&k| self.objects.get(k).and_then(|o| o.parent)).find_map(|k| {
+            let av = self.objects.get(k)?.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::NetworkAvatar>())?;
+            Some((k, av))
+        })
+    }
+
+    /// Skeleton and humanoid bone map of a skinned object (an Avatar
+    /// Descriptor's bone map on it or an ancestor wins).
+    pub(crate) fn humanoid_of(&self, i: usize) -> Option<(&citrus_assets::Skeleton, crate::humanoid::HumanoidRig)> {
+        let o = self.objects.get(i)?;
+        let mesh = o.render_slots().map(|r| r.mesh).find(|m| self.skinned_meshes.iter().any(|sm| sm.mesh_index == *m))?;
+        let sm = self.skinned_meshes.iter().find(|sm| sm.mesh_index == mesh)?;
+        let skel = self.skeletons.get(sm.skeleton)?;
+        let descriptor = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
+            self.objects[k].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::AvatarDescriptor>())
         });
-        local.or_else(|| self.skeletons.iter().find(|s| crate::humanoid::HumanoidRig::map(s).is_humanoid()))
-    }
-
-    /// Capture a full-body tracker calibration: the player holds a T-pose matching
-    /// the avatar's rest pose; `raw` is the live tracker poses (head/hands/hips/
-    /// feet) at that instant. After this, [`vr_apply_calibration`] remaps live
-    /// poses so each tracker drives its bone naturally. Returns false if there's no
-    /// humanoid avatar to calibrate against.
-    pub fn calibrate_vr_tpose(&mut self, raw: &citrus_core::TrackerTargets) -> bool {
-        let Some(skel) = self.first_humanoid() else {
-            return false;
+        let rig = match descriptor {
+            Some(desc) if !desc.bone_map.is_empty() => crate::humanoid::HumanoidRig::map_with_overrides(skel, &desc.bone_map).0,
+            _ => crate::humanoid::HumanoidRig::map(skel),
         };
-        let poses = crate::humanoid::TrackerPoses::from_targets(raw);
-        self.vr_calibration = Some(crate::humanoid::calibrate_tpose(skel, &poses));
-        true
+        Some((skel, rig))
     }
 
-    /// Clear any captured T-pose calibration (back to raw tracker poses).
-    pub fn clear_vr_calibration(&mut self) {
-        self.vr_calibration = None;
+    /// Every active humanoid Humanoid IK object, local ones (driven by this
+    /// machine's trackers) first.
+    pub(crate) fn humanoid_avatars(&self) -> Vec<HumanoidAvatar<'_>> {
+        use citrus_core::IkSource;
+        let active = self.active_flags();
+        let vr_player = self.objects.iter().position(|o| o.components.iter().any(|c| c.as_any().is::<citrus_core::VrPlayer>()));
+        let mut out: Vec<HumanoidAvatar<'_>> = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if !active[i] {
+                continue;
+            }
+            let Some(ik) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::HumanoidIk>()) else { continue };
+            let Some((skeleton, rig)) = self.humanoid_of(i).filter(|(_, r)| r.is_humanoid()) else { continue };
+            let net = self.network_avatar_of(i);
+            let remote = net.is_some_and(|(_, a)| a.remote);
+            let local = match ik.source {
+                IkSource::Auto => !remote,
+                IkSource::LocalTrackers => true,
+                IkSource::Network | IkSource::Objects => false,
+            };
+            let tracking_root = ik.tracking_root.id().and_then(|id| self.index_of(id)).or(vr_player);
+            out.push(HumanoidAvatar { index: i, skeleton, rig, local, network_avatar: net.map(|(k, _)| k), tracking_root });
+        }
+        out.sort_by_key(|a| !a.local);
+        out
     }
 
-    /// True once a T-pose calibration has been captured.
-    pub fn has_vr_calibration(&self) -> bool {
-        self.vr_calibration.is_some()
+    /// Give object `i` a skinned mesh posed by `skel` (no GPU data), for tests.
+    #[cfg(test)]
+    pub(crate) fn add_test_skeleton(&mut self, i: usize, skel: citrus_assets::Skeleton) {
+        let mesh = 1_000_000 + self.skinned_meshes.len();
+        self.skeletons.push(skel);
+        self.skinned_meshes.push(SkinnedMesh::new(mesh, Vec::new(), self.skeletons.len() - 1));
+        self.objects[i].render = Some(RenderInfo { mesh, material: 0 });
     }
 
-    /// Remap raw tracker poses through the captured calibration into IK targets.
-    /// Returns the raw targets unchanged when no calibration is set, so the caller
-    /// can always feed the result straight into [`set_ik_targets`].
-    pub fn vr_apply_calibration(
-        &self,
-        raw: &citrus_core::TrackerTargets,
-    ) -> citrus_core::TrackerTargets {
-        let cal = match &self.vr_calibration {
-            Some(cal) => *cal,
-            None => match self.first_humanoid() {
-                Some(skel) => crate::humanoid::default_calibration(skel),
-                None => return *raw,
-            },
-        };
-        crate::humanoid::targets_from_calibrated(&cal, &crate::humanoid::TrackerPoses::from_targets(raw))
+    /// The avatar full-body tracking drives: the local player's Humanoid IK
+    /// object, else (for default tracker offsets) any humanoid avatar.
+    pub(crate) fn local_avatar(&self) -> Option<HumanoidAvatar<'_>> {
+        self.humanoid_avatars().into_iter().next()
     }
 
     /// The local player's tracker targets (as set by `set_ik_targets`) in
@@ -3718,7 +3775,7 @@ impl LoadedScene {
                 continue;
             }
             let Some(ik) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<HumanoidIk>()) else { continue };
-            let net = o.components.iter().find_map(|c| c.as_any().downcast_ref::<NetworkAvatar>());
+            let net: Option<&NetworkAvatar> = self.network_avatar_of(i).map(|(_, a)| a);
             let local = || {
                 let root = ik.tracking_root.id().and_then(|id| self.index_of(id)).or(default_root);
                 stage.map(|t| t.transformed(root.map(|r| world[r]).unwrap_or(Mat4::IDENTITY)))
@@ -3751,6 +3808,11 @@ impl LoadedScene {
                 step_angle: ik.step_angle.to_radians(),
                 step_time: ik.step_time,
                 step_height: ik.step_height,
+                arm_reach: match (ik.source, net) {
+                    (IkSource::Auto, Some(av)) if av.remote => 1.0,
+                    (IkSource::Auto | IkSource::LocalTrackers, _) => self.local_body.arm_reach,
+                    _ => 1.0,
+                },
             };
             out.insert(i, (targets.transformed(world[i].inverse()), settings));
         }
@@ -3822,6 +3884,7 @@ impl LoadedScene {
         };
         let mut cloth_owner: HashMap<usize, usize> = HashMap::new();
         let cloth_time = self.cloth_time;
+        let viewer = if any_cloth { self.cloth_viewer.or_else(|| self.main_camera_view_proj(1.0).map(|v| v.2)) } else { None };
         let winds: Vec<citrus_core::WindSample> = if any_cloth {
             self.objects
                 .iter()
@@ -3931,6 +3994,12 @@ impl LoadedScene {
                     ik.runtime.humanoid = rig.is_humanoid();
                     ik.runtime.targets = input.map(|(t, _)| *t).unwrap_or_default();
                 }
+                if self.avatar_preview_for == Some(i) {
+                    self.avatar_preview = Some(AvatarPose {
+                        joints: skel.world_matrices(&locals).iter().map(|m| world[i].transform_point3(m.w_axis.truncate())).collect(),
+                        parents: skel.joints.iter().map(|j| j.parent).collect(),
+                    });
+                }
             }
             let morph_weights: Vec<Vec<f32>> = if has_face {
                 let avatar = std::iter::successors(Some(i), |&k| self.objects[k].parent).find_map(|k| {
@@ -3968,7 +4037,7 @@ impl LoadedScene {
                     .iter()
                     .map(|m| self.skinned_meshes[skinned_by_mesh[m]].base_vertices.as_slice())
                     .collect();
-                crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, cloth_time, dt);
+                crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, viewer, cloth_time, dt);
             }
             let palette = skel.palette(&locals);
 
@@ -4021,6 +4090,7 @@ impl LoadedScene {
                             world[i],
                             &cloth_shapes,
                             &winds,
+                            viewer,
                             cloth_time,
                             dt,
                         );
@@ -4098,7 +4168,7 @@ impl LoadedScene {
                         .filter(|m| cloth_owner.get(&m.mesh_index) == Some(&o) && m.skeleton == sm.skeleton)
                         .map(|m| m.base_vertices.as_slice())
                         .collect();
-                    crate::cloth::step(&mut self.objects[o].components, skel, &verts, &mut locals, world[o], &cloth_shapes, &winds, cloth_time, dt);
+                    crate::cloth::step(&mut self.objects[o].components, skel, &verts, &mut locals, world[o], &cloth_shapes, &winds, viewer, cloth_time, dt);
                     cloth_posed.insert(o, locals.clone());
                 }
             }

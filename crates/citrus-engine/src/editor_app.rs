@@ -71,6 +71,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         vr_targets: citrus_core::TrackerTargets::default(),
         face_input: crate::face_input::FaceInput::default(),
         slimevr: None,
+        body: crate::body::BodyTracking::load(),
         vr_rig: citrus_core::VrRig::default(),
         xr_stereo: None,
         vr_grab_anchor: None,
@@ -259,6 +260,7 @@ enum Selection {
 /// UI; this is the VR-only quick menu pointed at with the right controller.
 #[derive(Clone, Copy)]
 enum VrAction {
+    BodyMenu,
     CalibrateTpose,
     ClearCalibration,
     ToggleFootIk,
@@ -270,6 +272,7 @@ enum VrAction {
 /// from the in-VR UI panel (and the desktop). The full editor UI is otherwise
 /// shown as-is on the panel.
 const VR_TOOLS: &[(&str, VrAction)] = &[
+    ("Body Calibration", VrAction::BodyMenu),
     ("Calibrate T-pose", VrAction::CalibrateTpose),
     ("Clear Calibration", VrAction::ClearCalibration),
     ("Toggle Foot IK", VrAction::ToggleFootIk),
@@ -818,6 +821,8 @@ struct EngineApp {
     face_input: crate::face_input::FaceInput,
     /// SlimeVR server connection (full-body trackers), when enabled.
     slimevr: Option<crate::slimevr::SlimeVr>,
+    /// The player's measured body, tracker roles and calibration.
+    body: crate::body::BodyTracking,
     /// VR play-space rig (fly / scale / drag locomotion); identity until driven.
     vr_rig: citrus_core::VrRig,
     /// The per-eye XR swapchains (`setup_stereo`), once created.
@@ -1903,6 +1908,8 @@ impl EngineApp {
     /// Drop editor caches that hold renderer handles (after `reset_scene`).
     fn reset_render_caches(&mut self) {
         self.world_ui = crate::game_ui::WorldUi::default();
+        self.body.reset_render();
+        self.body.scene_changed();
         self.particles = crate::particles::ParticleRenderer::default();
         self.water = crate::water_render::WaterRenderer::default();
         self.water_fx = crate::water_fx::WaterFx::default();
@@ -2132,6 +2139,7 @@ impl EngineApp {
             ui_cancel: std::mem::take(&mut self.game_ui_frame.cancel),
             vr: crate::runtime::vr_frame(self.xr_session.as_ref(), &self.vr_targets),
             controls: self.input.controls_info(),
+            body: self.body.info(),
         }
     }
 
@@ -2764,12 +2772,14 @@ impl EngineApp {
             } else {
                 // Object mode: pick on press, then drag the selection along the ray.
                 if trigger_edge
+                    && !self.body.panel_visible()
                     && let Some(idx) = self.scene.pick(ray.origin, ray.dir) {
                         self.select_object(Some(idx));
                         let obj_pos = self.scene.world_transform(idx).w_axis.truncate();
                         self.vr_move_dist = (obj_pos - ray.origin).length();
                     }
                 if input.right_trigger
+                    && !self.body.panel_visible()
                     && let Selection::Object(idx) = self.selection
                         && idx < self.scene.objects.len() {
                             let target = ray.origin + ray.dir * self.vr_move_dist;
@@ -2814,12 +2824,9 @@ impl EngineApp {
     /// mirror operations that have no desktop button yet).
     fn dispatch_vr_action(&mut self, action: VrAction) {
         match action {
-            VrAction::CalibrateTpose => {
-                if self.scene.calibrate_vr_tpose(&self.vr_targets) {
-                    tracing::info!("VR: captured T-pose calibration");
-                }
-            }
-            VrAction::ClearCalibration => self.scene.clear_vr_calibration(),
+            VrAction::BodyMenu => self.body.menu_open = true,
+            VrAction::CalibrateTpose => self.body.calibrate_now(),
+            VrAction::ClearCalibration => self.body.clear_calibration(),
             VrAction::ToggleFootIk => {
                 let on = self.scene.foot_ik_enabled();
                 self.scene
@@ -2848,7 +2855,7 @@ impl EngineApp {
         egui::Window::new("VR Tools")
             .default_open(true)
             .show(ctx, |ui| {
-                ui.label(format!("Calibrated: {}", self.scene.has_vr_calibration()));
+                ui.label(format!("Calibrated: {}", self.body.calibrated()));
                 ui.label(format!("Foot IK: {}", self.scene.foot_ik_enabled()));
                 ui.label(format!("Player scale: {:.2}x", self.vr_rig.scale));
                 ui.separator();
@@ -4735,6 +4742,11 @@ impl EngineApp {
                             ui.close();
                         }
                     }
+                    ui.separator();
+                    if ui.selectable_label(self.body.window_open, "Body Tracking").on_hover_text("Height, tracker roles and full-body calibration").clicked() {
+                        self.body.window_open = true;
+                        ui.close();
+                    }
                 });
                 top_menu(&mut bar, ui, "Help", |ui| {
                     ui.checkbox(&mut self.show_help, "Controls");
@@ -5782,12 +5794,9 @@ impl EngineApp {
                 }
                 // In the editor, quitting the game ends Play mode.
                 ComponentCommand::Quit => quit = true,
-                ComponentCommand::CalibrateTrackers => {
-                    if self.scene.calibrate_vr_tpose(&self.vr_targets) {
-                        tracing::info!("VR: captured T-pose calibration");
-                    }
-                }
-                ComponentCommand::ClearTrackerCalibration => self.scene.clear_vr_calibration(),
+                ComponentCommand::CalibrateTrackers => self.body.calibrate_now(),
+                ComponentCommand::ClearTrackerCalibration => self.body.clear_calibration(),
+                ComponentCommand::Body(c) => self.body.command(c),
                 ComponentCommand::SetOscFaceTracking(port) => self.face_input.set_osc(port),
                 ComponentCommand::Content(c) => self.content.queue(c),
                 ComponentCommand::Input(c) => self.input.apply(c),
@@ -7935,6 +7944,7 @@ impl EngineApp {
             _ => None,
         };
         crate::river_edit::sync(&self.egui_ctx, &self.scene, selected_object, self.playing);
+        crate::cloth_paint::sync(&self.egui_ctx, &mut self.scene, selected_object, self.playing);
         let shader_info = self.selected_shader_info();
         let can_bake = self.renderer.as_ref().is_some_and(|r| r.supports_baking());
         // Winit-based viewport-hover test: stays correct right after a
@@ -7951,6 +7961,8 @@ impl EngineApp {
         let output = egui_ctx.run(raw_input, |ctx| {
             self.menu_bar(ctx);
             self.vr_tools_window(ctx);
+            let rig = self.vr_rig;
+            self.body.window(ctx, &mut self.scene, &rig);
             self.project_windows(ctx);
             self.bindings_window(ctx);
             self.network_window(ctx);
@@ -8365,6 +8377,7 @@ impl EngineApp {
             // Coalesce undo entries only while a pointer drag is in progress (one
             // slider/handle gesture = one entry); discrete edits each get their own.
             let gesture_active = self.egui_ctx.input(|i| i.pointer.any_down());
+            self.undo_stack.set_stroke(crate::cloth_paint::stroking(&self.egui_ctx));
             self.record_edits(pre_edit, gesture_active);
             // Not simulating → decay the play-only timings toward zero.
             FrameTimings::ema(&mut self.frame_timings.components, 0.0);
@@ -8386,6 +8399,10 @@ impl EngineApp {
         // mask did nothing until you ran the game). Restored right after the draw
         // build so the Layers window still edits the toggle, not the intersection.
         self.update_world_ui();
+        if let Some(renderer) = self.renderer.as_mut() {
+            let rig = self.vr_rig;
+            self.world_ui_draws.extend(self.body.panel_frame(renderer, &mut self.scene, &rig, dt));
+        }
         self.update_particles(dt);
         let view_toggle = self.scene.visible_layers;
         self.scene.visible_layers = view_toggle & self.scene.main_camera_culling_mask();
@@ -8473,22 +8490,12 @@ impl EngineApp {
         if let Some(session) = &mut self.xr_session {
             session.poll();
             let b = session.body_poses();
-            self.vr_targets = citrus_core::TrackerTargets {
-                head: b.head,
-                left_hand: b.left_hand,
-                right_hand: b.right_hand,
-                hips: b.hips,
-                left_foot: b.left_foot,
-                right_foot: b.right_foot,
-                chest: b.chest,
-                left_elbow: b.left_elbow,
-                right_elbow: b.right_elbow,
-                left_knee: b.left_knee,
-                right_knee: b.right_knee,
-            };
+            let mut devices = crate::body::xr_devices(&b);
             if let Some(slime) = &self.slimevr {
-                slime.feed(&mut self.vr_targets);
+                slime.send_devices(b.head, b.left_hand, b.right_hand);
+                devices.extend(slime.devices());
             }
+            self.vr_targets = self.body.assemble(b.head, b.left_hand, b.right_hand, devices);
             vr_input = session.input();
         }
         // In Play a VR Player owns locomotion: the headset rig follows it.
@@ -8515,10 +8522,13 @@ impl EngineApp {
         if self.project.tracking_input.slimevr != self.slimevr.is_some() {
             self.slimevr = self.project.tracking_input.slimevr.then(crate::slimevr::SlimeVr::start);
         }
-        let vr_targets = self.scene.vr_apply_calibration(&self.vr_targets);
+        let tracking = self.xr_session.as_ref().is_some_and(|s| s.running);
+        let body_frame = crate::body::BodyFrame { dt, tracking, apply: self.playing, triggers: [vr_input.left_trigger, vr_input.right_trigger] };
+        let vr_targets = self.body.update(&mut self.scene, &self.vr_targets, body_frame);
         self.scene
             .set_ik_targets(self.xr_session.as_ref().map(|_| vr_targets));
         self.scene.update_water_wind(dt);
+        self.scene.set_cloth_viewer(Some(game_view_now.map_or(self.camera.position, |g| g.2)));
         self.scene.update_skinning(renderer, dt);
         // Re-read the game camera after this frame's tick so it isn't a frame behind.
         let (view, proj, cam_pos) = game_view_now.unwrap_or((view, proj, self.camera.position));
@@ -9372,8 +9382,8 @@ impl EditorTabs<'_> {
         }
 
         // Maybe start a drag: a primary press on a handle (gizmo wins over orbit;
-        // the transform gizmo still wins over us).
-        if !response.drag_started_by(egui::PointerButton::Primary) || alt {
+        // the transform gizmo still wins over us). Painting cloth pins owns drags.
+        if !response.drag_started_by(egui::PointerButton::Primary) || alt || crate::cloth_paint::active(&response.ctx) {
             return;
         }
         let Selection::Object(i) = *self.selection else {
@@ -10753,7 +10763,8 @@ impl EditorTabs<'_> {
         // over the cursor now swallows the wheel like it swallows clicks.
         if self.pointer_in_viewport && response.contains_pointer() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
+            // Ctrl+Scroll sizes the cloth pin brush instead.
+            if scroll != 0.0 && !(crate::cloth_paint::active(ui.ctx()) && ui.input(|i| i.modifiers.command)) {
                 self.actions.push(EditorAction::Dolly(scroll / 50.0));
             }
         }
@@ -10774,6 +10785,9 @@ impl EditorTabs<'_> {
         let river_building = !self.playing
             && matches!(*self.selection, Selection::Object(i) if self.scene.is_active(i))
             && crate::river_edit::building(ui.ctx());
+        // Painting cloth pins: left drags paint (no orbit, no transform gizmo).
+        let cloth_painting = !self.playing && crate::cloth_paint::active(ui.ctx());
+        let river_building = river_building || cloth_painting;
 
         // Claim a drag for the gizmo the instant it starts on a handle (using
         // the gizmo's own enlarged pick band), so orbit is suppressed for the
@@ -10786,7 +10800,7 @@ impl EditorTabs<'_> {
             // continues through the gesture even if the pointer leaves. The
             // winit-based check keeps it working right after mouse-look ends.
             *self.orbit_armed =
-                self.pointer_in_viewport && press.is_some_and(|p| rect.contains(p));
+                !cloth_painting && self.pointer_in_viewport && press.is_some_and(|p| rect.contains(p));
             *self.gizmo_drag = !alt
                 && !river_building
                 && matches!(self.selection, Selection::Object(_))
@@ -11614,6 +11628,8 @@ impl EditorTabs<'_> {
                 .filter(|_| !ui_clicked && !self.looking && !self.orbiting);
             let dragging = response.dragged() || self.handle_drag.is_some();
             river_click = crate::river_edit::viewport(ui, self.scene, i, &view, cursor, new_drag, click, dragging);
+            let view = crate::cloth_paint::View::new(self.view, self.proj, *self.viewport_rect);
+            river_click |= crate::cloth_paint::viewport(ui, self.scene, i, &view, &response);
         }
 
         // Click-to-pick on release-without-drag, unless the gizmo owns the
@@ -13773,7 +13789,7 @@ impl ApplicationHandler for EngineApp {
                 // ...but not while a code editor / text field has focus (there
                 // Escape is the vim Insert -> Normal key, not a deselect). The
                 // first Escape only ends river path editing.
-                if !crate::river_edit::exit(&self.egui_ctx) {
+                if !crate::river_edit::exit(&self.egui_ctx) && !crate::cloth_paint::exit(&self.egui_ctx) {
                     self.selection = Selection::None;
                     self.file_material = None;
                 }

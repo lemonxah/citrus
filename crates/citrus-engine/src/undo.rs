@@ -109,6 +109,8 @@ pub struct UndoStack {
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
     last_push: Option<Instant>,
+    /// A paint stroke is open: its edits coalesce however long it pauses.
+    stroke: bool,
 }
 
 impl UndoStack {
@@ -123,7 +125,7 @@ impl UndoStack {
         let now = Instant::now();
         let in_window = self
             .last_push
-            .is_some_and(|t| now.duration_since(t) < MERGE_WINDOW);
+            .is_some_and(|t| self.stroke || now.duration_since(t) < MERGE_WINDOW);
         let coalesce = gesture_active
             && !matches!(entry, UndoEntry::Assign { .. })
             && in_window
@@ -140,6 +142,16 @@ impl UndoStack {
             }
         }
         self.last_push = Some(now);
+    }
+
+    /// Open or close a paint stroke. Opening one never merges into the
+    /// previous entry, and its edits then coalesce into one entry until it
+    /// closes, so one stroke is one undo step.
+    pub fn set_stroke(&mut self, stroking: bool) {
+        if stroking && !self.stroke {
+            self.last_push = None;
+        }
+        self.stroke = stroking;
     }
 
     pub fn pop_undo(&mut self) -> Option<UndoEntry> {
@@ -169,5 +181,63 @@ impl UndoStack {
         self.undo.clear();
         self.redo.clear();
         self.last_push = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(pins: &str) -> ObjectState {
+        ObjectState {
+            name: "Skirt".into(),
+            translation: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            cast_shadows: Default::default(),
+            components: vec![("Mesh Cloth".into(), format!("(paint: (pins: \"{pins}\"))"))],
+        }
+    }
+
+    fn edit(before: &str, after: &str) -> UndoEntry {
+        UndoEntry::Object { index: 3, before: state(before), after: state(after) }
+    }
+
+    fn after_of(e: &UndoEntry) -> &str {
+        match e {
+            UndoEntry::Object { after, .. } => &after.components[0].1,
+            _ => panic!("object entry"),
+        }
+    }
+
+    #[test]
+    fn a_paint_stroke_is_one_undo_step() {
+        let mut stack = UndoStack::default();
+        stack.record(edit("a", "b"), false);
+        stack.set_stroke(true);
+        stack.record(edit("b", "c"), true);
+        std::thread::sleep(MERGE_WINDOW + Duration::from_millis(50));
+        stack.record(edit("c", "d"), true);
+        stack.record(edit("d", "e"), true);
+        stack.set_stroke(false);
+        // A second stroke right after starts its own entry.
+        stack.set_stroke(true);
+        stack.record(edit("e", "f"), true);
+        stack.set_stroke(false);
+
+        let second = stack.pop_undo().unwrap();
+        assert!(after_of(&second).contains("\"f\""));
+        let stroke = stack.pop_undo().unwrap();
+        match &stroke {
+            UndoEntry::Object { before, after, .. } => {
+                assert_eq!(before, &state("b"), "the stroke undoes to its start, despite the pause");
+                assert_eq!(after, &state("e"));
+            }
+            _ => panic!(),
+        }
+        assert!(stack.can_undo(), "the edit before the stroke stays its own step");
+        stack.pop_undo();
+        assert!(!stack.can_undo());
+        assert!(after_of(&stack.pop_redo().unwrap()).contains("\"b\""));
     }
 }

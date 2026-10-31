@@ -12,6 +12,7 @@ use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::cloth::{ClothShapeWorld, ClothTeleport, WindSample, penetration};
+use crate::cloth_pins::{ClothPaint, WeldTopology};
 use crate::{ObjectRef, TypedComponent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -23,15 +24,18 @@ pub enum PinSource {
     Bones,
     /// The top `pin_height` share of the garment is pinned.
     Top,
+    /// Weights painted in the editor (`MeshCloth::paint`).
+    Painted,
 }
 
 impl PinSource {
-    pub const ALL: [PinSource; 3] = [PinSource::VertexColor, PinSource::Bones, PinSource::Top];
+    pub const ALL: [PinSource; 4] = [PinSource::VertexColor, PinSource::Bones, PinSource::Top, PinSource::Painted];
     pub fn label(self) -> &'static str {
         match self {
             PinSource::VertexColor => "Vertex colour",
             PinSource::Bones => "Bones",
             PinSource::Top => "Top of the mesh",
+            PinSource::Painted => "Painted",
         }
     }
 }
@@ -46,6 +50,45 @@ pub struct MeshClothRuntime {
     pub bones: Vec<String>,
     pub collider_names: Vec<String>,
     pub reset_requested: bool,
+    /// Bind-pose positions and triangles of the simulated submesh (object
+    /// space), captured when the simulation is built.
+    pub bind: Vec<Vec3>,
+    pub indices: Vec<u32>,
+    /// `topology_hash` of `bind` + `indices`.
+    pub topology: u64,
+    /// Pins the current (non-painted) source gives, to seed painting from.
+    pub source_pins: Vec<f32>,
+    /// The pin painter is open on this cloth (set by the editor each frame).
+    pub paint_mode: bool,
+    /// Hold the animated pose instead of simulating (painting without Simulate).
+    pub hold: bool,
+    /// The shown pose this frame (object space), kept while painting.
+    pub posed: Vec<Vec3>,
+    /// Painted values changed: push them into the running simulation;
+    /// `retether` also rebuilds the tethers (end of a stroke).
+    pub pins_dirty: bool,
+    pub retether: bool,
+    /// Welded topology for the brush, built on demand.
+    pub weld: Option<WeldTopology>,
+    /// Shown in the inspector (e.g. the paint was remapped to a new mesh).
+    pub paint_note: String,
+    /// Beyond the cull distance from the viewer this frame.
+    pub culled: bool,
+    /// Held or culled last step: restart from the animated pose.
+    pub idle: bool,
+}
+
+impl MeshClothRuntime {
+    /// The brush topology for the captured bind mesh.
+    pub fn weld(&mut self) -> Option<&WeldTopology> {
+        if self.bind.is_empty() {
+            return None;
+        }
+        if self.weld.as_ref().is_none_or(|w| w.vertex_count() != self.bind.len()) {
+            self.weld = Some(WeldTopology::build(&self.bind, &self.indices));
+        }
+        self.weld.as_ref()
+    }
 }
 
 /// Simulates one skinned mesh of this object as cloth.
@@ -90,6 +133,14 @@ pub struct MeshCloth {
     pub wind: f32,
     pub frequency: f32,
     pub iterations: u32,
+    /// Painted pin weights and max distances (`PinSource::Painted`).
+    pub paint: ClothPaint,
+    /// How far (object units, about metres) a vertex whose painted max
+    /// distance is 1 may stray from its animated position.
+    pub max_distance: f32,
+    /// Stop simulating (hold the animated pose) beyond this distance from the
+    /// camera (m, 0 = never).
+    pub cull_distance: f32,
     #[serde(skip)]
     pub runtime: MeshClothRuntime,
 }
@@ -124,6 +175,9 @@ impl Default for MeshCloth {
             wind: 1.0,
             frequency: 90.0,
             iterations: 4,
+            paint: ClothPaint::default(),
+            max_distance: 0.1,
+            cull_distance: 0.0,
             runtime: MeshClothRuntime::default(),
         }
     }
@@ -139,6 +193,8 @@ pub struct MeshParticle {
     pub vel: Vec3,
     /// 1 = follows the animation, 0 = free.
     pub pin: f32,
+    /// Farthest it may stray from its animated position (m, world).
+    pub max_distance: f32,
     prev_anim: Vec3,
     contact: Option<Vec3>,
 }
@@ -161,6 +217,8 @@ pub struct MeshClothSim {
     vertex_count: usize,
     last_world: Mat4,
     anim: Vec<Vec3>,
+    /// Particle rest positions (object space), for re-tethering.
+    rest: Vec<Vec3>,
 }
 
 impl MeshClothSim {
@@ -189,7 +247,6 @@ impl MeshClothSim {
             members[id as usize].push(v as u32);
             owner.push(id);
         }
-        let n = members.len();
         let mut edge_set: std::collections::HashSet<(u32, u32)> = Default::default();
         let mut tri_of_edge: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
         for tri in indices.as_chunks::<3>().0 {
@@ -217,28 +274,14 @@ impl MeshClothSim {
         let pin_of = |m: &Vec<u32>| m.iter().map(|&v| pins.get(v as usize).copied().unwrap_or(0.0)).fold(0.0f32, f32::max);
         let rest = |m: &Vec<u32>| m.iter().map(|&v| positions[v as usize]).sum::<Vec3>() / m.len().max(1) as f32;
         let rest_pos: Vec<Vec3> = members.iter().map(rest).collect();
-        let pinned: Vec<u32> = (0..n as u32).filter(|&i| pin_of(&members[i as usize]) > 0.5).collect();
-        let tethers = if pinned.is_empty() {
-            Vec::new()
-        } else {
-            (0..n as u32)
-                .filter(|&i| pin_of(&members[i as usize]) <= 0.5)
-                .map(|i| {
-                    let a = rest_pos[i as usize];
-                    let near = *pinned
-                        .iter()
-                        .min_by(|x, y| (rest_pos[**x as usize] - a).length_squared().total_cmp(&(rest_pos[**y as usize] - a).length_squared()))
-                        .unwrap();
-                    (i, near)
-                })
-                .collect()
-        };
+        let particle_pins: Vec<f32> = members.iter().map(pin_of).collect();
+        let tethers = tethers(&rest_pos, &particle_pins);
         let particles = members
             .iter()
             .enumerate()
             .map(|(i, m)| {
                 let w = world.transform_point3(rest_pos[i]);
-                MeshParticle { pos: w, vel: Vec3::ZERO, pin: pin_of(m), prev_anim: w, contact: None }
+                MeshParticle { pos: w, vel: Vec3::ZERO, pin: pin_of(m), max_distance: f32::INFINITY, prev_anim: w, contact: None }
             })
             .collect();
         Some(Self {
@@ -252,7 +295,36 @@ impl MeshClothSim {
             vertex_count: positions.len(),
             last_world: world,
             anim: Vec::new(),
+            rest: rest_pos,
         })
+    }
+
+    /// Take new per-render-vertex pin weights (a particle takes its
+    /// strongest vertex) without rebuilding; `retether` also re-links free
+    /// particles to their nearest pinned one.
+    pub fn set_pins(&mut self, pins: &[f32], retether: bool) {
+        if pins.len() != self.vertex_count {
+            return;
+        }
+        for (p, m) in self.particles.iter_mut().zip(&self.members) {
+            p.pin = m.iter().map(|&v| pins[v as usize]).fold(0.0f32, f32::max).clamp(0.0, 1.0);
+        }
+        if retether {
+            let pins: Vec<f32> = self.particles.iter().map(|p| p.pin).collect();
+            self.tethers = tethers(&self.rest, &pins);
+        }
+    }
+
+    /// Per-render-vertex distance limits (object units; a particle takes its
+    /// tightest vertex), or None to lift them.
+    pub fn set_limits(&mut self, limits: Option<&[f32]>) {
+        let scale = crate::cloth::max_scale(self.last_world);
+        for (p, m) in self.particles.iter_mut().zip(&self.members) {
+            p.max_distance = match limits {
+                Some(l) if l.len() == self.vertex_count => m.iter().map(|&v| l[v as usize]).fold(f32::INFINITY, f32::min).max(0.0) * scale,
+                _ => f32::INFINITY,
+            };
+        }
     }
 
     /// Animated particle positions (world) from the skinned render vertices.
@@ -344,8 +416,10 @@ impl MeshClothSim {
                     p.vel += (w - p.vel) * (1.0 - (-1.5 * cloth.wind * h).exp());
                 }
                 p.pos += p.vel * h;
-                // Partly pinned points lean toward the animation by their pin.
-                p.pos = p.pos.lerp(target[i], p.pin.max(shape_k));
+                // Partly pinned points lean toward the animation by their pin
+                // (per 1/90 s, so the pull doesn't depend on the step count).
+                let pin_k = 1.0 - (1.0 - p.pin.clamp(0.0, 1.0)).powf(h * 90.0);
+                p.pos = p.pos.lerp(target[i], pin_k.max(shape_k));
             }
             for _ in 0..cloth.iterations.max(1) {
                 solve_pairs(&mut self.particles, &self.edges, &target, cloth.stiffness, true);
@@ -356,6 +430,14 @@ impl MeshClothSim {
                     let d = self.particles[i].pos - self.particles[a].pos;
                     if d.length() > rest {
                         self.particles[i].pos = self.particles[a].pos + d.normalize_or_zero() * rest;
+                    }
+                }
+                for (p, t) in self.particles.iter_mut().zip(&target) {
+                    if p.max_distance.is_finite() {
+                        let d = p.pos - *t;
+                        if d.length_squared() > p.max_distance * p.max_distance {
+                            p.pos = *t + d.normalize_or_zero() * p.max_distance;
+                        }
                     }
                 }
                 if cloth.self_collision {
@@ -477,6 +559,26 @@ impl MeshClothSim {
     }
 }
 
+/// (free particle, its nearest pinned particle) for every particle with a
+/// pin of at most 0.5, by rest position.
+fn tethers(rest: &[Vec3], pins: &[f32]) -> Vec<(u32, u32)> {
+    let pinned: Vec<u32> = (0..rest.len() as u32).filter(|&i| pins[i as usize] > 0.5).collect();
+    if pinned.is_empty() {
+        return Vec::new();
+    }
+    (0..rest.len() as u32)
+        .filter(|&i| pins[i as usize] <= 0.5)
+        .map(|i| {
+            let a = rest[i as usize];
+            let near = *pinned
+                .iter()
+                .min_by(|x, y| (rest[**x as usize] - a).length_squared().total_cmp(&(rest[**y as usize] - a).length_squared()))
+                .unwrap();
+            (i, near)
+        })
+        .collect()
+}
+
 /// Distance constraints between particle pairs, rest lengths from the
 /// animated pose. `stretch_only` lets bends compress freely.
 fn solve_pairs(particles: &mut [MeshParticle], pairs: &[(u32, u32)], target: &[Vec3], stiffness: f32, stretch_only: bool) {
@@ -563,6 +665,66 @@ mod tests {
         assert_eq!(sim.particles.len(), 25, "the seam copy welds");
         let coarse = MeshClothSim::build(&pos, &idx, &pins, 0.5, Mat4::IDENTITY).unwrap();
         assert!(coarse.particles.len() < 12, "{}", coarse.particles.len());
+    }
+
+    #[test]
+    fn max_distance_keeps_free_points_near_the_animation() {
+        let (pos, idx) = sheet(6, 1.0);
+        let flat: Vec<Vec3> = pos.iter().map(|p| Vec3::new(p.x, 0.0, -p.y)).collect();
+        let pins: Vec<f32> = flat.iter().map(|p| if p.z.abs() < 1e-3 { 1.0 } else { 0.0 }).collect();
+        let cloth = MeshCloth { shape_stiffness: 0.0, ..Default::default() };
+        let mut sim = MeshClothSim::build(&flat, &idx, &pins, 0.0, Mat4::IDENTITY).unwrap();
+        sim.set_limits(Some(&vec![0.05; flat.len()]));
+        for _ in 0..240 {
+            sim.step(&cloth, &flat, Mat4::IDENTITY, &[], &[], 0.0, 1.0 / 60.0);
+        }
+        let anim = sim.animated(&flat, Mat4::IDENTITY);
+        for (p, a) in sim.particles.iter().zip(&anim) {
+            assert!((p.pos - *a).length() < 0.05 + 1e-4, "strayed {}", (p.pos - *a).length());
+        }
+        sim.set_limits(None);
+        for _ in 0..240 {
+            sim.step(&cloth, &flat, Mat4::IDENTITY, &[], &[], 0.0, 1.0 / 60.0);
+        }
+        let low = sim.particles.iter().map(|p| p.pos.y).fold(f32::MAX, f32::min);
+        assert!(low < -0.5, "lifting the limit lets it fall: {low}");
+    }
+
+    #[test]
+    fn new_pins_apply_without_a_rebuild() {
+        let (pos, idx) = sheet(6, 1.0);
+        let flat: Vec<Vec3> = pos.iter().map(|p| Vec3::new(p.x, 0.0, -p.y)).collect();
+        let cloth = MeshCloth { shape_stiffness: 0.0, ..Default::default() };
+        let mut sim = MeshClothSim::build(&flat, &idx, &vec![0.0; flat.len()], 0.0, Mat4::IDENTITY).unwrap();
+        let top: Vec<f32> = flat.iter().map(|p| if p.z.abs() < 1e-3 { 1.0 } else { 0.0 }).collect();
+        sim.set_pins(&top, true);
+        assert!(!sim.tethers.is_empty());
+        for _ in 0..120 {
+            sim.step(&cloth, &flat, Mat4::IDENTITY, &[], &[], 0.0, 1.0 / 60.0);
+        }
+        for (p, rest) in sim.particles.iter().zip(&sim.rest) {
+            if p.pin >= 1.0 {
+                assert!((p.pos - *rest).length() < 1e-4, "pinned stays");
+            }
+        }
+        assert!(sim.particles.iter().any(|p| p.pin == 0.0 && p.pos.y < -0.3), "free ones fall");
+    }
+
+    #[test]
+    fn old_scenes_load_and_paint_round_trips() {
+        let old: MeshCloth = ron::from_str("(slot: 1, pin: Top, pin_height: 0.2, stiffness: 0.5)").unwrap();
+        assert_eq!((old.slot, old.pin, old.pin_height, old.stiffness), (1, PinSource::Top, 0.2, 0.5));
+        assert!(old.paint.is_empty());
+        assert_eq!((old.max_distance, old.cull_distance), (0.1, 0.0));
+        let (pos, idx) = sheet(4, 1.0);
+        let pins: Vec<f32> = pos.iter().map(|p| if p.y > -0.3 { 1.0 } else { 0.25 }).collect();
+        let cloth = MeshCloth { pin: PinSource::Painted, paint: crate::ClothPaint::seed(&pos, &idx, &pins), ..Default::default() };
+        let text = ron::to_string(&cloth).unwrap();
+        let back: MeshCloth = ron::from_str(&text).unwrap();
+        assert_eq!(back.pin, PinSource::Painted);
+        assert_eq!(back.paint, cloth.paint);
+        let w = back.paint.pin_weights();
+        assert!(w.iter().zip(&pins).all(|(a, b)| (a - b).abs() < 1.0 / 255.0));
     }
 
     #[test]

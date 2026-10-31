@@ -542,6 +542,11 @@ ctx.calibrate_trackers();
 ctx.clear_tracker_calibration();
 ```
 
+Players also calibrate from the VR body menu (the VR Player's Menu button):
+height measurement, a guided T-pose that assigns tracker roles, and a floor
+check. The VR Player's Avatar scaling fits the avatar to the player's height
+(Scale avatar, Scale player, Off). See [vr-avatars.md](vr-avatars.md).
+
 ### Face tracking, lip sync and voice
 
 `Face Tracking` drives a model's blendshapes from Unified Expressions data. The

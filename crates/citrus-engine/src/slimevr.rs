@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use citrus_core::TrackerTargets;
 use glam::{Quat, Vec3};
 
 const PROTOCOL_VERSION: u64 = 2;
@@ -40,9 +39,11 @@ const ID_RIGHT: i64 = 2;
 const STALE: Duration = Duration::from_millis(500);
 
 /// A tracker the server shares with us.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Remote {
     role: i64,
+    serial: String,
+    name: String,
     pose: Option<(Vec3, Quat)>,
     at: Instant,
 }
@@ -104,39 +105,51 @@ impl SlimeVr {
         }
     }
 
-    /// Send the raw headset / controller poses in `raw` and fill every body
-    /// slot it lacks with the server's tracker for that role.
-    pub fn feed(&self, raw: &mut TrackerTargets) {
-        self.send_devices(raw.head, raw.left_hand, raw.right_hand);
-        let mut slots = raw.slots();
-        for (slot, ours) in slots.iter_mut().zip(self.targets().slots()) {
-            if slot.is_none() {
-                *slot = ours;
-            }
-        }
-        *raw = TrackerTargets::from_slots(slots);
+    /// The body trackers the server solved (tracking space), each with the
+    /// role the server gave it.
+    pub fn devices(&self) -> Vec<crate::body::TrackerDevice> {
+        let Ok(s) = self.shared.lock() else { return Vec::new() };
+        let mut out: Vec<(i64, crate::body::TrackerDevice)> = s
+            .trackers
+            .iter()
+            .filter(|(_, r)| r.at.elapsed() < STALE)
+            .filter_map(|(id, r)| {
+                let slot = role_slot(r.role)?;
+                let key = if r.serial.is_empty() { id.to_string() } else { r.serial.clone() };
+                let label = if r.name.is_empty() { format!("SlimeVR {}", citrus_core::role_name(slot)) } else { format!("SlimeVR {}", r.name) };
+                Some((*id, crate::body::TrackerDevice { id: format!("slimevr:{key}"), label, native: Some(slot), pose: r.pose }))
+            })
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out.into_iter().map(|(_, d)| d).collect()
     }
 
-    /// The body trackers the server solved (tracking space), by role.
-    pub fn targets(&self) -> TrackerTargets {
-        let Ok(s) = self.shared.lock() else { return TrackerTargets::default() };
-        let mut t = TrackerTargets::default();
-        for r in s.trackers.values().filter(|r| r.at.elapsed() < STALE) {
-            let slot = match r.role {
-                ROLE_WAIST => &mut t.hips,
-                ROLE_LEFT_FOOT => &mut t.left_foot,
-                ROLE_RIGHT_FOOT => &mut t.right_foot,
-                ROLE_CHEST => &mut t.chest,
-                ROLE_LEFT_KNEE => &mut t.left_knee,
-                ROLE_RIGHT_KNEE => &mut t.right_knee,
-                ROLE_LEFT_ELBOW => &mut t.left_elbow,
-                ROLE_RIGHT_ELBOW => &mut t.right_elbow,
-                _ => continue,
-            };
-            *slot = r.pose;
+    /// The trackers by their server role.
+    #[cfg(test)]
+    fn targets(&self) -> citrus_core::TrackerTargets {
+        let mut slots = [None; citrus_core::TRACKER_SLOTS];
+        for d in self.devices() {
+            if let Some(slot) = d.native {
+                slots[slot] = d.pose;
+            }
         }
-        t
+        citrus_core::TrackerTargets::from_slots(slots)
     }
+}
+
+/// Tracker slot of a server role.
+fn role_slot(role: i64) -> Option<usize> {
+    Some(match role {
+        ROLE_WAIST => 3,
+        ROLE_LEFT_FOOT => 4,
+        ROLE_RIGHT_FOOT => 5,
+        ROLE_CHEST => 6,
+        ROLE_LEFT_ELBOW => 7,
+        ROLE_RIGHT_ELBOW => 8,
+        ROLE_LEFT_KNEE => 9,
+        ROLE_RIGHT_KNEE => 10,
+        _ => return None,
+    })
 }
 
 impl Drop for SlimeVr {
@@ -254,15 +267,17 @@ fn handle(s: &mut Shared, msg: &[u8]) {
                 }
             }
             3 => {
-                let (mut id, mut role) = (0, 0);
+                let (mut id, mut role, mut serial, mut name) = (0, 0, String::new(), String::new());
                 for (f, v) in fields(body) {
                     match (f, v) {
                         (1, Value::Varint(x)) => id = x as i64,
+                        (2, Value::Bytes(b)) => serial = String::from_utf8_lossy(b).into_owned(),
+                        (3, Value::Bytes(b)) => name = String::from_utf8_lossy(b).into_owned(),
                         (4, Value::Varint(x)) => role = x as i64,
                         _ => {}
                     }
                 }
-                s.trackers.insert(id, Remote { role, pose: None, at: Instant::now() });
+                s.trackers.insert(id, Remote { role, serial, name, pose: None, at: Instant::now() });
             }
             _ => {}
         }
@@ -407,6 +422,8 @@ mod tests {
         assert!((p - Vec3::new(0.1, 0.95, -0.2)).length() < 1e-6);
         assert!(r.angle_between(Quat::from_rotation_y(0.5)) < 1e-5);
         assert!(t.left_foot.is_none());
+        let d = svr.devices();
+        assert_eq!((d.len(), d[0].id.as_str(), d[0].native), (1, "slimevr:citrus-Waist", Some(3)), "keyed by serial");
     }
 
     #[test]

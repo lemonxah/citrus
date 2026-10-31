@@ -18,6 +18,11 @@ mod audio_mixer;
 mod cloth;
 mod cloth_mesh;
 pub use cloth_mesh::{MeshCloth, MeshClothRuntime, MeshClothSim, MeshParticle, PinSource};
+mod cloth_pins;
+pub use cloth_pins::{
+    BrushFalloff, BrushMode, ClothPaint, Dab, PackedBytes, PaintChannel, PaintFit, WeldTopology, mirror_map, mirror_x,
+    ray_triangles, select_by_height, topology_hash,
+};
 mod face;
 mod voice;
 mod water;
@@ -66,6 +71,12 @@ mod models;
 mod savegame;
 mod ui;
 mod vr;
+mod body;
+pub use body::{
+    AvatarScaling, BodyCommand, BodyFit, BodyInfo, BodyProfile, DEFAULT_EYE_HEIGHT, EYE_TO_CROWN, FIRST_BODY_SLOT,
+    HEIGHT_CAPTURE_SECONDS, HeightSampler, StoredPose, TrackerRole, arm_reach, arm_span, assign_roles, fit_avatar,
+    robust_mean, role_name,
+};
 pub use ik::{
     HumanoidIk, HumanoidIkRuntime, IkSource, IkTargets, TRACKER_ROLES, TRACKER_SLOTS, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik,
     solve_two_bone,
@@ -86,7 +97,7 @@ mod net;
 pub use net::{
     HOST_PEER, InterpolationMode, NetAutoStart, NetEvent, NetObjectState, NetQuality, NetRpc, NetSpawnSource, NetValue,
     NetVar, NetView, NetWorldOp, NetworkAnimator, NetworkAvatar, NetworkManager, NetworkObject, NetworkVariables,
-    OwnershipMode, PeerInfo, RpcTarget, WORN_AVATAR_VAR, WornAvatar,
+    OwnershipMode, PeerInfo, RpcTarget, WORN_AVATAR_VAR, WornAvatar, AVATAR_SCALE_VAR, PLAYER_EYE_HEIGHT_VAR,
 };
 mod net_rewind;
 pub use net_rewind::{HitHistory, HitPose, HitShape, MAX_REWIND, RewindHit};
@@ -415,6 +426,8 @@ pub enum ComponentCommand {
     CalibrateTrackers,
     /// Drop the tracker calibration (back to the default offsets).
     ClearTrackerCalibration,
+    /// Player height measurement, body calibration and the VR body menu.
+    Body(BodyCommand),
     /// Start (`Some(port)`) or stop (`None`) the OSC face-tracking receiver.
     SetOscFaceTracking(Option<u16>),
     /// User-generated content request (load / spawn / enter world / unload).

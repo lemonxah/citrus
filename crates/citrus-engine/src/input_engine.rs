@@ -306,12 +306,20 @@ pub fn map_key(code: KeyCode) -> Key {
     }
 }
 
-/// The player's binding overrides for a shipped game: `input.ron` in the
-/// user's config folder for `title` (`%APPDATA%\<title>`, `~/Library/Application
-/// Support/<title>`, `$XDG_CONFIG_HOME/<title>` or `~/.config/<title>`).
-/// `CITRUS_CONFIG_DIR` replaces the base folder (platforms without one).
-pub fn player_bindings_path(title: &str) -> PathBuf {
-    let base = std::env::var_os("CITRUS_CONFIG_DIR").map(PathBuf::from).or_else(|| {
+static CONFIG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The config folder on platforms without a user one (Android: the app's
+/// internal storage). Call once at startup.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn set_user_config_dir(dir: PathBuf) {
+    let _ = CONFIG_DIR.set(dir);
+}
+
+/// The user's config folder (`%APPDATA%`, `~/Library/Application Support`,
+/// `$XDG_CONFIG_HOME` or `~/.config`). `CITRUS_CONFIG_DIR` replaces it
+/// (platforms without one).
+pub fn user_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CITRUS_CONFIG_DIR").map(PathBuf::from).or_else(|| CONFIG_DIR.get().cloned()).or_else(|| {
         if cfg!(windows) {
             std::env::var_os("APPDATA").map(PathBuf::from)
         } else if cfg!(target_os = "macos") {
@@ -321,12 +329,17 @@ pub fn player_bindings_path(title: &str) -> PathBuf {
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         }
-    });
+    })
+}
+
+/// The player's binding overrides for a shipped game: `input.ron` in the
+/// user's config folder for `title` (see [`user_config_dir`]).
+pub fn player_bindings_path(title: &str) -> PathBuf {
     let name: String = title
         .chars()
         .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    base.unwrap_or_else(|| PathBuf::from(".")).join(name).join("input.ron")
+    user_config_dir().unwrap_or_else(|| PathBuf::from(".")).join(name).join("input.ron")
 }
 
 /// Player overrides made in the editor's Play mode, kept in the project's

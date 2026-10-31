@@ -561,9 +561,20 @@ impl Inspect for VrPlayer {
             ("Grab right", &mut self.grab_right_action),
             ("Use left", &mut self.use_left_action),
             ("Use right", &mut self.use_right_action),
+            ("Body menu", &mut self.body_menu_action),
         ];
         actions(ui, "citrus-vr-controller-actions", &mut fields, &mut c);
         note(ui, "Move and Teleport are shared with the desktop fallback. Bind these in Project Settings > Input (VR Controllers scheme).");
+        widgets::eyebrow(ui, "Body");
+        let opts: Vec<(citrus_core::AvatarScaling, &str)> = citrus_core::AvatarScaling::ALL.iter().map(|m| (*m, m.label())).collect();
+        combo(ui, "citrus-vr-avatar-scaling", "Avatar scaling", &mut self.avatar_scaling, &opts, &mut c);
+        check(ui, "Match arm span", &mut self.match_arm_span, &mut c);
+        note(ui, match self.avatar_scaling {
+            citrus_core::AvatarScaling::ScaleAvatar => "The avatar is scaled so its eyes sit at the player's measured eye height.",
+            citrus_core::AvatarScaling::ScalePlayer => "The avatar keeps its size; the play space scales so the player sees from the avatar's eyes.",
+            citrus_core::AvatarScaling::Off => "Avatars keep their size and the play space is not scaled.",
+        });
+        note(ui, "The body menu action opens Calibrate / Height / Done in the headset (empty leaves the button to the game).");
         c
     }
 }
