@@ -1,7 +1,10 @@
 //! First Person Shooter template.
 
 use citrus_assets::PrimitiveShape;
-use citrus_core::{BodyKind, BoxCollider, CharacterController, FirstPersonController, Health, HitscanWeapon, RigidBody};
+use citrus_core::{
+    BodyKind, BoxCollider, CharacterController, FirstPersonController, Health, HitscanWeapon,
+    RigidBody,
+};
 use glam::Quat;
 
 use super::TemplateContent;
@@ -13,37 +16,118 @@ pub(super) fn arena(s: &mut Scene) {
     builder::sun(s, [-0.4, -1.0, -0.3], 3.0);
     s.ground(60.0, "ground");
     let walls = s.empty("Arena", None, [0.0; 3]);
-    s.block("Wall North", Some(walls), [0.0, 2.0, -30.0], [60.0, 4.0, 1.0], "wall");
-    s.block("Wall South", Some(walls), [0.0, 2.0, 30.0], [60.0, 4.0, 1.0], "wall");
-    s.block("Wall East", Some(walls), [30.0, 2.0, 0.0], [1.0, 4.0, 60.0], "wall");
-    s.block("Wall West", Some(walls), [-30.0, 2.0, 0.0], [1.0, 4.0, 60.0], "wall");
+    s.block(
+        "Wall North",
+        Some(walls),
+        [0.0, 2.0, -30.0],
+        [60.0, 4.0, 1.0],
+        "wall",
+    );
+    s.block(
+        "Wall South",
+        Some(walls),
+        [0.0, 2.0, 30.0],
+        [60.0, 4.0, 1.0],
+        "wall",
+    );
+    s.block(
+        "Wall East",
+        Some(walls),
+        [30.0, 2.0, 0.0],
+        [1.0, 4.0, 60.0],
+        "wall",
+    );
+    s.block(
+        "Wall West",
+        Some(walls),
+        [-30.0, 2.0, 0.0],
+        [1.0, 4.0, 60.0],
+        "wall",
+    );
     let cover = s.empty("Cover", None, [0.0; 3]);
-    for (k, (x, z, w)) in [(-6.0, 0.0, 3.0), (6.0, -2.0, 2.0), (-2.0, -8.0, 4.0), (9.0, 6.0, 2.5), (-10.0, 8.0, 2.0)]
-        .into_iter()
-        .enumerate()
+    for (k, (x, z, w)) in [
+        (-6.0, 0.0, 3.0),
+        (6.0, -2.0, 2.0),
+        (-2.0, -8.0, 4.0),
+        (9.0, 6.0, 2.5),
+        (-10.0, 8.0, 2.0),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        s.block(&format!("Cover {}", k + 1), Some(cover), [x, 0.6, z], [w, 1.2, 0.8], "trim");
+        s.block(
+            &format!("Cover {}", k + 1),
+            Some(cover),
+            [x, 0.6, z],
+            [w, 1.2, 0.8],
+            "trim",
+        );
     }
     let platform = s.empty("Platform", None, [0.0; 3]);
-    s.block("Deck", Some(platform), [-18.0, 1.5, -12.0], [8.0, 3.0, 8.0], "wall");
-    let ramp = s.block("Ramp", Some(platform), [-18.0, 0.75, -4.6], [3.0, 0.3, 7.6], "trim");
+    s.block(
+        "Deck",
+        Some(platform),
+        [-18.0, 1.5, -12.0],
+        [8.0, 3.0, 8.0],
+        "wall",
+    );
+    let ramp = s.block(
+        "Ramp",
+        Some(platform),
+        [-18.0, 0.75, -4.6],
+        [3.0, 0.3, 7.6],
+        "trim",
+    );
     s.rot(ramp, Quat::from_rotation_x(23f32.to_radians()));
     let crates = s.empty("Crates", None, [0.0; 3]);
-    for (k, p) in [[12.0, 0.5, -10.0], [13.1, 0.5, -10.0], [12.55, 1.5, -10.0], [12.0, 0.5, -11.1]].into_iter().enumerate() {
-        let c = s.prim(&format!("Crate {}", k + 1), PrimitiveShape::Cube, Some(crates), p, [1.0; 3], "wood");
+    for (k, p) in [
+        [12.0, 0.5, -10.0],
+        [13.1, 0.5, -10.0],
+        [12.55, 1.5, -10.0],
+        [12.0, 0.5, -11.1],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let c = s.prim(
+            &format!("Crate {}", k + 1),
+            PrimitiveShape::Cube,
+            Some(crates),
+            p,
+            [1.0; 3],
+            "wood",
+        );
         s.with(c, BoxCollider::default());
-        s.with(c, RigidBody { kind: BodyKind::Dynamic, mass: 8.0, ..Default::default() });
+        s.with(
+            c,
+            RigidBody {
+                kind: BodyKind::Dynamic,
+                mass: 8.0,
+                ..Default::default()
+            },
+        );
     }
-    for (k, (x, z)) in [(-8.0, -20.0), (-3.0, -24.0), (2.0, -18.0), (7.0, -22.0), (12.0, -26.0), (-14.0, -25.0)]
-        .into_iter()
-        .enumerate()
+    for (k, (x, z)) in [
+        (-8.0, -20.0),
+        (-3.0, -24.0),
+        (2.0, -18.0),
+        (7.0, -22.0),
+        (12.0, -26.0),
+        (-14.0, -25.0),
+    ]
+    .into_iter()
+    .enumerate()
     {
         builder::target_dummy(s, &format!("Target {}", k + 1), [x, 0.0, z], 0.0);
     }
 }
 
 /// The shooter weapon tuned for a rifle.
-pub(super) fn rifle(aim_from: citrus_core::ObjectRef, muzzle: citrus_core::ObjectRef, hit: citrus_core::ObjectRef) -> HitscanWeapon {
+pub(super) fn rifle(
+    aim_from: citrus_core::ObjectRef,
+    muzzle: citrus_core::ObjectRef,
+    hit: citrus_core::ObjectRef,
+) -> HitscanWeapon {
     HitscanWeapon {
         aim_from,
         muzzle,
@@ -65,16 +149,46 @@ pub fn build() -> TemplateContent {
 
     let player = s.empty("Player", None, [0.0, 0.0, 12.0]);
     s.character_layer(player);
+    super::avatar::visuals(&mut s, player, player, false);
     let cam = s.camera("Player Camera", Some(player), [0.0, 1.65, 0.0], 75.0);
-    let gun = s.prim("Rifle", PrimitiveShape::Cube, Some(cam), [0.22, -0.2, -0.45], [0.06, 0.09, 0.55], "metal");
-    s.prim("Grip", PrimitiveShape::Cube, Some(gun), [0.0, -0.9, 0.25], [0.9, 1.4, 0.15], "trim");
-    let muzzle = s.empty("Muzzle", Some(cam), [0.22, -0.17, -0.76]);
-    s.with(muzzle, builder::burst_emitter([1.0, 0.8, 0.35, 1.0], [0.5, 2.0], [0.12, 0.02], [0.04, 0.09], 25.0));
+    s.hide_own_body_from_camera(cam);
+    let gun = super::weapons::model(
+        &mut s,
+        "Rifle",
+        cam,
+        [0.22, -0.2, -0.45],
+        super::weapons::RIFLE,
+    );
+    let muzzle = s.empty("Muzzle", Some(gun), [0.0, 0.09, -0.316]);
+    s.with(
+        muzzle,
+        builder::burst_emitter(
+            [1.0, 0.8, 0.35, 1.0],
+            [0.5, 2.0],
+            [0.12, 0.02],
+            [0.04, 0.09],
+            25.0,
+        ),
+    );
     let weapon = rifle(s.r(cam), s.r(muzzle), s.r(hit));
-    s.with(player, FirstPersonController { camera: s.r(cam), ..Default::default() })
-        .with(player, CharacterController::default())
-        .with(player, Health { max: 100.0, current: 100.0, regen_per_sec: 5.0, ..Default::default() })
-        .with(player, weapon);
+    s.with(
+        player,
+        FirstPersonController {
+            camera: s.r(cam),
+            ..Default::default()
+        },
+    )
+    .with(player, CharacterController::default())
+    .with(
+        player,
+        Health {
+            max: 100.0,
+            current: 100.0,
+            regen_per_sec: 5.0,
+            ..Default::default()
+        },
+    )
+    .with(player, weapon);
 
     let player_ref = s.r(player);
     builder::shooter_hud(&mut s, player_ref, player_ref, "Shoot the targets");

@@ -25,6 +25,10 @@ mod shader_props;
 mod skeleton;
 mod tex_cache;
 pub mod package;
+// Project Hub support: template catalogue, recent projects, sibling executables.
+pub mod launcher;
+pub mod project_templates;
+pub mod recent_projects;
 
 pub use asset_meta::{
     AssetMeta, ImporterSettings, META_EXT, ModelImport, load_asset_meta,

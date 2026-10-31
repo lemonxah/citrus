@@ -1473,7 +1473,7 @@ mod tests {
             material: MaterialRef::File(String::new()),
             extra_materials: vec![],
             parent,
-            components: if data.is_empty() { vec![] } else { vec![ComponentData { kind: "Network Avatar".into(), data: data.into() }] },
+            components: if data.is_empty() { vec![] } else { vec![ComponentData::new("Network Avatar", data)] },
             translation: [0.0; 3],
             rotation: [0.0, 0.0, 0.0, 1.0],
             scale: [1.0; 3],

@@ -4,7 +4,7 @@
 use citrus_assets::PrimitiveShape;
 use citrus_core::{
     BodyKind, Grabbable, Key, NetworkAvatar, NetworkManager, PlanarReflection, RigidBody, SpawnPoint,
-    SphereCollider, Sync, UiAction, UiButton, UiPanel, UiRect, UiText, VrAvatar,
+    SphereCollider, Sync, UiAction, UiButton, UiPanel, UiRect, UiText,
 };
 use glam::Quat;
 
@@ -19,26 +19,17 @@ const AVATAR_PREFAB: &str = "prefabs/net_avatar.prefab";
 /// Head + hands + torso, spawned by the Network Manager for every player. The
 /// owner's copy mirrors the local VR Player and is hidden for them; everyone
 /// else sees it move.
-fn avatar_body(s: &mut Scene, parent: usize, head: usize) -> usize {
-    let body = s.empty("Avatar Body", Some(parent), [0.0, 1.43, 0.0]);
-    s.with(body, VrAvatar { head: s.r(head), ..Default::default() });
-    s.prim("Neck", PrimitiveShape::Capsule, Some(body), [0.0, -0.05, 0.0], [0.35, 0.12, 0.35], "skin");
-    s.prim("Torso", PrimitiveShape::Capsule, Some(body), [0.0, -0.42, 0.0], [1.5, 0.5, 1.0], "player");
-    s.prim("Hips", PrimitiveShape::Capsule, Some(body), [0.0, -0.8, 0.0], [1.3, 0.25, 0.9], "trim");
-    body
-}
-
 fn net_avatar_prefab() -> crate::prefab::Prefab {
     let mut p = Scene::new();
     let root = p.empty("Net Avatar", None, [0.0; 3]);
     let head = p.empty("Head", Some(root), [0.0, 1.65, 0.0]);
-    let head_model = p.prim("Head Model", PrimitiveShape::Sphere, Some(head), [0.0, 0.0, 0.03], [0.22, 0.25, 0.24], "skin");
     let left = p.empty("Left Hand", Some(root), [-0.22, 1.35, -0.38]);
-    let left_model = p.prim("Left Hand Model", PrimitiveShape::Cube, Some(left), [0.0, -0.01, 0.03], [0.07, 0.04, 0.13], "skin");
     let right = p.empty("Right Hand", Some(root), [0.2, 1.45, -0.42]);
-    let right_model = p.prim("Right Hand Model", PrimitiveShape::Cube, Some(right), [0.0, -0.01, 0.03], [0.07, 0.04, 0.13], "skin");
-    let body = avatar_body(&mut p, root, head);
-    let hidden = vec![p.r(head_model), p.r(left_model), p.r(right_model), p.r(body)];
+    let visual = super::avatar::visuals(&mut p, root, root, true);
+    p.component_mut::<citrus_core::TemplateAvatar>(visual).unwrap().follow_local_player = true;
+    let body = p.child(visual, "Avatar Body").unwrap();
+    let hidden = vec![p.r(body)];
+    p.with(root, citrus_core::NetworkVariables::default());
     p.with(
         root,
         NetworkAvatar {
@@ -105,12 +96,8 @@ pub fn build() -> TemplateContent {
         s.with(p, SpawnPoint { tag: "player".into(), index: k as u32 });
     }
 
-    let rig = vr_rig(&mut s, [0.0, 0.0, 4.0], "player");
-    // Local avatar: a head shell on the camera (culled from inside, visible in
-    // the mirror) and a torso that follows the head. Other players see the
-    // Network Manager's avatar prefab instead.
-    s.prim("Head Model", PrimitiveShape::Sphere, Some(rig.head), [0.0, 0.0, 0.03], [0.22, 0.25, 0.24], "skin");
-    avatar_body(&mut s, rig.root, rig.head);
+    vr_rig(&mut s, [0.0, 0.0, 4.0], "player");
+    // The shared VR rig supplies both full-body mannequin variants.
 
     // Host / join from the Network window (or set Auto Start for built games).
     let net = s.empty("Network Manager", None, [0.0, 0.0, 4.0]);

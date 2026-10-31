@@ -19,6 +19,7 @@ use crate::swapchain::Swapchain;
 pub struct ProfilerWindow {
     allocator: Arc<Mutex<Allocator>>,
     surface: vk::SurfaceKHR,
+    owns_surface: bool,
     swapchain: Swapchain,
     egui: egui_ash_renderer::Renderer,
     command_pool: vk::CommandPool,
@@ -48,7 +49,20 @@ impl ProfilerWindow {
             ash_window::create_surface(&ctx.entry, &ctx.instance, display, window, None)
         }
         .context("creating profiler surface")?;
+        Self::with_surface(ctx, allocator, surface, true, width, height, vsync)
+    }
 
+    /// Like [`ProfilerWindow::new`] on an existing surface. `owns_surface`
+    /// decides whether `destroy` frees it (false when the context owns it).
+    pub fn with_surface(
+        ctx: &GpuContext,
+        allocator: Arc<Mutex<Allocator>>,
+        surface: vk::SurfaceKHR,
+        owns_surface: bool,
+        width: u32,
+        height: u32,
+        vsync: bool,
+    ) -> Result<Self> {
         let swapchain = Swapchain::new_for_surface(ctx, surface, width, height, vsync)?;
 
         let egui = egui_ash_renderer::Renderer::with_gpu_allocator(
@@ -91,6 +105,7 @@ impl ProfilerWindow {
         Ok(Self {
             allocator,
             surface,
+            owns_surface,
             swapchain,
             egui,
             command_pool,
@@ -254,7 +269,9 @@ impl ProfilerWindow {
             ctx.device.destroy_fence(self.in_flight, None);
             self.swapchain.destroy(&ctx.device);
             ctx.device.destroy_command_pool(self.command_pool, None);
-            ctx.surface_loader.destroy_surface(self.surface, None);
+            if self.owns_surface {
+                ctx.surface_loader.destroy_surface(self.surface, None);
+            }
         }
         // egui renderer + allocator handle drop themselves.
         let _ = &self.allocator;

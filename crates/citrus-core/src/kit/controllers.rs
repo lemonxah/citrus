@@ -70,6 +70,9 @@ pub struct Walker {
 }
 
 impl Walker {
+    pub fn is_grounded(&self) -> bool {
+        self.grounded
+    }
     /// Swimming (or climbing out of the water) this frame.
     pub fn swimming(&self) -> bool {
         self.swimming || self.climb.is_some()

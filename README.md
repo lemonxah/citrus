@@ -173,12 +173,62 @@ goals:
 
 ## Running
 
+### Development commands
+
+The root `justfile` follows the same workflow as ZestBay. It requires `just`,
+Bash, Python 3.11+ (for `tomllib`), and the Rust toolchain. Native builds also
+need `glslc`, the Vulkan loader/drivers, ALSA and udev development libraries,
+and libclang for Steam Audio's bindings. Steam Audio's SDK downloads on its
+first build.
+
 ```sh
-cargo run --bin citrus
+just                          # list recipes
+just current                  # workspace version
+just check                    # check all workspace targets
+just test                     # workspace tests
+just fmt                      # format Rust sources
+just build                    # release workspace build
+just run                      # editor on this checkout's project
+just run "/path/to/My Game"    # editor on another project
+just hub                      # Project Hub (also builds the editor)
+just install                  # build + install to /usr using sudo (Linux)
+just install "$HOME/.local" "" # install for this user without sudo
+just bump 0.2.0               # update workspace version + Cargo.lock
+just release 0.2.0 "changes"   # bump, commit, tag, push, GitHub release
+```
+
+Installation puts the editor, hub, relay and `libphonon.so` together under
+`<prefix>/lib/citrus`, adds links in `<prefix>/bin`, and installs a desktop
+launcher that opens the Project Hub. For a user install, put `$HOME/.local/bin`
+on `PATH`. Keep this source checkout available: generated game projects use
+local engine crate paths. The install is a local developer install.
+
+`bump` changes `[workspace.package].version` (inherited by the engine crates)
+and updates the lockfile offline; the example plugin and standalone game
+examples keep their independent versions. `release` requires a clean working
+tree, a branch with an upstream, and authenticated `gh`. It commits the version
+files, creates `v<version>`, pushes the branch and that tag to `origin`, then
+creates a GitHub release with generated notes. It does not upload build artifacts.
+
+```sh
+cargo run --bin citrus                      # the project in the current folder, else the Project Hub
+cargo run --bin citrus -- <project-dir>     # open a project directly
+cargo run --bin citrus-hub                  # the Project Hub
 ```
 
 Open a model or scene directly: `cargo run -- world.glb` / `model.fbx` /
-`scenes/world.scene`.
+`scenes/world.scene` (the project is the folder above it holding `project.citrus`).
+
+### Project Hub
+
+`citrus-hub` (or `citrus --hub`, or **File → Project Hub** in the editor) lists recent
+projects (pin, search, sort, show in file manager, locate moved ones), creates new
+projects from the templates and opens projects in the editor, which runs as its own
+process (`citrus <project-dir>`). The editor is found next to the hub executable; set
+`CITRUS_EDITOR` or the path in the hub's Settings otherwise. The recent list lives in
+`<config>/Citrus/projects.ron` (the editor records every project it opens there too),
+hub preferences in `<config>/Citrus/hub.ron`. A `thumbnail.png` in a project's root (or
+its `.citrus/` folder) is shown as its picture.
 
 ### Editor
 

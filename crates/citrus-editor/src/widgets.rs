@@ -14,6 +14,15 @@ fn radius(r: u8) -> CornerRadius {
     CornerRadius::same(r)
 }
 
+/// Measure an action button before laying out a centered group. Uses the
+/// same font, icon gap and padding as the button itself (including DPI scale).
+pub fn action_button_width(ui: &Ui, icon: Option<Icon>, label: &str, primary: bool, height: f32) -> f32 {
+    let font = if primary { theme::semibold(theme::SIZE_BODY) } else { egui::FontId::proportional(theme::SIZE_BODY) };
+    let text = ui.painter().layout_no_wrap(label.to_owned(), font, theme::TEXT_SECONDARY);
+    let icon_width = if icon.is_some() { 14.0 + if label.is_empty() { 0.0 } else { 6.0 } } else { 0.0 };
+    (20.0 + icon_width + text.size().x).max(height)
+}
+
 /// A button drawn by hand so its fill, text and icon follow the spec exactly.
 #[allow(clippy::too_many_arguments)]
 fn button_impl(
@@ -128,6 +137,31 @@ pub fn icon_button_sized(ui: &mut Ui, icon: Icon, tooltip: &str, active: bool, s
         let color = if active || response.hovered() { theme::TEXT_STRONG } else { theme::TEXT_MUTED };
         let s = (size.y * 0.6).clamp(12.0, 16.0);
         icons::paint(ui.painter(), egui::Rect::from_center_size(rect.center(), Vec2::splat(s)), icon, color);
+        focus_ring(ui, &response, rect, theme::R_FIELD);
+    }
+    response.on_hover_text(tooltip)
+}
+
+/// The narrow down-arrow half of a split button (opens its dropdown).
+pub fn dropdown_arrow_button(ui: &mut Ui, tooltip: &str, open: bool) -> Response {
+    let size = Vec2::new(14.0, theme::H_TOGGLE);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let fill = if open {
+            theme::BG_SEGMENT_ACTIVE
+        } else if response.hovered() {
+            theme::BG_BUTTON
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, radius(theme::R_FIELD), fill);
+        let color = if open || response.hovered() { theme::TEXT_STRONG } else { theme::TEXT_MUTED };
+        let c = rect.center();
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![c + Vec2::new(-3.5, -1.5), c + Vec2::new(3.5, -1.5), c + Vec2::new(0.0, 2.5)],
+            color,
+            egui::Stroke::NONE,
+        ));
         focus_ring(ui, &response, rect, theme::R_FIELD);
     }
     response.on_hover_text(tooltip)
@@ -438,6 +472,48 @@ pub fn dashed_button(ui: &mut Ui, icon: Option<Icon>, label: &str) -> Response {
     response
 }
 
+/// Selectable card of `size`: icon tile, title, a meta line under it and a
+/// clipped description (New Project template pickers). Selected cards get the
+/// accent border and faint accent fill.
+pub fn select_card(ui: &mut Ui, size: Vec2, icon: Icon, title: &str, meta: &str, description: &str, selected: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let (fill, stroke) = if selected {
+        (theme::accent_faint(), Stroke::new(1.0_f32, theme::accent()))
+    } else if response.hovered() {
+        (theme::BG_BUTTON, Stroke::new(1.0_f32, theme::LINE_BUTTON))
+    } else {
+        (theme::BG_FIELD, Stroke::new(1.0_f32, theme::LINE_FIELD))
+    };
+    let p = ui.painter();
+    p.rect(rect, radius(theme::R_TOOLBAR), fill, stroke, StrokeKind::Inside);
+
+    let pad = 10.0;
+    let tile = egui::Rect::from_min_size(rect.min + Vec2::splat(pad), Vec2::splat(32.0));
+    let icon_color = if selected { theme::accent() } else { theme::TEXT_SECONDARY };
+    p.rect_filled(tile, radius(theme::R_ROW), theme::with_alpha(icon_color, 0.14));
+    icons::paint(p, egui::Rect::from_center_size(tile.center(), Vec2::splat(18.0)), icon, icon_color);
+
+    let text_x = tile.right() + 10.0;
+    let name = p.layout(title.to_owned(), theme::semibold(theme::SIZE_TITLE), theme::TEXT_STRONG, rect.right() - text_x - pad);
+    p.galley(egui::pos2(text_x, tile.top() - 1.0), name, theme::TEXT_STRONG);
+    p.text(
+        egui::pos2(text_x, tile.bottom() + 1.0),
+        egui::Align2::LEFT_BOTTOM,
+        meta,
+        egui::FontId::proportional(theme::SIZE_META),
+        if selected { theme::accent() } else { theme::TEXT_DIM },
+    );
+
+    let desc = p.layout(description.to_owned(), egui::FontId::proportional(theme::SIZE_META), theme::TEXT_MUTED, size.x - pad * 2.0);
+    let desc_rect = egui::Rect::from_min_max(egui::pos2(rect.left() + pad, tile.bottom() + 8.0), rect.max - Vec2::splat(pad));
+    p.with_clip_rect(desc_rect).galley(desc_rect.min, desc, theme::TEXT_MUTED);
+    focus_ring(ui, &response, rect, theme::R_TOOLBAR);
+    response
+}
+
 /// Search field: magnifier icon, placeholder, 28 px.
 pub fn search_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Response {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, theme::H_TOOLBAR), Sense::hover());
@@ -514,6 +590,34 @@ pub fn section_header_with(
     default_open: bool,
     trailing: impl FnOnce(&mut Ui),
 ) -> (bool, bool) {
+    section_header_impl(ui, id, icon, title, enabled, false, default_open, trailing)
+}
+
+/// [`section_header`] with an on/off checkbox that can be `locked` (shown,
+/// not clickable).
+pub fn section_header_toggle(
+    ui: &mut Ui,
+    id: egui::Id,
+    icon: Option<(Icon, Color32)>,
+    title: &str,
+    enabled: &mut bool,
+    locked: bool,
+    trailing: impl FnOnce(&mut Ui),
+) -> (bool, bool) {
+    section_header_impl(ui, id, icon, title, Some(enabled), locked, true, trailing)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn section_header_impl(
+    ui: &mut Ui,
+    id: egui::Id,
+    icon: Option<(Icon, Color32)>,
+    title: &str,
+    enabled: Option<&mut bool>,
+    locked: bool,
+    default_open: bool,
+    trailing: impl FnOnce(&mut Ui),
+) -> (bool, bool) {
     let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
     let mut toggled_enabled = false;
     let open = state.is_open();
@@ -533,7 +637,7 @@ pub fn section_header_with(
     child.with_layout(Layout::right_to_left(Align::Center), |ui| {
         trailing(ui);
         if let Some(e) = enabled {
-            toggled_enabled = ui.checkbox(e, "").changed();
+            toggled_enabled = ui.add_enabled(!locked, egui::Checkbox::without_text(e)).changed();
         }
     });
     if click {

@@ -284,6 +284,10 @@ pub fn asset_chip(ui: &mut Ui, salt: &str, value: &mut String, hint: &str, exts:
 /// egui temp data (`String`): the project root, published by the editor each
 /// frame so asset fields can list and create files.
 pub const PROJECT_ROOT_KEY: &str = "citrus-project-root";
+
+/// Egui temp-data key (bool) the editor sets while Play is running:
+/// components can only be switched on or off in edit mode.
+pub const PLAY_MODE_KEY: &str = "citrus-play-mode";
 /// egui temp data (`Vec<AssetTemplate>`): asset kinds an asset field's [+]
 /// can create.
 pub const ASSET_TEMPLATES_KEY: &str = "citrus-asset-templates";
@@ -691,7 +695,7 @@ pub fn components_ui(
     asset_editor: Option<&AssetEditor<'_>>,
 ) -> ComponentsResponse {
     let mut response = ComponentsResponse::default();
-    let has_body = components.iter().any(|c| c.type_name() == "Rigid Body");
+    let has_body = components.iter().any(|c| c.type_name() == "Rigid Body" && citrus_core::component_enabled(c.as_ref()));
     let inspect_ctx = InspectCtx { objects, layer_names, asset_editor, has_body };
     // Plugin components (cdylibs) statically link their own copy of egui, so a
     // selectable label drawn from a plugin's egui panics (mismatched TypeId for
@@ -701,7 +705,11 @@ pub fn components_ui(
         let id = ui.make_persistent_id(("citrus-component", index, component.type_name()));
         crate::widgets::divider(ui);
         let (icon, color) = component_icon(component.type_name());
-        let (open, _) = crate::widgets::section_header(ui, id, Some((icon, color)), component.type_name(), None, |ui| {
+        // The header's checkbox switches the component on and off in place;
+        // a switched-off component stays listed, greyed out.
+        let mut on = citrus_core::component_enabled(component.as_ref());
+        let playing = ui.data(|d| d.get_temp::<bool>(egui::Id::new(PLAY_MODE_KEY)).unwrap_or(false));
+        let (open, toggled) = crate::widgets::section_header_toggle(ui, id, Some((icon, color)), component.type_name(), &mut on, playing, |ui| {
             let kebab = crate::widgets::icon_button(ui, crate::icons::Icon::Kebab, "Component options", false);
             egui::Popup::menu(&kebab).show(|ui| {
                 if ui.button("Remove component").clicked() {
@@ -721,9 +729,15 @@ pub fn components_ui(
             egui::Frame::new()
                 .inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 })
                 .show(ui, |ui| {
-                    response.changed |= editor.inspect(component.as_mut(), ui, &inspect_ctx);
+                    ui.add_enabled_ui(on, |ui| {
+                        response.changed |= editor.inspect(citrus_core::component_inner_mut(component), ui, &inspect_ctx);
+                    });
                 });
             ui.data_mut(|d| d.remove::<Vec<String>>(egui::Id::new(crate::widgets::MIXED_FIELDS_KEY)));
+        }
+        if toggled && !playing {
+            citrus_core::set_component_enabled(component, on);
+            response.changed = true;
         }
     }
     crate::widgets::divider(ui);

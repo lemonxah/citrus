@@ -60,6 +60,16 @@ impl Inspect for HumanoidIk {
         note(ui, &if live.is_empty() { "No trackers right now".to_owned() } else { format!("Tracking: {}", live.join(", ")) });
 
         widgets::eyebrow(ui, "Body");
+        widgets::property_row(ui, "Locomotion", |ui| {
+            use citrus_core::TrackingLocomotion;
+            egui::ComboBox::from_id_salt("tracking-locomotion")
+                .selected_text(format!("{:?}", self.locomotion)).show_ui(ui, |ui| {
+                    for value in [TrackingLocomotion::Auto, TrackingLocomotion::On, TrackingLocomotion::Off] {
+                        changed |= ui.selectable_value(&mut self.locomotion, value, format!("{value:?}")).changed();
+                    }
+                });
+        });
+        note(ui, "Auto disables canned locomotion while hips and both feet are tracked. IK still drives the body in every mode.");
         drag(ui, "Weight", &mut self.weight, 0.005, 0.0..=1.0, &mut changed);
         drag(ui, "Spine twist", &mut self.spine_twist, 0.005, 0.0..=1.0, &mut changed);
         drag(ui, "Shoulder rotation", &mut self.shoulder_rotation, 0.005, 0.0..=1.0, &mut changed);

@@ -1573,7 +1573,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let spin = ComponentData { kind: "Spin".into(), data: "(axis:(0.0,1.0,0.0),degrees_per_second:90.0)".into() };
+        let spin = ComponentData::new("Spin", "(axis:(0.0,1.0,0.0),degrees_per_second:90.0)");
         let scene = SceneFile {
             entries: vec![
                 entry(
@@ -1703,7 +1703,7 @@ mod tests {
         let root = entry("Root", ObjectSource::Empty, MaterialRef::File(String::new()), vec![]);
         let mut child = entry("Child", ObjectSource::Empty, MaterialRef::File(String::new()), vec![]);
         child.parent = Some(0);
-        child.components.push(ComponentData { kind: "Ref".into(), data: format!("(target:\"{}\")", root.id) });
+        child.components.push(ComponentData::new("Ref", format!("(target:\"{}\")", root.id)));
         let file = SceneFile { entries: vec![root.clone(), child], ..Default::default() };
         let root_id = ObjectId::new();
         let copy = remap_ids(&file, root_id);
@@ -1722,10 +1722,7 @@ mod tests {
             MaterialRef::File(String::new()),
             vec![],
         );
-        table.components.push(ComponentData {
-            kind: "Avatar Descriptor".into(),
-            data: "(view_position:(0.0,9.0,0.0))".into(),
-        });
+        table.components.push(ComponentData::new("Avatar Descriptor", "(view_position:(0.0,9.0,0.0))"));
         let warnings = avatar_warnings(&root, &SceneFile { entries: vec![table], ..Default::default() });
         assert!(warnings.iter().any(|w| w.contains("eye height")), "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("skeleton")), "{warnings:?}");

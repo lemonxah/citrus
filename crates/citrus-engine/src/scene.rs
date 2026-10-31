@@ -108,20 +108,15 @@ impl SceneObject {
             .chain(self.extra_render.iter().copied())
     }
 
-    /// Serialize all components (undo snapshots, play-mode restore).
-    pub fn save_components(&self) -> Vec<(String, String)> {
-        self.components
-            .iter()
-            .map(|c| (c.type_name().to_owned(), c.save()))
-            .collect()
+    /// Serialize all components, switched-off ones included (undo snapshots,
+    /// play-mode restore).
+    pub fn save_components(&self) -> Vec<citrus_assets::ComponentData> {
+        self.components.iter().map(|c| citrus_assets::ComponentData::of(c.as_ref())).collect()
     }
 
     /// Rebuild the component list from serialized state.
-    pub fn load_components(&mut self, saved: &[(String, String)], registry: &ComponentRegistry) {
-        self.components = saved
-            .iter()
-            .filter_map(|(kind, data)| registry.load(kind, data))
-            .collect();
+    pub fn load_components(&mut self, saved: &[citrus_assets::ComponentData], registry: &ComponentRegistry) {
+        self.components = saved.iter().filter_map(|c| c.load(registry)).collect();
     }
 
     pub fn kind_label(&self) -> &'static str {
@@ -3776,9 +3771,20 @@ impl LoadedScene {
             }
             let Some(ik) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<HumanoidIk>()) else { continue };
             let net: Option<&NetworkAvatar> = self.network_avatar_of(i).map(|(_, a)| a);
+            let objects = || {
+                let mut slots = [None; citrus_core::TRACKER_SLOTS];
+                for (k, r) in ik.objects.iter().enumerate().take(citrus_core::TRACKER_SLOTS) {
+                    if let Some(j) = r.id().and_then(|id| self.index_of(id)) {
+                        let (_, rotation, position) = world[j].to_scale_rotation_translation();
+                        slots[k] = Some((position, rotation));
+                    }
+                }
+                let targets = citrus_core::TrackerTargets::from_slots(slots);
+                targets.any().then_some(targets)
+            };
             let local = || {
                 let root = ik.tracking_root.id().and_then(|id| self.index_of(id)).or(default_root);
-                stage.map(|t| t.transformed(root.map(|r| world[r]).unwrap_or(Mat4::IDENTITY)))
+                stage.map(|t| t.transformed(root.map(|r| world[r]).unwrap_or(Mat4::IDENTITY))).or_else(objects)
             };
             let targets = match ik.source {
                 IkSource::Auto => match net {
@@ -3787,16 +3793,7 @@ impl LoadedScene {
                 },
                 IkSource::LocalTrackers => local(),
                 IkSource::Network => net.map(|av| av.targets),
-                IkSource::Objects => {
-                    let mut slots = [None; citrus_core::TRACKER_SLOTS];
-                    for (k, r) in ik.objects.iter().enumerate().take(citrus_core::TRACKER_SLOTS) {
-                        if let Some(j) = r.id().and_then(|id| self.index_of(id)) {
-                            let (_, rot, pos) = world[j].to_scale_rotation_translation();
-                            slots[k] = Some((pos, rot));
-                        }
-                    }
-                    Some(citrus_core::TrackerTargets::from_slots(slots))
-                }
+                IkSource::Objects => objects(),
             };
             let Some(targets) = targets.filter(|t| t.any()) else { continue };
             let settings = crate::humanoid::BodyIkSettings {
@@ -3971,6 +3968,14 @@ impl LoadedScene {
                 None => (skel.rest_locals(), true),
             };
             // Morphed and cloth vertices are written by the CPU skinning path.
+            if let Some(ik) = self.objects[i].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::HumanoidIk>())
+                && !ik.locomotion.animate(ik_inputs.get(&i).map(|(targets, _)| targets))
+            {
+                locals = skel.rest_locals();
+                if let Some(animator) = self.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Animator>()) {
+                    animator.state.root_delta = Vec3::ZERO;
+                }
+            }
             let has_mesh_cloth = any_cloth && crate::cloth::has_mesh_cloth(&self.objects[i].components);
             let gpu = gpu && !has_face && !has_mesh_cloth;
             if has_ik {
@@ -5012,10 +5017,7 @@ impl LoadedScene {
                     components: object
                         .components
                         .iter()
-                        .map(|c| citrus_assets::ComponentData {
-                            kind: c.type_name().to_owned(),
-                            data: c.save(),
-                        })
+                        .map(|c| citrus_assets::ComponentData::of(c.as_ref()))
                         .collect(),
                     translation: object.translation.to_array(),
                     rotation: object.rotation.to_array(),
@@ -5338,7 +5340,7 @@ impl LoadedScene {
                 components: entry
                     .components
                     .iter()
-                    .filter_map(|c| registry.load(&c.kind, &c.data))
+                    .filter_map(|c| c.load(registry))
                     .collect(),
             });
         }

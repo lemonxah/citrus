@@ -1899,6 +1899,38 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   `worn_avatar_package_reaches_peers_and_late_joiners`, `remote_players_announced_avatar_is_requested_once`,
   plus chest / knee replication in the network convergence test.
 - [done] Command palette: the list no longer stays at the height of an earlier search.
+- [done] Project Hub (`citrus-hub`, a separate executable): recent projects (search, sort, pin, show in
+  file manager, locate / prune missing folders, thumbnails from a project's `thumbnail.png`), New
+  Project from the templates (runs `citrus --new-project`, so the hub and editor share the template
+  code), Open folder (an in-theme folder browser; offers to initialise a folder without a
+  project.citrus), Settings (editor path or `CITRUS_EDITOR`, minimise or close the hub after
+  opening, default location). Opens a project by starting the editor as `citrus <dir>`. Recent
+  projects are shared with the editor in `<config>/Citrus/projects.ron` (the editor records every
+  project it opens, CLI included); hub settings and window size in `<config>/Citrus/hub.ron`.
+- [done] CLI: `citrus <project-dir>` opens that project; `citrus <scene|model>` finds its project;
+  `citrus --hub` starts the hub; bare `citrus` opens the project in the current folder, else the
+  hub, else the last project. Editor: File > Project Hub..., command-palette project entries, and
+  a Save / Discard / Cancel prompt before switching projects with unsaved changes.
+- [done] Editor splash (editor only, never in games): Plex type, project name + version, a six-step
+  progress bar (Vulkan, plugins, project, scene parse, install, open) in the project's accent.
+- [done] Default dock layout: the left column holds the Scene tree above Files (full height), the
+  console sits under the viewport (Reset Layout applies it).
+- [done] Stuck modifier fix: editor shortcuts read Ctrl / Shift from the window's modifier state, and
+  held keys are cleared when the window loses focus, so a Ctrl released while another window had
+  focus no longer stays "held" (plain D duplicated, W / E / R / T stopped switching tools).
+- [done] Viewport visibility split button (top right): the eye shows / hides every gizmo and billboard at
+  once, except the move / rotate / scale handles, which always show (eye-off icon while hidden;
+  also the command palette's "Show / hide gizmos and billboards"); its dropdown arrow picks what
+  shows: Gizmos (component gizmos such as collider shapes and bounds, Rigid Body markers, light
+  ranges, volumes, water outlines and joints; the orientation cross), Billboards
+  (lights, cameras, probe volumes, reflection probes, audio sources, UI canvases, post FX volumes,
+  each with its size) and the Game UI overlay. Replaces the separate gizmo and billboard buttons.
+- [done] Component on/off checkbox (edit mode): each component header in the Inspector has a checkbox;
+  switched off, a component stays in place, greyed out, keeps its settings, and does nothing
+  (no callbacks; physics, water, lights, kit components and every other system look components
+  up by type and don't see it) until switched back on. Saved in scenes and prefabs (`enabled:
+  false`, omitted when on, so old scenes load unchanged), undoable, applies to a multi-selection;
+  locked while Play runs.
 - [done] Avatar scaling to the player's height: standing eye height measured in the headset (a 1 s
   stand-straight capture, outlier rejection, movement check), arm span from the T-pose, manual
   height (cm) override and reset, saved per user in `Citrus/body.ron` (shared by every game and the

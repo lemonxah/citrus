@@ -10,4 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 citrus-engine.workspace = true
+citrus-assets.workspace = true
 anyhow.workspace = true

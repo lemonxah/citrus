@@ -872,10 +872,7 @@ pub fn plan_package(opts: &BuildOptions) -> Result<PackagePlan> {
         && !root_entry.components.iter().any(|c| c.kind == AVATAR_DESCRIPTOR)
     {
         warnings.push("avatar root had no Avatar Descriptor; added a default one (eye height 1.6 m)".into());
-        root_entry.components.push(crate::ComponentData {
-            kind: AVATAR_DESCRIPTOR.into(),
-            data: ron::to_string(&citrus_core::AvatarDescriptor::default())?,
-        });
+        root_entry.components.push(crate::ComponentData::new(AVATAR_DESCRIPTOR, ron::to_string(&citrus_core::AvatarDescriptor::default())?));
         components.insert(AVATAR_DESCRIPTOR.into());
     }
 
@@ -1718,10 +1715,10 @@ mod tests {
                     ObjectSource::Primitive { shape: crate::PrimitiveShape::Cube },
                     MaterialRef::File("materials/ferris.material".into()),
                     vec![
-                        ComponentData { kind: "Spin".into(), data: "(axis:(0.0,1.0,0.0),degrees_per_second:45.0)".into() },
-                        ComponentData { kind: "Audio Source".into(), data: "(clip:\"audio/beep.wav\",volume:1.0)".into() },
-                        ComponentData { kind: "My Plugin Thing".into(), data: "()".into() },
-                        ComponentData { kind: "Ghost".into(), data: "()".into() },
+                        ComponentData::new("Spin", "(axis:(0.0,1.0,0.0),degrees_per_second:45.0)"),
+                        ComponentData::new("Audio Source", "(clip:\"audio/beep.wav\",volume:1.0)"),
+                        ComponentData::new("My Plugin Thing", "()"),
+                        ComponentData::new("Ghost", "()"),
                     ],
                 ),
                 entry("Light", ObjectSource::Light, MaterialRef::File(String::new()), vec![]),

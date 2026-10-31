@@ -1,7 +1,9 @@
 //! CPU-drawn splash window shown before the Vulkan renderer exists. Uses
 //! softbuffer to present a scaled-down background (a static image, or an animated
 //! WebP/GIF/APNG played by elapsed time) with a status line along the bottom, so
-//! the user sees branding while the editor loads.
+//! the user sees branding while the editor loads. The bottom band carries the
+//! load phase, the editor version + project name and a step progress bar.
+//! Editor only: a shipped game never shows it.
 //!
 //! Animation only visibly plays while the main thread is free to tick it; the
 //! renderer build is backgrounded (see editor_app) so it animates during that.
@@ -20,7 +22,8 @@ use image::AnimationDecoder;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId, WindowLevel};
 
-const SPLASH_FONT: &[u8] = include_bytes!("../assets/splash_font.ttf");
+/// Plex Sans Medium, the editor's UI face (docs/design).
+const SPLASH_FONT: &[u8] = include_bytes!("../../citrus-editor/assets/fonts/IBMPlexSans-Medium.ttf");
 /// Embedded animated splash (looped). Default branding; an external
 /// `splash.webp`/`splash.gif` in the project root still overrides it.
 const SPLASH_WEBP: &[u8] = include_bytes!("../../citrus-editor/assets/splash.webp");
@@ -46,6 +49,12 @@ pub struct Splash {
     start: Instant,
     font: FontRef<'static>,
     status: String,
+    /// Right side of the band: "Citrus Editor 0.1.0" and the project name.
+    caption: String,
+    /// Completed load steps out of the total; the bar eases towards it.
+    progress: f32,
+    shown_progress: f32,
+    accent: u32,
     /// Animation frames streamed in from a worker thread as they decode (so the
     /// animation starts almost immediately instead of after a multi-second full
     /// decode). The placeholder shows until the first frame arrives.
@@ -93,6 +102,10 @@ impl Splash {
             start: Instant::now(),
             font,
             status: String::new(),
+            caption: format!("Citrus Editor {}", env!("CARGO_PKG_VERSION")),
+            progress: 0.0,
+            shown_progress: 0.0,
+            accent: 0xF5C84B,
             frames_rx: Some(rx),
             streaming: false,
         })
@@ -125,6 +138,20 @@ impl Splash {
             .iter()
             .position(|f| t < f.end_ms)
             .unwrap_or(n - 1)
+    }
+
+    /// Name the project being opened (shown beside the version) and use its
+    /// accent colour for the progress bar.
+    pub fn set_project(&mut self, name: &str, accent: Option<[u8; 3]>) {
+        self.caption = format!("{name}   Citrus Editor {}", env!("CARGO_PKG_VERSION"));
+        if let Some([r, g, b]) = accent {
+            self.accent = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+        }
+    }
+
+    /// Step `done` of `total` load steps has started; drives the progress bar.
+    pub fn set_progress(&mut self, done: usize, total: usize) {
+        self.progress = (done as f32 / total.max(1) as f32).clamp(0.0, 1.0);
     }
 
     /// Update the bottom status line and redraw. Returns whether it painted.
@@ -173,7 +200,7 @@ impl Splash {
         buf.copy_from_slice(&frame.px);
 
         // Darkened bottom band (fades in) so the text reads over any background.
-        let band = 56u32;
+        let band = 64u32;
         for y in (H - band)..H {
             let t = (y - (H - band)) as f32 / band as f32;
             let d = (t * 0.72).clamp(0.0, 0.72);
@@ -188,7 +215,20 @@ impl Splash {
         } else {
             self.status.as_str()
         };
-        draw_text(&mut buf, &self.font, 24.0, 24, (H - 20) as i32, text, 0xF2F2F2);
+        draw_text(&mut buf, &self.font, 18.0, 24, (H - 22) as i32, text, 0xF2F3F5);
+        let caption_w = text_width(&self.font, 13.0, &self.caption);
+        draw_text(&mut buf, &self.font, 13.0, W as i32 - 24 - caption_w as i32, (H - 22) as i32, &self.caption, 0xA3A6AF);
+
+        // Step progress along the bottom edge: a dim track and the accent fill,
+        // easing forward so a step that lands at once still reads as motion.
+        self.shown_progress += (self.progress - self.shown_progress) * 0.18;
+        let fill = (self.shown_progress * W as f32) as u32;
+        for y in (H - 3)..H {
+            for x in 0..W {
+                let i = (y * W + x) as usize;
+                buf[i] = if x < fill { self.accent } else { blend(buf[i], 0x26282D, 0.8) };
+            }
+        }
 
         buf.present().is_ok()
     }
@@ -368,6 +408,12 @@ fn blend(dst: u32, color: u32, cov: f32) -> u32 {
         (dd + (cc - dd) * cov) as u32
     };
     (chan(16) << 16) | (chan(8) << 8) | chan(0)
+}
+
+/// Advance width of `text` at `px`.
+fn text_width(font: &FontRef, px: f32, text: &str) -> f32 {
+    let sf = font.as_scaled(PxScale::from(px));
+    text.chars().map(|c| sf.h_advance(sf.glyph_id(c))).sum()
 }
 
 /// Rasterize a left-aligned string (baseline at `baseline`) blended over the

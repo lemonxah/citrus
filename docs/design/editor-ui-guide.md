@@ -46,6 +46,11 @@ Plex for icons the spec set doesn't cover.
    `H_BUTTON_SMALL`, ...).
 8. **Icon-only controls need a tooltip** that reads like an accessible name ("Move
    (W)", "Hide Sphere").
+9. **Center the complete action group under centered content.** In empty states
+   and welcome panels, center the combined button widths plus their gap beneath
+   the icon/title/message. Do not center a fixed-width container and leave its
+   buttons aligned to that container's left edge. Use measured widget widths so
+   text, fonts and display scaling keep the group aligned.
 
 ## 3. Building a panel: an example
 
@@ -164,12 +169,15 @@ builds on the previous; the shell (A–B) is what every later panel relies on.
 - [x] New Project: template picker cards (icon tile, name, category, description; accent
   border when selected), All / Desktop / VR segmented filter, feature info note, location rows,
   primary Create & Open (`new_project_ui.rs`)
+- [x] Project Hub (`crates/citrus-hub`, separate executable): sidebar nav, project rows
+  (thumbnail or initial, name + pin, mono path, last opened, version), template cards via
+  `widgets::select_card`, in-theme folder picker, modals for initialise / creating
 - [ ] Project Settings, Open Project, Unsaved changes, Layers, Input
   Bindings, Audio Mixer, Network, VR Tools, Controls, Generate Lightmap UVs, Component
   build failed, Background tasks
 - [ ] Busy modal and bake modal cards
 - [ ] Profiler window (separate OS window) on the theme
-- [ ] Splash screen status line in Plex
+- [x] Splash screen status line in Plex (plus version, project name and a step progress bar)
 - [ ] VR headset editor panels
 
 ### Behaviour changes the spec asks for (outside pure styling)

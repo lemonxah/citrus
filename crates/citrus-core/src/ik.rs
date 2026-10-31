@@ -151,6 +151,8 @@ pub struct HumanoidIkRuntime {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HumanoidIk {
+    /// Whether canned locomotion supplies the base pose under tracking.
+    pub locomotion: TrackingLocomotion,
     pub source: IkSource,
     /// Objects source: one object per tracker role, in `TRACKER_ROLES` order.
     pub objects: Vec<ObjectRef>,
@@ -179,6 +181,7 @@ pub struct HumanoidIk {
 impl Default for HumanoidIk {
     fn default() -> Self {
         Self {
+            locomotion: TrackingLocomotion::Auto,
             source: IkSource::Auto,
             objects: vec![ObjectRef::NONE; TRACKER_SLOTS],
             tracking_root: ObjectRef::NONE,
@@ -192,6 +195,41 @@ impl Default for HumanoidIk {
             step_height: 0.08,
             runtime: HumanoidIkRuntime::default(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackingLocomotion {
+    /// Suppress locomotion when hips and both feet have tracker targets.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl TrackingLocomotion {
+    pub fn animate(self, targets: Option<&TrackerTargets>) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Auto => !targets.is_some_and(|t| t.hips.is_some() && t.left_foot.is_some() && t.right_foot.is_some()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tracking_locomotion_tests {
+    use super::*;
+    #[test]
+    fn full_body_tracking_takes_over_only_in_auto_or_off() {
+        let pose = Some((Vec3::ZERO, Quat::IDENTITY));
+        let hands_only = TrackerTargets { head: pose, left_hand: pose, right_hand: pose, ..Default::default() };
+        let full_body = TrackerTargets { hips: pose, left_foot: pose, right_foot: pose, ..hands_only };
+        assert!(TrackingLocomotion::Auto.animate(None));
+        assert!(TrackingLocomotion::Auto.animate(Some(&hands_only)));
+        assert!(!TrackingLocomotion::Auto.animate(Some(&full_body)));
+        assert!(TrackingLocomotion::On.animate(Some(&full_body)));
+        assert!(!TrackingLocomotion::Off.animate(None));
     }
 }
 

@@ -6,6 +6,7 @@
 //! them like any other component.
 
 mod combat;
+mod avatar;
 mod controllers;
 mod controls_menu;
 mod hud;
@@ -17,6 +18,7 @@ mod vr_kit;
 pub use combat::{
     DamageEvent, DeathAction, DeathEvent, Health, HitscanWeapon, ScoreEvent, TargetDummy, WeaponTrigger, spread_direction,
 };
+pub use avatar::{AvatarVariant, TemplateAvatar};
 pub use controllers::{FirstPersonController, FollowCamera, ThirdPersonController, boom_position, look_rotation};
 pub use controls_menu::ControlsMenu;
 pub use hud::{HudBinding, HudValue, format_hud};
@@ -31,6 +33,7 @@ pub use vr_kit::{Grabbable, VrAvatar, VrHand, VrLocomotion, VrPlayer, teleport_a
 use crate::ComponentRegistry;
 
 pub(crate) fn register_kit(registry: &mut ComponentRegistry) {
+    registry.register::<TemplateAvatar>();
     registry.register::<Health>();
     registry.register::<HitscanWeapon>();
     registry.register::<TargetDummy>();

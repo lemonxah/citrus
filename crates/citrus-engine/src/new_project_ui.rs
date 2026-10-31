@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use citrus_editor::{icons, theme, widgets};
-use egui::{Rect, Sense, Ui, Vec2};
+use egui::{Ui, Vec2};
 
-use crate::templates::{ProjectTemplate, TEMPLATES, TemplateCategory};
+use crate::templates::{ProjectTemplate, TEMPLATES, TemplateCategory, TemplateIcon};
 
 pub(crate) struct NewProjectState<'a> {
     pub parent: &'a mut String,
@@ -98,46 +98,20 @@ pub(crate) fn new_project_ui(ui: &mut Ui, s: NewProjectState, cancel: &mut bool)
 }
 
 fn template_card(ui: &mut Ui, t: &ProjectTemplate, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(CARD_W, CARD_H), Sense::click());
-    let response = response.on_hover_text(t.description);
-    if !ui.is_rect_visible(rect) {
-        return response;
+    widgets::select_card(ui, Vec2::new(CARD_W, CARD_H), template_icon(t.icon), t.name, t.category.label(), t.description, selected)
+        .on_hover_text(t.description)
+}
+
+/// The editor icon drawn on a template's card.
+fn template_icon(icon: TemplateIcon) -> icons::Icon {
+    use icons::Icon;
+    match icon {
+        TemplateIcon::Empty => Icon::Plus,
+        TemplateIcon::Crosshair => Icon::Target,
+        TemplateIcon::Camera => Icon::Camera,
+        TemplateIcon::Pointer => Icon::ToolSelect,
+        TemplateIcon::Grid => Icon::Grid,
+        TemplateIcon::Headset => Icon::Gizmo,
+        TemplateIcon::Social => Icon::Audio,
     }
-    let hovered = response.hovered();
-    let (fill, stroke) = if selected {
-        (theme::accent_faint(), egui::Stroke::new(1.0_f32, theme::accent()))
-    } else if hovered {
-        (theme::BG_BUTTON, egui::Stroke::new(1.0_f32, theme::LINE_BUTTON))
-    } else {
-        (theme::BG_FIELD, egui::Stroke::new(1.0_f32, theme::LINE_FIELD))
-    };
-    let p = ui.painter();
-    p.rect(rect, theme::R_TOOLBAR, fill, stroke, egui::StrokeKind::Inside);
-
-    let pad = 10.0;
-    let tile = Rect::from_min_size(rect.min + Vec2::splat(pad), Vec2::splat(32.0));
-    let icon_color = if selected { theme::accent() } else { theme::TEXT_SECONDARY };
-    p.rect_filled(tile, theme::R_ROW, theme::with_alpha(icon_color, 0.14));
-    icons::paint(p, Rect::from_center_size(tile.center(), Vec2::splat(18.0)), t.icon.editor_icon(), icon_color);
-
-    let text_x = tile.right() + 10.0;
-    let name = p.layout(t.name.to_string(), theme::semibold(theme::SIZE_TITLE), theme::TEXT_STRONG, rect.right() - text_x - pad);
-    p.galley(egui::pos2(text_x, tile.top() - 1.0), name, theme::TEXT_STRONG);
-    p.text(
-        egui::pos2(text_x, tile.bottom() + 1.0),
-        egui::Align2::LEFT_BOTTOM,
-        t.category.label(),
-        egui::FontId::proportional(theme::SIZE_META),
-        if selected { theme::accent() } else { theme::TEXT_DIM },
-    );
-
-    let desc = p.layout(
-        t.description.to_string(),
-        egui::FontId::proportional(theme::SIZE_META),
-        theme::TEXT_MUTED,
-        CARD_W - pad * 2.0,
-    );
-    let desc_rect = Rect::from_min_max(egui::pos2(rect.left() + pad, tile.bottom() + 8.0), rect.max - Vec2::splat(pad));
-    p.with_clip_rect(desc_rect).galley(desc_rect.min, desc, theme::TEXT_MUTED);
-    response
 }

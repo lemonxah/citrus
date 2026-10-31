@@ -15,6 +15,7 @@ use crate::theme;
 use crate::widgets;
 
 pub(crate) fn register(e: &mut EditorComponents) {
+    e.register::<citrus_core::TemplateAvatar>();
     e.register::<Health>();
     e.register::<HitscanWeapon>();
     e.register::<TargetDummy>();
@@ -34,6 +35,23 @@ pub(crate) fn register(e: &mut EditorComponents) {
     e.register::<VrAvatar>();
     e.register::<ControlsMenu>();
 }
+
+impl Inspect for citrus_core::TemplateAvatar {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        use citrus_core::AvatarVariant;
+        let mut changed = false;
+        combo(ui, "avatar-variant", "Avatar", &mut self.variant,
+            &[(AvatarVariant::Male, "Male"), (AvatarVariant::Female, "Female")], &mut changed);
+        changed |= ctx.object_ref(ui, "Male model", &mut self.male);
+        changed |= ctx.object_ref(ui, "Female model", &mut self.female);
+        changed |= ctx.object_ref(ui, "Movement root", &mut self.player);
+        text(ui, "Switch action", &mut self.switch_action, &mut changed);
+        check(ui, "Follow local VR player", &mut self.follow_local_player, &mut changed);
+        widgets::info_note(ui, "F6 switches avatar in the starter projects. Both models share the same animation controller; movement stays on the player root.");
+        changed
+    }
+}
+impl Gizmo for citrus_core::TemplateAvatar {}
 
 /// Header icon for kit components (None = not a kit component).
 pub(crate) fn icon(name: &str) -> Option<(crate::icons::Icon, egui::Color32)> {

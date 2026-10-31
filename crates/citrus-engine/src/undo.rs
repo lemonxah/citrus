@@ -25,7 +25,7 @@ pub struct ObjectState {
     pub scale: Vec3,
     pub cast_shadows: citrus_core::ShadowCasting,
     /// Components as (registry name, RON). Diffable and restorable.
-    pub components: Vec<(String, String)>,
+    pub components: Vec<citrus_assets::ComponentData>,
 }
 
 #[derive(Clone)]
@@ -195,7 +195,7 @@ mod tests {
             rotation: Quat::IDENTITY,
             scale: Vec3::ONE,
             cast_shadows: Default::default(),
-            components: vec![("Mesh Cloth".into(), format!("(paint: (pins: \"{pins}\"))"))],
+            components: vec![citrus_assets::ComponentData::new("Mesh Cloth", format!("(paint: (pins: \"{pins}\"))"))],
         }
     }
 
@@ -205,7 +205,7 @@ mod tests {
 
     fn after_of(e: &UndoEntry) -> &str {
         match e {
-            UndoEntry::Object { after, .. } => &after.components[0].1,
+            UndoEntry::Object { after, .. } => &after.components[0].data,
             _ => panic!("object entry"),
         }
     }

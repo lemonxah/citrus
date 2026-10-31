@@ -43,7 +43,7 @@ pub use code_editor::{
 pub use components::{
     ASSET_TEMPLATES_KEY, AUTHORED_COLLISION_KEY, AssetEditor, AssetTemplate, ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents,
     Gizmo, GizmoEdit, GizmoSpec, Inspect, InspectCtx, MIXED_COMPONENTS_KEY, OPEN_ANIM_CONTROLLER_KEY,
-    OPEN_FILE_KEY, PING_FILE_KEY, PROJECT_ROOT_KEY, asset_browse_button, asset_chip, asset_new_button, components_ui,
+    OPEN_FILE_KEY, PING_FILE_KEY, PLAY_MODE_KEY, PROJECT_ROOT_KEY, asset_browse_button, asset_chip, asset_new_button, components_ui,
     resolve_slot,
 };
 pub use audio_ui::{AudioSettingsResponse, audio_settings_ui};

@@ -78,7 +78,7 @@ pub use body::{
     robust_mean, role_name,
 };
 pub use ik::{
-    HumanoidIk, HumanoidIkRuntime, IkSource, IkTargets, TRACKER_ROLES, TRACKER_SLOTS, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik,
+    HumanoidIk, HumanoidIkRuntime, IkSource, IkTargets, TrackingLocomotion, TRACKER_ROLES, TRACKER_SLOTS, TrackerCalibration, TrackerTargets, TwoBoneSolution, solve_fabrik,
     solve_two_bone,
 };
 pub use audio_mixer::AudioMixer;
@@ -716,6 +716,82 @@ pub trait Component: 'static {
     fn as_any(&self) -> &dyn std::any::Any;
     /// Mutable downcasting (assigning ids, editor inspector/gizmo dispatch).
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// A component switched off with the inspector's checkbox (edit mode): it
+/// keeps its place in the list, its settings and its saved data, but none of
+/// its callbacks run and systems that look components up by type don't see
+/// it. Turning it back on unwraps it.
+pub struct Disabled(pub Box<dyn Component>);
+
+impl Component for Disabled {
+    fn type_name(&self) -> &'static str {
+        self.0.type_name()
+    }
+    fn start(&mut self, _ctx: &mut ComponentCtx) {}
+    fn update(&mut self, _ctx: &mut ComponentCtx) {}
+    fn late_update(&mut self, _ctx: &mut ComponentCtx) {}
+    fn fixed_update(&mut self, _ctx: &mut ComponentCtx) {}
+    fn on_collision_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    fn on_collision_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    fn on_trigger_enter(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    fn on_trigger_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
+    fn on_animation_event(&mut self, _ctx: &mut ComponentCtx, _name: &str) {}
+    fn save(&self) -> String {
+        self.0.save()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Whether `c` is switched on (not wrapped in [`Disabled`]).
+pub fn component_enabled(c: &dyn Component) -> bool {
+    !c.as_any().is::<Disabled>()
+}
+
+/// The component itself, whether or not it is switched off.
+pub fn component_inner(c: &dyn Component) -> &dyn Component {
+    match c.as_any().downcast_ref::<Disabled>() {
+        Some(d) => d.0.as_ref(),
+        None => c,
+    }
+}
+
+/// The component itself, mutably, whether or not it is switched off.
+pub fn component_inner_mut(c: &mut Box<dyn Component>) -> &mut dyn Component {
+    if c.as_any().is::<Disabled>() {
+        let d = c.as_any_mut().downcast_mut::<Disabled>().expect("checked above");
+        return d.0.as_mut();
+    }
+    c.as_mut()
+}
+
+/// Switch the component in `slot` on or off in place; true when it changed.
+pub fn set_component_enabled(slot: &mut Box<dyn Component>, on: bool) -> bool {
+    if component_enabled(slot.as_ref()) == on {
+        return false;
+    }
+    if on {
+        let d = slot.as_any_mut().downcast_mut::<Disabled>().expect("checked above");
+        let inner = std::mem::replace(&mut d.0, Box::new(Placeholder));
+        *slot = inner;
+    } else {
+        let taken = std::mem::replace(slot, Box::new(Placeholder));
+        *slot = Box::new(Disabled(taken));
+    }
+    true
+}
+
+/// Stands in for a slot's component for the instant it is being swapped.
+#[derive(Serialize, Deserialize, Default)]
+struct Placeholder;
+
+impl TypedComponent for Placeholder {
+    const NAME: &'static str = "Placeholder";
 }
 
 /// Typed component interface; blanket-implements [`Component`]. All lifecycle
@@ -3251,6 +3327,24 @@ impl TypedComponent for Sync {
                 ctx.request_ownership();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod component_toggle_tests {
+    use super::*;
+
+    #[test]
+    fn a_component_switched_off_keeps_its_place_and_settings() {
+        let mut slot: Box<dyn Component> = Box::new(CharacterController { radius: 0.5, ..Default::default() });
+        assert!(component_enabled(slot.as_ref()));
+        assert!(set_component_enabled(&mut slot, false));
+        assert!(!component_enabled(slot.as_ref()) && slot.type_name() == "Character Controller");
+        assert!(slot.as_any().downcast_ref::<CharacterController>().is_none(), "systems looking it up by type don't see it");
+        assert!(component_inner(slot.as_ref()).as_any().downcast_ref::<CharacterController>().is_some_and(|c| c.radius == 0.5));
+        assert!(!set_component_enabled(&mut slot, false), "already off");
+        assert!(set_component_enabled(&mut slot, true));
+        assert!(slot.as_any().downcast_ref::<CharacterController>().is_some_and(|c| c.radius == 0.5), "back as it was");
     }
 }
 

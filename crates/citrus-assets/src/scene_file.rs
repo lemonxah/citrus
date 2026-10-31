@@ -95,11 +95,36 @@ pub enum MaterialRef {
     },
 }
 
-/// One serialized component: registry name + its RON-encoded state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One serialized component: registry name + its RON-encoded state, and
+/// whether it is switched on (omitted when it is).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComponentData {
     pub kind: String,
     pub data: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+impl ComponentData {
+    /// A switched-on component.
+    pub fn new(kind: impl Into<String>, data: impl Into<String>) -> Self {
+        Self { kind: kind.into(), data: data.into(), enabled: true }
+    }
+
+    /// `c` saved, switched off when it is wrapped in [`citrus_core::Disabled`].
+    pub fn of(c: &dyn citrus_core::Component) -> Self {
+        Self { kind: c.type_name().to_owned(), data: c.save(), enabled: citrus_core::component_enabled(c) }
+    }
+
+    /// Rebuilt through `registry`, switched off when saved off.
+    pub fn load(&self, registry: &citrus_core::ComponentRegistry) -> Option<Box<dyn citrus_core::Component>> {
+        let c = registry.load(&self.kind, &self.data)?;
+        Some(if self.enabled { c } else { Box::new(citrus_core::Disabled(c)) })
+    }
 }
 
 fn default_true() -> bool {
@@ -908,6 +933,18 @@ mod rgi_compat_tests {
     use super::*;
 
     #[test]
+    fn component_enabled_flag_is_saved_only_when_off() {
+        let on = ComponentData::new("Grabbable", "()");
+        assert!(!ron::to_string(&on).unwrap().contains("enabled"), "omitted while on");
+        let off = ComponentData { enabled: false, ..on.clone() };
+        let text = ron::to_string(&off).unwrap();
+        assert!(text.contains("enabled:false"), "{text}");
+        assert_eq!(ron::from_str::<ComponentData>(&text).unwrap(), off);
+        let old: ComponentData = ron::from_str("(kind:\"Grabbable\",data:\"()\")").unwrap();
+        assert!(old.enabled, "old scenes load switched on");
+    }
+
+    #[test]
     fn voxel_grid_mode_all_covers_every_variant_with_labels() {
         assert_eq!(VoxelGridMode::ALL.len(), 4);
         for m in VoxelGridMode::ALL {
@@ -1017,7 +1054,7 @@ mod model_instance_tests {
         file.entries.push(entry("Lamp", ObjectSource::Empty, Some(0), [0.0; 3]));
         // Something references Part3, so it must keep its id and stay stored.
         let part3_id = file.entries[3].id.clone();
-        file.entries[4].components.push(ComponentData { kind: "Spin".into(), data: format!("(target:(Some(\"{part3_id}\")))") });
+        file.entries[4].components.push(ComponentData::new("Spin", format!("(target:(Some(\"{part3_id}\")))")));
 
         let full = file.clone();
         file.compact_models(&|_| Some(parts()));
@@ -1051,7 +1088,7 @@ mod model_instance_tests {
             file.entries.push(entry(&format!("Part{k}"), model(k), Some(0), [k as f32, 0.0, 0.0]));
         }
         file.entries[2].material = MaterialRef::File("materials/brick.material".into());
-        file.entries[3].components.push(ComponentData { kind: "Spin".into(), data: "()".into() });
+        file.entries[3].components.push(ComponentData::new("Spin", "()"));
         file.compact_models(&|_| Some(parts()));
         assert_eq!(file.entries.len(), 3, "root + the two edited parts");
     }

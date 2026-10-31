@@ -14,12 +14,11 @@ use super::builder::{self, CHARACTER_LAYER, Scene, axis1, button, keys, mouse, w
 fn unit(s: &mut Scene, name: &str, t: [f32; 3]) -> usize {
     let root = s.empty(name, None, t);
     s.character_layer(root);
-    s.prim("Body", PrimitiveShape::Capsule, Some(root), [0.0, 0.6, 0.0], [1.6, 0.8, 1.6], "ally");
-    s.prim("Helmet", PrimitiveShape::Sphere, Some(root), [0.0, 1.15, 0.0], [0.45; 3], "metal");
+    super::avatar::visuals(s, root, root, false);
     let ring = s.prim("Selection Ring", PrimitiveShape::Plane, Some(root), [0.0, 0.03, 0.0], [0.6, 1.0, 0.6], "select_ring");
     s.hidden(ring);
     let ring = s.r(ring);
-    s.with(root, CharacterController { radius: 0.4, height: 1.2, center: [0.0, 0.6, 0.0], ..Default::default() })
+    s.with(root, CharacterController { radius: 0.4, ..Default::default() })
         .with(root, NavAgent { speed: 5.0, turn_speed: 720.0, stopping_distance: 0.15, ..Default::default() })
         .with(root, Selectable { ring, team: 1, ..Default::default() });
     root

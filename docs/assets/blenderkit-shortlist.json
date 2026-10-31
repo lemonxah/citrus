@@ -1,0 +1,515 @@
+{
+  "checked": "2026-10-31",
+  "assets": [
+    {
+      "role": "Rifle",
+      "priority": "P0",
+      "templates": "FPS, TPS",
+      "name": "Low poly TR21 assault rifle",
+      "author": "fakhrodin Nastari",
+      "asset_base_id": "d859aa94-2e31-4784-aa16-a307a936e2bc",
+      "asset_id": "e60a987f-176e-4001-bcbc-810db8884212",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/d859aa94-2e31-4784-aa16-a307a936e2bc/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 4787,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Pistol",
+      "priority": "P0",
+      "templates": "VR Shooter",
+      "name": "P320 Handgun",
+      "author": "Zuhaib Khoso",
+      "asset_base_id": "78f8c399-3f03-4ea8-b58f-da40b42c6b7f",
+      "asset_id": "d1510159-defc-4546-aa3c-274dbc3fb165",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/78f8c399-3f03-4ea8-b58f-da40b42c6b7f/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 1998,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Blaster",
+      "priority": "P1",
+      "templates": "VR Shooter",
+      "name": "Sci-Fi Energy Blaster Gun",
+      "author": "Adeel afzal",
+      "asset_base_id": "fd4a9a84-ed5c-4220-ae37-79f8a684fce7",
+      "asset_id": "14fc5afb-8736-46e3-ae1a-b346da1ab8b4",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/fd4a9a84-ed5c-4220-ae37-79f8a684fce7/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 3332,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Rigged hands",
+      "priority": "P0",
+      "templates": "FPS, VR",
+      "name": "Rigged Hand For CGI",
+      "author": "Mahmoud Aboghnima",
+      "asset_base_id": "cf4b4bbb-486a-4cc6-8e7b-41f58e27a76f",
+      "asset_id": "c40e4a05-c447-42af-914b-1182c893cffd",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/cf4b4bbb-486a-4cc6-8e7b-41f58e27a76f/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 1772,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Wooden crate",
+      "priority": "P0",
+      "templates": "FPS, TPS",
+      "name": "Wooden Military Crate",
+      "author": "Poly Haven ",
+      "asset_base_id": "ffae7880-9e4f-42e0-a61e-d0a5e1a1c766",
+      "asset_id": "776cf4cd-dc48-4c61-88da-16b25fcccdc5",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/ffae7880-9e4f-42e0-a61e-d0a5e1a1c766/",
+      "license": "cc_zero",
+      "access": "Free",
+      "reported_faces": 11541,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Metal crate",
+      "priority": "P1",
+      "templates": "FPS, TPS",
+      "name": "Old Military Crate",
+      "author": "Poly Haven ",
+      "asset_base_id": "10fa7d45-e4b0-465b-9e0c-aca47991f00c",
+      "asset_id": "655a1ef2-c5bd-424a-97b1-667602f07e93",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/10fa7d45-e4b0-465b-9e0c-aca47991f00c/",
+      "license": "cc_zero",
+      "access": "Free",
+      "reported_faces": 15936,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Concrete cover",
+      "priority": "P0",
+      "templates": "FPS, TPS",
+      "name": "Damaged Concrete Barrier",
+      "author": "DiCaprio ",
+      "asset_base_id": "93bfa213-a008-40ad-a805-504914e5b24a",
+      "asset_id": "7ea0c525-c477-43c8-8c92-7c0b1ed3a6a9",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/93bfa213-a008-40ad-a805-504914e5b24a/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 687,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Gun bench",
+      "priority": "P1",
+      "templates": "VR Shooter",
+      "name": "Work Bench",
+      "author": "Haseeb Ahmed",
+      "asset_base_id": "17754f9b-0fa5-4124-8375-d3e4d066c648",
+      "asset_id": "71c8784b-3d33-4631-806e-acd11c43e95e",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/17754f9b-0fa5-4124-8375-d3e4d066c648/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 876,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Target stand",
+      "priority": "P1",
+      "templates": "Shooters; adapt to firearm target",
+      "name": "Archery straw target",
+      "author": "Joachim Bornemann",
+      "asset_base_id": "40c57767-107b-4b80-96a9-dbca2dd9d627",
+      "asset_id": "762b8d4a-e61f-4919-83f7-3fea3fbb856c",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/40c57767-107b-4b80-96a9-dbca2dd9d627/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 6468,
+      "formats": [
+        "blend"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Lever",
+      "priority": "P1",
+      "templates": "Top-down",
+      "name": "Factory lever switch",
+      "author": "Robert Restu Pambudi",
+      "asset_base_id": "6451e732-fde3-4493-ab56-299f3b0c892a",
+      "asset_id": "0bb13e5f-061e-4d80-bcb0-b8bfd132c73d",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/6451e732-fde3-4493-ab56-299f3b0c892a/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 8427,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Gate",
+      "priority": "P1",
+      "templates": "Top-down",
+      "name": "Modern Metal Gate",
+      "author": "FortaMesh Moezi",
+      "asset_base_id": "66e3bb3c-14d6-4d1a-a853-f80ada095201",
+      "asset_id": "7ac6aa9f-5826-452d-b094-e5cbcb4486e2",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/66e3bb3c-14d6-4d1a-a853-f80ada095201/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 9786,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Lamp post",
+      "priority": "P1",
+      "templates": "Top-down",
+      "name": "Classic Single Street Lamp",
+      "author": "Kumar Chitrasen",
+      "asset_base_id": "59a65814-9c15-4595-adab-e69e31396fe7",
+      "asset_id": "82b647c8-2f42-4ed2-9214-40e4de8aff30",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/59a65814-9c15-4595-adab-e69e31396fe7/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 717,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Rock variants",
+      "priority": "P1",
+      "templates": "Top-down, RTS",
+      "name": "Low Poly Rock",
+      "author": "Samaneh Jeiroodi",
+      "asset_base_id": "d4bc0e5f-4628-4ff2-865b-ce6737fb8e96",
+      "asset_id": "30f99655-1d28-46cb-9f18-b89a745b5360",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/d4bc0e5f-4628-4ff2-865b-ce6737fb8e96/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 4964,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Treasure chest",
+      "priority": "P1",
+      "templates": "Top-down",
+      "name": "Wooden Treasure Chest",
+      "author": "Banula Perera",
+      "asset_base_id": "9b31aaae-e983-4b0e-954b-9b2ef880fd14",
+      "asset_id": "5c8a0a7c-5352-4dcb-a8ff-d77d64cbf96a",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/9b31aaae-e983-4b0e-954b-9b2ef880fd14/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 8729,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Tree",
+      "priority": "P1",
+      "templates": "RTS, top-down",
+      "name": "Low poly tree",
+      "author": "Amal David",
+      "asset_base_id": "346d99d8-36fb-4f9d-a4a1-2f9ad9233e79",
+      "asset_id": "251d2e42-8c78-490e-9d44-ea4069c61a89",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/346d99d8-36fb-4f9d-a4a1-2f9ad9233e79/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 537,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Base building",
+      "priority": "P1",
+      "templates": "RTS",
+      "name": "Low poly house",
+      "author": "Abraham Ballesteros",
+      "asset_base_id": "21c30fc8-4bf2-421b-aaf5-45329a7aea67",
+      "asset_id": "5fb76932-3d97-49a2-b004-043151a3f26f",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/21c30fc8-4bf2-421b-aaf5-45329a7aea67/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 4446,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Table",
+      "priority": "P1",
+      "templates": "VR Social",
+      "name": "Bistro Wood Table",
+      "author": "Visual Diverse ",
+      "asset_base_id": "a156684f-3298-4548-b36d-c1795893bd20",
+      "asset_id": "fcfb9b7e-579b-480f-9d9f-a54be39c2963",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/a156684f-3298-4548-b36d-c1795893bd20/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 8354,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Sofa",
+      "priority": "P2",
+      "templates": "VR Social, scene demos",
+      "name": "Low - Poly Sofa 1",
+      "author": "Saptarshi ",
+      "asset_base_id": "da429d01-94f6-4866-b7e6-18a9c99b23b0",
+      "asset_id": "8a2e81d5-180b-457e-ae1d-175ea4eb89cd",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/da429d01-94f6-4866-b7e6-18a9c99b23b0/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 2240,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Wall light",
+      "priority": "P1",
+      "templates": "VR Social",
+      "name": "Modern Facade Sconce",
+      "author": "Dal Roron",
+      "asset_base_id": "7a9fff83-b2f4-4aeb-ba6c-de5ac3d6c0ef",
+      "asset_id": "38b72f14-2dee-4378-9e5d-0698fbe3013d",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/7a9fff83-b2f4-4aeb-ba6c-de5ac3d6c0ef/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 1185,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Throwable ball",
+      "priority": "P1",
+      "templates": "VR templates",
+      "name": "Football (Soccer Ball)",
+      "author": "Mohammed Hossain",
+      "asset_base_id": "bd288ef9-e19b-40a7-adc5-47aca6f18d6d",
+      "asset_id": "ea078c17-d373-4b7c-bdcf-1d7fa04b4ebf",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/bd288ef9-e19b-40a7-adc5-47aca6f18d6d/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": 2160,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Barrel",
+      "priority": "P2",
+      "templates": "Shooters",
+      "name": "Wasteland Oil Barrel",
+      "author": "Mr. Naseriyan ",
+      "asset_base_id": "b749913f-7d22-4e79-bc52-50b75e341ea0",
+      "asset_id": "43e2472d-0508-480c-9d67-18574c6d0fd3",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/b749913f-7d22-4e79-bc52-50b75e341ea0/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 2573,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Room walls",
+      "priority": "P1",
+      "templates": "VR Social",
+      "name": "Modular office walls",
+      "author": "Felipe de Melo",
+      "asset_base_id": "d6defc31-e193-4134-976b-f348392d784f",
+      "asset_id": "9046d40e-285a-4faa-89d1-b405c78a9bb1",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/d6defc31-e193-4134-976b-f348392d784f/",
+      "license": "royalty_free",
+      "access": "Full plan",
+      "reported_faces": 888,
+      "formats": [
+        "blend",
+        "gltf",
+        "gltf_godot"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Concrete PBR",
+      "priority": "P1",
+      "templates": "Shooters",
+      "name": "Concrete floor or wall",
+      "author": "Steffen ",
+      "asset_base_id": "8c46499f-fa02-4f51-9e9d-346fae88e2d3",
+      "asset_id": "03e00808-a05e-4064-ba3e-07157fed796e",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/8c46499f-fa02-4f51-9e9d-346fae88e2d3/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": null,
+      "formats": [
+        "blend"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Wood PBR",
+      "priority": "P1",
+      "templates": "VR Social",
+      "name": "Wood Floor",
+      "author": "Griffin Ernyei",
+      "asset_base_id": "16e334c2-9af0-425b-bfac-1032c7cc2e94",
+      "asset_id": "a328a7d9-855e-45e2-bfb4-b5318813774c",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/16e334c2-9af0-425b-bfac-1032c7cc2e94/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": null,
+      "formats": [
+        "blend"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Ground PBR",
+      "priority": "P1",
+      "templates": "Top-down, RTS",
+      "name": "Grass Ground",
+      "author": "Julio Sillet",
+      "asset_base_id": "d31de4c9-c5de-483f-8744-e8aa69740fc4",
+      "asset_id": "f6238676-831a-4874-b264-b223721ecaab",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/d31de4c9-c5de-483f-8744-e8aa69740fc4/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": null,
+      "formats": [
+        "blend"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    },
+    {
+      "role": "Sky HDRI",
+      "priority": "P1",
+      "templates": "Outdoor templates",
+      "name": "Cloudy Sky HDRI",
+      "author": "Ibrohim Toxirov",
+      "asset_base_id": "34fd406a-9f84-4e6f-913f-9cef65f99c70",
+      "asset_id": "23cc8d16-8e3b-4b75-babe-310fa427f261",
+      "url": "https://www.blenderkit.com/asset-gallery-detail/34fd406a-9f84-4e6f-913f-9cef65f99c70/",
+      "license": "royalty_free",
+      "access": "Free",
+      "reported_faces": null,
+      "formats": [
+        "blend"
+      ],
+      "status": "candidate",
+      "authorship": "unverified"
+    }
+  ]
+}

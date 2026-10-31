@@ -2108,6 +2108,30 @@ mod tests {
     }
 
     #[test]
+    fn a_switched_off_component_is_ignored_and_survives_a_save() {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        let ball = obj(&mut scene, Vec3::new(0.0, 3.0, 0.0), vec![Box::new(SphereCollider::default()), Box::new(RbComponent::default())]);
+        let i = scene.index_of(ball).unwrap();
+        // Rigid Body off: the ball is a fixed collider and stays put.
+        assert!(citrus_core::set_component_enabled(&mut scene.objects[i].components[1], false));
+        let mut pw = PhysicsWorld::build(&scene);
+        run(&mut pw, &mut scene, 60);
+        assert!((scene.world_transform(i).w_axis.y - 3.0).abs() < 1e-4, "a switched-off Rigid Body doesn't fall");
+        // Snapshots keep it off, settings and all.
+        let saved = scene.objects[i].save_components();
+        assert!(!saved[1].enabled && saved[0].enabled);
+        let registry = citrus_core::ComponentRegistry::with_builtins();
+        scene.objects[i].load_components(&saved, &registry);
+        assert!(!citrus_core::component_enabled(scene.objects[i].components[1].as_ref()));
+        // Back on, it falls.
+        assert!(citrus_core::set_component_enabled(&mut scene.objects[i].components[1], true));
+        let mut pw = PhysicsWorld::build(&scene);
+        run(&mut pw, &mut scene, 60);
+        assert!(scene.world_transform(i).w_axis.y < 2.5, "switched back on, it falls");
+    }
+
+    #[test]
     fn static_friction_holds_what_sliding_friction_would_let_go() {
         // tan 26 = 0.49: more than 0.4 sliding friction, less than 0.6 static.
         let sliding = PhysicsMaterial { friction: 0.4, static_friction: None, ..Default::default() };

@@ -487,6 +487,75 @@ fn tokenize(d: &str) -> Vec<Tok> {
     out
 }
 
+const APP_ICON_SIZE: u32 = 256;
+
+/// The same orange slice as `paint_logo`, rasterized for window and desktop icons.
+pub fn app_icon_rgba() -> (u32, u32, Vec<u8>) {
+    let size = APP_ICON_SIZE;
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    let accent = crate::theme::ACCENT_DEFAULT;
+    let dark = crate::theme::BG_CHROME;
+    // Work in paint_logo's 20×20 coordinate space, with four samples per axis.
+    for y in 0..size {
+        for x in 0..size {
+            let mut rgba = [0_u32; 4];
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let dx = (x as f32 + (sx as f32 + 0.5) / 4.0) * 20.0 / size as f32 - 10.0;
+                    let dy = (y as f32 + (sy as f32 + 0.5) / 4.0) * 20.0 / size as f32 - 10.0;
+                    let radius = dx.hypot(dy);
+                    if radius > 9.0 {
+                        continue;
+                    }
+                    let on_spoke = [(0.0_f32, 6.6_f32), (5.7, 3.3), (5.7, -3.3)]
+                        .iter()
+                        .any(|&(vx, vy)| {
+                            let t = ((dx * vx + dy * vy) / (vx * vx + vy * vy)).clamp(-1.0, 1.0);
+                            (dx - t * vx).hypot(dy - t * vy) <= 0.6
+                        });
+                    let color = if radius <= 1.6 || (radius - 6.6).abs() <= 0.6 || on_spoke { dark } else { accent };
+                    rgba[0] += color.r() as u32;
+                    rgba[1] += color.g() as u32;
+                    rgba[2] += color.b() as u32;
+                    rgba[3] += 255;
+                }
+            }
+            // Keep partially covered edge pixels in straight-alpha format.
+            let samples = rgba[3] / 255;
+            if samples == 0 {
+                pixels.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                pixels.extend_from_slice(&[
+                    (rgba[0] / samples) as u8,
+                    (rgba[1] / samples) as u8,
+                    (rgba[2] / samples) as u8,
+                    (rgba[3] / 16) as u8,
+                ]);
+            }
+        }
+    }
+    (size, size, pixels)
+}
+
+/// Refresh the user icon for Wayland, including older green Citrus icons.
+/// Shared by the editor and hub so either entry point updates the cached PNG.
+pub fn install_app_icon() -> image::ImageResult<()> {
+    let Some(home) = std::env::var_os("HOME") else { return Ok(()) };
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(home).join(".local/share"));
+    let path = data.join("icons/hicolor/256x256/apps/citrus.png");
+    let (width, height, pixels) = app_icon_rgba();
+    let buffer = image::RgbaImage::from_raw(width, height, pixels).expect("icon buffer size");
+    if image::open(&path).is_ok_and(|existing| existing.to_rgba8() == buffer) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    buffer.save(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

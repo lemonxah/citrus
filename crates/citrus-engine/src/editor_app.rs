@@ -38,6 +38,10 @@ use crate::scene::{LoadedScene, RenderInfo, material_from_model, model_from_mate
 use crate::shaders::ShaderLibrary;
 use crate::undo::{ObjectState, UndoEntry, UndoStack};
 
+/// Startup steps the splash's progress bar counts: Vulkan, plugins, project,
+/// scene parse, scene install, open.
+const LOAD_STEPS: usize = 6;
+
 pub struct AppConfig {
     pub title: String,
     pub width: u32,
@@ -192,6 +196,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         panning: false,
         look_delta: (0.0, 0.0),
         keys: HashSet::new(),
+        modifiers: winit::keyboard::ModifiersState::empty(),
         input: crate::input_engine::InputManager::default(),
         net: None,
         voice: None,
@@ -215,6 +220,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_project_settings: false,
         show_new_project: false,
         show_open_project: false,
+        pending_project_switch: None,
         open_project_path: String::new(),
         lightmap_preview: false,
         scene_dirty: false,
@@ -565,6 +571,8 @@ enum EditorAction {
     NewProject { parent: PathBuf, name: String, template: String },
     /// Open (switch to) an existing project folder.
     OpenProject(PathBuf),
+    /// Start the Project Hub executable.
+    OpenProjectHub,
     /// Compile the current project into a standalone executable for a target.
     BuildGame(bundle::BuildTarget),
 }
@@ -603,17 +611,19 @@ fn default_layout() -> DockState<Tab> {
     let tree = state.main_surface_mut();
     // Right (Inspector) node a touch wider (~30px at the 1600px default)
     // so the inspector's rows fit without clipping.
-    // Spec §3 at the 1600x960 reference: inspector 324, hierarchy 264, bottom
-    // dock 288 (hierarchy and inspector run full height).
+    // At the 1600x960 reference: inspector 324 and the left column 264 run
+    // full height; the left column holds the Scene tree above Files, and the
+    // console sits under the viewport.
     let [viewport, _right] = tree.split_right(
         NodeIndex::root(),
         1.0 - citrus_editor::theme::W_INSPECTOR / 1600.0,
         vec![Tab::Inspector, Tab::Environment, Tab::Baker, Tab::Occlusion],
     );
-    let [viewport, _left] =
+    let [viewport, left] =
         tree.split_left(viewport, citrus_editor::theme::W_HIERARCHY / (1600.0 - citrus_editor::theme::W_INSPECTOR), vec![Tab::Scene]);
+    let [_scene, _files] = tree.split_below(left, 0.55, vec![Tab::Files]);
     let [_viewport, _bottom] =
-        tree.split_below(viewport, 1.0 - citrus_editor::theme::H_BOTTOM_DOCK / 894.0, vec![Tab::Files, Tab::Log]);
+        tree.split_below(viewport, 1.0 - citrus_editor::theme::H_BOTTOM_DOCK / 894.0, vec![Tab::Log]);
     state
 }
 
@@ -765,14 +775,17 @@ impl Default for WidgetSetting {
     }
 }
 
-/// Viewport billboard-widget filter (top-right overlay). Only billboard icons
-/// are filtered; the move/rotate/scale gizmos are never hidden. A filtered-
-/// off billboard still draws when its object is the current selection.
+/// What the viewport draws over the scene (the eye split button, top
+/// right): the eye hides or shows every gizmo and billboard at once, its
+/// dropdown picks which kinds show. A filtered-off billboard still draws when
+/// its object is the current selection.
 #[derive(Clone)]
 struct WidgetFilter {
-    /// Master toggle (the eye button): when false, no gizmos/widgets/billboards
-    /// are shown at all (transform handles included).
+    /// Master toggle (the eye): when false, no gizmos or billboards are shown
+    /// except the move / rotate / scale handles, which always show.
     enabled: bool,
+    /// Component gizmos: collider shapes, volumes, water outlines, joints...
+    components: bool,
     lights: WidgetSetting,
     cameras: WidgetSetting,
     probes: WidgetSetting,
@@ -792,6 +805,7 @@ impl Default for WidgetFilter {
     fn default() -> Self {
         Self {
             enabled: true,
+            components: true,
             lights: WidgetSetting::default(),
             cameras: WidgetSetting::default(),
             probes: WidgetSetting::default(),
@@ -1030,6 +1044,8 @@ struct EngineApp {
     /// Raw mouse deltas accumulated while looking.
     look_delta: (f64, f64),
     keys: HashSet<KeyCode>,
+    /// Ctrl / Shift / Alt as the window reports them.
+    modifiers: winit::keyboard::ModifiersState,
     /// Input binding system (2C): drives Play-mode components from the active
     /// control scheme; editable in the Bindings window.
     input: crate::input_engine::InputManager,
@@ -1125,6 +1141,9 @@ struct EngineApp {
     new_project_filter: Option<crate::templates::TemplateCategory>,
     /// Open Project dialog open + the folder path being entered.
     show_open_project: bool,
+    /// Project chosen while the scene had unsaved edits: the Save / Discard /
+    /// Cancel prompt is up, then the switch goes ahead.
+    pending_project_switch: Option<PathBuf>,
     open_project_path: String,
     /// Baker's Man: render objects as a lightmap-UV checker (texel-density preview).
     lightmap_preview: bool,
@@ -1584,10 +1603,56 @@ impl EngineApp {
         }
     }
 
+    /// Enter startup step `step` of [`LOAD_STEPS`]: advances the splash's
+    /// progress bar and shows `status`.
+    fn set_load_step(&mut self, step: usize, status: &str) {
+        if let Some(s) = self.splash.as_mut() {
+            s.set_progress(step, LOAD_STEPS);
+        }
+        self.set_load_status(status);
+    }
+
+    /// Add the open project to the shared recent-projects list (the Project
+    /// Hub shows it), so projects opened from the command line appear there.
+    fn record_recent_project(&self) {
+        if let Err(e) = citrus_assets::recent_projects::record_opened(&self.project_root, &self.project.name, env!("CARGO_PKG_VERSION")) {
+            tracing::warn!("recording recent project: {e:#}");
+        }
+    }
+
+    /// Start the Project Hub (a separate executable next to the editor).
+    fn launch_project_hub(&mut self) {
+        use citrus_assets::launcher;
+        let started = launcher::find_executable(launcher::HUB_BIN, None, launcher::HUB_ENV).and_then(|hub| {
+            let cmd = launcher::LaunchCommand::hub(&hub);
+            cmd.command().spawn().map_err(|e| anyhow::anyhow!("starting {}: {e}", cmd.display()))
+        });
+        match started {
+            Ok(_) => self.tasks.notify("Project Hub opened", crate::tasks::NotifyLevel::Info),
+            Err(e) => {
+                tracing::error!("Project Hub: {e:#}");
+                self.tasks.notify(format!("Project Hub: {e}"), crate::tasks::NotifyLevel::Warn);
+            }
+        }
+    }
+
+    /// Switch to `root`, first asking to save when the scene has unsaved edits.
+    fn request_switch_project(&mut self, root: PathBuf) {
+        if self.scene_dirty {
+            self.pending_project_switch = Some(root);
+        } else {
+            self.switch_project(root);
+        }
+    }
+
     /// Open the editor window (deferred until the renderer + scene finished
     /// loading, so it never appears half-loaded). The splash closes on the first
     /// editor frame.
     fn open_editor(&mut self) {
+        if let Some(s) = self.splash.as_mut() {
+            s.set_progress(LOAD_STEPS, LOAD_STEPS);
+            s.set_status("Opening editor…");
+        }
         *self.load_status.lock().unwrap() = String::new();
         self.window = self.pending_window.take();
         if let Some(w) = &self.window {
@@ -1611,6 +1676,7 @@ impl EngineApp {
             });
             self.plugin_rx = Some(rx);
         }
+        self.set_load_step(1, "Starting Vulkan and building pipelines…");
         // Phosphor icon font (file-browser type icons, etc.).
         citrus_editor::install_icon_font(&self.egui_ctx);
         apply_editor_style(&self.egui_ctx);
@@ -1696,6 +1762,7 @@ impl EngineApp {
         xr: Option<citrus_xr::XrContext>,
         plugins_built: Option<Result<Vec<String>>>,
     ) -> Result<()> {
+        self.set_load_step(3, "Loading project…");
         // Plugins first: scene files may reference plugin components.
         let loaded = plugins_built.map(|built| {
             built.and_then(|names| {
@@ -1728,6 +1795,7 @@ impl EngineApp {
             }
         }
         window.set_title(&format!("{} — citrus", self.project.name));
+        self.record_recent_project();
         // Load the project's input bindings (2C) into the live input manager.
         self.sync_input_bindings();
         renderer.set_vsync(self.project.settings.vsync);
@@ -1737,7 +1805,7 @@ impl EngineApp {
         self.gizmo.grid_size = self.project.settings.grid_size;
         apply_accent(&self.egui_ctx, self.project.settings.accent);
 
-        self.set_load_status("Loading scene…");
+        self.set_load_step(4, "Loading scene…");
         // Decide the scene to load. A `.scene` is parsed on a worker thread (the
         // editor opens only once it's fully loaded, never half-loaded). Cheap/rare
         // cases (a single CLI model, the builtin test scene) load synchronously
@@ -1834,7 +1902,11 @@ impl EngineApp {
     /// frames (`step_post_load`) so the editor keeps drawing. Opens the editor if
     /// this was the startup load.
     fn apply_loaded_scene(&mut self, data: crate::scene_loader::LoadedSceneData) {
-        self.set_load_status("Installing scene…");
+        if self.window.is_none() {
+            self.set_load_step(5, "Installing scene…");
+        } else {
+            self.set_load_status("Installing scene…");
+        }
         let path = data.path.clone();
         let editor_camera = data.file.editor_camera;
         let collapsed = data.file.collapsed.clone();
@@ -4093,7 +4165,7 @@ impl EngineApp {
                     match bundle::scaffold_project(&parent, &name, &template) {
                         Ok(root) => {
                             tracing::info!("scaffolded project at {}", root.display());
-                            self.switch_project(root);
+                            self.request_switch_project(root);
                         }
                         Err(e) => {
                             tracing::error!("creating project: {e:#}");
@@ -4104,7 +4176,7 @@ impl EngineApp {
                 EditorAction::OpenProject(root) => {
                     if root.join("project.citrus").is_file() {
                         tracing::info!("opening project {}", root.display());
-                        self.switch_project(root);
+                        self.request_switch_project(root);
                     } else {
                         self.set_status(
                             format!("no project.citrus in {}", root.display()),
@@ -4112,6 +4184,7 @@ impl EngineApp {
                         );
                     }
                 }
+                EditorAction::OpenProjectHub => self.launch_project_hub(),
                 EditorAction::BuildGame(target) => {
                     if self.building_game {
                         self.tasks.notify("A game build is already running", crate::tasks::NotifyLevel::Info);
@@ -4212,6 +4285,9 @@ impl EngineApp {
         add("Save scene", "File", PaletteCmd::SaveScene);
         add("New scene", "File", PaletteCmd::NewScene);
         add("Build game", "File", PaletteCmd::BuildGame);
+        add("Open Project Hub", "File", PaletteCmd::ProjectHub);
+        add("New project", "File", PaletteCmd::NewProject);
+        add("Open project", "File", PaletteCmd::OpenProject);
         if !cfg!(windows) {
             add("Build game for Windows", "File", PaletteCmd::BuildGameWindows);
         }
@@ -4221,6 +4297,7 @@ impl EngineApp {
         add("Focus selection", "View", PaletteCmd::Focus);
         add("Reset layout", "View", PaletteCmd::ResetLayout);
         add("Toggle game UI overlay", "View", PaletteCmd::ToggleGameUi);
+        add("Show / hide gizmos and billboards", "View", PaletteCmd::ToggleGizmos);
         for (k, (_, label)) in PALETTE_TABS.iter().enumerate() {
             add(&format!("Open {label}"), "Windows", PaletteCmd::OpenTab(k));
         }
@@ -4255,6 +4332,19 @@ impl EngineApp {
             PaletteCmd::SaveScene => self.actions.push(EditorAction::SaveScene(None)),
             PaletteCmd::NewScene => self.actions.push(EditorAction::NewScene),
             PaletteCmd::BuildGame => self.actions.push(EditorAction::BuildGame(bundle::BuildTarget::Host)),
+            PaletteCmd::ProjectHub => self.actions.push(EditorAction::OpenProjectHub),
+            PaletteCmd::NewProject => {
+                if self.new_project_parent.is_empty() {
+                    self.new_project_parent = self.project_root.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                }
+                self.show_new_project = true;
+            }
+            PaletteCmd::OpenProject => {
+                if self.open_project_path.is_empty() {
+                    self.open_project_path = self.project_root.display().to_string();
+                }
+                self.show_open_project = true;
+            }
             PaletteCmd::BuildGameWindows => self.actions.push(EditorAction::BuildGame(bundle::BuildTarget::Windows)),
             PaletteCmd::Undo => self.actions.push(EditorAction::Undo),
             PaletteCmd::Redo => self.actions.push(EditorAction::Redo),
@@ -4266,6 +4356,7 @@ impl EngineApp {
             PaletteCmd::Focus => self.actions.push(EditorAction::FocusSelected),
             PaletteCmd::ResetLayout => self.dock_state = default_layout(),
             PaletteCmd::ToggleGameUi => self.widget_filter.game_ui = !self.widget_filter.game_ui,
+            PaletteCmd::ToggleGizmos => self.widget_filter.enabled = !self.widget_filter.enabled,
             PaletteCmd::OpenTab(k) => {
                 let tab = PALETTE_TABS[k].0.clone();
                 match self.dock_state.find_tab(&tab) {
@@ -4324,6 +4415,14 @@ impl EngineApp {
             });
             egui::MenuBar::new().style(menu_style).ui(&mut left_ui, |ui| {
                 top_menu(&mut bar, ui, "File", |ui| {
+                    if ui
+                        .button("Project Hub…")
+                        .on_hover_text("Recent projects, templates and opening projects (a separate window)")
+                        .clicked()
+                    {
+                        self.actions.push(EditorAction::OpenProjectHub);
+                        ui.close();
+                    }
                     if ui.button("New Project…").clicked() {
                         if self.new_project_parent.is_empty() {
                             // Default new projects beside the current project.
@@ -6429,11 +6528,50 @@ impl EngineApp {
                 self.show_quit_dialog = false;
             }
         }
+
+        // ---- Unsaved changes before switching project ----
+        if let Some(root) = self.pending_project_switch.clone() {
+            let mut open = true;
+            let mut decided = false;
+            egui::Window::new("Switch project")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    ui.label(format!("This scene has unsaved changes. Save before opening {name}?"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if citrus_editor::widgets::primary_button(ui, None, "Save & Switch").clicked() {
+                            // Actions run in order: the save lands, then the switch.
+                            self.actions.push(EditorAction::SaveScene(None));
+                            self.actions.push(EditorAction::OpenProject(root.clone()));
+                            decided = true;
+                        }
+                        if citrus_editor::widgets::secondary_button(ui, None, "Discard & Switch").clicked() {
+                            self.scene_dirty = false;
+                            self.actions.push(EditorAction::OpenProject(root.clone()));
+                            decided = true;
+                        }
+                        if citrus_editor::widgets::secondary_button(ui, None, "Cancel").clicked() {
+                            decided = true;
+                        }
+                    });
+                });
+            if decided || !open {
+                self.pending_project_switch = None;
+            }
+        }
     }
 
     /// Point the editor at a different project root: reload its project file,
     /// file browser, plugins, and boot/last scene. Used after New Project.
     fn switch_project(&mut self, root: PathBuf) {
+        // Keep the working folder on the project, as `citrus <dir>` starts it.
+        if let Err(e) = std::env::set_current_dir(&root) {
+            tracing::warn!("entering {}: {e}", root.display());
+        }
         self.project_root = root.clone();
         self.file_browser = FileBrowser::new(root.clone());
         self.current_scene_path = None;
@@ -6473,6 +6611,7 @@ impl EngineApp {
         if let Some(window) = self.window.as_ref() {
             window.set_title(&format!("{} — citrus", self.project.name));
         }
+        self.record_recent_project();
         self.set_status(format!("opened project {}", self.project.name), false);
     }
 
@@ -7163,15 +7302,15 @@ impl EngineApp {
         let changed: Vec<(String, String)> = after
             .components
             .iter()
-            .filter(|(name, ron)| {
-                before
-                    .components
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, r)| r)
-                    != Some(ron)
-            })
-            .cloned()
+            .filter(|c| before.components.iter().find(|b| b.kind == c.kind).map(|b| &b.data) != Some(&c.data))
+            .map(|c| (c.kind.clone(), c.data.clone()))
+            .collect();
+        // Components switched on or off on the anchor this edit.
+        let toggled: Vec<(String, bool)> = after
+            .components
+            .iter()
+            .filter(|c| before.components.iter().find(|b| b.kind == c.kind).is_some_and(|b| b.enabled != c.enabled))
+            .map(|c| (c.kind.clone(), c.enabled))
             .collect();
         let targets: Vec<usize> = self
             .multi_objects
@@ -7186,7 +7325,7 @@ impl EngineApp {
         let field_edits: Vec<FieldEdit> = changed
             .iter()
             .map(|(name, ron)| {
-                let before_ron = before.components.iter().find(|(n, _)| n == name).map(|(_, r)| r.as_str()).unwrap_or("");
+                let before_ron = before.components.iter().find(|c| &c.kind == name).map(|c| c.data.as_str()).unwrap_or("");
                 (name.clone(), crate::ron_fields::changed(before_ron, ron))
             })
             .collect();
@@ -7207,14 +7346,19 @@ impl EngineApp {
             if after.cast_shadows != before.cast_shadows {
                 self.scene.objects[j].cast_shadows = after.cast_shadows;
             }
+            for (name, on) in &toggled {
+                if let Some(slot) = self.scene.objects[j].components.iter_mut().find(|c| c.type_name() == name.as_str()) {
+                    citrus_core::set_component_enabled(slot, *on);
+                }
+            }
             if !changed.is_empty() {
                 let mut comps = self.scene.objects[j].save_components();
                 let mut touched = false;
                 for ((name, ron), (_, fields)) in changed.iter().zip(&field_edits) {
-                    if let Some(slot) = comps.iter_mut().find(|(n, _)| n == name) {
+                    if let Some(slot) = comps.iter_mut().find(|c| &c.kind == name) {
                         // Only the fields that changed, so the others keep their
                         // own values; whole-component copy when the RON can't be split.
-                        slot.1 = fields.as_ref().and_then(|f| crate::ron_fields::patch(&slot.1, f)).unwrap_or_else(|| ron.clone());
+                        slot.data = fields.as_ref().and_then(|f| crate::ron_fields::patch(&slot.data, f)).unwrap_or_else(|| ron.clone());
                         touched = true;
                     }
                 }
@@ -10848,7 +10992,7 @@ impl EditorTabs<'_> {
         // While the camera is actively orbiting, ignore every viewport widget so
         // a rotate gesture can't grab a probe/collider/audio handle or the gizmo
         // as the cursor sweeps across them.
-        if !self.orbiting && self.widget_filter.enabled {
+        if !self.orbiting && self.widget_filter.enabled && self.widget_filter.components {
             // Light Probe Volume box-resize: dragging a face handle changes the
             // volume's size along that axis, keeping the opposite face fixed. Run
             // before the transform gizmo so a grabbed handle wins the drag; the
@@ -10861,8 +11005,9 @@ impl EditorTabs<'_> {
             .then(|| self.handle_drag.as_ref().map(|d| (d.object, d.component, d.gizmo)))
             .flatten();
 
+        // The move / rotate / scale handles always show (the eye and its
+        // menu only hide the other gizmos and the billboards).
         if !self.orbiting
-            && self.widget_filter.enabled
             && !probe_active
             && !river_building
             && !ui_selected_screen
@@ -11006,6 +11151,7 @@ impl EditorTabs<'_> {
         // ALL drawn here uniformly (built-ins and plugins alike).
         // Every selected object's gizmos, not just the active one's.
         let gizmo_sels: Vec<usize> = match self.selection {
+            _ if !(self.widget_filter.enabled && self.widget_filter.components) => Vec::new(),
             Selection::Object(i) if self.multi_objects.len() > 1 && self.multi_objects.contains(i) => self.multi_objects.clone(),
             Selection::Object(i) => vec![*i],
             _ => Vec::new(),
@@ -11097,9 +11243,11 @@ impl EditorTabs<'_> {
                 }
             };
             let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+            // Shown with the eye on and Component gizmos ticked.
+            let show_components = self.widget_filter.enabled && self.widget_filter.components;
             // Mesh Collider: the shape it actually builds (triangles, a hull,
             // or the convex pieces a moving body gets).
-            if let Some(mc) = self.scene.objects[sel].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::MeshCollider>()) {
+            if let Some(mc) = self.scene.objects[sel].components.iter().filter(|_| show_components).find_map(|c| c.as_any().downcast_ref::<citrus_core::MeshCollider>()) {
                 let moving = self.scene.objects[sel]
                     .components
                     .iter()
@@ -11115,7 +11263,7 @@ impl EditorTabs<'_> {
                 }
             }
             // Joints: a dashed line from the anchor to the connected body.
-            for comp in &self.scene.objects[sel].components {
+            for comp in self.scene.objects[sel].components.iter().filter(|_| show_components) {
                 let Some(j) = comp.as_any().downcast_ref::<citrus_core::PhysicsJoint>() else { continue };
                 let Some(id) = j.connected.id() else { continue };
                 let Some(other) = self.scene.objects.iter().position(|o| o.id == id) else { continue };
@@ -11131,7 +11279,7 @@ impl EditorTabs<'_> {
                     painter.circle_stroke(pb, 5.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 200, 90)));
                 }
             }
-            for comp in &self.scene.objects[sel].components {
+            for comp in self.scene.objects[sel].components.iter().filter(|_| show_components) {
                 for spec in self.editor_components.gizmos(comp.as_ref()) {
                     match spec {
                         citrus_editor::GizmoSpec::Box {
@@ -11368,6 +11516,7 @@ impl EditorTabs<'_> {
         // component (not only dedicated Light objects). Directional/spot show
         // their aim; point/spot show their range; spot shows its cone.
         let light_sels: Vec<usize> = match *self.selection {
+            _ if !(self.widget_filter.enabled && self.widget_filter.components) => Vec::new(),
             Selection::Object(i) if self.multi_objects.len() > 1 && self.multi_objects.contains(&i) => self.multi_objects.clone(),
             Selection::Object(i) => vec![i],
             _ => Vec::new(),
@@ -11472,6 +11621,8 @@ impl EditorTabs<'_> {
         // not a `gizmos()` resize box — kept as a dedicated read-only draw.
         if let Selection::Object(i) = *self.selection
             && self.scene.is_active(i)
+            && self.widget_filter.enabled
+            && self.widget_filter.components
         {
             const YELLOW: egui::Color32 = egui::Color32::from_rgb(240, 220, 70);
             let world = self.scene.world_transform(i);
@@ -11769,17 +11920,24 @@ impl EditorTabs<'_> {
                         }
                     });
                     widgets::trough(ui, |ui| {
-                        let gizmos = widgets::icon_button(ui, Icon::Gizmo, "Gizmos (right-click: billboard widgets)", self.widget_filter.enabled);
-                        if gizmos.clicked() {
-                            self.widget_filter.enabled = !self.widget_filter.enabled;
+                        // Split button: the eye shows / hides every gizmo and
+                        // billboard, the arrow picks which kinds show.
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let shown = self.widget_filter.enabled;
+                        let (icon, tip) = if shown { (Icon::Eye, "Hide gizmos and billboards") } else { (Icon::EyeOff, "Show gizmos and billboards") };
+                        if widgets::icon_button(ui, icon, tip, shown).clicked() {
+                            self.widget_filter.enabled = !shown;
                         }
-                        egui::Popup::context_menu(&gizmos)
+                        // Highlighted while its dropdown is open (as of last frame).
+                        let open_id = egui::Id::new("vp-widget-filter-open");
+                        let was_open = ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false));
+                        let arrow = widgets::dropdown_arrow_button(ui, "Choose what shows in the viewport", was_open);
+                        egui::Popup::menu(&arrow)
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                             .show(|ui| billboard_menu(ui, self.widget_filter));
-                        let billboards = widgets::icon_button(ui, Icon::Eye, "Billboard widgets", false);
-                        egui::Popup::menu(&billboards)
-                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                            .show(|ui| billboard_menu(ui, self.widget_filter));
+                        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&arrow));
+                        ui.data_mut(|d| d.insert_temp(open_id, open));
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         if widgets::icon_button(ui, Icon::Stats, "Stats", *self.viewport_stats).clicked() {
                             *self.viewport_stats = !*self.viewport_stats;
                         }
@@ -12144,7 +12302,7 @@ impl EditorTabs<'_> {
                                 self.scene.objects[j]
                                     .save_components()
                                     .into_iter()
-                                    .map(|(n, _)| n)
+                                    .map(|c| c.kind)
                                     .collect::<std::collections::BTreeSet<String>>()
                             });
                             match sets.next() {
@@ -12244,6 +12402,7 @@ impl EditorTabs<'_> {
                     let root = self.project_root.to_string_lossy().into_owned();
                     ui.data_mut(|d| {
                         d.insert_temp(egui::Id::new(citrus_editor::PROJECT_ROOT_KEY), root);
+                        d.insert_temp(egui::Id::new(citrus_editor::PLAY_MODE_KEY), self.playing);
                         let authored = crate::authored_collision::authored_pieces(self.scene, index)
                             .map(|p| (p.len(), crate::authored_collision::pieces_summary(&p)));
                         d.insert_temp(egui::Id::new(citrus_editor::AUTHORED_COLLISION_KEY), authored);
@@ -13024,7 +13183,7 @@ struct PlayObjectState {
     rotation: glam::Quat,
     scale: glam::Vec3,
     enabled: bool,
-    components: Vec<(String, String)>,
+    components: Vec<citrus_assets::ComponentData>,
 }
 
 struct PlaySnapshot {
@@ -13639,6 +13798,11 @@ impl ApplicationHandler for EngineApp {
         // override the embedded static image.
         match crate::splash::Splash::new(event_loop, &self.project_root) {
             Ok(mut s) => {
+                let project = citrus_assets::load_project_file(&self.project_root).ok();
+                let name = project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| {
+                    self.project_root.file_name().map_or_else(|| "citrus project".into(), |n| n.to_string_lossy().into_owned())
+                });
+                s.set_project(&name, project.and_then(|p| p.settings.accent));
                 s.set_status("Starting…");
                 self.splash = Some(s);
             }
@@ -13727,7 +13891,6 @@ impl ApplicationHandler for EngineApp {
             } else {
                 false
             };
-
         // Rebind capture (2C): while a binding slot is armed, the next key
         // press is captured into it (Esc cancels). Highest priority so it
         // pre-empts editor shortcuts. Mouse buttons are captured by the
@@ -13814,8 +13977,11 @@ impl ApplicationHandler for EngineApp {
                     if !self.looking {
                         self.input.key(code, true);
                     }
-                    let ctrl = self.keys.contains(&KeyCode::ControlLeft)
-                        || self.keys.contains(&KeyCode::ControlRight);
+                    // The window's modifier state, not our held-key set: a Ctrl
+                    // released while the window was unfocused never sends its
+                    // release, which left Ctrl "held" (plain D duplicated,
+                    // W / E / R / T stopped switching tools).
+                    let ctrl = self.modifiers.control_key();
                     if !self.looking {
                         match code {
                             // Unity-style: W move, E scale, R rotate (these
@@ -13834,8 +14000,7 @@ impl ApplicationHandler for EngineApp {
                                 self.actions.push(EditorAction::FocusSelected);
                             }
                             KeyCode::KeyZ if ctrl => {
-                                let shift = self.keys.contains(&KeyCode::ShiftLeft)
-                                    || self.keys.contains(&KeyCode::ShiftRight);
+                                let shift = self.modifiers.shift_key();
                                 self.actions.push(if shift {
                                     EditorAction::Redo
                                 } else {
@@ -13906,6 +14071,15 @@ impl ApplicationHandler for EngineApp {
             // Regained focus → reimport assets edited in other apps (e.g. an FBX
             // re-exported from Blender) without a manual reimport.
             WindowEvent::Focused(true) => self.reload_changed_assets(),
+            // Keys released while another window has focus never send their
+            // release: forget everything held so nothing stays stuck down.
+            WindowEvent::Focused(false) => {
+                for code in std::mem::take(&mut self.keys) {
+                    self.input.key(code, false);
+                }
+                self.modifiers = winit::keyboard::ModifiersState::empty();
+            }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressed = state == ElementState::Pressed;
                 if self.playing {
@@ -14008,7 +14182,10 @@ impl ApplicationHandler for EngineApp {
                     None => Some(None),
                     Some(Ok(built)) => Some(Some(built)),
                     Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
-                        *self.load_status.lock().unwrap() = "Building plugins…".into();
+                        if let Some(s) = self.splash.as_mut() {
+                            s.set_progress(2, LOAD_STEPS);
+                        }
+                        *self.load_status.lock().unwrap() = "Building component plugins…".into();
                         None
                     }
                     Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
@@ -14225,6 +14402,9 @@ enum PaletteCmd {
     TogglePlay,
     SaveScene,
     NewScene,
+    ProjectHub,
+    NewProject,
+    OpenProject,
     BuildGame,
     BuildGameWindows,
     Undo,
@@ -14233,6 +14413,7 @@ enum PaletteCmd {
     Focus,
     ResetLayout,
     ToggleGameUi,
+    ToggleGizmos,
     OpenTab(usize),
     ProjectSettings,
     Layers,
@@ -14264,7 +14445,27 @@ const PALETTE_TABS: [(Tab, &str); 12] = [
 
 /// Per-kind billboard visibility + size, orientation cross, game UI overlay.
 fn billboard_menu(ui: &mut egui::Ui, filter: &mut WidgetFilter) {
-    ui.label(egui::RichText::new("Billboard widgets").size(citrus_editor::theme::SIZE_META).color(citrus_editor::theme::TEXT_MUTED));
+    ui.checkbox(&mut filter.enabled, "Show gizmos and billboards")
+        .on_hover_text("Same as clicking the eye: off hides everything below (the move / rotate / scale handles always show)");
+    ui.separator();
+    ui.add_enabled_ui(filter.enabled, |ui| {
+        ui.label(egui::RichText::new("Gizmos").size(citrus_editor::theme::SIZE_META).color(citrus_editor::theme::TEXT_MUTED));
+        ui.checkbox(&mut filter.components, "Component gizmos")
+            .on_hover_text("Collider shapes, probe and post volumes, water outlines, joints and other component handles");
+        ui.checkbox(&mut filter.cross, "Orientation cross").on_hover_text(
+            "The grey axis cross at the selected object's pivot (Move/Scale tools). Independent of the transform handles.",
+        );
+        ui.add_space(4.0);
+        billboard_settings(ui, filter);
+    });
+    ui.separator();
+    ui.checkbox(&mut filter.game_ui, "Game UI overlay")
+        .on_hover_text("Preview the scene's UI canvases over the viewport (always shown in Play)");
+}
+
+/// The billboard kinds with their show toggles and sizes.
+fn billboard_settings(ui: &mut egui::Ui, filter: &mut WidgetFilter) {
+    ui.label(egui::RichText::new("Billboards").size(citrus_editor::theme::SIZE_META).color(citrus_editor::theme::TEXT_MUTED));
     for (label, setting) in [
         ("Lights", &mut filter.lights),
         ("Cameras", &mut filter.cameras),
@@ -14280,12 +14481,6 @@ fn billboard_menu(ui: &mut egui::Ui, filter: &mut WidgetFilter) {
                 .on_hover_text("Widget size");
         });
     }
-    ui.separator();
-    ui.checkbox(&mut filter.cross, "Orientation cross").on_hover_text(
-        "The grey axis cross at the selected object's pivot (Move/Scale tools). Independent of the transform handles.",
-    );
-    ui.checkbox(&mut filter.game_ui, "Game UI overlay")
-        .on_hover_text("Preview the scene's UI canvases over the viewport (always shown in Play)");
 }
 
 /// Thin vertical divider between segments in a trough.

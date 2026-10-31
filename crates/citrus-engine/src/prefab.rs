@@ -157,10 +157,7 @@ mod tests {
     fn instantiate_remaps_internal_references() {
         let gun_id = ObjectId::new().to_string();
         let mut base = entry("Base", None);
-        base.components.push(citrus_assets::ComponentData {
-            kind: "Turret".into(),
-            data: format!("(barrel: Some(\"{gun_id}\"))"),
-        });
+        base.components.push(citrus_assets::ComponentData::new("Turret", format!("(barrel: Some(\"{gun_id}\"))")));
         let mut gun = entry("Gun", Some(0));
         gun.id = gun_id.clone();
         let p = Prefab::new(vec![base, gun]);

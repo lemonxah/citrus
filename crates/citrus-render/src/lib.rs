@@ -8,6 +8,7 @@ mod alloc;
 mod bloom;
 mod bake;
 mod context;
+mod egui_window;
 mod frame;
 mod gpu_cull;
 mod gpu_gi;
@@ -74,6 +75,7 @@ struct TsResult {
 }
 
 pub use bake::{BakeJob, BakeStep};
+pub use egui_window::EguiWindow;
 pub use gpu_cull::GpuCullSettings;
 pub use gpu_gi::{GpuGiEmitter, GpuGiMarch, GpuGiMaterial};
 pub use hdr_format::*;

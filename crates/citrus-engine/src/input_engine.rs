@@ -319,17 +319,10 @@ pub fn set_user_config_dir(dir: PathBuf) {
 /// `$XDG_CONFIG_HOME` or `~/.config`). `CITRUS_CONFIG_DIR` replaces it
 /// (platforms without one).
 pub fn user_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CITRUS_CONFIG_DIR").map(PathBuf::from).or_else(|| CONFIG_DIR.get().cloned()).or_else(|| {
-        if cfg!(windows) {
-            std::env::var_os("APPDATA").map(PathBuf::from)
-        } else if cfg!(target_os = "macos") {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
-        } else {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        }
-    })
+    std::env::var_os("CITRUS_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| CONFIG_DIR.get().cloned())
+        .or_else(citrus_assets::recent_projects::platform_config_dir)
 }
 
 /// The player's binding overrides for a shipped game: `input.ron` in the
