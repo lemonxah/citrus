@@ -454,6 +454,13 @@ impl Predictable for FirstPersonController {
 impl TypedComponent for FirstPersonController {
     const NAME: &'static str = "First Person Controller";
 
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        Some(self)
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        Some(self)
+    }
+
     fn start(&mut self, ctx: &mut ComponentCtx) {
         self.yaw = ctx.rotation.to_euler(EulerRot::YXZ).0.to_degrees();
         self.walker = Walker { floor_y: ctx.translation.y, grounded: true, ..Default::default() };
@@ -701,6 +708,13 @@ impl Predictable for ThirdPersonController {
 
 impl TypedComponent for ThirdPersonController {
     const NAME: &'static str = "Third Person Controller";
+
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        Some(self)
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        Some(self)
+    }
 
     fn start(&mut self, ctx: &mut ComponentCtx) {
         self.body_yaw = ctx.rotation.to_euler(EulerRot::YXZ).0.to_degrees();

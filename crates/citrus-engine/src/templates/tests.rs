@@ -54,6 +54,10 @@ fn every_template_scaffolds_and_loads() {
             template.id
         );
         assert!(root.join("Cargo.toml").is_file() && root.join("src/main.rs").is_file());
+        let vr = template.category == citrus_assets::project_templates::TemplateCategory::Vr;
+        assert_eq!(project.vr, vr, "{}: only VR templates start in VR", template.id);
+        let xr = crate::GameConfig::from_project_dir(&root).expect("game config").xr;
+        assert_eq!(xr, if vr { crate::XrMode::Auto } else { crate::XrMode::Off }, "{}", template.id);
 
         let scene_path = root.join(&boot);
         let scene = citrus_assets::load_scene_file(&scene_path)

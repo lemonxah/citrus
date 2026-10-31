@@ -29,6 +29,7 @@ mod tier;
 mod types;
 mod underwater;
 mod water_sim;
+mod vsm;
 
 /// GPU timestamp zones (a begin/end pair each) for the per-pass profiler
 /// breakdown. Zone Z occupies query slots `2*Z` (begin) and `2*Z+1` (end).
@@ -51,18 +52,22 @@ pub(crate) mod gpu_zone {
     /// GPU-driven culling dispatch, and the Hi-Z pyramid build after the scene.
     pub const CULL: usize = 11;
     pub const HIZ: usize = 12;
+    /// The late occlusion pass inside the first main-camera depth pass: its
+    /// pyramid build + re-test dispatch.
+    pub const CULL_LATE: usize = 13;
     /// GPU checkpoint names per zone (see `GpuContext::checkpoint`).
-    pub const BEGIN: [&std::ffi::CStr; 13] = [
+    pub const BEGIN: [&std::ffi::CStr; 14] = [
         c"frame begin", c"shadows begin", c"GI begin", c"scene begin", c"reflections begin", c"post begin",
         c"UI begin", c"camera preview begin", c"GI gather begin", c"GI denoise begin", c"GI integrate begin",
-        c"GPU cull begin", c"Hi-Z build begin",
+        c"GPU cull begin", c"Hi-Z build begin", c"late cull begin",
     ];
-    pub const END: [&std::ffi::CStr; 13] = [
+    pub const END: [&std::ffi::CStr; 14] = [
         c"frame end", c"shadows end", c"GI end", c"scene end", c"reflections end", c"post end",
         c"UI end", c"camera preview end", c"GI gather end", c"GI denoise end", c"GI integrate end",
-        c"GPU cull end", c"Hi-Z build end",
+        c"GPU cull end", c"Hi-Z build end", c"late cull end",
     ];
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
+    const _: () = assert!(crate::frame::TS_COUNT as usize == 2 * COUNT);
 }
 
 /// One GPU timestamp query read back with availability (TYPE_64 layout: the
@@ -84,7 +89,7 @@ pub use water_sim::{MAX_WATER_DISPLACERS, WaterSimBody, WaterSimEwave, WaterSimR
 pub use pipeline::{CUSTOM_KEYWORDS, CUSTOM_TEXTURES};
 pub use tier::RenderTier;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -312,6 +317,15 @@ struct FrameUbo {
     /// x = slot 0 blend distance, y = slot 1 blend distance, z = slot that wins
     /// where both boxes overlap.
     refl_blend: [f32; 4],
+    /// Third/fourth reflection probes (bindings 11/12), same layout as refl_*.
+    refl3_center: [f32; 4],
+    refl3_extents: [f32; 4],
+    refl3_box: [f32; 4],
+    refl4_center: [f32; 4],
+    refl4_extents: [f32; 4],
+    refl4_box: [f32; 4],
+    /// x = slot 2 blend distance, y = slot 3 blend distance.
+    refl_blend2: [f32; 4],
     /// x = water clock, y = the opaque scene copies (bindings 5/6) are valid
     /// for this pass, z = water body count.
     water: [f32; 4],
@@ -585,22 +599,20 @@ pub struct Uploader {
 }
 
 impl Uploader {
-    /// Upload meshes + textures on the transfer queue. `has_skeleton` mirrors the
-    /// main-thread path: a mesh with skin weights + a skeleton becomes a
-    /// host-visible skinned mesh.
+    /// Upload meshes + (already compressed) textures on the transfer queue.
+    /// `has_skeleton` mirrors the main-thread path: a mesh with skin weights +
+    /// a skeleton becomes a host-visible skinned mesh.
     pub fn prepare(
         &self,
         meshes: &[MeshData],
-        textures: &[TextureData],
+        textures: &[CompressedTexture],
         has_skeleton: bool,
     ) -> Result<PreparedScene> {
         let gpu_textures = {
             let mut alloc = self.allocator.lock().unwrap();
             textures
                 .iter()
-                .map(|t| {
-                    GpuTexture::upload(&self.device, &mut alloc, self.command_pool, self.queue, t)
-                })
+                .map(|t| GpuTexture::upload_compressed(&self.device, &mut alloc, self.command_pool, self.queue, t))
                 .collect::<Result<Vec<_>>>()?
         };
         let mut gpu_meshes = Vec::with_capacity(meshes.len());
@@ -2476,6 +2488,8 @@ impl CameraPreview {
         lightmap_sampler: vk::Sampler,
         env_cube_view: vk::ImageView,
         env_b_view: vk::ImageView,
+        env_c_view: vk::ImageView,
+        env_d_view: vk::ImageView,
         ripple_view: vk::ImageView,
         post_layout: vk::DescriptorSetLayout,
         post_sampler: vk::Sampler,
@@ -2614,6 +2628,14 @@ impl CameraPreview {
                 .sampler(sampler)
                 .image_view(env_b_view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let env_c_info = [vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(env_c_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let env_d_info = [vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(env_d_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let ripples = ripple_infos(sampler, [ripple_view; MAX_WATER_BODIES]);
             let writes = [
                 vk::WriteDescriptorSet::default()
@@ -2676,6 +2698,16 @@ impl CameraPreview {
                     .dst_binding(9)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&env_b_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(11)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&env_c_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(12)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&env_d_info),
                 ripple_write(set, &ripples),
             ];
             unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -3093,8 +3125,10 @@ pub struct Renderer {
     /// Prefiltered environment reflection cubemap (reflection probe), rebuilt
     /// from the skybox. Sampled in the forward shader's specular term.
     reflection_env: ReflectionEnv,
-    /// Second reflection-probe slot (binding 9), blended per pixel with slot 0.
+    /// Extra reflection-probe slots (bindings 9/11/12), blended per pixel.
     reflection_env_b: ReflectionEnv,
+    reflection_env_c: ReflectionEnv,
+    reflection_env_d: ReflectionEnv,
     /// Dedicated set-0 + UBO for the precomputed scene reflection capture (6-face
     /// render from a probe position into the env cube). Set once, reused per face.
     refl_capture_pool: vk::DescriptorPool,
@@ -3493,6 +3527,18 @@ impl Renderer {
         )?;
         // Second probe slot (two-probe blending); neutral until a probe fills it.
         let reflection_env_b = ReflectionEnv::neutral(
+            &ctx.device,
+            &mut allocator.lock().unwrap(),
+            command_pool,
+            ctx.queue,
+        )?;
+        let reflection_env_c = ReflectionEnv::neutral(
+            &ctx.device,
+            &mut allocator.lock().unwrap(),
+            command_pool,
+            ctx.queue,
+        )?;
+        let reflection_env_d = ReflectionEnv::neutral(
             &ctx.device,
             &mut allocator.lock().unwrap(),
             command_pool,
@@ -4068,6 +4114,8 @@ impl Renderer {
             last_frame_ubo: None,
             reflection_env,
             reflection_env_b,
+            reflection_env_c,
+            reflection_env_d,
             refl_capture_pool,
             refl_capture_sets,
             refl_capture_ubos,
@@ -4891,6 +4939,41 @@ impl Renderer {
     /// Render every camera in `input.camera_targets` into its texture, before
     /// the passes that sample them. Materials sampling any camera target are
     /// left out of these passes, so a screen never draws itself.
+    fn camera_target_render_order(ids: &[u128], deps: &HashMap<u128, Vec<u128>>) -> Vec<u128> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut done: HashSet<u128> = HashSet::with_capacity(ids.len());
+        let mut pending = ids.to_vec();
+        while !pending.is_empty() {
+            let mut progressed = false;
+            let mut i = 0;
+            while i < pending.len() {
+                let id = pending[i];
+                let ready = deps
+                    .get(&id)
+                    .is_none_or(|need| need.iter().all(|d| done.contains(d)));
+                if ready {
+                    out.push(id);
+                    done.insert(id);
+                    pending.remove(i);
+                    progressed = true;
+                } else {
+                    i += 1;
+                }
+            }
+            if !progressed {
+                // Dependency cycle: keep deterministic order and accept one-frame
+                // latency inside the loop.
+                out.extend_from_slice(&pending);
+                break;
+            }
+        }
+        out
+    }
+
+    /// Render every camera in `input.camera_targets` into its texture, before
+    /// the passes that sample them. Materials sampling a camera's OWN target are
+    /// left out of that camera pass to avoid feedback; other screens remain so
+    /// nested portals/screens can render.
     #[allow(clippy::too_many_arguments)]
     fn record_camera_targets(
         &mut self,
@@ -4904,32 +4987,126 @@ impl Renderer {
         order: &[usize],
     ) -> Result<()> {
         let target_textures: Vec<usize> = self.camera_targets.iter().map(|t| t.texture.0).collect();
+        let target_by_texture: HashMap<usize, u128> =
+            self.camera_targets.iter().map(|t| (t.texture.0, t.id)).collect();
+        let mut target_index: HashMap<u128, usize> = HashMap::new();
+        for (k, t) in self.camera_targets.iter().enumerate() {
+            target_index.insert(t.id, k);
+        }
         let screen_material: Vec<bool> = self
             .materials
             .iter()
             .map(|m| m.slots.iter().flatten().any(|h| target_textures.contains(&h.0)))
             .collect();
-        // Only targets shown on a screen the main camera can see are worth a pass.
+        // Seed with targets shown on a screen the main camera can see.
         let main_planes = frustum_planes(input.camera.proj * input.camera.view);
-        let mut visible_textures: Vec<usize> = Vec::new();
+        let mut seed_textures: Vec<usize> = Vec::new();
         for &d in order {
             let draw = &input.draws[d];
             if screen_material.get(draw.material.0).copied().unwrap_or(false) && sphere_in_planes(&main_planes, draw, true) {
-                visible_textures.extend(self.materials[draw.material.0].slots.iter().flatten().map(|h| h.0));
+                seed_textures.extend(self.materials[draw.material.0].slots.iter().flatten().map(|h| h.0));
             }
         }
-        for view in input.camera_targets {
-            let Some(t) = self.camera_targets.iter().find(|t| t.id == view.id) else {
+
+        // Follow camera-target dependencies from visible screens so nested
+        // portals/screens get rendered when they are reachable through another
+        // screen, not just directly visible in the main view.
+        let view_by_id: HashMap<u128, &CameraTargetView> =
+            input.camera_targets.iter().map(|v| (v.id, v)).collect();
+        let mut wanted: HashSet<u128> = HashSet::new();
+        let mut queue: VecDeque<usize> = seed_textures.into_iter().collect();
+        while let Some(tex) = queue.pop_front() {
+            let Some(&cam_id) = target_by_texture.get(&tex) else {
                 continue;
             };
-            if !visible_textures.contains(&t.texture.0) {
+            if !wanted.insert(cam_id) {
                 continue;
             }
-            let ext = t.extent;
-            let set = t.sets[self.frame_index];
-            let image = self.textures[t.texture.0].image;
-            let color_view = self.textures[t.texture.0].view;
-            let (depth_img, depth_view) = (t.depth.image, t.depth.view);
+            let Some(view) = view_by_id.get(&cam_id).copied() else {
+                continue;
+            };
+            let planes = frustum_planes(view.camera.proj * view.camera.view);
+            for &d in order {
+                let draw = &input.draws[d];
+                if !screen_material.get(draw.material.0).copied().unwrap_or(false)
+                    || !sphere_in_planes(&planes, draw, true)
+                {
+                    continue;
+                }
+                let mat = &self.materials[draw.material.0];
+                for h in mat.slots.iter().flatten() {
+                    if h.0 != tex && target_by_texture.contains_key(&h.0) {
+                        queue.push_back(h.0);
+                    }
+                }
+            }
+        }
+
+        let wanted_ids: Vec<u128> = input
+            .camera_targets
+            .iter()
+            .map(|v| v.id)
+            .filter(|id| wanted.contains(id))
+            .collect();
+        if wanted_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Build a dependency graph so cameras that feed another screen render first.
+        let mut deps: HashMap<u128, Vec<u128>> = HashMap::new();
+        for &id in &wanted_ids {
+            let Some(&idx) = target_index.get(&id) else {
+                continue;
+            };
+            let self_tex = self.camera_targets[idx].texture.0;
+            let Some(view) = view_by_id.get(&id).copied() else {
+                continue;
+            };
+            let planes = frustum_planes(view.camera.proj * view.camera.view);
+            let mut need: HashSet<u128> = HashSet::new();
+            for &d in order {
+                let draw = &input.draws[d];
+                if !screen_material.get(draw.material.0).copied().unwrap_or(false)
+                    || !sphere_in_planes(&planes, draw, true)
+                {
+                    continue;
+                }
+                let mat = &self.materials[draw.material.0];
+                for h in mat.slots.iter().flatten() {
+                    if h.0 == self_tex {
+                        continue;
+                    }
+                    if let Some(dep) = target_by_texture.get(&h.0)
+                        && wanted.contains(dep)
+                        && *dep != id
+                    {
+                        need.insert(*dep);
+                    }
+                }
+            }
+            deps.insert(id, need.into_iter().collect());
+        }
+        let render_order = Self::camera_target_render_order(&wanted_ids, &deps);
+
+        for id in render_order {
+            let Some(view) = view_by_id.get(&id).copied() else {
+                continue;
+            };
+            let Some(&tidx) = target_index.get(&id) else {
+                continue;
+            };
+            let (ext, set, self_tex, depth_img, depth_view) = {
+                let t = &self.camera_targets[tidx];
+                (
+                    t.extent,
+                    t.sets[self.frame_index],
+                    t.texture.0,
+                    t.depth.image,
+                    t.depth.view,
+                )
+            };
+            let image = self.textures[self_tex].image;
+            let color_view = self.textures[self_tex].view;
             let mut ubo = frame_ubo(
                 &view.camera, input, lights, count, shadow_vp, cascade_splits,
                 &self.probe_volumes, [ext.width as f32, ext.height as f32],
@@ -4948,10 +5125,7 @@ impl Renderer {
                 ];
                 ubo.refl_box = [p.center[0], p.center[1], p.center[2], 0.0];
             }
-            let ubo_index = self.frame_index;
-            if let Some(t) = self.camera_targets.iter_mut().find(|t| t.id == view.id) {
-                t.ubos[ubo_index].write(0, bytemuck::bytes_of(&ubo));
-            }
+            self.camera_targets[tidx].ubos[self.frame_index].write(0, bytemuck::bytes_of(&ubo));
             // Shared lighting resources (shadows, probes, lightmaps, env) come
             // from this frame's set; binding 0 is the target's own UBO.
             let src = self.frame_sets[self.frame_index];
@@ -5041,8 +5215,15 @@ impl Renderer {
                 .iter()
                 .copied()
                 .filter(|&d| {
-                    !screen_material.get(input.draws[d].material.0).copied().unwrap_or(false)
-                        && sphere_in_planes(&planes, &input.draws[d], true)
+                    if !sphere_in_planes(&planes, &input.draws[d], true) {
+                        return false;
+                    }
+                    if !screen_material.get(input.draws[d].material.0).copied().unwrap_or(false) {
+                        return true;
+                    }
+                    let mat = &self.materials[input.draws[d].material.0];
+                    // Keep nested screens, but block direct self-feedback.
+                    !mat.slots.contains(&Some(TextureHandle(self_tex)))
                 })
                 .collect();
             let drawn = self.record_scene_draws(device, cb, &pass_order, input, set, false);
@@ -5765,6 +5946,7 @@ impl Renderer {
                     old.destroy(&self.ctx.device, &mut self.allocator().lock().unwrap());
                 }
                 self.skybox_has_texture = false;
+                self.skybox_is_cube = false;
                 self.rebuild_reflection_env(None)?;
             }
         }
@@ -5842,16 +6024,33 @@ impl Renderer {
         }
     }
 
-    /// Replace reflection-probe slot `slot`'s cube (0 = binding 7, 1 = binding 9)
+    /// The reflection-cube holder for a probe slot (0..`MAX_REFLECTION_PROBES`).
+    fn reflection_slot_env(&mut self, slot: u8) -> &mut ReflectionEnv {
+        match slot {
+            1 => &mut self.reflection_env_b,
+            2 => &mut self.reflection_env_c,
+            3 => &mut self.reflection_env_d,
+            _ => &mut self.reflection_env,
+        }
+    }
+
+    /// Replace reflection-probe slot `slot`'s cube (binding 7/9/11/12 by slot)
     /// and re-point every scene descriptor set at it.
     fn swap_reflection_env_slot(&mut self, slot: u8, new_env: ReflectionEnv) {
+        // The old cube is destroyed below; in-flight frames may still sample it
+        // (and the descriptor sets re-pointed here may be in use), so wait for
+        // the GPU to finish first. A swap is infrequent — only when a
+        // probe-boundary crossing re-uploads a baked probe or the first capture
+        // changes the cube size — so this stall is rare and short.
+        unsafe { self.ctx.device.device_wait_idle().ok() };
         let allocator = self.allocator();
-        let target = if slot == 1 { &mut self.reflection_env_b } else { &mut self.reflection_env };
+        let slot = (slot as usize).min(MAX_REFLECTION_PROBES - 1);
+        let target = self.reflection_slot_env(slot as u8);
         let mut old = std::mem::replace(target, new_env);
         old.destroy(&self.ctx.device, &mut allocator.lock().unwrap());
 
-        let view = if slot == 1 { self.reflection_env_b.view } else { self.reflection_env.view };
-        let binding = if slot == 1 { 9 } else { 7 };
+        let view = self.reflection_slot_env(slot as u8).view;
+        let binding = REFLECTION_BINDINGS[slot];
         let sampler = self.sampler;
         for set in self.shared_binding_sets() {
             let info = [vk::DescriptorImageInfo::default()
@@ -5941,7 +6140,7 @@ impl Renderer {
             center,
             size: resolution.clamp(32, 8192),
             static_only: false,
-            slot: slot.min(1),
+            slot: slot.min((MAX_REFLECTION_PROBES - 1) as u8),
             min_interval,
             sliced,
             dynamic,
@@ -6069,7 +6268,7 @@ impl Renderer {
     }
 
     /// Upload a prebuilt baked cube (full mip chain, any [`HdrTextureFormat`],
-    /// e.g. BC6H from a compressed `.reflprobe`) into slot `slot` (0 or 1).
+    /// e.g. BC6H from a compressed `.reflprobe`) into slot `slot`.
     pub fn set_reflection_cube_slot(&mut self, slot: u8, cube: &HdrCube) -> Result<()> {
         let device = self.ctx.device.clone();
         let (queue, pool) = (self.ctx.queue, self.command_pool);
@@ -6078,11 +6277,11 @@ impl Renderer {
             let mut alloc = allocator.lock().unwrap();
             ReflectionEnv::upload_chain(&device, &mut alloc, pool, queue, cube)?
         };
-        self.swap_reflection_env_slot(slot.min(1), env);
+        self.swap_reflection_env_slot(slot.min((MAX_REFLECTION_PROBES - 1) as u8), env);
         Ok(())
     }
 
-    /// Upload baked faces into reflection-probe slot `slot` (0 or 1).
+    /// Upload baked faces into reflection-probe slot `slot`.
     pub fn set_reflection_faces_slot(&mut self, slot: u8, faces: &[TextureData; 6]) -> Result<()> {
         let device = self.ctx.device.clone();
         let queue = self.ctx.queue;
@@ -6095,7 +6294,7 @@ impl Renderer {
             ];
             ReflectionEnv::from_faces(&device, &mut alloc, pool, queue, &refs)?
         };
-        self.swap_reflection_env_slot(slot.min(1), env);
+        self.swap_reflection_env_slot(slot.min((MAX_REFLECTION_PROBES - 1) as u8), env);
         Ok(())
     }
 
@@ -6582,6 +6781,13 @@ impl Renderer {
         gbuf: bool,
         pass: &MainPass,
     ) -> Result<RenderStats> {
+        // The first main-camera depth pass runs the late occlusion pass after
+        // its early GPU batches (unless a depth prepass already did).
+        self.gpu_late_split(gpu_cull::LateSplit {
+            colors: std::iter::once(pass.color_view).chain(pass.gbuf_view).collect(),
+            depth: (pass.depth_image, pass.depth_view),
+            extent: pass.extent,
+        });
         let split = if self.water_copy { self.water_split(order, input) } else { None };
         let Some(split) = split else {
             return self.record_scene_draws(device, cb, order, input, frame_set, gbuf);
@@ -7613,6 +7819,28 @@ impl Renderer {
             ubo.refl_blend[1] = p.blend_distance.max(0.0);
             ubo.refl_blend[2] = input.reflection_primary.min(1) as f32;
         }
+        if let Some(p) = input.reflection_probes.get(2).copied().flatten() {
+            ubo.refl3_center = [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)];
+            ubo.refl3_extents = [
+                p.half_extents[0],
+                p.half_extents[1],
+                p.half_extents[2],
+                if p.box_projection { 1.0 } else { 0.0 },
+            ];
+            ubo.refl3_box = [p.center[0], p.center[1], p.center[2], 0.0];
+            ubo.refl_blend2[0] = p.blend_distance.max(0.0);
+        }
+        if let Some(p) = input.reflection_probes.get(3).copied().flatten() {
+            ubo.refl4_center = [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)];
+            ubo.refl4_extents = [
+                p.half_extents[0],
+                p.half_extents[1],
+                p.half_extents[2],
+                if p.box_projection { 1.0 } else { 0.0 },
+            ];
+            ubo.refl4_box = [p.center[0], p.center[1], p.center[2], 0.0];
+            ubo.refl_blend2[1] = p.blend_distance.max(0.0);
+        }
         if let Some(f) = input.fog {
             ubo.fog_color = [f.color[0], f.color[1], f.color[2], f.density.max(0.0)];
             ubo.fog_params = [f.height_falloff.max(0.0), f.height_ref, f.start_distance.max(0.0), 0.0];
@@ -7802,6 +8030,8 @@ impl Renderer {
                         self.lightmap_sampler,
                         self.reflection_env.view,
                         self.reflection_env_b.view,
+                        self.reflection_env_c.view,
+                        self.reflection_env_d.view,
                         self.ripple_dummy.view,
                         self.post_pass.set_layout(),
                         self.post_pass.sampler(),
@@ -8727,6 +8957,13 @@ fn frame_ubo(
         refl2_extents: [0.0; 4],
         refl2_box: [0.0; 4],
         refl_blend: [0.0; 4],
+        refl3_center: [0.0; 4],
+        refl3_extents: [0.0; 4],
+        refl3_box: [0.0; 4],
+        refl4_center: [0.0; 4],
+        refl4_extents: [0.0; 4],
+        refl4_box: [0.0; 4],
+        refl_blend2: [0.0; 4],
         water: [input.water_time, 0.0, input.water.len().min(MAX_WATER_BODIES) as f32, 0.0],
         water_bodies: water_bodies(input),
         eye_view: [[[0.0; 4]; 4]; 2],
@@ -8960,6 +9197,15 @@ impl Renderer {
             .collect();
         unsafe { device.update_descriptor_sets(&[], &copies) };
         self.draw_mode = DrawMode::Prepass;
+        if main_cam {
+            // The late occlusion pass runs here, so its batches are in the
+            // depth the main pass tests EQUAL against.
+            self.gpu_late_split(gpu_cull::LateSplit {
+                colors: Vec::new(),
+                depth: (depth_image, depth_view),
+                extent,
+            });
+        }
         self.gpu_arm(main_cam);
         let prepass = self.record_scene_draws(device, cb, &prepass_order, input, pset, false);
         self.gpu_arm(false);
@@ -9262,8 +9508,8 @@ impl Renderer {
             return Err(e);
         }
         // Instance matrices for every draw in `order`: draw k reads instance k
-        // (first_instance), so a run of draws sharing pipeline, material, mesh
-        // and fragment push data becomes one instanced draw.
+        // (first_instance), so a run of draws sharing pipeline, material set,
+        // mesh and fragment push data becomes one instanced draw.
         if order.is_empty() {
             self.materials_seen_scratch = materials_seen;
             return Ok(stats);
@@ -9306,7 +9552,10 @@ impl Renderer {
                 batchable
                     && b.batchable
                     && b.pipeline == pipeline
-                    && b.material == draw.material.0
+                    // Cross-material instancing: the material handle may differ,
+                    // but the draw can still share one instanced batch when it
+                    // resolves to the same bound set + same fragment lanes.
+                    && self.materials[b.material].set == material.set
                     && b.mesh == draw.mesh.0
                     && b.first + b.count == k
                     && b.push.base_color == push.base_color
@@ -11668,11 +11917,13 @@ impl Drop for Renderer {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Combined samplers in one set-0 descriptor set: bindings 1 and 3-9, and
+/// Combined samplers in one set-0 descriptor set: bindings 1,3-9,11,12 and
 /// binding 10's ripple field per water body.
-const SET0_SAMPLERS: u32 = 8 + MAX_WATER_BODIES as u32;
+const SET0_SAMPLERS: u32 = 10 + MAX_WATER_BODIES as u32;
 /// Set-0 binding of the water bodies' ripple fields (by body slot).
 const RIPPLE_BINDING: u32 = 10;
+/// Set-0 bindings of reflection probe cubes (slot order).
+const REFLECTION_BINDINGS: [u32; MAX_REFLECTION_PROBES] = [7, 9, 11, 12];
 
 /// Binding 10's descriptors: `views` by water body slot, sampled with `sampler`.
 fn ripple_infos(sampler: vk::Sampler, views: [vk::ImageView; MAX_WATER_BODIES]) -> [vk::DescriptorImageInfo; MAX_WATER_BODIES] {
@@ -11972,6 +12223,7 @@ mod cascade_tests {
             postfx: PostFx::default(),
             preview_postfx: PostFx::default(),
             reflection_probe: None,
+            reflection_probes: [None; MAX_REFLECTION_PROBES],
             reflection_probe_b: None,
             reflection_primary: 0,
             fog: None,
@@ -12016,5 +12268,31 @@ mod cascade_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod camera_target_tests {
+    use super::Renderer;
+    use std::collections::HashMap;
+
+    #[test]
+    fn camera_target_render_order_respects_dependencies() {
+        let ids = vec![10u128, 20, 30];
+        let mut deps: HashMap<u128, Vec<u128>> = HashMap::new();
+        deps.insert(10, vec![20]);
+        deps.insert(20, vec![30]);
+        let out = Renderer::camera_target_render_order(&ids, &deps);
+        assert_eq!(out, vec![30, 20, 10]);
+    }
+
+    #[test]
+    fn camera_target_render_order_keeps_stable_order_on_cycle() {
+        let ids = vec![1u128, 2, 3];
+        let mut deps: HashMap<u128, Vec<u128>> = HashMap::new();
+        deps.insert(1, vec![2]);
+        deps.insert(2, vec![1]); // cycle
+        let out = Renderer::camera_target_render_order(&ids, &deps);
+        assert_eq!(out, vec![3, 1, 2]);
     }
 }

@@ -28,6 +28,12 @@ fn controller_slot(scene: &LoadedScene, i: usize) -> Option<usize> {
     scene.objects[i].components.iter().position(|c| citrus_core::is_predictable(c.as_ref()))
 }
 
+/// Host: seconds over which a remote predicted pawn's display catches up
+/// with its simulation after a clump of inputs.
+const HOST_SMOOTH_TIME: f32 = 0.08;
+/// Host: a display gap larger than this (metres) is a teleport, shown at once.
+const HOST_SMOOTH_SNAP: f32 = 2.0;
+
 fn predictable(scene: &mut LoadedScene, i: usize) -> Option<&mut dyn Predictable> {
     let slot = controller_slot(scene, i)?;
     as_predictable(scene.objects[i].components[slot].as_mut())
@@ -259,6 +265,7 @@ impl PlaySession {
         let blank = InputState::default();
         let input = if self.typing { &blank } else { input };
         let mut predicting = Vec::new();
+        let mut smoothing = Vec::new();
         for (i, id) in movers {
             let raw = id.raw();
             let owner = net.owner_of_raw(raw);
@@ -266,20 +273,39 @@ impl PlaySession {
                 if owner == 0 || owner == local {
                     continue;
                 }
+                let world_pos = |scene: &LoadedScene| scene.world_transform(i).w_axis.truncate();
+                // Where this frame starts out showing it (the true position
+                // plus last frame's display offset).
+                let mut shown = Some(world_pos(scene) + net.host_smoothing.get(&raw).copied().unwrap_or(Vec3::ZERO));
                 if let Some(anchor) = net.take_anchor(raw) {
                     // Just took over as host: carry on from where the owner is.
                     MoverSim::new(scene, &mut self.physics, i, water_time).rewind(&anchor.state);
+                    shown = None;
                 }
                 let cmds = net.take_inputs(raw, unscaled);
-                let Some(last) = cmds.last().map(|c| c.seq) else {
-                    continue;
-                };
-                let mut sim = MoverSim::new(scene, &mut self.physics, i, water_time);
-                for c in &cmds {
-                    sim.step(c);
+                if let Some(last) = cmds.last().map(|c| c.seq) {
+                    let mut sim = MoverSim::new(scene, &mut self.physics, i, water_time);
+                    for c in &cmds {
+                        sim.step(c);
+                    }
+                    let state = sim.state();
+                    net.send_auth(raw, owner, &AuthState { ack: last, state });
                 }
-                let state = sim.state();
-                net.send_auth(raw, owner, &AuthState { ack: last, state });
+                // Inputs arrive in clumps: show the pawn easing from where it
+                // was shown towards where it now is, instead of stepping.
+                let mut offset = shown.map_or(Vec3::ZERO, |s| s - world_pos(scene)) * (-(unscaled as f32) / HOST_SMOOTH_TIME).exp();
+                if offset.length() > HOST_SMOOTH_SNAP || offset.length() < 1e-4 {
+                    offset = Vec3::ZERO;
+                }
+                if offset != Vec3::ZERO {
+                    smoothing.push(raw);
+                    net.host_smoothing.insert(raw, offset);
+                    let local_off = crate::net_sync::local_offset(scene, i, offset);
+                    scene.objects[i].translation += local_off;
+                    if let Some(n) = scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<NetworkObject>()) {
+                        n.state.visual_offset = offset;
+                    }
+                }
             } else if owner == local && predictable(scene, i).is_some_and(|p| p.locally_driven()) {
                 predicting.push(raw);
                 let mut pred = net.predictors.remove(&raw).unwrap_or_default();
@@ -305,6 +331,7 @@ impl PlaySession {
             }
         }
         net.predictors.retain(|id, _| predicting.contains(id));
+        net.host_smoothing.retain(|id, _| smoothing.contains(id));
     }
 
     fn net_remove(&mut self, w: &mut World, id: ObjectId) {

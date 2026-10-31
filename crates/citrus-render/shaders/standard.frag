@@ -23,6 +23,9 @@ layout(set = 0, binding = 6) uniform sampler2D u_opaque_color;
 layout(set = 0, binding = 7) uniform samplerCube u_env;
 // Second reflection probe, blended per pixel with u_env by box influence.
 layout(set = 0, binding = 9) uniform samplerCube u_env_b;
+// Third/fourth reflection probes.
+layout(set = 0, binding = 11) uniform samplerCube u_env_c;
+layout(set = 0, binding = 12) uniform samplerCube u_env_d;
 // Planar reflections: per-plane mirrored scene renders, sampled at screen UV
 // by surfaces whose push constant carries a planar layer (pc.emission.w >= 1).
 layout(set = 0, binding = 8) uniform sampler2DArray u_planar;
@@ -535,6 +538,8 @@ layout(location = 2) in vec2 v_uv;
 layout(location = 3) in vec4 v_color;
 layout(location = 4) in vec4 v_tangent;
 layout(location = 5) in vec2 v_uv1;
+// Baked-lightmap layer (or the lightmap-UV preview's resolution), see standard.vert.
+layout(location = 6) flat in float v_lightmap;
 
 layout(location = 0) out vec4 o_color;
 // Deferred-SSR G-buffer (gbuf pipeline variants only): the specular reflectance
@@ -961,7 +966,7 @@ void main() {
     // carries this object's lightmap resolution (texels/side) in preview mode; a
     // fixed 8-texel cell means low-res objects show big squares, high-res small.
     if (frame.debug.x > 0.5) {
-        float res = pc.params1.w;
+        float res = v_lightmap;
         if (res < 1.0) {
             o_color = vec4(0.12, 0.12, 0.14, 1.0); // not lightmapped (non-static)
         } else {
@@ -1054,12 +1059,15 @@ void main() {
         vec2 rest = v_uv;
         float foot = max(max(length(dFdx(rest)), length(dFdy(rest))), 1e-4);
         float calm = 1.0 - v_color.b * v_color.b;
+        // The waves (not the simulated layer) also calm over the shallows
+        // near a shore (the vertex shader's water_shore).
+        float wcalm = calm * clamp(v_color.a, 0.0, 1.0);
         vec3 wd;
         vec3 wn;
         float crest_n;
         float lost;
         water_waves(ws, rest, wt, foot, wd, wn, crest_n, lost);
-        wn = normalize(mix(vec3(0.0, 1.0, 0.0), wn, calm));
+        wn = normalize(mix(vec3(0.0, 1.0, 0.0), wn, wcalm));
         // The simulated layer at the footprint's mip (r height, gb slope).
         vec2 ruv = water_ripple_uv(ws, rest);
         float rfade = water_ripple_fade(ruv) * calm;
@@ -1072,7 +1080,7 @@ void main() {
         // World-space flow (m/s), decoded by the vertex shader.
         vec2 flow = v_color.rg;
         N = water_ripples(N, v_world_pos.xz, wt, look0.y, max(look0.z, 0.01), flow);
-        float surface_h = wd.y * calm + rip.r;
+        float surface_h = wd.y * wcalm + rip.r;
         roughness = clamp(look0.x, 0.02, 1.0);
         metallic = 0.0;
         ao = 1.0;
@@ -1148,7 +1156,7 @@ void main() {
             water_alpha = 1.0 - clarity * 0.4;
         }
         float height = clamp(surface_h / max(look1.w, 1e-4), -1.0, 1.0);
-        float crest = smoothstep(0.35, 0.95, crest_n * calm) * smoothstep(0.1, 0.7, height) * look1.x;
+        float crest = smoothstep(0.35, 0.95, crest_n * wcalm) * smoothstep(0.1, 0.7, height) * look1.x;
         // Contact foam in two layers: dense against whatever the water
         // touches, patchy lace further out, the band lapping in and out.
         float lap = 0.85 + 0.15 * sin(wt * 1.3 + dot(v_world_pos.xz, vec2(0.7, 0.4)));
@@ -1197,7 +1205,7 @@ void main() {
         vec3 dndy = dFdy(N);
         float spread = 0.25 * (dot(dndx, dndx) + dot(dndy, dndy));
         float a = roughness * roughness;
-        float a2 = clamp(a * a + min(2.0 * spread, 0.18) + 2.0 * lost * calm, 0.0, 1.0);
+        float a2 = clamp(a * a + min(2.0 * spread, 0.18) + 2.0 * lost * wcalm, 0.0, 1.0);
         roughness = clamp(sqrt(sqrt(a2)), 0.02, 1.0);
     }
 
@@ -1218,7 +1226,7 @@ void main() {
     // lights under a pool throw it out onto what's above.
     bool caustics = !FEAT_WATER && frame.water.z > 0.5;
     vec3 color = vec3(0.0);
-    bool has_lightmap = pc.params1.w >= 0.0;
+    bool has_lightmap = v_lightmap >= 0.0;
     uvec4 light_mask = floatBitsToUint(pc.model[0]);
     vec3 voxel_emit = vec3(0.0); // FluxVoxel moving emitters (indirect, kind 3)
     for (int w = 0; w < 4; ++w) {
@@ -1344,7 +1352,7 @@ void main() {
     vec3 indirect;
     vec3 flux_gi = vec3(0.0); // realtime screen GI part (view mode 6)
     if (has_lightmap) {
-        int layer = int(pc.params1.w + 0.5);
+        int layer = int(v_lightmap + 0.5);
         indirect = texture(u_lightmap, vec3(v_uv1, float(layer))).rgb / PI;
         // MIXED LIGHTING: a lightmapped (static-baked) surface ALSO receives the
         // realtime FluxVoxel probe GI, added on top of the baked bounce. The bake
@@ -1445,18 +1453,40 @@ void main() {
     // angle — never the dark diffuse-GI stand-in. The fullscreen SSR resolve pass
     // (deferred, current-frame) overlays screen-space reflections on top of this.
     vec3 spec_env = textureLod(u_env, R, max(roughness * ENV_MAX_LOD, env_aa_lod)).rgb * env_scale;
-    // Second probe: blend toward it where its box covers this fragment. Where
-    // both boxes do, the higher-priority probe (importance, then smaller box)
-    // wins; outside both, slot 0 (the probe nearest the camera) is used.
+    // Multi-probe blend: slot 0 is the fallback, additional slots blend in by
+    // their box influence. This supports 3+ overlapping reflection probes.
+    float pw0 = probe_influence(v_world_pos, frame.refl_box.xyz, frame.refl_extents.xyz, frame.refl_blend.x);
+    float pw1 = probe_influence(v_world_pos, frame.refl2_box.xyz, frame.refl2_extents.xyz, frame.refl_blend.y);
+    float pw2 = probe_influence(v_world_pos, frame.refl3_box.xyz, frame.refl3_extents.xyz, frame.refl_blend2.x);
+    float pw3 = probe_influence(v_world_pos, frame.refl4_box.xyz, frame.refl4_extents.xyz, frame.refl_blend2.y);
+    float wsum = pw0;
+    vec3 mix_spec = vec3(0.0);
+    if (probe_intensity > 0.0) {
+        mix_spec += spec_env * pw0;
+    }
     float probe2_intensity = frame.refl2_center.w;
-    if (probe2_intensity > 0.0 && probe_intensity >= 0.0) {
+    if (probe2_intensity > 0.0 && pw1 > 0.0) {
         vec3 R2 = probe_dir(R_raw, frame.refl2_center.xyz, frame.refl2_box.xyz, frame.refl2_extents.xyz, frame.refl2_extents.w > 0.5);
         float lod2 = max(roughness * float(textureQueryLevels(u_env_b) - 1), env_aa_lod);
-        vec3 spec_b = textureLod(u_env_b, R2, lod2).rgb * probe2_intensity;
-        float f0 = probe_influence(v_world_pos, frame.refl_box.xyz, frame.refl_extents.xyz, frame.refl_blend.x);
-        float f1 = probe_influence(v_world_pos, frame.refl2_box.xyz, frame.refl2_extents.xyz, frame.refl_blend.y);
-        float wb = frame.refl_blend.z > 0.5 ? f1 : f1 * (1.0 - f0);
-        spec_env = mix(spec_env, spec_b, wb);
+        mix_spec += textureLod(u_env_b, R2, lod2).rgb * probe2_intensity * pw1;
+        wsum += pw1;
+    }
+    float probe3_intensity = frame.refl3_center.w;
+    if (probe3_intensity > 0.0 && pw2 > 0.0) {
+        vec3 R3 = probe_dir(R_raw, frame.refl3_center.xyz, frame.refl3_box.xyz, frame.refl3_extents.xyz, frame.refl3_extents.w > 0.5);
+        float lod3 = max(roughness * float(textureQueryLevels(u_env_c) - 1), env_aa_lod);
+        mix_spec += textureLod(u_env_c, R3, lod3).rgb * probe3_intensity * pw2;
+        wsum += pw2;
+    }
+    float probe4_intensity = frame.refl4_center.w;
+    if (probe4_intensity > 0.0 && pw3 > 0.0) {
+        vec3 R4 = probe_dir(R_raw, frame.refl4_center.xyz, frame.refl4_box.xyz, frame.refl4_extents.xyz, frame.refl4_extents.w > 0.5);
+        float lod4 = max(roughness * float(textureQueryLevels(u_env_d) - 1), env_aa_lod);
+        mix_spec += textureLod(u_env_d, R4, lod4).rgb * probe4_intensity * pw3;
+        wsum += pw3;
+    }
+    if (wsum > 1e-4) {
+        spec_env = mix_spec / wsum;
     }
     if (probe_intensity < 0.0) {
         // Reflection-cube capture: no reflections of reflections (no probe

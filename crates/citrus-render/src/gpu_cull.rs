@@ -1,7 +1,7 @@
 //! GPU-driven culling with indirect draws.
 //!
 //! Each frame the CPU groups the culled passes' instances into batches (one per
-//! material + mesh + per-draw push lanes for camera views, one per mesh for
+//! material-set + mesh + per-draw push lanes for camera views, one per mesh for
 //! shadow views) and uploads the per-draw data once into persistent, growable
 //! per-submission buffers. A compute pass (`gpu_cull.comp`) then tests every
 //! (view, instance) candidate against the view's frustum, an optional distance
@@ -12,7 +12,18 @@
 //! fill one `VkDrawIndexedIndirectCommand` per batch, so the passes draw with
 //! `vkCmdDrawIndexedIndirect` and the vertex shaders stay unchanged.
 //!
-//! Every batch binds its own mesh, material and push constants, so each one is
+//! Hi-Z is two-phase so nothing coming into view is drawn a frame late. The
+//! early pass above draws what last frame's pyramid does not hide and flags
+//! the main-view instances it rejected. The first main-camera depth pass (the
+//! depth prepass when there is one, else the main pass) draws the early
+//! batches, ends, builds a pyramid from that depth with this frame's camera,
+//! and the late pass re-tests only the flagged instances against it into a
+//! second set of commands / instances (`Late`); the pass resumes (LOAD) and
+//! draws them, and every later pass of the main camera draws both sets. The
+//! pyramid is rebuilt from the finished depth after the main pass for the
+//! next frame's early pass.
+//!
+//! Every batch binds its own mesh, material-set and push constants, so each one is
 //! a single-command indirect draw: a count buffer would only ever say 1. The
 //! batch's instance region is bound as the instance vertex buffer offset, so
 //! `firstInstance` stays 0 and `drawIndirectFirstInstance` is not required.
@@ -26,6 +37,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use ash::vk;
+use ash::vk::Handle;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use gpu_allocator::MemoryLocation;
@@ -35,19 +47,31 @@ use crate::alloc::Buffer;
 use crate::frame::FRAMES_IN_FLIGHT;
 use crate::pipeline::INSTANCE_STRIDE;
 use crate::{
-    AlphaMode, BoundDraw, DrawCmd, FrameInput, PushData, RENDER_QUEUE_TRANSPARENT, RenderStats, Renderer,
+    AlphaMode, BoundDraw, CameraData, DrawCmd, FrameInput, PushData, RENDER_QUEUE_TRANSPARENT, RenderStats, Renderer,
     SceneBatch, XR_SLOTS, frustum_planes, gpu_zone, image_barrier, scene_pipeline_key, sphere_light_mask,
 };
 
 const CULL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_cull.comp.spv"));
+/// Storage-buffer bindings of gpu_cull.comp (draws, candidates, batches,
+/// views, commands, instances, counters, late commands, late instances,
+/// occluded flags) and its pyramid sampler.
+const CULL_BUFFER_BINDINGS: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 8, 9, 10];
+const CULL_HIZ_BINDING: u32 = 7;
 const HIZ_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hiz_build.comp.spv"));
 
 /// Views one cull dispatch can serve (main camera + every shadow layer fits).
 /// Matches `MAX_VIEWS` in gpu_cull.comp (and its 64-thread workgroup).
 pub(crate) const MAX_CULL_VIEWS: usize = 16;
 const MAX_HIZ_MIPS: usize = 16;
-/// Per view: tested, visible, frustum/distance/size culled, occluded.
-const COUNTER_BYTES: u64 = (MAX_CULL_VIEWS * 16) as u64;
+/// Per view: tested, visible, frustum/distance/size culled, occluded (early
+/// pass); then the late pass's block: re-tested, recovered, -, still occluded.
+const LATE_COUNTERS: u64 = (MAX_CULL_VIEWS * 16) as u64;
+const COUNTER_BYTES: u64 = 2 * LATE_COUNTERS;
+/// Pyramid builds per frame slot: after the main pass (next frame's early
+/// pass), and inside the first main-camera depth pass (this frame's late pass).
+const HIZ_BUILDS: usize = 2;
+const HIZ_BUILD_NEXT: usize = 0;
+const HIZ_BUILD_LATE: usize = 1;
 /// Smallest allocation of a growable cull buffer.
 const MIN_BUFFER_BYTES: usize = 64 * 1024;
 const INDIRECT_STRIDE: u32 = size_of::<IndirectCmd>() as u32;
@@ -64,8 +88,9 @@ pub struct GpuCullSettings {
     /// Cull + draw opaque / alpha-test instances on the GPU (indirect draws).
     /// Off = the CPU frustum cull and instanced draws.
     pub enabled: bool,
-    /// Also reject main-camera instances hidden behind the previous frame's
-    /// depth (Hi-Z). Disoccluded objects can show up one frame late.
+    /// Also reject main-camera instances hidden behind the depth (Hi-Z,
+    /// two-phase: what last frame's depth hides is re-tested against this
+    /// frame's, so disoccluded objects appear the same frame).
     pub hiz_occlusion: bool,
     /// Main camera: skip instances whose projected radius is under this many
     /// pixels. 0 = off.
@@ -106,8 +131,13 @@ pub(crate) struct GpuDraw {
 }
 
 impl GpuDraw {
-    fn of(d: &DrawCmd) -> Self {
-        Self { model: d.transform.to_cols_array_2d(), sphere: d.mesh_center.extend(d.bound_radius).to_array() }
+    /// `lightmap`: pack the draw's baked-lightmap layer into the instance
+    /// (col0.w = layer + 1; the vertex shaders read it and clear it), so
+    /// lightmapped statics batch together instead of one batch per layer.
+    fn of(d: &DrawCmd, lightmap: bool) -> Self {
+        let mut model = d.transform.to_cols_array_2d();
+        model[0][3] = if lightmap && d.lightmap_layer >= 0 { d.lightmap_layer as f32 + 1.0 } else { 0.0 };
+        Self { model, sphere: d.mesh_center.extend(d.bound_radius).to_array() }
     }
 }
 
@@ -150,6 +180,18 @@ pub(crate) struct IndirectCmd {
     first_instance: u32,
 }
 
+/// Push constants of gpu_cull.comp.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CullPush {
+    /// Late pass: the view-projection its pyramid was built with.
+    late_vp: [[f32; 4]; 4],
+    count: u32,
+    /// 0 = early pass, 1 = late pass.
+    late: u32,
+}
+
+const _: () = assert!(size_of::<CullPush>() == 72);
 const _: () = assert!(size_of::<IndirectCmd>() == size_of::<vk::DrawIndexedIndirectCommand>());
 const _: () = assert!(size_of::<GpuView>() == 208);
 const _: () = assert!(size_of::<GpuDraw>() == 80);
@@ -170,6 +212,8 @@ pub(crate) struct CullBuilder {
     candidates: Vec<[u32; 2]>,
     /// (view, first instance of the batch's region, candidate count, 0).
     batches: Vec<[u32; 4]>,
+    /// Pack lightmap layers into the instances (off for the lightmap-UV preview).
+    pack_lightmap: bool,
     cmds: Vec<IndirectCmd>,
     views: Vec<GpuView>,
 }
@@ -201,7 +245,7 @@ impl CullBuilder {
     fn add_candidate(&mut self, index: usize, d: &DrawCmd, batch: u32) {
         let slot = match self.draw_slot[index] {
             u32::MAX => {
-                self.draws.push(GpuDraw::of(d));
+                self.draws.push(GpuDraw::of(d, self.pack_lightmap));
                 let s = self.draws.len() as u32 - 1;
                 self.draw_slot[index] = s;
                 s
@@ -301,6 +345,11 @@ struct CullFrame {
     cmd_src: GrowBuffer,
     cmds: GrowBuffer,
     instances: GrowBuffer,
+    /// Late pass: its commands / instances (main-view batches) and the early
+    /// pass's per-candidate occluded flags. Minimal while Hi-Z is off.
+    late_cmds: GrowBuffer,
+    late_instances: GrowBuffer,
+    occluded: GrowBuffer,
     counters: Buffer,
     readback: Buffer,
     set: vk::DescriptorSet,
@@ -310,24 +359,33 @@ struct CullFrame {
 impl CullFrame {
     fn new(device: &ash::Device, allocator: &mut Allocator, set: vk::DescriptorSet) -> Result<Self> {
         let host = |name| GrowBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, name);
+        let indirect = |name| {
+            GrowBuffer::new(
+                vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuOnly,
+                name,
+            )
+        };
+        let instances = |name| {
+            GrowBuffer::new(
+                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER,
+                MemoryLocation::GpuOnly,
+                name,
+            )
+        };
         Ok(Self {
             draws: host("cull-draws"),
             candidates: host("cull-candidates"),
             batches: host("cull-batches"),
             views: host("cull-views"),
             cmd_src: GrowBuffer::new(vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "cull-cmd-src"),
-            cmds: GrowBuffer::new(
-                vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuOnly,
-                "cull-indirect",
-            ),
-            instances: GrowBuffer::new(
-                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER,
-                MemoryLocation::GpuOnly,
-                "cull-instances",
-            ),
+            cmds: indirect("cull-indirect"),
+            instances: instances("cull-instances"),
+            late_cmds: indirect("cull-late-indirect"),
+            late_instances: instances("cull-late-instances"),
+            occluded: GrowBuffer::new(vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "cull-occluded"),
             counters: Buffer::new(
                 device,
                 allocator,
@@ -360,6 +418,9 @@ impl CullFrame {
             &mut self.cmd_src,
             &mut self.cmds,
             &mut self.instances,
+            &mut self.late_cmds,
+            &mut self.late_instances,
+            &mut self.occluded,
         ] {
             b.destroy(device, allocator);
         }
@@ -461,6 +522,48 @@ impl HiZ {
     }
 }
 
+/// This frame's late (second-phase) occlusion pass of the main camera.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Late {
+    /// None: Hi-Z off, no main camera, or the early pass had no pyramid to
+    /// test against (so it rejected nothing as occluded).
+    Off,
+    /// The early pass tested occlusion: the first main-camera depth pass runs
+    /// the late pass after drawing the early batches.
+    Pending,
+    /// Recorded: the main camera's passes draw the late batches too.
+    Done,
+}
+
+impl Late {
+    /// State after the early pass was recorded.
+    pub(crate) fn after_early(hiz_tested: bool) -> Self {
+        if hiz_tested { Late::Pending } else { Late::Off }
+    }
+
+    /// Whether a pass drawing the early batches into `split` (a pass to
+    /// split for the late pass, if any) runs the late pass after them.
+    pub(crate) fn runs_in(self, split: bool) -> bool {
+        self == Late::Pending && split
+    }
+}
+
+/// The attachments of a main-camera pass the late pass can split: ended,
+/// then resumed with LOAD after the late cull. Depth is attachment-optimal.
+pub(crate) struct LateSplit {
+    pub colors: Vec<vk::ImageView>,
+    pub depth: (vk::Image, vk::ImageView),
+    pub extent: vk::Extent2D,
+}
+
+/// Main-view counts once the late pass folds in: early [tested, visible,
+/// frustum, occluded] plus late [re-tested, recovered, -, still occluded]
+/// give final [tested, visible, frustum, occluded] and the recovered count.
+pub(crate) fn fold_late_counts(early: [u32; 4], late: [u32; 4]) -> ([u32; 4], u32) {
+    let recovered = late[1].min(early[3]);
+    ([early[0], early[1] + recovered, early[2], early[3] - recovered], recovered)
+}
+
 /// A GPU-culled camera batch, drawn by `record_scene_draws`.
 pub(crate) struct SceneIndirect {
     material: usize,
@@ -476,6 +579,19 @@ pub(crate) struct SceneIndirect {
     bounds: Option<(Vec3, Vec3)>,
 }
 
+/// One camera-batch key for GPU-cull scene draws. The material handle itself
+/// is intentionally absent: variants that resolve to the same descriptor set
+/// and push lanes can share an instanced batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SceneBatchKey {
+    set: u64,
+    mesh: usize,
+    base_color: [u32; 4],
+    emission: [u32; 4],
+    params0: [u32; 4],
+    params1: [u32; 4],
+}
+
 /// A GPU-culled shadow batch (one mesh in one shadow layer).
 pub(crate) struct ShadowIndirect {
     mesh: usize,
@@ -488,6 +604,7 @@ pub(crate) struct ShadowIndirect {
 #[derive(Clone, Copy, Default)]
 struct CullCounts {
     main: [u32; 4],
+    late: [u32; 4],
     shadow_visible: u32,
     eye_visible: u32,
 }
@@ -502,14 +619,14 @@ pub(crate) struct GpuCull {
     pool: vk::DescriptorPool,
     /// Frame slots `[0, FRAMES_IN_FLIGHT)`, then VR eye slots.
     frames: Vec<CullFrame>,
-    /// Hi-Z build sets per frame slot, one per mip.
+    /// Hi-Z build sets per frame slot and build (`HIZ_BUILDS`), one per mip.
     hiz_sets: Vec<vk::DescriptorSet>,
     sampler: vk::Sampler,
     hiz: HiZ,
     /// The pyramid's frame serial, view-projection, camera position + forward.
     hiz_built: Option<(u64, Mat4, Vec3, Vec3)>,
     builder: CullBuilder,
-    key_map: HashMap<(usize, usize, u32, u32), usize>,
+    key_map: HashMap<SceneBatchKey, usize>,
     mesh_map: HashMap<usize, usize>,
     /// This submission's camera batches (main view or a VR eye).
     scene: Vec<SceneIndirect>,
@@ -517,6 +634,15 @@ pub(crate) struct GpuCull {
     shadow: Vec<(usize, Vec<ShadowIndirect>)>,
     cmd_buffer: vk::Buffer,
     inst_buffer: vk::Buffer,
+    late_cmd_buffer: vk::Buffer,
+    late_inst_buffer: vk::Buffer,
+    /// The main camera's late pass this frame: its state, candidate count (the
+    /// main view's candidates come first) and camera (`pyramid_camera`).
+    late: Late,
+    late_count: u32,
+    late_cam: (Mat4, Vec3, Vec3),
+    /// The pass the next `record_scene_draws` may split for the late pass.
+    split: Option<LateSplit>,
     /// Draws of `FrameInput::draws` the camera batches cover (the CPU part of
     /// the pass skips them).
     handled: Vec<bool>,
@@ -559,9 +685,10 @@ impl GpuCull {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         };
-        let cull_bindings: Vec<_> = (0..7)
-            .map(|b| binding(b, vk::DescriptorType::STORAGE_BUFFER))
-            .chain([binding(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)])
+        let cull_bindings: Vec<_> = CULL_BUFFER_BINDINGS
+            .iter()
+            .map(|&b| binding(b, vk::DescriptorType::STORAGE_BUFFER))
+            .chain([binding(CULL_HIZ_BINDING, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)])
             .collect();
         let hiz_bindings =
             [binding(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER), binding(1, vk::DescriptorType::STORAGE_IMAGE)];
@@ -581,14 +708,17 @@ impl GpuCull {
                 )
             }
         };
-        let pipeline_layout = layout(set_layout, 4)?;
+        let pipeline_layout = layout(set_layout, size_of::<CullPush>() as u32)?;
         let hiz_pipeline_layout = layout(hiz_set_layout, 16)?;
         let pipeline = compute_pipeline(device, pipeline_layout, CULL_SPV)?;
         let hiz_pipeline = compute_pipeline(device, hiz_pipeline_layout, HIZ_SPV)?;
 
-        let hiz_set_count = FRAMES_IN_FLIGHT * MAX_HIZ_MIPS;
+        let hiz_set_count = FRAMES_IN_FLIGHT * HIZ_BUILDS * MAX_HIZ_MIPS;
         let sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 7 * CULL_SLOTS as u32 },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: (CULL_BUFFER_BINDINGS.len() * CULL_SLOTS) as u32,
+            },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: (CULL_SLOTS + hiz_set_count) as u32,
@@ -651,6 +781,12 @@ impl GpuCull {
             shadow: Vec::new(),
             cmd_buffer: vk::Buffer::null(),
             inst_buffer: vk::Buffer::null(),
+            late_cmd_buffer: vk::Buffer::null(),
+            late_inst_buffer: vk::Buffer::null(),
+            late: Late::Off,
+            late_count: 0,
+            late_cam: (Mat4::IDENTITY, Vec3::ZERO, Vec3::ZERO),
+            split: None,
             handled: Vec::new(),
             pending: false,
             hiz_from_copy: false,
@@ -689,6 +825,8 @@ impl GpuCull {
                 self.counts.eye_visible = rec.main.map_or(0, |v| view(v)[1]);
             } else {
                 self.counts.main = rec.main.map_or([0; 4], view);
+                // Zero when no late pass ran (cleared with the early block).
+                self.counts.late = rec.main.map_or([0; 4], |v| view(v + MAX_CULL_VIEWS as u32));
                 self.counts.shadow_visible = (rec.shadow_views.0..rec.shadow_views.1).map(|v| view(v)[1]).sum();
             }
         }
@@ -697,11 +835,21 @@ impl GpuCull {
         self.handled.clear();
         self.pending = false;
         self.hiz_from_copy = false;
+        self.late = Late::Off;
+        self.split = None;
     }
 
     /// Size this slot's buffers for the builder's lists, write them and point
-    /// the slot's descriptor set at them.
-    fn upload(&mut self, device: &ash::Device, allocator: &mut Allocator, slot: usize, instances: u32) -> Result<()> {
+    /// the slot's descriptor set at them. `late`: size the late pass's buffers
+    /// for the main view (its candidates and instance regions come first).
+    fn upload(
+        &mut self,
+        device: &ash::Device,
+        allocator: &mut Allocator,
+        slot: usize,
+        instances: u32,
+        late: bool,
+    ) -> Result<()> {
         let b = &self.builder;
         let f = &mut self.frames[slot];
         let draws: &[u8] = bytemuck::cast_slice(&b.draws);
@@ -716,12 +864,17 @@ impl GpuCull {
         f.cmd_src.ensure(device, allocator, cmds.len())?;
         f.cmds.ensure(device, allocator, cmds.len())?;
         f.instances.ensure(device, allocator, instances as usize * INSTANCE_STRIDE as usize)?;
+        let late_count = if late { self.late_count as usize } else { 0 };
+        f.late_cmds.ensure(device, allocator, if late { cmds.len() } else { 0 })?;
+        f.late_instances.ensure(device, allocator, late_count * INSTANCE_STRIDE as usize)?;
+        f.occluded.ensure(device, allocator, late_count * size_of::<u32>())?;
         f.draws.write(draws);
         f.candidates.write(candidates);
         f.batches.write(batches);
         f.views.write(views);
         f.cmd_src.write(cmds);
 
+        // In CULL_BUFFER_BINDINGS order.
         let buffers = [
             f.draws.handle(),
             f.candidates.handle(),
@@ -730,6 +883,9 @@ impl GpuCull {
             f.cmds.handle(),
             f.instances.handle(),
             f.counters.handle,
+            f.late_cmds.handle(),
+            f.late_instances.handle(),
+            f.occluded.handle(),
         ];
         let infos: Vec<[vk::DescriptorBufferInfo; 1]> =
             buffers.iter().map(|&b| [vk::DescriptorBufferInfo::default().buffer(b).range(vk::WHOLE_SIZE)]).collect();
@@ -739,11 +895,11 @@ impl GpuCull {
             .image_layout(vk::ImageLayout::GENERAL)];
         let mut writes: Vec<vk::WriteDescriptorSet> = infos
             .iter()
-            .enumerate()
-            .map(|(i, info)| {
+            .zip(CULL_BUFFER_BINDINGS)
+            .map(|(info, binding)| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(f.set)
-                    .dst_binding(i as u32)
+                    .dst_binding(binding)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(info)
             })
@@ -751,23 +907,26 @@ impl GpuCull {
         writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(f.set)
-                .dst_binding(7)
+                .dst_binding(CULL_HIZ_BINDING)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&image),
         );
         unsafe { device.update_descriptor_sets(&writes, &[]) };
         self.cmd_buffer = f.cmds.handle();
         self.inst_buffer = f.instances.handle();
+        self.late_cmd_buffer = f.late_cmds.handle();
+        self.late_inst_buffer = f.late_instances.handle();
         Ok(())
     }
 
-    /// Record the cull: reset the indirect commands + counters, dispatch,
-    /// and make the results visible to indirect / vertex fetch (and copy the
-    /// counters out for the next readback of this slot).
-    fn record(&mut self, device: &ash::Device, cb: vk::CommandBuffer, slot: usize, rec: Recorded) {
+    /// Record the (early) cull: reset the indirect commands (the late pass's
+    /// too when `late`) + counters, dispatch, and make the results visible to
+    /// indirect / vertex fetch (and copy the counters out for the next
+    /// readback of this slot).
+    fn record(&mut self, device: &ash::Device, cb: vk::CommandBuffer, slot: usize, rec: Recorded, late: bool) {
         let f = &mut self.frames[slot];
         let cmd_bytes = (self.builder.cmds.len() * size_of::<IndirectCmd>()) as u64;
-        let count = self.builder.candidates.len() as u32;
+        let push = CullPush { late_vp: Mat4::IDENTITY.to_cols_array_2d(), count: self.builder.candidates.len() as u32, late: 0 };
         unsafe {
             if !self.hiz.ready {
                 image_barrier_range(
@@ -784,6 +943,14 @@ impl GpuCull {
                 f.cmds.handle(),
                 &[vk::BufferCopy::default().size(cmd_bytes)],
             );
+            if late {
+                device.cmd_copy_buffer(
+                    cb,
+                    f.cmd_src.handle(),
+                    f.late_cmds.handle(),
+                    &[vk::BufferCopy::default().size(cmd_bytes)],
+                );
+            }
             device.cmd_fill_buffer(cb, f.counters.handle, 0, COUNTER_BYTES, 0);
             // Also orders the previous frame's pyramid build before this read.
             let pre = [vk::MemoryBarrier2::default()
@@ -798,8 +965,8 @@ impl GpuCull {
             device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
             device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[f.set], &[]);
-            device.cmd_push_constants(cb, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &count.to_ne_bytes());
-            device.cmd_dispatch(cb, count.div_ceil(64), 1, 1);
+            device.cmd_push_constants(cb, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push));
+            device.cmd_dispatch(cb, push.count.div_ceil(64), 1, 1);
             let post = [vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -829,6 +996,170 @@ impl GpuCull {
         }
         f.recorded = Some(rec);
     }
+
+    /// Record the late pass (outside rendering, after this frame's pyramid
+    /// was built): re-test the main-view candidates the early pass flagged
+    /// occluded, fill the late commands / instances, and copy the late
+    /// counters out after the early ones.
+    fn record_late(&mut self, device: &ash::Device, cb: vk::CommandBuffer, slot: usize) {
+        let f = &self.frames[slot];
+        let push = CullPush { late_vp: self.late_cam.0.to_cols_array_2d(), count: self.late_count, late: 1 };
+        unsafe {
+            // The early pass's flags + its counter readback copy, the late
+            // commands' reset copy and the pyramid build, before the late pass.
+            let pre = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER | vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ
+                        | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                        | vk::AccessFlags2::SHADER_SAMPLED_READ
+                        | vk::AccessFlags2::TRANSFER_WRITE,
+                )];
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&pre));
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[f.set], &[]);
+            device.cmd_push_constants(cb, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push));
+            device.cmd_dispatch(cb, push.count.div_ceil(64), 1, 1);
+            let post = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::DRAW_INDIRECT
+                        | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
+                        | vk::PipelineStageFlags2::TRANSFER,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags2::INDIRECT_COMMAND_READ
+                        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
+                        | vk::AccessFlags2::TRANSFER_READ,
+                )];
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&post));
+            device.cmd_copy_buffer(
+                cb,
+                f.counters.handle,
+                f.readback.handle,
+                &[vk::BufferCopy::default().src_offset(LATE_COUNTERS).dst_offset(LATE_COUNTERS).size(LATE_COUNTERS)],
+            );
+            let host = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&host));
+        }
+    }
+
+    /// Record a pyramid build (outside rendering) into descriptor sets
+    /// `build` of frame slot `frame`. `src`: the depth view to reduce;
+    /// `depth_image`: its image when it is an attachment (DEPTH_ATTACHMENT_
+    /// OPTIMAL, moved to SHADER_READ_ONLY_OPTIMAL and back), else it is
+    /// already SHADER_READ_ONLY_OPTIMAL.
+    fn record_pyramid(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        frame: usize,
+        build: usize,
+        src: vk::ImageView,
+        depth_image: Option<vk::Image>,
+    ) {
+        let depth_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+            .level_count(1)
+            .layer_count(1);
+        if let Some(image) = depth_image {
+            image_barrier(
+                device, cb, image, vk::ImageAspectFlags::DEPTH,
+                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
+            );
+        }
+        unsafe {
+            // The source's last write (depth tests, or the opaque-copy transfer)
+            // before the compute read.
+            let src_ready = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&src_ready));
+        }
+        // Rewritten whole: this frame's cull reads are the only prior use.
+        image_barrier_range(
+            device, cb, self.hiz.image, self.hiz.range(),
+            vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE,
+        );
+        self.hiz.ready = true;
+        let first = (frame * HIZ_BUILDS + build) * MAX_HIZ_MIPS;
+        let sets = &self.hiz_sets[first..first + MAX_HIZ_MIPS];
+        let mut src_size = self.hiz.src;
+        unsafe {
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.hiz_pipeline);
+            for (mip, &set) in sets.iter().enumerate().take(self.hiz.mips as usize) {
+                let dst_size = [(self.hiz.size[0] >> mip).max(1), (self.hiz.size[1] >> mip).max(1)];
+                let (view, layout) = if mip == 0 {
+                    (src, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                } else {
+                    (self.hiz.mip_views[mip - 1], vk::ImageLayout::GENERAL)
+                };
+                let src_info = [vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(view).image_layout(layout)];
+                let dst_info = [vk::DescriptorImageInfo::default()
+                    .image_view(self.hiz.mip_views[mip])
+                    .image_layout(vk::ImageLayout::GENERAL)];
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&src_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&dst_info),
+                ];
+                device.update_descriptor_sets(&writes, &[]);
+                device.cmd_bind_descriptor_sets(
+                    cb, vk::PipelineBindPoint::COMPUTE, self.hiz_pipeline_layout, 0, &[set], &[],
+                );
+                let push: [i32; 4] = [src_size[0] as i32, src_size[1] as i32, dst_size[0] as i32, dst_size[1] as i32];
+                device.cmd_push_constants(
+                    cb, self.hiz_pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push),
+                );
+                device.cmd_dispatch(cb, dst_size[0].div_ceil(8), dst_size[1].div_ceil(8), 1);
+                let done = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
+                device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&done));
+                src_size = dst_size;
+            }
+        }
+        if let Some(image) = depth_image {
+            image_barrier_range(
+                device, cb, image, depth_range,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::empty(),
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            );
+        }
+    }
+
+    /// This frame's camera can't leave a pyramid for the next frame's early
+    /// pass. One the late pass built this frame (from the early batches'
+    /// depth, this frame's camera) still serves.
+    fn drop_next_pyramid(&mut self) {
+        if self.late != Late::Done {
+            self.hiz_built = None;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -854,6 +1185,11 @@ fn image_barrier_range(
         .dst_access_mask(dst_access)
         .subresource_range(range)];
     unsafe { device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&barrier)) };
+}
+
+/// A pyramid's camera: view-projection, position, forward.
+fn pyramid_camera(cam: &CameraData) -> (Mat4, Vec3, Vec3) {
+    (cam.proj * cam.view, cam.position, -cam.view.row(2).truncate().normalize_or_zero())
 }
 
 /// Union of two world AABBs (None = unbounded, absorbing).
@@ -926,6 +1262,17 @@ impl Renderer {
         }
     }
 
+    /// The next `record_scene_draws` records into this main-camera pass (a
+    /// depth-writing one, rendering begun): when the late pass is pending it
+    /// splits the pass after the early batches to run it.
+    pub(crate) fn gpu_late_split(&mut self, split: LateSplit) {
+        if let Some(g) = self.gpu_cull.as_mut()
+            && g.late == Late::Pending
+        {
+            g.split = Some(split);
+        }
+    }
+
     /// Whether this frame draws the main camera (game view, or the editor
     /// viewport's offscreen target).
     fn main_camera_drawn(&self, input: &FrameInput) -> bool {
@@ -975,8 +1322,20 @@ impl Renderer {
                 continue;
             }
             let material = &self.materials[d.material.0];
-            let push = self.draw_push(d, material, input);
-            let key = (d.material.0, d.mesh.0, push.emission[3].to_bits(), push.params1[3].to_bits());
+            let mut push = self.draw_push(d, material, input);
+            if !input.lightmap_preview {
+                // The layer rides in each instance (GpuDraw::of): one batch
+                // for all of the mesh's lightmapped copies.
+                push.params1[3] = -1.0;
+            }
+            let key = SceneBatchKey {
+                set: material.set.as_raw(),
+                mesh: d.mesh.0,
+                base_color: push.base_color.map(f32::to_bits),
+                emission: push.emission.map(f32::to_bits),
+                params0: push.params0.map(f32::to_bits),
+                params1: push.params1.map(f32::to_bits),
+            };
             let k = *g.key_map.entry(key).or_insert_with(|| {
                 let batch = g.builder.add_batch(view, self.meshes[d.mesh.0].index_count);
                 g.scene.push(SceneIndirect {
@@ -1023,15 +1382,19 @@ impl Renderer {
         }
     }
 
-    /// Upload + record the built cull into slot `slot`. On failure the frame
-    /// falls back to the CPU path.
-    fn gpu_cull_submit(&mut self, g: &mut GpuCull, cb: vk::CommandBuffer, slot: usize, rec: Recorded) {
+    /// Upload + record the built cull into slot `slot` (`late`: the main view
+    /// tests Hi-Z, so a late pass follows). On failure the frame falls back to
+    /// the CPU path.
+    fn gpu_cull_submit(&mut self, g: &mut GpuCull, cb: vk::CommandBuffer, slot: usize, rec: Recorded, late: bool) {
         let instances = g.builder.finalize();
         Self::gpu_place_batches(g);
         let allocator = self.allocator();
-        let uploaded = g.upload(&self.ctx.device, &mut allocator.lock().unwrap(), slot, instances);
+        let uploaded = g.upload(&self.ctx.device, &mut allocator.lock().unwrap(), slot, instances, late);
         match uploaded {
-            Ok(()) => g.record(&self.ctx.device, cb, slot, rec),
+            Ok(()) => {
+                g.record(&self.ctx.device, cb, slot, rec, late);
+                g.late = Late::after_early(late);
+            }
             Err(e) => {
                 tracing::warn!("GPU cull upload failed, CPU path this frame: {e:#}");
                 g.scene.clear();
@@ -1102,11 +1465,18 @@ impl Renderer {
             g.hiz_built = None;
         }
         g.builder.begin(input.draws.len());
+        g.builder.pack_lightmap = !input.lightmap_preview;
         let mut main = None;
+        let mut late = false;
         if self.main_camera_drawn(input) {
-            let view = g.builder.add_view(self.gpu_main_view(&g, input, main_extent));
+            let main_view = self.gpu_main_view(&g, input, main_extent);
+            let view = g.builder.add_view(main_view);
             self.gpu_build_scene(&mut g, view, order, input);
             main = Some(view);
+            // The main view's candidates (and instance regions) come first.
+            late = main_view.hiz[3] > 0.5 && !g.builder.candidates.is_empty();
+            g.late_count = g.builder.candidates.len() as u32;
+            g.late_cam = pyramid_camera(&input.camera);
         }
         let first_shadow = g.builder.views.len() as u32;
         for (layer, view_proj, casters) in shadow_work {
@@ -1130,7 +1500,7 @@ impl Renderer {
         let rec = Recorded { main, shadow_views: (first_shadow, g.builder.views.len() as u32), eye: false };
         if !g.builder.candidates.is_empty() {
             self.gpu_zone_begin(cb, gpu_zone::CULL);
-            self.gpu_cull_submit(&mut g, cb, self.frame_index, rec);
+            self.gpu_cull_submit(&mut g, cb, self.frame_index, rec, late);
             self.gpu_zone_end(cb, gpu_zone::CULL);
         } else {
             g.scene.clear();
@@ -1154,18 +1524,22 @@ impl Renderer {
         }
         let mut g = self.gpu_cull.take().unwrap();
         g.builder.begin(input.draws.len());
+        g.builder.pack_lightmap = !input.lightmap_preview;
         let view = g.builder.add_view(GpuView::new(view_proj, cam_pos, true));
         self.gpu_build_scene(&mut g, view, order, input);
         if !g.builder.candidates.is_empty() {
             self.ctx.checkpoint(cb, c"GPU cull (VR eye)");
             let rec = Recorded { main: Some(view), shadow_views: (0, 0), eye: true };
-            self.gpu_cull_submit(&mut g, cb, eye_slot(slot), rec);
+            self.gpu_cull_submit(&mut g, cb, eye_slot(slot), rec, false);
         }
         self.gpu_cull = Some(g);
     }
 
     /// Draw the armed GPU camera batches (called by `record_scene_draws` before
-    /// its CPU draws, so the pass's state comes from the same key logic).
+    /// its CPU draws, so the pass's state comes from the same key logic):
+    /// the early batches, then the late ones once the late pass has run. When
+    /// it is pending and this pass was offered as its split, run it here
+    /// between the two.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_gpu_scene_batches(
         &mut self,
@@ -1180,23 +1554,60 @@ impl Renderer {
         let Some(g) = self.gpu_cull.as_mut() else {
             return Ok(());
         };
+        let split = g.split.take();
         if !std::mem::take(&mut g.pending) {
             return Ok(());
         }
         let batches = std::mem::take(&mut g.scene);
-        let (cmds, insts) = (g.cmd_buffer, g.inst_buffer);
-        let mut result = Ok(());
+        let early = (g.cmd_buffer, g.inst_buffer);
+        let late = (g.late_cmd_buffer, g.late_inst_buffer);
+        let late_state = g.late;
         let mut drawn = 0;
-        for b in &batches {
+        let mut result =
+            self.draw_gpu_batches(device, cb, frame_set, gbuf, &batches, early, bound, stats, materials_seen, &mut drawn);
+        if result.is_ok() {
+            let draw_late = match split {
+                Some(split) if late_state.runs_in(true) => {
+                    let ran = self.gpu_cull_late(device, cb, &split);
+                    // Resumed rendering: rebind everything.
+                    *bound = BoundDraw::default();
+                    ran
+                }
+                _ => late_state == Late::Done,
+            };
+            if draw_late {
+                result = self.draw_gpu_batches(
+                    device, cb, frame_set, gbuf, &batches, late, bound, stats, materials_seen, &mut drawn,
+                );
+            }
+        }
+        stats.indirect_draws += drawn;
+        if let Some(g) = self.gpu_cull.as_mut() {
+            g.scene = batches;
+            g.indirect_draws += drawn;
+        }
+        result
+    }
+
+    /// One indirect draw per camera batch from `(commands, instances)`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_gpu_batches(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        frame_set: vk::DescriptorSet,
+        gbuf: bool,
+        batches: &[SceneIndirect],
+        (cmds, insts): (vk::Buffer, vk::Buffer),
+        bound: &mut BoundDraw,
+        stats: &mut RenderStats,
+        materials_seen: &mut [bool],
+        drawn: &mut u32,
+    ) -> Result<()> {
+        for b in batches {
             let material = &self.materials[b.material];
             let key = scene_pipeline_key(material, gbuf, self.capturing_refl, self.draw_mode, false);
-            let pipeline = match self.pipeline_cache.get(device, key) {
-                Ok(p) => p,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
+            let pipeline = self.pipeline_cache.get(device, key)?;
             let mut push = b.push;
             push.model[0] = if self.cull_active { b.mask } else { [u32::MAX; 4] }.map(f32::from_bits);
             if let Some(seen) = materials_seen.get_mut(b.material)
@@ -1216,14 +1627,75 @@ impl Renderer {
                 indirect: Some((cmds, b.cmd_offset, insts, b.inst_offset)),
             };
             self.flush_scene_batch(device, cb, frame_set, &batch, bound, stats);
-            drawn += 1;
+            *drawn += 1;
         }
-        stats.indirect_draws += drawn;
-        if let Some(g) = self.gpu_cull.as_mut() {
-            g.scene = batches;
-            g.indirect_draws += drawn;
+        Ok(())
+    }
+
+    /// The late pass, inside the main-camera pass `split` (rendering begun,
+    /// the early batches drawn): end it, build this frame's pyramid from its
+    /// depth, re-test the instances the early pass found occluded, and resume
+    /// it (LOAD). False when it could not run (the late batches stay empty).
+    fn gpu_cull_late(&mut self, device: &ash::Device, cb: vk::CommandBuffer, split: &LateSplit) -> bool {
+        let Some(mut g) = self.gpu_cull.take() else {
+            return false;
+        };
+        // The pyramid follows the main depth's size (the early pass only
+        // tested occlusion when it matched).
+        let fits = g.hiz.src == [split.extent.width, split.extent.height];
+        unsafe { device.cmd_end_rendering(cb) };
+        if fits {
+            self.gpu_zone_begin(cb, gpu_zone::CULL_LATE);
+            g.record_pyramid(device, cb, self.frame_index, HIZ_BUILD_LATE, split.depth.1, Some(split.depth.0));
+            g.record_late(device, cb, self.frame_index);
+            self.gpu_zone_end(cb, gpu_zone::CULL_LATE);
+            let (vp, pos, forward) = g.late_cam;
+            g.hiz_built = Some((self.frame_serial, vp, pos, forward));
+            g.late = Late::Done;
+        } else {
+            g.late = Late::Off;
         }
-        result
+        // The pass's colour writes before it resumes with LOAD (depth was
+        // ordered by the pyramid build's transitions).
+        let color = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)];
+        let load = |view: vk::ImageView, layout: vk::ImageLayout| {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(layout)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE)
+        };
+        let colors: Vec<_> =
+            split.colors.iter().map(|&v| load(v, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)).collect();
+        let depth = load(split.depth.1, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+        let area = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: split.extent };
+        let info = vk::RenderingInfo::default()
+            .render_area(area)
+            .layer_count(1)
+            .color_attachments(&colors)
+            .depth_attachment(&depth);
+        // Negative-height viewport, as every main-camera pass.
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: split.extent.height as f32,
+            width: split.extent.width as f32,
+            height: -(split.extent.height as f32),
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        unsafe {
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&color));
+            device.cmd_begin_rendering(cb, &info);
+            device.cmd_set_viewport(cb, 0, &[viewport]);
+            device.cmd_set_scissor(cb, 0, &[area]);
+        }
+        let ran = g.late == Late::Done;
+        self.gpu_cull = Some(g);
+        ran
     }
 
     /// Record the GPU-culled casters of shadow layer `layer` (shadow pipeline
@@ -1291,7 +1763,7 @@ impl Renderer {
             Some((v, e)) if [e.width, e.height] == src => (v, false),
             // A copy of another size doesn't hold this pass's depth.
             Some(_) => {
-                g.hiz_built = None;
+                g.drop_next_pyramid();
                 self.gpu_cull = Some(g);
                 return;
             }
@@ -1302,123 +1774,38 @@ impl Renderer {
             return;
         }
         self.gpu_zone_begin(cb, gpu_zone::HIZ);
-        let depth_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::DEPTH)
-            .level_count(1)
-            .layer_count(1);
-        if transition {
-            image_barrier(
-                device, cb, depth.0, vk::ImageAspectFlags::DEPTH,
-                vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
-            );
-        }
-        unsafe {
-            // The source's last write (depth tests, or the opaque-copy transfer)
-            // before the compute read.
-            let src_ready = [vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE | vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&src_ready));
-        }
-        // Rewritten whole: this frame's cull reads are the only prior use.
-        image_barrier_range(
-            device, cb, g.hiz.image, g.hiz.range(),
-            vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL,
-            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::empty(),
-            vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_STORAGE_WRITE,
-        );
-        g.hiz.ready = true;
-        let sets = &g.hiz_sets[self.frame_index * MAX_HIZ_MIPS..(self.frame_index + 1) * MAX_HIZ_MIPS];
-        let mut src_size = src;
-        unsafe {
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, g.hiz_pipeline);
-            for (mip, &set) in sets.iter().enumerate().take(g.hiz.mips as usize) {
-                let dst_size = [(g.hiz.size[0] >> mip).max(1), (g.hiz.size[1] >> mip).max(1)];
-                let (view, layout) = if mip == 0 {
-                    (src_view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                } else {
-                    (g.hiz.mip_views[mip - 1], vk::ImageLayout::GENERAL)
-                };
-                let src_info = [vk::DescriptorImageInfo::default().sampler(g.sampler).image_view(view).image_layout(layout)];
-                let dst_info = [vk::DescriptorImageInfo::default()
-                    .image_view(g.hiz.mip_views[mip])
-                    .image_layout(vk::ImageLayout::GENERAL)];
-                let writes = [
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(0)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .image_info(&src_info),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(set)
-                        .dst_binding(1)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&dst_info),
-                ];
-                device.update_descriptor_sets(&writes, &[]);
-                device.cmd_bind_descriptor_sets(
-                    cb, vk::PipelineBindPoint::COMPUTE, g.hiz_pipeline_layout, 0, &[set], &[],
-                );
-                let push: [i32; 4] = [src_size[0] as i32, src_size[1] as i32, dst_size[0] as i32, dst_size[1] as i32];
-                device.cmd_push_constants(
-                    cb, g.hiz_pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push),
-                );
-                device.cmd_dispatch(cb, dst_size[0].div_ceil(8), dst_size[1].div_ceil(8), 1);
-                let done = [vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)];
-                device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&done));
-                src_size = dst_size;
-            }
-        }
-        if transition {
-            image_barrier_range(
-                device, cb, depth.0, depth_range,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::empty(),
-                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            );
-        }
+        g.record_pyramid(device, cb, self.frame_index, HIZ_BUILD_NEXT, src_view, transition.then_some(depth.0));
         self.gpu_zone_end(cb, gpu_zone::HIZ);
-        let cam = &input.camera;
-        g.hiz_built = Some((
-            self.frame_serial,
-            cam.proj * cam.view,
-            cam.position,
-            -cam.view.row(2).truncate().normalize_or_zero(),
-        ));
+        let (vp, pos, forward) = pyramid_camera(&input.camera);
+        g.hiz_built = Some((self.frame_serial, vp, pos, forward));
         self.gpu_cull = Some(g);
     }
 
     /// The pyramid of this frame can't be built (e.g. the selection outline
-    /// wiped the depth): next frame culls without occlusion.
+    /// wiped the depth): next frame's early pass tests against the late
+    /// pass's pyramid when one was built this frame, else culls without
+    /// occlusion.
     pub(crate) fn gpu_hiz_invalidate(&mut self) {
         if let Some(g) = self.gpu_cull.as_mut() {
-            g.hiz_built = None;
+            g.drop_next_pyramid();
         }
     }
 
     /// Fold the GPU cull counters into this frame's stats.
     pub(crate) fn gpu_cull_stats(&self, stats: &mut RenderStats) {
-        stats.gpu_cull_ms = self.gpu_zone_ms[gpu_zone::CULL];
+        stats.gpu_cull_ms = self.gpu_zone_ms[gpu_zone::CULL] + self.gpu_zone_ms[gpu_zone::CULL_LATE];
         stats.gpu_hiz_ms = self.gpu_zone_ms[gpu_zone::HIZ];
         let Some(g) = self.gpu_cull.as_ref().filter(|_| self.gpu_cull_settings.enabled) else {
             return;
         };
         stats.gpu_culling = true;
         stats.indirect_draws = g.indirect_draws;
-        let [tested, visible, frustum, occluded] = g.counts.main;
+        let ([tested, visible, frustum, occluded], recovered) = fold_late_counts(g.counts.main, g.counts.late);
         stats.gpu_cull_tested = tested;
         stats.gpu_cull_visible = visible;
         stats.gpu_cull_frustum = frustum;
         stats.gpu_cull_occluded = occluded;
+        stats.gpu_cull_recovered = recovered;
         stats.gpu_cull_shadow_visible = g.counts.shadow_visible;
         stats.gpu_cull_eye_visible = g.counts.eye_visible;
         stats.opaque_draws += visible;
@@ -1530,7 +1917,7 @@ mod tests {
                 for _ in 0..4000 {
                     let d = random_draw(&mut rng);
                     let cpu = sphere_in_planes(&planes, &d, near);
-                    let gpu = classify(&v, &GpuDraw::of(&d)) == 0;
+                    let gpu = classify(&v, &GpuDraw::of(&d, false)) == 0;
                     assert_eq!(cpu, gpu, "near={near} draw={:?} r={}", d.transform, d.bound_radius);
                     kept[cpu as usize] += 1;
                 }
@@ -1543,8 +1930,8 @@ mod tests {
     fn distance_and_size_hooks_only_cull_when_set() {
         let vp = views()[0];
         let mut v = GpuView::new(vp, Vec3::new(3.0, 4.0, 10.0), true);
-        let near_big = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -5.0)), Vec3::ZERO, 1.0));
-        let far_small = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -150.0)), Vec3::ZERO, 0.05));
+        let near_big = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -5.0)), Vec3::ZERO, 1.0), false);
+        let far_small = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -150.0)), Vec3::ZERO, 0.05), false);
         assert_eq!(classify(&v, &near_big), 0);
         assert_eq!(classify(&v, &far_small), 0);
         v.cam[3] = 100.0;
@@ -1566,6 +1953,61 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IndirectCmd, first_instance), 16);
         assert_eq!(INDIRECT_STRIDE, 20);
         assert_eq!(MAX_CULL_VIEWS * 4, 64, "one shared counter per thread of the 64-wide group");
+        assert_eq!(std::mem::offset_of!(CullPush, count), 64);
+        assert_eq!(std::mem::offset_of!(CullPush, late), 68);
+        assert_eq!(LATE_COUNTERS, MAX_CULL_VIEWS as u64 * 16, "late block starts at counters[MAX_VIEWS * 4]");
+        assert!(!CULL_BUFFER_BINDINGS.contains(&CULL_HIZ_BINDING));
+    }
+
+    #[test]
+    fn late_counts_fold_into_the_main_view() {
+        // Early: 100 tested, 60 visible, 25 frustum, 15 occluded; the late
+        // pass re-tests the 15 and finds 4 visible now.
+        let (main, recovered) = fold_late_counts([100, 60, 25, 15], [15, 4, 0, 11]);
+        assert_eq!(main, [100, 64, 25, 11]);
+        assert_eq!(recovered, 4);
+        // No late pass (its block stays cleared): the early counts stand.
+        assert_eq!(fold_late_counts([100, 60, 25, 15], [0; 4]), ([100, 60, 25, 15], 0));
+    }
+
+    #[test]
+    fn late_pass_runs_once_in_the_offered_split() {
+        assert_eq!(Late::after_early(false), Late::Off, "no pyramid tested: nothing to re-test");
+        assert_eq!(Late::after_early(true), Late::Pending);
+        assert!(Late::Pending.runs_in(true));
+        assert!(!Late::Pending.runs_in(false), "a pass that can't be split leaves it pending");
+        assert!(!Late::Done.runs_in(true), "the prepass ran it: the main pass only draws its batches");
+        assert!(!Late::Off.runs_in(true));
+    }
+
+    #[test]
+    fn main_view_candidates_lead_the_list() {
+        // The late pass dispatches over candidates [0, main count) and writes
+        // instances below the main count: the main view must come first.
+        let mut b = CullBuilder::default();
+        b.begin(4);
+        let d: Vec<DrawCmd> = (0..4).map(|i| draw(Mat4::from_translation(Vec3::X * i as f32), Vec3::ZERO, 1.0)).collect();
+        let main = b.add_view(GpuView::new(Mat4::IDENTITY, Vec3::ZERO, true));
+        let m0 = b.add_batch(main, 36);
+        let m1 = b.add_batch(main, 36);
+        for i in 0..4 {
+            b.add_candidate(i, &d[i], if i % 2 == 0 { m0 } else { m1 });
+        }
+        let main_count = b.candidates.len() as u32;
+        let shadow = b.add_view(GpuView::new(Mat4::IDENTITY, Vec3::ZERO, false));
+        let s = b.add_batch(shadow, 36);
+        for i in 0..4 {
+            b.add_candidate(i, &d[i], s);
+        }
+        b.finalize();
+        for (k, c) in b.candidates.iter().enumerate() {
+            let view = b.batches[c[1] as usize][0];
+            assert_eq!(view == main, (k as u32) < main_count, "candidate {k}");
+        }
+        for batch in [m0, m1] {
+            let [_, first, count, _] = b.batches[batch as usize];
+            assert!(first + count <= main_count, "main regions fit the late instance buffer");
+        }
     }
 
     #[test]
@@ -1780,6 +2222,61 @@ mod tests {
         assert!(occluded > 50, "only {occluded} random spheres were occluded");
     }
 
+    /// Depth of an axis-aligned wall (plane z = `z`, |x| <= hx, |y| <= hy)
+    /// rendered with `vp` into a `w` x `h` target, 1 elsewhere.
+    fn wall_depth(vp: Mat4, w: u32, h: u32, z: f32, hx: f32, hy: f32) -> Vec<f32> {
+        let inv = vp.inverse();
+        let mut depth = vec![1.0f32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let ndc = glam::Vec2::new((x as f32 + 0.5) / w as f32 * 2.0 - 1.0, 1.0 - (y as f32 + 0.5) / h as f32 * 2.0);
+                let near = inv.project_point3(ndc.extend(0.0));
+                let far = inv.project_point3(ndc.extend(1.0));
+                let t = (z - near.z) / (far.z - near.z);
+                let p = near + (far - near) * t;
+                if (0.0..=1.0).contains(&t) && p.x.abs() <= hx && p.y.abs() <= hy {
+                    depth[(y * w + x) as usize] = vp.project_point3(p).z;
+                }
+            }
+        }
+        depth
+    }
+
+    #[test]
+    fn late_pass_draws_disoccluded_instances_the_same_frame() {
+        // Two frames: the camera strafes 2 m right (within the early pass's
+        // camera-cut gate) past a wall. Instance A was behind the wall last
+        // frame and is in view now; B is behind it in both frames.
+        // The wall is 2.5 m ahead, A and B 12.5 m: seen through the wall
+        // plane, A moves from x = 0 (hidden) to 1.6 (past the 1.2 m edge) and B
+        // from -0.8 to 0.8.
+        let (w, h) = (321u32, 193u32);
+        let proj = Mat4::perspective_rh(1.2, w as f32 / h as f32, 0.1, 100.0);
+        let eye = |x: f32| Mat4::look_at_rh(Vec3::new(x, 0.0, 1.25), Vec3::new(x, 0.0, -1.0), Vec3::Y);
+        let (prev_vp, vp) = (proj * eye(0.0), proj * eye(2.0));
+        assert!(Vec3::new(0.0, 0.0, 1.25).distance(Vec3::new(2.0, 0.0, 1.25)) <= HIZ_MAX_MOVE);
+        let wall = |vp| wall_depth(vp, w, h, -1.25, 1.2, 1.0);
+        let (a, b, r) = (Vec3::new(0.0, 0.0, -11.25), Vec3::new(-4.0, 0.0, -11.25), 0.25);
+
+        // Early pass: last frame's pyramid (its depth, its camera).
+        let last = Pyramid::build(&wall(prev_vp), [w, h]);
+        let early_occluded = |c| last.occluded(prev_vp, c, r);
+        assert!(early_occluded(a), "a one-phase cull drops A this frame");
+        assert!(early_occluded(b));
+
+        // A really is in view this frame: its centre is nearer than the depth.
+        let depth = wall(vp);
+        let ndc = vp.project_point3(a);
+        let (px, py) = (((ndc.x * 0.5 + 0.5) * w as f32) as u32, ((0.5 - ndc.y * 0.5) * h as f32) as u32);
+        assert!(ndc.x.abs() < 1.0 && ndc.z < depth[(py * w + px) as usize], "A is visible this frame");
+
+        // Late pass: this frame's pyramid from the early batches' depth (the
+        // wall), this frame's camera, re-testing only the flagged instances.
+        let now = Pyramid::build(&depth, [w, h]);
+        assert!(!now.occluded(vp, a, r), "the late pass draws A the same frame");
+        assert!(now.occluded(vp, b, r), "B stays culled");
+    }
+
     #[test]
     fn batch_light_bounds_merge() {
         let a = draw_bounds(&draw(Mat4::from_translation(Vec3::X * 10.0), Vec3::ZERO, 1.0));
@@ -1788,5 +2285,57 @@ mod tests {
         assert_eq!(lo, Vec3::new(-1.0, -1.0, -1.0));
         assert_eq!(hi, Vec3::new(11.0, 3.0, 1.0));
         assert!(merge_bounds(a, None).is_none(), "an unbounded instance makes the batch unbounded");
+    }
+
+    #[test]
+    fn scene_batch_key_merges_material_variants_with_same_set_and_push() {
+        let mut map: HashMap<SceneBatchKey, usize> = HashMap::new();
+        let key_a = SceneBatchKey {
+            set: 7,
+            mesh: 3,
+            base_color: [1, 2, 3, 4],
+            emission: [5, 6, 7, 8],
+            params0: [9, 10, 11, 12],
+            params1: [13, 14, 15, 16],
+        };
+        let key_b = key_a;
+        let slot_a = *map.entry(key_a).or_insert(0);
+        let slot_b = *map.entry(key_b).or_insert(1);
+        assert_eq!(slot_a, slot_b, "same set + mesh + push lanes should share one batch");
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn scene_batch_key_splits_when_set_or_push_differs() {
+        let base = SceneBatchKey {
+            set: 7,
+            mesh: 3,
+            base_color: [1, 2, 3, 4],
+            emission: [5, 6, 7, 8],
+            params0: [9, 10, 11, 12],
+            params1: [13, 14, 15, 16],
+        };
+        let mut different_set = base;
+        different_set.set = 8;
+        let mut different_push = base;
+        different_push.params1[0] ^= 1;
+
+        let mut map: HashMap<SceneBatchKey, usize> = HashMap::new();
+        map.insert(base, 0);
+        map.insert(different_set, 1);
+        map.insert(different_push, 2);
+        assert_eq!(map.len(), 3, "set changes and push-lane changes must split batches");
+    }
+
+    #[test]
+    fn lightmap_layers_ride_in_the_instance_matrix() {
+        let mut d = draw(Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)), Vec3::ZERO, 1.0);
+        d.lightmap_layer = 4;
+        let packed = GpuDraw::of(&d, true);
+        assert_eq!(packed.model[0][3], 5.0, "layer + 1 in col0.w");
+        assert_eq!(packed.model[3], [1.0, 2.0, 3.0, 1.0], "the transform is otherwise untouched");
+        assert_eq!(GpuDraw::of(&d, false).model[0][3], 0.0, "lightmap preview keeps the push lane");
+        d.lightmap_layer = -1;
+        assert_eq!(GpuDraw::of(&d, true).model[0][3], 0.0, "no lightmap: 0, the shader falls back to the push lane");
     }
 }

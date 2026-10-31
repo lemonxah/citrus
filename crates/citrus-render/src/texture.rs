@@ -282,11 +282,15 @@ impl GpuTexture {
             TexFormat::Astc6x6Unorm => vk::Format::ASTC_6X6_UNORM_BLOCK,
             TexFormat::Astc8x8Srgb => vk::Format::ASTC_8X8_SRGB_BLOCK,
             TexFormat::Astc8x8Unorm => vk::Format::ASTC_8X8_UNORM_BLOCK,
+            TexFormat::Astc4x4Hdr => vk::Format::ASTC_4X4_SFLOAT_BLOCK,
         };
         // A block format the device can't sample would fail image creation
         // (or worse); the import cache never hands one over, so this is a
         // last line of defence against stale / foreign data.
-        if (tex.format.is_bc() && !crate::bc_supported()) || (tex.format.is_astc() && !crate::astc_supported()) {
+        if (tex.format.is_bc() && !crate::bc_supported())
+            || (tex.format.is_astc() && !crate::astc_supported())
+            || (tex.format == TexFormat::Astc4x4Hdr && !crate::astc_hdr_supported())
+        {
             anyhow::bail!("{:?} texture is not supported by this device", tex.format);
         }
         // Every mip must hold exactly its level's bytes: the copies below read

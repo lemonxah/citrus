@@ -15,6 +15,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 mod audio_mixer;
+pub mod ai;
+pub mod destruction;
+pub mod sequencer;
+pub mod vehicle;
 mod cloth;
 mod cloth_mesh;
 pub use cloth_mesh::{MeshCloth, MeshClothRuntime, MeshClothSim, MeshParticle, PinSource};
@@ -47,7 +51,10 @@ pub use water_pipe::{
     CELL_OBSTACLE, CELL_SHORE, CELL_WATER, MAX_SIM_SUBSTEPS, RUNUP_HEIGHT, PipeParams, PipeSim, SimField, SimWindow, WaterDisplacer, WaterSimFeed, choose_window,
     max_sim_dt, pipe_substeps, sim_resolution,
 };
-pub use water::{Buoyancy, FLUID_PRESETS, FluidPreset, GerstnerWave, OutlinePreset, ResolvedWave, RiverPoint, RiverSection, UnderwaterSettings, Water, WaterBody, WaterColumn, WaterLook, WaterRuntime};
+pub use water::{
+    Buoyancy, FLUID_PRESETS, FluidPreset, GerstnerWave, OutlinePreset, ResolvedWave, RiverPoint, RiverSection, SHORE_NO_GROUND, ShoreDepth, UnderwaterSettings, Water,
+    WaterBody, WaterColumn, WaterLook, WaterRuntime, shore_damping,
+};
 pub use voice::{
     LipSync, LipSyncMode, LipSyncRuntime, VISEMES, VisemeFrame, VoiceChat, VoiceRange, VoiceRolloff, VoiceTransmit,
     viseme_index,
@@ -716,6 +723,14 @@ pub trait Component: 'static {
     fn as_any(&self) -> &dyn std::any::Any;
     /// Mutable downcasting (assigning ids, editor inspector/gizmo dispatch).
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    /// The component as a movement controller networked prediction can
+    /// rewind and replay, if it is one.
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        None
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        None
+    }
 }
 
 /// A component switched off with the inspector's checkbox (edit mode): it
@@ -818,6 +833,16 @@ pub trait TypedComponent: Serialize + DeserializeOwned + Default + 'static {
     fn on_trigger_exit(&mut self, _ctx: &mut ComponentCtx, _other: ObjectId) {}
     /// An `Animator` on this object passed an animation event marker.
     fn on_animation_event(&mut self, _ctx: &mut ComponentCtx, _name: &str) {}
+    /// A movement component that implements [`Predictable`] returns
+    /// `Some(self)` from this and [`Self::predictable_mut`]: an owner-predicted
+    /// `NetworkObject` carrying it then moves at once on its owner and is
+    /// reconciled against the host, like the built-in controllers.
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        None
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        None
+    }
 }
 
 impl<T: TypedComponent> Component for T {
@@ -860,6 +885,12 @@ impl<T: TypedComponent> Component for T {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        TypedComponent::predictable(self)
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        TypedComponent::predictable_mut(self)
+    }
 }
 
 struct ComponentInfo {
@@ -895,6 +926,8 @@ impl ComponentRegistry {
         registry.register::<CapsuleCollider>();
         registry.register::<MeshCollider>();
         registry.register::<Terrain>();
+        registry.register::<TerrainFoliage>();
+        registry.register::<DecalProjector>();
         registry.register::<BoneAttach>();
         registry.register::<WeaponHold>();
         registry.register::<Spin>();
@@ -2105,6 +2138,11 @@ pub struct Terrain {
     pub material: String,
     /// Build a heightfield collider from `heights` so physics walks on it.
     pub collider: bool,
+    /// Per-vertex painted texture-layer weights (RGBA = up to 4 layers),
+    /// row-major over Z then X like `heights`.
+    /// Empty means "not painted yet" and defaults to layer 0 at runtime/editor.
+    #[serde(default)]
+    pub texture_weights: Vec<[f32; 4]>,
 }
 
 impl Default for Terrain {
@@ -2116,12 +2154,302 @@ impl Default for Terrain {
             heights: vec![0.0; (resolution as usize + 1).pow(2)],
             material: String::new(),
             collider: true,
+            texture_weights: Vec::new(),
         }
     }
 }
 
 impl TypedComponent for Terrain {
     const NAME: &'static str = "Terrain";
+}
+
+/// One foliage layer scattered over a terrain: instanced copies of a model,
+/// placed deterministically from a seed.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FoliageLayer {
+    /// Project-relative model path to instance.
+    pub model: String,
+    /// Target instances per square metre.
+    pub density: f32,
+    /// Per-instance uniform scale range.
+    pub scale_min: f32,
+    pub scale_max: f32,
+    /// Random yaw range in radians (± this about the surface up).
+    pub yaw: f32,
+    /// Skip placements on slopes steeper than this (radians; 0 = any).
+    pub max_slope: f32,
+    /// Orient the instance's up axis along the surface normal.
+    pub align_to_normal: bool,
+}
+
+impl Default for FoliageLayer {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            density: 1.0,
+            scale_min: 1.0,
+            scale_max: 1.0,
+            yaw: std::f32::consts::PI,
+            max_slope: 0.0,
+            align_to_normal: true,
+        }
+    }
+}
+
+/// Foliage scattered on a [`Terrain`] (a component on the terrain object).
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TerrainFoliage {
+    pub layers: Vec<FoliageLayer>,
+    pub seed: u32,
+}
+
+impl TypedComponent for TerrainFoliage {
+    const NAME: &'static str = "Terrain Foliage";
+}
+
+/// One placed foliage instance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FoliageInstance {
+    pub position: [f32; 3],
+    /// Unit quaternion `[x, y, z, w]`.
+    pub rotation: [f32; 4],
+    pub scale: f32,
+}
+
+/// Cap on scattered instances per layer (guards a large density × area).
+const MAX_FOLIAGE_INSTANCES: usize = 1_000_000;
+
+/// Deterministic xorshift64 RNG: a seed always scatters the same instances.
+struct FoliageRng(u64);
+
+impl FoliageRng {
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0xBF58_476D_1CE4_E5B9))
+    }
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x as u32
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next_u32() >> 8) as f32 / (1u32 << 24) as f32
+    }
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.unit()
+    }
+}
+
+/// Bilinear height at continuous grid coords `(gx, gz)` (clamped to the grid).
+fn foliage_height(heights: &[f32], n: usize, gx: f32, gz: f32) -> f32 {
+    let x0 = gx.floor().clamp(0.0, (n - 1) as f32) as usize;
+    let z0 = gz.floor().clamp(0.0, (n - 1) as f32) as usize;
+    let x1 = (x0 + 1).min(n - 1);
+    let z1 = (z0 + 1).min(n - 1);
+    let (fx, fz) = (gx - x0 as f32, gz - z0 as f32);
+    let h00 = heights[z0 * n + x0];
+    let h10 = heights[z0 * n + x1];
+    let h01 = heights[z1 * n + x0];
+    let h11 = heights[z1 * n + x1];
+    (h00 * (1.0 - fx) + h10 * fx) * (1.0 - fz) + (h01 * (1.0 - fx) + h11 * fx) * fz
+}
+
+/// Surface normal at the nearest grid point, matching `heightfield_mesh`'s
+/// clamped central difference.
+fn foliage_normal(heights: &[f32], n: usize, res: usize, xi: i64, zi: i64, step: f32) -> Vec3 {
+    let sample = |x: i64, z: i64| {
+        let x = x.clamp(0, res as i64) as usize;
+        let z = z.clamp(0, res as i64) as usize;
+        heights[z * n + x]
+    };
+    let dh_dx = sample(xi + 1, zi) - sample(xi - 1, zi);
+    let dh_dz = sample(xi, zi + 1) - sample(xi, zi - 1);
+    Vec3::new(-dh_dx, 2.0 * step, -dh_dz).normalize_or(Vec3::Y)
+}
+
+/// Scatter one foliage layer over `terrain`, deterministically from `seed`.
+/// Returns the placed instances (fewer than the density target where the slope
+/// limit rejects spots).
+pub fn scatter_foliage(terrain: &Terrain, layer: &FoliageLayer, seed: u32) -> Vec<FoliageInstance> {
+    let res = terrain.resolution as usize;
+    let n = res + 1;
+    if terrain.heights.len() != n * n || layer.density <= 0.0 {
+        return Vec::new();
+    }
+    let step = terrain.size / terrain.resolution as f32;
+    let half = terrain.size * 0.5;
+    let count = ((layer.density * terrain.size * terrain.size).round() as usize).min(MAX_FOLIAGE_INSTANCES);
+    let mut rng = FoliageRng::new(seed as u64);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let wx = rng.range(-half, half);
+        let wz = rng.range(-half, half);
+        let gx = (wx + half) / step;
+        let gz = (wz + half) / step;
+        let height = foliage_height(&terrain.heights, n, gx, gz);
+        let normal = foliage_normal(&terrain.heights, n, res, gx.round() as i64, gz.round() as i64, step);
+        if layer.max_slope > 0.0 && normal.y.acos() > layer.max_slope {
+            continue;
+        }
+        let scale = rng.range(layer.scale_min, layer.scale_max);
+        let yaw = rng.range(-layer.yaw, layer.yaw);
+        let up = if layer.align_to_normal { normal } else { Vec3::Y };
+        // Yaw about the local up first, then tilt the up axis onto the surface,
+        // so the instance keeps its yaw about the aligned normal.
+        let rotation = Quat::from_rotation_arc(Vec3::Y, up) * Quat::from_rotation_y(yaw);
+        out.push(FoliageInstance {
+            position: [wx, height, wz],
+            rotation: rotation.normalize().to_array(),
+            scale,
+        });
+    }
+    out
+}
+
+/// A decal projector: an orthographic box that projects a texture onto nearby
+/// geometry (bullet holes, scorch marks, puddles). The box is the object's
+/// local X/Y extents and a `depth` along its -Z (the projection direction).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecalProjector {
+    /// Project-relative texture path (the decal image).
+    pub texture: String,
+    /// Orthographic box width/height in metres (local X/Y).
+    pub size: [f32; 2],
+    /// Projection depth along the projector's -Z (local), in metres.
+    pub depth: f32,
+    /// Fade the decal out over this fraction of `depth` at the far end.
+    pub fade: f32,
+    /// UV tiling over the box.
+    pub tiling: [f32; 2],
+}
+
+impl Default for DecalProjector {
+    fn default() -> Self {
+        Self {
+            texture: String::new(),
+            size: [1.0, 1.0],
+            depth: 1.0,
+            fade: 0.1,
+            tiling: [1.0, 1.0],
+        }
+    }
+}
+
+impl TypedComponent for DecalProjector {
+    const NAME: &'static str = "Decal Projector";
+}
+
+/// Project a world point into a decal projector's UV space (0..1, origin at the
+/// box's -X/-Y corner). `projector` is the object's world transform; `None`
+/// when the point falls outside the orthographic box.
+pub fn decal_uv(world: Vec3, projector: Mat4, size: [f32; 2], depth: f32) -> Option<[f32; 2]> {
+    let local = projector.inverse().transform_point3(world);
+    let hx = size[0] * 0.5;
+    let hy = size[1] * 0.5;
+    if local.x < -hx || local.x > hx || local.y < -hy || local.y > hy || local.z < -depth || local.z > 0.0 {
+        return None;
+    }
+    Some([(local.x / size[0]) + 0.5, (local.y / size[1]) + 0.5])
+}
+
+/// Volumetric cloud settings: the density field a cloud raymarch pass samples.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VolumetricClouds {
+    /// Cloud layer base altitude (metres, world Y).
+    pub base: f32,
+    /// Cloud layer thickness (metres).
+    pub thickness: f32,
+    /// Global coverage 0..1 (0 = clear sky).
+    pub coverage: f32,
+    /// Peak density inside a cloud body.
+    pub density: f32,
+    /// Wind direction (world XZ, used as a unit vector) and speed (m/s).
+    pub wind: [f32; 3],
+    /// Noise scale (larger = bigger, puffier clouds).
+    pub scale: f32,
+    /// Noise seed.
+    pub seed: u32,
+}
+
+impl Default for VolumetricClouds {
+    fn default() -> Self {
+        Self {
+            base: 1500.0,
+            thickness: 800.0,
+            coverage: 0.5,
+            density: 1.0,
+            wind: [1.0, 0.0, 0.0],
+            scale: 0.0008,
+            seed: 0,
+        }
+    }
+}
+
+/// Deterministic 3D value noise in [0,1].
+fn cloud_noise(p: Vec3, seed: u32) -> f32 {
+    let (xi, yi, zi) = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+    let (xf, yf, zf) = (p.x - xi as f32, p.y - yi as f32, p.z - zi as f32);
+    let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+    let (u, v, w) = (smooth(xf), smooth(yf), smooth(zf));
+    let hash = |x: i32, y: i32, z: i32| -> f32 {
+        let mut n = (seed as i32)
+            .wrapping_add(x.wrapping_mul(1619))
+            .wrapping_add(y.wrapping_mul(31337))
+            .wrapping_add(z.wrapping_mul(6971));
+        n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+        n ^= n >> 16;
+        (n & 0x7FFFFF) as f32 / 0x7FFFFF as f32
+    };
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let c000 = hash(xi, yi, zi);
+    let c100 = hash(xi + 1, yi, zi);
+    let c010 = hash(xi, yi + 1, zi);
+    let c110 = hash(xi + 1, yi + 1, zi);
+    let c001 = hash(xi, yi, zi + 1);
+    let c101 = hash(xi + 1, yi, zi + 1);
+    let c011 = hash(xi, yi + 1, zi + 1);
+    let c111 = hash(xi + 1, yi + 1, zi + 1);
+    let x00 = lerp(c000, c100, u);
+    let x10 = lerp(c010, c110, u);
+    let x01 = lerp(c001, c101, u);
+    let x11 = lerp(c011, c111, u);
+    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
+}
+
+/// Four octaves of value noise for puffy cloud structure, roughly in [0,1].
+fn cloud_fbm(p: Vec3, seed: u32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 0.5;
+    let mut q = p;
+    for _ in 0..4 {
+        sum += amp * cloud_noise(q, seed);
+        amp *= 0.5;
+        q *= 2.0;
+    }
+    sum / 0.9375
+}
+
+/// Sample the volumetric cloud density at a world point, in [0,1]. This is the
+/// deterministic CPU reference the raymarch shader reproduces: a height-graded
+/// layer shaped by coverage-modulated fBm noise, advected by wind.
+pub fn cloud_density(point: Vec3, clouds: &VolumetricClouds, time: f32) -> f32 {
+    let p = point - Vec3::from(clouds.wind) * time;
+    let t = (p.y - clouds.base) / clouds.thickness.max(1.0);
+    if t <= 0.0 || t >= 1.0 {
+        return 0.0;
+    }
+    let height = 4.0 * t * (1.0 - t);
+    let n = cloud_fbm(p * clouds.scale, clouds.seed);
+    let lo = (1.0 - clouds.coverage).clamp(0.0, 1.0);
+    let s = ((n - lo) / 0.06).clamp(0.0, 1.0);
+    let shape = s * s * (3.0 - 2.0 * s);
+    (shape * height * clouds.density).clamp(0.0, 1.0)
 }
 
 /// Places this object on a bone of an animated model every frame (a weapon in
@@ -3100,7 +3428,9 @@ impl Animator {
     }
 
     /// Force a controller state by name (on the first layer that has it),
-    /// cross-fading over `fade` seconds.
+    /// cross-fading over `fade` seconds. States inside sub-state machines are
+    /// named by path, `"Locomotion/Walk"` (and so reported by
+    /// [`Self::current_state`] and state-change events).
     pub fn play_state(&mut self, state: &str, fade: f32) {
         self.state.requests.push(StateRequest { layer: None, state: state.to_owned(), fade });
     }
@@ -3371,6 +3701,13 @@ impl Pawn {
 
 impl TypedComponent for Pawn {
     const NAME: &'static str = "Pawn";
+
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        Some(self)
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        Some(self)
+    }
 
     fn start(&mut self, ctx: &mut ComponentCtx) {
         self.vel = Vec3::ZERO;
@@ -3645,6 +3982,7 @@ mod terrain_tests {
         assert_eq!(t.heights.len(), 33 * 33);
         assert!(t.heights.iter().all(|h| *h == 0.0));
         assert!(t.collider);
+        assert!(t.texture_weights.is_empty());
     }
 
     #[test]
@@ -3655,6 +3993,12 @@ mod terrain_tests {
             heights: (0..25).map(|i| i as f32).collect(),
             material: "ground.mat".into(),
             collider: false,
+            texture_weights: (0..25)
+                .map(|i| {
+                    let t = i as f32 / 24.0;
+                    [1.0 - t, t, 0.0, 0.0]
+                })
+                .collect(),
         };
         let s = ron::to_string(&t).expect("serialize");
         let back: Terrain = ron::from_str(&s).expect("deserialize");
@@ -3663,5 +4007,143 @@ mod terrain_tests {
         assert_eq!(back.heights, t.heights);
         assert_eq!(back.material, "ground.mat");
         assert!(!back.collider);
+        assert_eq!(back.texture_weights, t.texture_weights);
+    }
+
+    #[test]
+    fn scatter_is_deterministic_and_counts_density() {
+        let t = Terrain { size: 10.0, resolution: 4, heights: vec![0.0; 25], ..Default::default() };
+        let layer = FoliageLayer { density: 1.0, ..Default::default() };
+        let a = scatter_foliage(&t, &layer, 42);
+        let b = scatter_foliage(&t, &layer, 42);
+        assert_eq!(a.len(), 100, "1/m² over 100 m² = 100 instances");
+        assert_eq!(a, b, "the same seed must scatter identically");
+        assert!(a.iter().all(|i| i.position[1].abs() < 1e-5), "flat terrain -> on the surface");
+    }
+
+    #[test]
+    fn scatter_skips_steep_slopes() {
+        // A step: x < 4 flat, x >= 4 raised, so the cliff is steeper than 0.5 rad.
+        let res = 8usize;
+        let n = res + 1;
+        let mut heights = vec![0.0f32; n * n];
+        for z in 0..n {
+            for x in 0..n {
+                if x >= 4 {
+                    heights[z * n + x] = 3.0;
+                }
+            }
+        }
+        let t = Terrain { size: 8.0, resolution: res as u32, heights, ..Default::default() };
+        let layer = FoliageLayer { density: 2.0, max_slope: 0.5, ..Default::default() };
+        let out = scatter_foliage(&t, &layer, 7);
+        assert!(!out.is_empty());
+        let step = t.size / t.resolution as f32;
+        let half = t.size * 0.5;
+        for i in &out {
+            let gx = (i.position[0] + half) / step;
+            let gz = (i.position[2] + half) / step;
+            let normal = foliage_normal(&t.heights, n, res, gx.round() as i64, gz.round() as i64, step);
+            assert!(normal.y.acos() <= layer.max_slope + 1e-4, "instance on a slope {}", normal.y.acos());
+        }
+    }
+
+    #[test]
+    fn scatter_aligns_instances_to_the_surface() {
+        // A uniform +X slope so every surface normal tilts toward +X.
+        let res = 4usize;
+        let n = res + 1;
+        let mut heights = vec![0.0f32; n * n];
+        for z in 0..n {
+            for x in 0..n {
+                heights[z * n + x] = x as f32 * 0.5;
+            }
+        }
+        let t = Terrain { size: 4.0, resolution: res as u32, heights, ..Default::default() };
+        let layer = FoliageLayer { density: 4.0, align_to_normal: true, ..Default::default() };
+        let out = scatter_foliage(&t, &layer, 7);
+        assert!(!out.is_empty());
+        for i in &out {
+            let up = Quat::from_array(i.rotation) * Vec3::Y;
+            assert!(up.y > 0.89, "aligned up should stay mostly vertical: {up}");
+            assert!(up.x < -0.1, "up tilts toward -X for an uphill +X slope: {up}");
+            assert!(up.z.abs() < 1e-3, "no Z tilt on a pure +X slope: {up}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod decal_tests {
+    use super::*;
+
+    #[test]
+    fn decal_uv_centers_points_in_front() {
+        let id = Mat4::IDENTITY;
+        let size = [2.0, 2.0];
+        let c = decal_uv(Vec3::new(0.0, 0.0, -0.5), id, size, 1.0).unwrap();
+        assert!((c[0] - 0.5).abs() < 1e-5 && (c[1] - 0.5).abs() < 1e-5);
+        let corner = decal_uv(Vec3::new(-1.0, 1.0, 0.0), id, size, 1.0).unwrap();
+        assert!(corner[0].abs() < 1e-5 && (corner[1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn decal_uv_rejects_outside_the_box() {
+        let id = Mat4::IDENTITY;
+        let size = [2.0, 2.0];
+        assert!(decal_uv(Vec3::new(2.0, 0.0, -0.5), id, size, 1.0).is_none(), "outside X");
+        assert!(decal_uv(Vec3::new(0.0, 0.0, 1.0), id, size, 1.0).is_none(), "behind the projector");
+        assert!(decal_uv(Vec3::new(0.0, 0.0, -2.0), id, size, 1.0).is_none(), "past the depth");
+    }
+
+    #[test]
+    fn decal_uv_follows_the_projector_transform() {
+        let projector = Mat4::from_translation(Vec3::new(2.0, 0.0, 3.0));
+        let uv = decal_uv(Vec3::new(2.0, 0.0, 2.5), projector, [1.0, 1.0], 1.0).unwrap();
+        assert!((uv[0] - 0.5).abs() < 1e-5 && (uv[1] - 0.5).abs() < 1e-5);
+        assert!(decal_uv(Vec3::new(0.0, 0.0, 2.5), projector, [1.0, 1.0], 1.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod cloud_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_density_is_zero_outside_the_layer() {
+        let c = VolumetricClouds::default();
+        assert_eq!(cloud_density(Vec3::new(0.0, c.base - 1.0, 0.0), &c, 0.0), 0.0);
+        assert_eq!(cloud_density(Vec3::new(0.0, c.base + c.thickness + 1.0, 0.0), &c, 0.0), 0.0);
+    }
+
+    #[test]
+    fn cloud_density_vanishes_at_zero_coverage() {
+        let c = VolumetricClouds { coverage: 0.0, ..Default::default() };
+        for y in [c.base, c.base + c.thickness * 0.25, c.base + c.thickness * 0.5] {
+            for x in [0.0, 100.0, -250.0] {
+                assert_eq!(cloud_density(Vec3::new(x, y, 0.0), &c, 0.0), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_density_advects_with_the_wind() {
+        let c = VolumetricClouds::default();
+        let p = Vec3::new(120.0, c.base + c.thickness * 0.5, -40.0);
+        let t = 7.5;
+        let a = cloud_density(p, &c, t);
+        let b = cloud_density(p - Vec3::from(c.wind) * t, &c, 0.0);
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+
+    #[test]
+    fn cloud_density_is_deterministic_and_bounded() {
+        let c = VolumetricClouds::default();
+        let p = Vec3::new(33.0, c.base + c.thickness * 0.5, 17.0);
+        assert_eq!(cloud_density(p, &c, 1.0), cloud_density(p, &c, 1.0));
+        for i in 0..200 {
+            let q = Vec3::new(i as f32 * 7.0, c.base + (i % 9) as f32 * c.thickness / 9.0, i as f32 * 3.0);
+            let d = cloud_density(q, &c, 0.5);
+            assert!((0.0..=1.0).contains(&d), "{d}");
+        }
     }
 }

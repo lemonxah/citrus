@@ -17,6 +17,6 @@ layout(location = 10) in vec4 a_model2;
 layout(location = 11) in vec4 a_model3;
 
 void main() {
-    mat4 model = mat4(a_model0, a_model1, a_model2, a_model3);
+    mat4 model = mat4(vec4(a_model0.xyz, 0.0), a_model1, a_model2, a_model3);
     gl_Position = pc.light_vp * model * vec4(a_position, 1.0);
 }

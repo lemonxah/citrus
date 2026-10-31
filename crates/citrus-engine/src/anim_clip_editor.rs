@@ -29,6 +29,8 @@ type KeyDrag = (f32, Vec<(usize, usize, f32)>);
 pub struct AnimClipTab {
     path: Option<String>,
     clip: AnimClip,
+    /// Undo history of the open document.
+    history: crate::undo::DocHistory<AnimClip>,
     dirty: bool,
     target: Option<ObjectId>,
     playhead: f32,
@@ -57,6 +59,7 @@ impl Default for AnimClipTab {
             path: None,
             clip: AnimClip::default(),
             dirty: false,
+            history: Default::default(),
             target: None,
             playhead: 0.0,
             playing: false,
@@ -250,6 +253,25 @@ impl AnimClipTab {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, selected: Option<usize>, root: &Path, playing_game: bool) {
+        let (before, path) = (self.clip.clone(), self.path.clone());
+        self.ui_inner(ui, scene, selected, root, playing_game);
+        if self.path != path {
+            self.history.clear();
+        } else {
+            self.history.observe(before, &self.clip, ui.input(|i| i.pointer.any_down()));
+        }
+    }
+
+    /// Ctrl+Z / Ctrl+Shift+Z while this tab has focus.
+    pub fn history_step(&mut self, undo: bool) {
+        if self.history.step(&mut self.clip, undo) {
+            self.dirty = true;
+            // Key selections are indices into the document: drop them.
+            self.selected.clear();
+        }
+    }
+
+    fn ui_inner(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, selected: Option<usize>, root: &Path, playing_game: bool) {
         scene.anim_assets.set_root(root);
         let selected = selected.filter(|&i| i < scene.objects.len());
         if playing_game && self.preview {
@@ -973,6 +995,37 @@ impl AnimClipTab {
                                 }
                             }
                         });
+                        // A Custom (bezier) key exposes its tangents (derivatives
+                        // w.r.t. time). Rotation keeps automatic tangents (editing
+                        // quaternion derivatives by hand is error-prone).
+                        if key.interp == KeyInterp::Custom {
+                            for (label, slot) in [("Tangent out", &mut key.tangent_out), ("Tangent in", &mut key.tangent_in)] {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
+                                    match property {
+                                        TrackProperty::Rotation => {
+                                            ui.label(egui::RichText::new("auto").color(theme::TEXT_DIM));
+                                        }
+                                        TrackProperty::LightIntensity => {
+                                            let mut t = slot.unwrap_or([0.0; 4]);
+                                            if ui.add(egui::DragValue::new(&mut t[0]).speed(0.05)).changed() {
+                                                *slot = Some(t);
+                                                edited = true;
+                                            }
+                                        }
+                                        _ => {
+                                            let mut t = slot.unwrap_or([0.0; 4]);
+                                            let mut v = [t[0], t[1], t[2]];
+                                            if widgets::vec3_field(ui, &mut v, 3, 0.01) {
+                                                t[..3].copy_from_slice(&v);
+                                                *slot = Some(t);
+                                                edited = true;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     }
                     n => {
                         widgets::eyebrow(ui, &format!("{n} keys"));

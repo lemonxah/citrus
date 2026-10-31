@@ -795,6 +795,9 @@ pub struct NetworkManager {
     pub allow_list: Vec<String>,
     /// Player fingerprints refused at the door.
     pub ban_list: Vec<String>,
+    /// Optional account logins (`name:password`, one per line). Empty keeps
+    /// identity+secret-only auth.
+    pub account_list: Vec<String>,
 }
 
 impl Default for NetworkManager {
@@ -818,6 +821,7 @@ impl Default for NetworkManager {
             pin_host: false,
             allow_list: Vec::new(),
             ban_list: Vec::new(),
+            account_list: Vec::new(),
         }
     }
 }

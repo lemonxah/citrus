@@ -38,7 +38,7 @@ struct GpuWater {
     mat4 to_local; // world to the body's local space
     vec4 bounds;   // xy half extents in local XZ (0 = endless), z rest surface, w caustic strength
     vec4 foam[MAX_WATER_FOAM]; // churned spots: xy centre (local XZ), z radius, w amount
-    vec4 extra;    // x lights under the surface throw caustics out of it (pools)
+    vec4 extra;    // x lights under the surface throw caustics out of it (pools), y shore depth (0 = off), zw shore texture half extents (local XZ)
 };
 
 layout(set = 0, binding = 0) uniform FrameData {
@@ -71,6 +71,13 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 refl2_extents;
     vec4 refl2_box;
     vec4 refl_blend;    // x = slot 0 blend distance, y = slot 1 blend distance, z = slot on top where boxes overlap
+    vec4 refl3_center;  // third probe (binding 11)
+    vec4 refl3_extents;
+    vec4 refl3_box;
+    vec4 refl4_center;  // fourth probe (binding 12)
+    vec4 refl4_extents;
+    vec4 refl4_box;
+    vec4 refl_blend2;   // x = slot 2 blend distance, y = slot 3 blend distance
     vec4 water;         // x = water clock, y = opaque copy valid (bindings 5/6), z = body count
     GpuWater water_bodies[MAX_WATER_BODIES];
 #ifdef MULTIVIEW

@@ -155,6 +155,9 @@ a manual clock (`use_manual_clock` / `advance`).
 - **Built games**: a Network Manager with Auto Start = Host / Join, or the
   environment variables `CITRUS_HOST=<port>` / `CITRUS_JOIN=<host:port or
   room code>`, `CITRUS_RELAY=<relay:port>`, `CITRUS_SECRET`, `CITRUS_NAME`,
+  `CITRUS_ACCOUNT`, `CITRUS_PASSWORD`,
+  `CITRUS_ACCOUNTS=name1:pass1,name2:pass2` (host-side account list; when set,
+  joiners must present one of those account logins),
   `CITRUS_RELAY_TOKEN` (relays that require an operator token)
   (`CITRUS_NO_PUNCH` keeps relay peers on the relay).
 - **From gameplay** (menus): `ctx.net_host(port)` (0 = the Network Manager's
@@ -197,12 +200,12 @@ machine it runs on and that's it.
   firewalls) keeps the peer relayed; a direct route silent for 4 s falls back
   to the relay, and punching retries after 20 s. Relayed packets are always
   accepted, so switching paths never drops the connection.
-- **Relay protocol 2** (`citrus_relay::proto`): REGISTER (role, room code,
+- **Relay protocol 3** (`citrus_relay::proto`): REGISTER (role, room code,
   nonce, LAN endpoints, cookie, proof; padded to 160 bytes) / COOKIE /
   REGISTERED (slot, own punch token, public endpoint, claim nonce) / PEER
   (introduction) / DATA (slot + payload: destination going in, source coming
-  out) / PUNCH / PUNCH_ACK / CLAIM / KEEPALIVE / LEAVE / ERROR. Tags are
-  0xF1..0xFB, so relay control, relayed data and direct game traffic share
+  out) / PUNCH / PUNCH_ACK / CLAIM / KEEPALIVE / LEAVE / ERROR /
+  SUCCESSORS. Tags are 0xF1..0xFC, so relay control, relayed data and direct game traffic share
   one socket. Star topology like the sessions: the host reaches every
   client, a client only the host. The relay only sees ciphertext.
 - **Relay authentication.** A REGISTER without a valid cookie only gets a
@@ -219,14 +222,21 @@ machine it runs on and that's it.
   rooms per IP, room and server caps on pending joiners (admitted but no
   data exchanged yet, dropped after 15 s), exponential back-off for an IP
   after repeated failures (up to 60 s, during which it gets nothing), and
-  idle members dropped after 30 s. The join key travels to the relay in the
-  clear: someone sniffing the host's link to the relay could pass the
-  relay's check, but still not the session's.
+  idle members dropped after 30 s. The relay has an X25519 key whose public half
+  every COOKIE carries; a host seals the join key to it (ephemeral X25519,
+  HKDF bound to the cookie, ChaCha20-Poly1305), so someone sniffing the
+  host's link to the relay can't learn it. The relay's key isn't pinned, so
+  an attacker who can rewrite that link can still swap in its own.
 - **Rooms survive their host.** When the host leaves or goes idle the room
   stays open for `--orphan-grace` seconds; a member signs a CLAIM (over the
   room code, its slot, its nonce and a relay-issued claim nonce) with the
   room owner key, which the host shared inside the encrypted session, and
-  takes the host slot. Every member is re-introduced to the new host and
+  takes the host slot. Since every member holds that key, the relay also
+  checks whose turn it is: the host keeps the relay told of its migration
+  order (SUCCESSORS, accepted from the host slot only) and keepalives every
+  0.25 s, and a claim is ignored while the host was heard within the last
+  second or a better-ranked member within the last 12 s. The claimant keeps
+  retrying, so it gets the slot as soon as its turn comes. Every member is re-introduced to the new host and
   keeps reaching it at the same virtual address.
 - Relay peers appear to the session as virtual `240.x.y.z` addresses that
   encode their relay slot; the transport resolves them to the punched
@@ -642,12 +652,14 @@ Rider when every client should compute the bobbing itself).
   too is lost; the lag-compensation history and the host's input queues
   start over.
 - Prediction covers the built-in Pawn, First / Third Person Controller and
-  VR Player (their movement and Character Controller); other movement
-  components aren't replayed unless they implement `Predictable`. The host
+  VR Player (their movement and Character Controller), and any movement
+  component of your own that implements `Predictable` and returns
+  `Some(self)` from `TypedComponent::predictable` / `predictable_mut`. The host
   takes the owner's view angles, VR poses and teleport targets as sent (a
   teleport is only checked against the arc's reach). The host shows
-  remote predicted pawns at their simulated position without smoothing, so on
-  a listen server they can step when inputs arrive in bursts.
+  remote predicted pawns easing towards their simulated position (about
+  0.08 s behind), so on a listen server they glide even when inputs arrive in
+  bursts.
 - Lag compensation rewinds recorded hitboxes only (not world geometry or
   physics), sampled once per host frame.
 - Snapshots are stamped with the sender's clock; the receiver estimates the
@@ -657,12 +669,13 @@ Rider when every client should compute the bobbing itself).
   spawn via `net_clone` of scene templates).
 - After `net_load_scene`, other world changes are held for 0.5 s so they land
   in the new scene; a very slow scene load can still miss them.
-- Security: the first contact has no prior trust: an on-path attacker that
-  races a forged CHALLENGE ahead of the host's can stall that join (not
-  break into the session), and without Pin Host Identity a client can't tell
+- Security: the first contact has no prior trust. A client keeps up to four
+  other answers to its HELLO and tries the next when its JOIN gets no
+  WELCOME within a second, so a forged CHALLENGE raced ahead of the host's
+  only delays the join; an attacker that floods forgeries (or drops the
+  host's packets) can still stall it, and without Pin Host Identity a client can't tell
   a different host behind the same address. Player ids are per install, not
-  accounts. The relay join key is sent to the relay in the clear (see
-  Relay authentication). An older client gets a clear version error from a
+  accounts. An older client gets a clear version error from a
   protocol 6 host (rate-limited, the only pre-auth reply that can be larger
   than its request).
 

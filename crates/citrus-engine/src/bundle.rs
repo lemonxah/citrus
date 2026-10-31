@@ -230,8 +230,9 @@ use anyhow::Result;
 fn main() -> Result<()> {{
     citrus_engine::init_logging();
 
-    // Assets ship next to the executable (build/assets); for `cargo run` during
-    // development they live in the project folder.
+    // Shipped builds carry assets.pak next to the executable, which
+    // GameConfig::from_project_dir unpacks and uses; for `cargo run` during
+    // development the assets live in the project folder.
     let exe_assets = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("assets")))
@@ -263,6 +264,8 @@ fn main() -> Result<()> {{
         last_scene: Some(boot.clone()),
         boot_scene: Some(boot),
         bindings,
+        vr: citrus_assets::project_templates::find(template)
+            .is_some_and(|t| t.category == citrus_assets::project_templates::TemplateCategory::Vr),
         ..Default::default()
     };
     citrus_assets::save_project_file(&root, &project).context("writing project.citrus")?;
@@ -286,8 +289,9 @@ fn add_rlib_crate_type(manifest: &Path) -> Result<()> {
 }
 
 /// Compile the project `--release` and assemble a self-contained `build/`
-/// folder: the executable plus a `build/assets/` copy of the referenced asset
-/// dirs and `project.citrus`. Returns the path of the produced executable.
+/// folder: the executable plus `assets.pak`, the cooked referenced assets and
+/// `project.citrus` in one archive (Android packs them into its APK instead).
+/// Returns the path of the produced executable.
 /// `log` receives human-readable progress lines.
 pub fn build_game(
     project_root: &Path,
@@ -325,7 +329,15 @@ pub fn build_game(
         }
     }
     log(format!("cargo build --release ({pkg}, {})…", target.label()));
-    let output = std::process::Command::new("cargo")
+    let mut cargo = std::process::Command::new("cargo");
+    // Link the MSVC C/C++ runtime statically (cc builds the C++ deps with /MT
+    // to match), so players need no Visual C++ Redistributable installed.
+    if target.is_windows() {
+        let var = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS";
+        let existing = std::env::var(var).unwrap_or_default();
+        cargo.env(var, format!("{existing} -C target-feature=+crt-static").trim());
+    }
+    let output = cargo
         .current_dir(project_root)
         .args(&args)
         .output()
@@ -380,6 +392,10 @@ pub fn build_game(
     }
 
     stage_assets(project_root, &assets_dir, target, &mut log)?;
+    log("packing assets…".into());
+    let packed = citrus_assets::game_pak::write_game_pak(&assets_dir, &build_dir.join(citrus_assets::game_pak::GAME_PAK_NAME))?;
+    std::fs::remove_dir_all(&assets_dir).context("removing the staged assets")?;
+    log(format!("packed {packed} file(s) into {}", citrus_assets::game_pak::GAME_PAK_NAME));
     log(format!("done: {}", out_exe.display()));
     Ok(out_exe)
 }
@@ -414,6 +430,14 @@ fn stage_assets(project_root: &Path, assets_dir: &Path, target: BuildTarget, log
     if target.is_android() {
         cook_astc_textures(project_root, &cooked.files, assets_dir, log);
     }
+    // Builds run from the editor; the probe writer is editor-only.
+    #[cfg(any(feature = "editor", test))]
+    if target == BuildTarget::Quest {
+        let n = cook_astc_hdr_bakes(assets_dir, log);
+        if n > 0 {
+            log(format!("re-encoded {n} baked lighting file(s) as ASTC HDR"));
+        }
+    }
     log("precompiling shaders…".into());
     precompile_shaders(assets_dir, log);
     let baked = crate::shaders::bake_project_variants(assets_dir, log);
@@ -425,6 +449,65 @@ fn stage_assets(project_root: &Path, assets_dir: &Path, target: BuildTarget, log
     )
     .context("copying project.citrus")?;
     Ok(())
+}
+
+/// Meta Quest: re-encode the shipped BC6H baked lighting (lightmap layers,
+/// prefiltered reflection-probe chains) as ASTC 4x4 HDR, which its GPU
+/// samples directly; BC6H would otherwise decode to uncompressed formats on
+/// the device. Uncompressed bakes stay as they are. Failures are logged and
+/// leave that file BC6H. Returns the files re-encoded.
+#[cfg(any(feature = "editor", test))]
+fn cook_astc_hdr_bakes(assets_dir: &Path, log: &mut impl FnMut(String)) -> usize {
+    use citrus_assets::hdr_codec::{transcode_array, transcode_cube};
+    use citrus_render::HdrTextureFormat::{AstcHdr4x4, Bc6h};
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "lightmap" || e == "reflprobe") {
+                out.push(path);
+            }
+        }
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut files = Vec::new();
+    walk(assets_dir, &mut files);
+    let mut done = 0;
+    for path in files {
+        let result: anyhow::Result<bool> = (|| {
+            if path.extension().is_some_and(|e| e == "lightmap") {
+                let mut layers = citrus_assets::read_lightmap_layers(&path)?;
+                if layers.array.format != Bc6h {
+                    return Ok(false);
+                }
+                layers.array = transcode_array(layers.array, AstcHdr4x4, threads)?;
+                citrus_assets::save_lightmap_layers(&path, &layers)?;
+                return Ok(true);
+            }
+            let mut set = crate::refl_slots::read_reflprobes_stored(&path);
+            let mut changed = false;
+            for cube in set.entries.values_mut().chain(set.legacy.as_mut()) {
+                if let crate::refl_slots::ProbeCube::Chain(chain) = cube
+                    && chain.format == Bc6h
+                {
+                    let empty = citrus_render::HdrCube { format: Bc6h, size: 0, faces: Default::default() };
+                    *chain = transcode_cube(std::mem::replace(chain, empty), AstcHdr4x4, threads)?;
+                    changed = true;
+                }
+            }
+            if changed {
+                crate::refl_slots::write_reflprobes(&path, &set)?;
+            }
+            Ok(changed)
+        })();
+        match result {
+            Ok(true) => done += 1,
+            Ok(false) => {}
+            Err(e) => log(format!("warning: {} stays BC6H: {e:#}", path.display())),
+        }
+    }
+    done
 }
 
 /// Android / Quest: pre-encode the ASTC import cache of every (texture,
@@ -1172,5 +1255,41 @@ mod android_tests {
         assert!(!phone.contains("oculus"), "{phone}");
         assert!(phone.contains("android.intent.category.LAUNCHER"));
         assert!(phone.contains(r#"android:minSdkVersion="30""#));
+    }
+
+    #[test]
+    fn quest_cook_reencodes_bc6h_bakes_as_astc_hdr() {
+        use citrus_render::HdrTextureFormat::{AstcHdr4x4, Bc6h, Rgba32f};
+        let dir = std::env::temp_dir().join(format!("citrus-quest-bakes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("scenes")).unwrap();
+        let texels: Vec<u8> = (0..64).flat_map(|_| [1.25f32, 0.5, 0.25, 1.0]).flat_map(f32::to_le_bytes).collect();
+        let bc6h = citrus_assets::hdr_codec::transcode_level(&texels, Rgba32f, Bc6h, 8, 8, 1).unwrap();
+        let lightmap = dir.join("scenes/main.lightmap");
+        let layers = citrus_assets::LightmapLayers {
+            objects: vec![1],
+            sizes: vec![8],
+            array: citrus_render::HdrTextureArray { format: Bc6h, size: 8, layers: vec![bc6h.clone()] },
+        };
+        citrus_assets::save_lightmap_layers(&lightmap, &layers).unwrap();
+        let probes = dir.join("scenes/main.reflprobe");
+        let mip = |s: u32| {
+            let texels: Vec<u8> = (0..s * s).flat_map(|_| [1.25f32, 0.5, 0.25, 1.0]).flat_map(f32::to_le_bytes).collect();
+            citrus_assets::hdr_codec::transcode_level(&texels, Rgba32f, Bc6h, s, s, 1).unwrap()
+        };
+        let faces: [Vec<Vec<u8>>; 6] = std::array::from_fn(|_| [8, 4, 2, 1].map(mip).to_vec());
+        let mut set = crate::refl_slots::ReflProbeSet::default();
+        set.entries.insert(7, crate::refl_slots::ProbeCube::Chain(citrus_render::HdrCube { format: Bc6h, size: 8, faces }));
+        crate::refl_slots::write_reflprobes(&probes, &set).unwrap();
+
+        assert_eq!(crate::refl_slots::read_reflprobes_stored(&probes).entries[&7].format(), Bc6h, "a valid BC6H chain");
+        let mut warnings = Vec::new();
+        let mut log = |w: String| warnings.push(w);
+        let n = cook_astc_hdr_bakes(&dir, &mut log);
+        assert_eq!(n, 2, "{warnings:?}");
+        assert_eq!(citrus_assets::read_lightmap_layers(&lightmap).unwrap().array.format, AstcHdr4x4);
+        assert_eq!(crate::refl_slots::read_reflprobes_stored(&probes).entries[&7].format(), AstcHdr4x4);
+        assert_eq!(cook_astc_hdr_bakes(&dir, &mut log), 0, "already ASTC: left alone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

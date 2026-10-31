@@ -1012,7 +1012,14 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   preview playback, length / loop / FPS, clip events). Files: icons, Create -> New Animator
   Controller / New Animation Clip, selecting the file opens its tab; Animator inspector has
   the Controller field + Open.
-- [todo] Animation follow-ups: curve (tangent) editor, sub-state machines, transition
+- [done] **Animator sub-state machines** (2026-10-31): a state can hold a nested state machine
+  (`AnimState.sub_machine`, absent from files that don't use it). Animator Controller tab:
+  Create Sub-State Machine from the canvas menu, double-click (or Open) to edit inside,
+  breadcrumb path / Esc to go back up, stacked-card nodes, transitions to / from them at the
+  parent level. Runtime flattens each layer (`StateMachine::flatten`): inner states run as
+  `Outer/Inner`, entering a sub-machine enters its default state, its outgoing transitions
+  apply from every inner state, its Any State applies only inside it.
+- [todo] Animation follow-ups: curve (tangent) editor, transition
   interruption sources, humanoid retargeting, bone preview / record for skinned models in edit
   mode (bone tracks are keyed by value), material colour tracks.
 - [done] **Physics joints** (`Joint`: fixed / hinge / ball / slider / spring / rope, limits,
@@ -2014,8 +2021,12 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   per body type (camera-following ocean grid, lake grid / polygon, river ribbon). VR eyes and
   preview cameras get waves without refraction.
 - [partial] Water: the ripple field in the shader, underwater fog / waterline / caustics and
-  mitred river bends landed (below). Open: shoreline depth bake (wave damping near shore),
-  planar reflections on water, freeing old water meshes (released mesh rings are pooled for
+  mitred river bends landed (below), and the shoreline depth bake: `WaterWalls` bakes each
+  lake / pool / ocean's depth over the static ground (`ShoreDepth`, 128x128 over its area,
+  rebaked when the water or the geometry under it changes) into a texture (water material slot
+  14, `GpuWater::extra`), and the waves, normals and crest foam calm by
+  smoothstep(0, `shore_depth`, depth) (default 2 m, 0 = off), in `Water::displacement` too so
+  floating bodies ride what is drawn. Open: planar reflections on water, freeing old water meshes (released mesh rings are pooled for
   reuse, never freed).
 - [done] **Multi-object editing**: fields that differ across the selection show an em dash (header
   name, per-axis transform, component fields matched by label); typed transform values set that
@@ -2368,7 +2379,12 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   alpha-test instances per view (frustum; optional distance / small-object limits; optional Hi-Z
   occlusion against the previous frame's max-depth pyramid from `hiz_build.comp`, built from the
   pre-water opaque copy when water splits the pass), compacts the visible ones into the instance
-  stream and fills one indirect draw per batch. Used by the main camera pass and its depth
+  stream and fills one indirect draw per batch. Hi-Z is two-phase: the first main-camera depth pass
+  (the depth prepass when there is one, else the main pass) draws the early batches, ends, builds
+  a pyramid from that depth with this frame's camera, and a late dispatch re-tests only the
+  instances the early pass rejected as occluded into a second set of indirect draws, drawn after
+  the pass resumes (LOAD), so objects coming into view appear the same frame (profiler / frame
+  stats "recovered"). Used by the main camera pass and its depth
   prepass (EQUAL stays exact), the shadow layers that re-render, and each VR eye; transparent,
   custom-shader, outlined, water and error draws and the secondary cameras stay on the CPU path.
   Grow-only per-frame / per-eye buffers, counts read back without stalling (profiler "GPU

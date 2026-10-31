@@ -19,7 +19,7 @@ use citrus_assets::{
     AnimClip, AnimParamKind, AnimationClip, AnimatorController, ChannelPath, LayerBlend, Motion, Skeleton, StateMachine,
     TrackProperty,
 };
-use citrus_core::{Animator, BlendTree, LayerPlayback};
+use citrus_core::{Animator, BlendMotion, BlendTree, LayerPlayback};
 
 pub const CH_T: u8 = 1;
 pub const CH_R: u8 = 2;
@@ -348,15 +348,16 @@ pub fn sample_motion(
                 .filter(|(_, w)| **w > 1e-4)
                 .filter_map(|(m, &w)| clips.find(&m.clip).map(|c| (c, w)))
                 .collect();
-            let dur: f32 = parts.iter().map(|(c, w)| c.duration() * w).sum();
-            let phase = if dur > 1e-6 { time / dur } else { 0.0 };
+            // Each clip advances at its own rate off the shared state clock, so
+            // moving the blend between clips (idle <-> walk) never rewinds or
+            // jumps a clip mid-cycle. The old weight-averaged phase made the
+            // walk visibly restart as the weights shifted between clips with
+            // different lengths.
             let poses: Vec<(Pose, f32)> = parts
                 .iter()
                 .map(|(c, w)| {
                     let mut p = Pose::rest(rig);
-                    let d = c.duration();
-                    let t = if looping { phase * d } else { phase.min(1.0) * d };
-                    c.sample(rig, t, looping, &mut p);
+                    c.sample(rig, time, looping, &mut p);
                     (p, *w)
                 })
                 .collect();
@@ -383,10 +384,11 @@ fn dominant_clip<'a>(
                 .zip(&w)
                 .filter_map(|(m, &w)| clips.find(&m.clip).map(|c| (m.clip.as_str(), c, w)))
                 .collect();
-            let dur: f32 = parts.iter().map(|(_, c, w)| c.duration() * w).sum();
             let (name, c, _) = parts.iter().copied().max_by(|a, b| a.2.total_cmp(&b.2))?;
-            let local = if dur > 1e-6 { time / dur * c.duration() } else { 0.0 };
-            Some((name, c, local))
+            // Local time is the raw state time: `sample_motion` samples each
+            // blend-tree clip at `time`, so events and root motion must follow
+            // the same clock rather than a weight-averaged phase.
+            Some((name, c, time))
         }
     }
 }
@@ -554,6 +556,15 @@ pub fn advance_controller(
     clips: &ClipSet,
     dt: f32,
 ) -> AnimOutput {
+    // Sub-state machines run flattened (`Outer/Inner` state names); assets
+    // from `AnimAssets` arrive flattened already.
+    let flat;
+    let ctrl = if ctrl.layers.iter().any(|l| l.machine.has_sub_machines()) {
+        flat = ctrl.flattened();
+        &flat
+    } else {
+        ctrl
+    };
     animator.state.fired.clear();
     if animator.state.controller_ready.as_deref() != Some(path) || animator.state.layers.len() != ctrl.layers.len() {
         init_controller(animator, ctrl, path);
@@ -898,6 +909,7 @@ impl AnimAssets {
 
     /// Replace a controller with an in-memory version (editor live edit).
     pub fn set_controller(&mut self, path: &str, ctrl: AnimatorController) {
+        let ctrl = ctrl.flattened();
         self.load_controller_clips(&ctrl);
         let arc = Some(Arc::new(ctrl));
         for k in self.keys_for(path, self.controllers.keys()) {
@@ -920,12 +932,13 @@ impl AnimAssets {
         self.clips.clear();
     }
 
+    /// A controller with its sub-state machines flattened (what the runtime plays).
     pub fn controller(&mut self, path: &str) -> Option<Arc<AnimatorController>> {
         if let Some(c) = self.controllers.get(path) {
             return c.clone();
         }
         let loaded = self.root.as_ref().and_then(|root| match citrus_assets::load_anim_controller(citrus_core::asset_ref::resolve_path(root, path)) {
-            Ok(c) => Some(c),
+            Ok(c) => Some(c.flattened()),
             Err(e) => {
                 tracing::warn!("animator controller {path}: {e:#}");
                 None
@@ -1105,8 +1118,25 @@ mod tests {
                 target: target.into(),
                 property: TrackProperty::Translation,
                 keys: vec![
-                    Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Linear },
-                    Keyframe { time: 1.0, value: [to, 0.0, 0.0, 0.0], interp: KeyInterp::Linear },
+                    Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Linear, ..Default::default() },
+                    Keyframe { time: 1.0, value: [to, 0.0, 0.0, 0.0], interp: KeyInterp::Linear, ..Default::default() },
+                ],
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Moves `target` along X from 0 to `to` over `len` seconds.
+    fn clip_len(target: &str, to: f32, len: f32) -> AnimClip {
+        AnimClip {
+            length: len,
+            looping: true,
+            tracks: vec![AnimTrack {
+                target: target.into(),
+                property: TrackProperty::Translation,
+                keys: vec![
+                    Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Linear, ..Default::default() },
+                    Keyframe { time: len, value: [to, 0.0, 0.0, 0.0], interp: KeyInterp::Linear, ..Default::default() },
                 ],
             }],
             ..Default::default()
@@ -1256,7 +1286,7 @@ mod tests {
             tracks: vec![AnimTrack {
                 target: String::new(),
                 property: TrackProperty::Translation,
-                keys: vec![Keyframe { time: 0.0, value: [10.0, 0.0, 0.0, 0.0], interp: KeyInterp::Step }],
+                keys: vec![Keyframe { time: 0.0, value: [10.0, 0.0, 0.0, 0.0], interp: KeyInterp::Step, ..Default::default() }],
             }],
             ..Default::default()
         })]);
@@ -1284,6 +1314,33 @@ mod tests {
         let p = step(&mut a, &c, &clips, 0.5);
         assert!(!a.is_in_transition(0));
         assert!((x(&p, 0) - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn blend_tree_clip_time_does_not_rewind_on_weight_change() {
+        // Idle and walk with different lengths: the old weight-averaged phase
+        // scaled the dominant clip's local time, so the walk loop jumped
+        // backwards as the blend moved between the two (visible as a restart).
+        let clips = assets(&[
+            ("idle.anim", clip_len("", 20.0, 2.0)),
+            ("walk.anim", clip_len("", 10.0, 1.0)),
+        ]);
+        let tree = BlendTree {
+            name: "Locomotion".into(),
+            parameter: "Forward".into(),
+            parameter_y: String::new(),
+            motions: vec![
+                BlendMotion { clip: "idle.anim".into(), position: [0.0, 0.0] },
+                BlendMotion { clip: "walk.anim".into(), position: [1.0, 0.0] },
+            ],
+        };
+        let motion = Motion::BlendTree(tree);
+        let mut params = HashMap::new();
+        params.insert("Forward".into(), 0.9);
+        let set = ClipSet { imported: &[], indices: &[], assets: &clips };
+        let (name, _clip, t) = dominant_clip(&motion, &params, &set, 1.0).expect("walk dominates at Forward 0.9");
+        assert_eq!(name, "walk.anim");
+        assert!((t - 1.0).abs() < 1e-5, "walk local time must be the raw state time, got {t}");
     }
 
     #[test]
@@ -1381,5 +1438,55 @@ mod tests {
         let p = advance_simple(&mut a, &rig(), &set, 0.25).pose;
         assert!((x(&p, 1) - 0.5).abs() < 1e-4);
         assert_eq!(p.touched[0], 0, "root untouched");
+    }
+
+    #[test]
+    fn sub_state_machine_plays_nested_states() {
+        let clips = assets(&[("idle.anim", clip("", 1.0)), ("walk.anim", clip("", 4.0)), ("run.anim", clip("", 10.0))]);
+        let cond = |p: &str, op, threshold| AnimCondition { parameter: p.into(), op, threshold };
+        let go = |from: Option<&str>, to: &str, c: AnimCondition| AnimTransition {
+            from: from.map(Into::into),
+            to: to.into(),
+            conditions: vec![c],
+            duration: 0.0,
+            ..Default::default()
+        };
+        let locomotion = StateMachine {
+            states: vec![state("Walk", "walk.anim"), state("Run", "run.anim")],
+            default_state: "Walk".into(),
+            transitions: vec![go(Some("Walk"), "Run", cond("Speed", CondOp::Greater, 2.0))],
+            ..Default::default()
+        };
+        let c = controller(
+            vec![state("Idle", "idle.anim"), AnimState { name: "Locomotion".into(), sub_machine: Some(Box::new(locomotion)), ..Default::default() }],
+            vec![
+                go(Some("Idle"), "Locomotion", cond("Speed", CondOp::Greater, 0.5)),
+                go(Some("Locomotion"), "Idle", cond("Speed", CondOp::Less, 0.5)),
+            ],
+            vec![AnimParameter { name: "Speed".into(), ..Default::default() }],
+        );
+        let mut a = animator();
+        step(&mut a, &c, &clips, 0.1);
+        assert_eq!(a.current_state(0), Some("Idle"));
+        // Entering the sub-machine enters its default state.
+        a.set_float("Speed", 1.0);
+        step(&mut a, &c, &clips, 0.1);
+        assert_eq!(a.current_state(0), Some("Locomotion/Walk"));
+        let p = step(&mut a, &c, &clips, 0.25);
+        assert!((x(&p, 0) - 1.0).abs() < 1e-3, "walk clip plays: {}", x(&p, 0));
+        // An inner transition.
+        a.set_float("Speed", 3.0);
+        step(&mut a, &c, &clips, 0.1);
+        assert_eq!(a.current_state(0), Some("Locomotion/Run"));
+        // Leaving from an inner state through the sub-machine's own transition.
+        a.set_float("Speed", 0.0);
+        step(&mut a, &c, &clips, 0.1);
+        assert_eq!(a.current_state(0), Some("Idle"));
+        assert_eq!(a.state.state_changes.last().map(|s| s.1.as_str()), Some("Locomotion/Run"));
+        // Scripts force nested states by path.
+        a.set_float("Speed", 1.0);
+        a.play_state("Locomotion/Run", 0.0);
+        step(&mut a, &c, &clips, 0.0);
+        assert_eq!(a.current_state(0), Some("Locomotion/Run"));
     }
 }

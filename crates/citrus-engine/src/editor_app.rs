@@ -218,7 +218,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_stats: true,
         show_stats_overlay: false,
         show_help: false,
-        show_project_settings: false,
+        project_settings_dirty: false,
         show_new_project: false,
         show_open_project: false,
         pending_project_switch: None,
@@ -411,6 +411,9 @@ impl Stats {
 /// processed afterwards).
 enum EditorAction {
     SelectFile(PathBuf),
+    /// The Environment tab changed the settings this frame (from `before`):
+    /// record an undo step (`gesture`: a drag still in progress).
+    EnvironmentEdited { before: Box<citrus_assets::WorldEnvironment>, gesture: bool },
     /// Re-render the active Reflection Probe's cubemap from the current scene
     /// (realtime probe refresh — surroundings changed since the last capture).
     RecaptureReflections,
@@ -601,6 +604,8 @@ enum Tab {
     AnimClip,
     /// Occlusion culling: bake settings, Bake / Clear, visualization.
     Occlusion,
+    /// Project-wide settings (name, VR, boot scene, input, build target...).
+    ProjectSettings,
     /// Independent code/shader editor tab (can be opened many times, dragged, closed).
     Code(PathBuf),
 }
@@ -608,7 +613,10 @@ enum Tab {
 fn default_layout() -> DockState<Tab> {
     // Camera shares the Viewport node (tab next to it); Environment shares the
     // Inspector node.
-    let mut state = DockState::new(vec![Tab::Viewport, Tab::Camera, Tab::UiEditor]);
+    // Project Settings docks into the main (central) area by default, next to
+    // the Scene view, so its long form scrolls in a dock instead of overflowing
+    // a floating window on small screens.
+    let mut state = DockState::new(vec![Tab::Viewport, Tab::Camera, Tab::UiEditor, Tab::ProjectSettings]);
     let tree = state.main_surface_mut();
     // Right (Inspector) node a touch wider (~30px at the 1600px default)
     // so the inspector's rows fit without clipping.
@@ -1134,8 +1142,9 @@ struct EngineApp {
     /// outside the main egui pass.
     last_render_stats: citrus_render::RenderStats,
     show_help: bool,
-    /// Project Settings window open.
-    show_project_settings: bool,
+    /// Set by the dockable Project Settings tab when it edits the project;
+    /// saved once after the dock pass (see `redraw`).
+    project_settings_dirty: bool,
     /// New Project dialog open + its inputs (parent dir, project name).
     show_new_project: bool,
     new_project_parent: String,
@@ -2910,7 +2919,9 @@ impl EngineApp {
             VrAction::DeleteSelected => {
                 if let Selection::Object(idx) = self.selection
                     && idx < self.scene.objects.len() {
+                        let before = self.scene.snapshot_objects();
                         self.scene.remove_object(idx);
+                        self.record_structure(before);
                         self.selection = Selection::None;
                     }
             }
@@ -3924,12 +3935,16 @@ impl EngineApp {
                     }
                 }
                 EditorAction::SetParent(child, parent) => {
+                    let before = self.scene.snapshot_objects();
                     self.scene.set_parent(child, parent);
+                    self.record_structure(before);
                 }
                 EditorAction::GroupIntoEmpty(members) => {
                     // Structural, like delete and reorder: indices shift, so the
                     // new group becomes the selection and undo diffing skips it.
+                    let before = self.scene.snapshot_objects();
                     if let Some(group) = self.scene.group_into_empty(&members) {
+                        self.record_structure(before);
                         self.selection = Selection::Object(group);
                         self.multi_objects = vec![group];
                         self.inspector_lock_target = None;
@@ -3938,8 +3953,10 @@ impl EngineApp {
                     }
                 }
                 EditorAction::MoveObject(child, parent, before) => {
+                    let snapshot = self.scene.snapshot_objects();
                     let map = self.scene.reorder_object(child, parent, before);
                     if !map.is_empty() {
+                        self.record_structure(snapshot);
                         // Object indices shifted; remap selection + lock target,
                         // and keep this structural change out of undo diffing.
                         let remap = |sel: &Selection| match sel {
@@ -3954,8 +3971,9 @@ impl EngineApp {
                     }
                 }
                 EditorAction::DeleteObject(index) => {
-                    // By design, deletion is NOT undoable (see TODO.md).
+                    let before = self.scene.snapshot_objects();
                     self.scene.remove_object(index);
+                    self.record_structure(before);
                     // Indices shifted; drop selection/lock to stay safe.
                     self.selection = Selection::None;
                     self.inspector_lock_target = None;
@@ -3973,6 +3991,10 @@ impl EngineApp {
                 }
                 EditorAction::SetCanvasMode(index, mode) => self.set_canvas_mode(index, mode),
                 EditorAction::ObjectToggled => {}
+                EditorAction::EnvironmentEdited { before, gesture } => {
+                    let after = Box::new(self.scene.environment.clone());
+                    self.undo_stack.record(UndoEntry::Environment { before, after }, gesture);
+                }
                 EditorAction::BakeAudio => self.start_audio_bake(),
                 EditorAction::BakeOcclusion => self.start_occlusion_bake(),
                 EditorAction::ClearOcclusion => self.clear_occlusion(),
@@ -4010,10 +4032,12 @@ impl EngineApp {
                     }
                 }
                 EditorAction::DuplicateObject(index) => {
-                    // Not undoable (like delete). Select the new copy.
+                    // Structural like delete: one undo step. Select the new copy.
+                    let before = self.scene.snapshot_objects();
                     if let Some(new_root) =
                         self.scene.duplicate_object(index, &self.components)
                     {
+                        self.record_structure(before);
                         self.selection = Selection::Object(new_root);
                     }
                 }
@@ -4366,7 +4390,7 @@ impl EngineApp {
                     None => self.dock_state.push_to_focused_leaf(tab),
                 }
             }
-            PaletteCmd::ProjectSettings => self.show_project_settings = true,
+            PaletteCmd::ProjectSettings => self.open_or_focus_tab(Tab::ProjectSettings),
             PaletteCmd::Layers => self.show_layers = true,
             PaletteCmd::InputBindings => self.show_bindings = true,
             PaletteCmd::AudioMixer => self.show_mixer = true,
@@ -4445,7 +4469,7 @@ impl EngineApp {
                         ui.close();
                     }
                     if ui.button("Project Settings…").clicked() {
-                        self.show_project_settings = true;
+                        self.open_or_focus_tab(Tab::ProjectSettings);
                         ui.close();
                     }
                     if ui
@@ -4785,8 +4809,9 @@ impl EngineApp {
                                     egui::Checkbox::new(&mut cull.hiz_occlusion, "Hi-Z occlusion"),
                                 )
                                 .on_hover_text(
-                                    "Also skip objects hidden behind the previous frame's depth. \
-                                     Objects coming into view can appear one frame late",
+                                    "Also skip objects hidden behind the depth (two-phase: what the \
+                                     previous frame's depth hides is re-tested against this frame's, \
+                                     so objects coming into view appear the same frame)",
                                 )
                                 .changed();
                             if changed {
@@ -4830,6 +4855,7 @@ impl EngineApp {
                         (Tab::Environment, "Environment"),
                         (Tab::Baker, "FluxBaker"),
                         (Tab::Occlusion, "Occlusion"),
+                        (Tab::ProjectSettings, "Project Settings"),
                         (Tab::Files, "Files"),
                         (Tab::Log, "Log"),
                     ] {
@@ -4900,10 +4926,11 @@ impl EngineApp {
             let mut right_ui = ui.new_child(
                 egui::UiBuilder::new().max_rect(right).layout(egui::Layout::right_to_left(egui::Align::Center)),
             );
-            if widgets::icon_button_sized(&mut right_ui, Icon::Gear, "Project settings", self.show_project_settings, egui::vec2(28.0, 28.0))
+            let settings_open = self.dock_state.iter_all_tabs().any(|(_, t)| *t == Tab::ProjectSettings);
+            if widgets::icon_button_sized(&mut right_ui, Icon::Gear, "Project settings", settings_open, egui::vec2(28.0, 28.0))
                 .clicked()
             {
-                self.show_project_settings = !self.show_project_settings;
+                self.open_or_focus_tab(Tab::ProjectSettings);
             }
             right_ui.add_space(4.0);
             let search_w = 220.0_f32.min((right.width() - 40.0).max(0.0));
@@ -4977,6 +5004,21 @@ impl EngineApp {
                     ui.label("Drag a .material from Files onto a mesh or a material slot");
                     ui.label("Double-click a model file in Files to import it");
                 });
+        }
+    }
+
+    /// Open `tab` docked into the main (central) area next to the Scene view,
+    /// or focus it if it's already open somewhere.
+    fn open_or_focus_tab(&mut self, tab: Tab) {
+        if let Some(loc) = self.dock_state.find_tab(&tab) {
+            self.dock_state.set_active_tab(loc);
+        } else {
+            // Focus the Viewport's leaf so the tab lands in the main docking
+            // area, not in a side (Inspector) or bottom (Log/Files) dock.
+            if let Some((surface, node, _)) = self.dock_state.find_tab(&Tab::Viewport) {
+                self.dock_state.set_focused_node_and_surface((surface, node));
+            }
+            self.dock_state.push_to_focused_leaf(tab);
         }
     }
 
@@ -6244,23 +6286,8 @@ impl EngineApp {
     /// Project Settings > Input: the bindings editor plus where players'
     /// own remaps live. Saves the project when the bindings change.
     fn input_settings_ui(&mut self, ui: &mut egui::Ui, id: &str) {
-        if citrus_editor::bindings_editor_ui(ui, id, &mut self.project.bindings, &mut self.bindings_editor) {
+        if bindings_section_ui(ui, id, &mut self.project, &mut self.bindings_editor, &mut self.input) {
             self.bindings_changed();
-        }
-        ui.add_space(6.0);
-        citrus_editor::widgets::eyebrow(ui, "Player remaps");
-        let overrides = self.input.controls().overrides();
-        let note = if overrides.is_empty() {
-            "No Play-mode remaps. Games save their players' remaps (ctx.rebind, the Controls menu) to input.ron in the user's config folder, on top of these defaults.".to_owned()
-        } else {
-            format!(
-                "Play mode has {} remapped action(s) on top of these defaults (saved in .citrus/input_overrides.ron). Shipped games keep their players' remaps in input.ron in the user's config folder.",
-                overrides.actions.len()
-            )
-        };
-        citrus_editor::widgets::info_note(ui, &note);
-        if !overrides.is_empty() && ui.button("Clear Play-mode remaps").clicked() {
-            self.input.apply(citrus_core::InputCommand::ResetAll);
         }
     }
 
@@ -6361,144 +6388,6 @@ impl EngineApp {
                 .push(EditorAction::OpenProject(PathBuf::from(self.open_project_path.clone())));
         }
 
-        // ---- Project Settings ----
-        let mut open = self.show_project_settings;
-        let mut dirty = false;
-        egui::Window::new("Project Settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .show(ctx, |ui| {
-                egui::Grid::new("project-settings-grid").num_columns(2).show(ui, |ui| {
-                    ui.label("Name");
-                    dirty |= ui.text_edit_singleline(&mut self.project.name).changed();
-                    ui.end_row();
-
-                    ui.label("Starting scene")
-                        .on_hover_text("The scene a built game loads first (boot scene).");
-                    let scenes = scan_project_files(&self.project_root, "scene");
-                    let current = self
-                        .project
-                        .boot_scene
-                        .clone()
-                        .unwrap_or_else(|| "(none)".into());
-                    egui::ComboBox::from_id_salt("boot-scene")
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for rel in &scenes {
-                                if ui
-                                    .selectable_label(
-                                        self.project.boot_scene.as_deref() == Some(rel.as_str()),
-                                        rel,
-                                    )
-                                    .clicked()
-                                {
-                                    self.project.boot_scene = Some(rel.clone());
-                                    dirty = true;
-                                }
-                            }
-                            if scenes.is_empty() {
-                                ui.label(egui::RichText::new("no .scene files").small().weak());
-                            }
-                        });
-                    ui.end_row();
-                });
-                ui.add_space(8.0);
-                citrus_editor::widgets::eyebrow(ui, "Appearance");
-                citrus_editor::widgets::property_row(ui, "Accent", |ui| {
-                    let current = citrus_editor::theme::accent();
-                    for (name, c) in citrus_editor::theme::ACCENT_PRESETS {
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
-                        ui.painter().rect_filled(r, egui::CornerRadius::same(citrus_editor::theme::R_FIELD), c);
-                        if c == current {
-                            ui.painter().rect_stroke(r.expand(2.0), egui::CornerRadius::same(citrus_editor::theme::R_ROW), egui::Stroke::new(1.5_f32, citrus_editor::theme::TEXT_STRONG), egui::StrokeKind::Outside);
-                        }
-                        if resp.on_hover_text(name).clicked() {
-                            self.project.settings.accent = Some([c.r(), c.g(), c.b()]);
-                            dirty = true;
-                        }
-                    }
-                    let mut rgb = [current.r(), current.g(), current.b()];
-                    if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Custom accent").changed() {
-                        self.project.settings.accent = Some(rgb);
-                        dirty = true;
-                    }
-                });
-                if dirty {
-                    apply_accent(ctx, self.project.settings.accent);
-                }
-                ui.add_space(8.0);
-                egui::CollapsingHeader::new("Spatial Audio").id_salt("citrus-spatial-audio").show(ui, |ui| {
-                    let r = citrus_editor::audio_settings_ui(ui, &mut self.project.spatial_audio);
-                    dirty |= r.changed;
-                    if r.bake {
-                        self.actions.push(EditorAction::BakeAudio);
-                    }
-                });
-                egui::CollapsingHeader::new("Physics").id_salt("citrus-physics-settings").show(ui, |ui| {
-                    let root = self.project_root.clone();
-                    dirty |= citrus_editor::physics_settings_ui(ui, &mut self.project.physics, || physmat_files(&root));
-                });
-                egui::CollapsingHeader::new("External tracking").id_salt("citrus-external-tracking").show(ui, |ui| {
-                    let ft = &mut self.project.tracking_input;
-                    citrus_editor::widgets::eyebrow(ui, "SlimeVR");
-                    citrus_editor::widgets::property_row(ui, "Connect to server", |ui| dirty |= ui.checkbox(&mut ft.slimevr, "").changed());
-                    let slime = match &self.slimevr {
-                        Some(s) if s.connected() => "Connected".to_owned(),
-                        Some(_) => format!("Waiting for the server at {}", crate::slimevr::socket_path().display()),
-                        None => "Off".to_owned(),
-                    };
-                    ui.label(egui::RichText::new(slime).small().weak());
-                    citrus_editor::widgets::eyebrow(ui, "OSC (Open Sound Control)");
-                    citrus_editor::widgets::property_row(ui, "Receive", |ui| dirty |= ui.checkbox(&mut ft.osc_enabled, "").changed());
-                    citrus_editor::widgets::property_row(ui, "UDP port", |ui| {
-                        dirty |= ui.add(egui::DragValue::new(&mut ft.osc_port).range(1024..=65535)).changed();
-                    });
-                    let status = match self.face_input.osc_port() {
-                        Some(p) => format!("Listening on UDP {p}"),
-                        None => "Not listening (starts with Play when enabled)".to_owned(),
-                    };
-                    ui.label(egui::RichText::new(status).small().weak());
-                    citrus_editor::widgets::info_note(
-                        ui,
-                        "Only for tools that send over OSC (Open Sound Control): VRCFaceTracking, Babble, Steam Link. Headset face and eye tracking from WiVRn or Virtual Desktop is read directly through OpenXR and needs none of this.",
-                    );
-                });
-                egui::CollapsingHeader::new("Input")
-                    .id_salt("citrus-input-settings")
-                    .show(ui, |ui| self.input_settings_ui(ui, "project-settings"));
-                ui.separator();
-                if let Some(status) = &self.build_status {
-                    ui.label(egui::RichText::new(status).small());
-                }
-                ui.horizontal(|ui| {
-                    ui.label("Target");
-                    egui::ComboBox::from_id_salt("citrus-build-target")
-                        .selected_text(self.build_target.label())
-                        .show_ui(ui, |ui| {
-                            for t in bundle::BuildTarget::available() {
-                                ui.selectable_value(&mut self.build_target, t, t.label());
-                            }
-                        });
-                });
-                if self.build_target.is_android() {
-                    citrus_editor::widgets::info_note(
-                        ui,
-                        "Builds a signed APK with tools/android/build_apk.sh. Needs the Android SDK, NDK and build-tools (ANDROID_HOME, ANDROID_NDK_HOME) and `rustup target add aarch64-linux-android`. Meta Quest builds also bundle the Khronos OpenXR loader (OPENXR_LOADER_SO, or fetched once). Release signing: CITRUS_KEYSTORE / CITRUS_KEYSTORE_PASS.",
-                    );
-                }
-                if ui
-                    .add_enabled(!self.building_game, egui::Button::new("Build Game"))
-                    .on_hover_text(format!("Build and bundle into {}/", self.build_target.output_hint()))
-                    .clicked()
-                {
-                    self.actions.push(EditorAction::BuildGame(self.build_target));
-                }
-            });
-        self.show_project_settings = open;
-        if dirty {
-            self.save_project();
-        }
 
         // ---- Unsaved-changes (quit) dialog ----
         if self.show_quit_dialog {
@@ -7656,8 +7545,22 @@ impl EngineApp {
         );
     }
 
+    /// Record a structural edit (the object list before it, and now) as one
+    /// undo step, and keep its index shifts out of per-frame edit diffing.
+    fn record_structure(&mut self, before: scene::ObjectsSnapshot) {
+        let after = self.scene.snapshot_objects();
+        self.undo_stack.record(UndoEntry::Structure { before: Box::new(before), after: Box::new(after) }, false);
+        self.suppress_undo_record = true;
+    }
+
     /// Apply one history entry (true = undo, false = redo).
     fn apply_history(&mut self, undo: bool) {
+        // The animation tabs keep their own document histories.
+        match self.dock_state.find_active_focused().map(|(_, tab)| tab.clone()) {
+            Some(Tab::AnimClip) => return self.anim_clip_tab.history_step(undo),
+            Some(Tab::AnimController) => return self.anim_ctrl_tab.history_step(undo),
+            _ => {}
+        }
         let Some(entry) = (if undo {
             self.undo_stack.pop_undo()
         } else {
@@ -7673,6 +7576,24 @@ impl EngineApp {
     /// the pop + `suppress_undo_record`; this just mutates the scene.
     fn apply_entry(&mut self, entry: UndoEntry, undo: bool) {
         match entry {
+            UndoEntry::Environment { before, after } => {
+                let mut env = *if undo { before } else { after };
+                // Skybox images go through their own load actions (not part of
+                // this history): keep the ones on screen.
+                env.skybox_faces = self.scene.environment.skybox_faces.clone();
+                self.scene.environment = env;
+                self.scene_dirty = true;
+            }
+            UndoEntry::Structure { before, after } => {
+                let snapshot = if undo { before } else { after };
+                self.scene.restore_objects(&snapshot, &self.components);
+                // Indices differ between the two lists: start from no selection.
+                self.selection = Selection::None;
+                self.multi_objects.clear();
+                self.inspector_lock_target = None;
+                self.inspector.locked = false;
+                self.scene_dirty = true;
+            }
             UndoEntry::Group(entries) => {
                 // Undo reverts in reverse application order; redo replays forward.
                 if undo {
@@ -7945,6 +7866,9 @@ impl EngineApp {
                     count_row(ui, "Indirect draws", s.indirect_draws);
                     count_row(ui, "Instances tested", s.gpu_cull_tested);
                     count_row(ui, "  visible", s.gpu_cull_visible);
+                    if s.gpu_cull_recovered > 0 {
+                        count_row(ui, "    recovered (late Hi-Z)", s.gpu_cull_recovered);
+                    }
                     count_row(ui, "  frustum / size culled", s.gpu_cull_frustum);
                     count_row(ui, "  occluded (Hi-Z)", s.gpu_cull_occluded);
                     count_row(ui, "Shadow instances", s.gpu_cull_shadow_visible);
@@ -8243,6 +8167,15 @@ impl EngineApp {
                 generated_uv_models: &generated_uv_models,
                 bake_sizes: self.bake_sizes.unwrap_or_default(),
                 selected_material_slot: &mut self.selected_material_slot,
+                project: &mut self.project,
+                bindings_editor: &mut self.bindings_editor,
+                input: &mut self.input,
+                build_status: &self.build_status,
+                build_target: &mut self.build_target,
+                building_game: &self.building_game,
+                slimevr: &self.slimevr,
+                face_input: &self.face_input,
+                project_settings_dirty: &mut self.project_settings_dirty,
             };
             DockArea::new(&mut dock_state)
                 .style(citrus_editor::theme::dock_style(ctx.style().as_ref()))
@@ -8259,6 +8192,10 @@ impl EngineApp {
             self.active_tabs = active_now;
             clamp_leaf_width(&mut dock_state, &Tab::Inspector, INSPECTOR_MIN_WIDTH);
             self.dock_state = dock_state;
+            if self.project_settings_dirty {
+                self.save_project();
+                self.project_settings_dirty = false;
+            }
             if std::mem::take(&mut self.focus_game_tab) && self.playing {
                 match self.dock_state.find_tab(&Tab::Camera) {
                     Some(loc) => self.dock_state.set_active_tab(loc),
@@ -8759,9 +8696,10 @@ impl EngineApp {
             viewport_extent,
             postfx,
             preview_postfx,
-            reflection_probe: refl.0,
-            reflection_probe_b: refl.1,
-            reflection_primary: refl.2,
+            reflection_probe: refl[0],
+            reflection_probes: refl,
+            reflection_probe_b: refl[1],
+            reflection_primary: 0,
             camera_targets: &camera_views,
             planar: &planar,
             fog: self.scene.fog_params(),
@@ -9007,6 +8945,24 @@ struct EditorTabs<'a> {
     bake_sizes: crate::bake_store::BakeSizes,
     /// Inspector: selected material slot of the current object (multi-material).
     selected_material_slot: &'a mut usize,
+    /// Project Settings tab: the project file being edited in place.
+    project: &'a mut citrus_assets::ProjectFile,
+    /// Project Settings > Input: the bindings editor state.
+    bindings_editor: &'a mut citrus_editor::BindingsEditor,
+    /// Live input manager (bindings push + Play-mode remaps).
+    input: &'a mut crate::input_engine::InputManager,
+    /// Build status line shown at the bottom of Project Settings.
+    build_status: &'a Option<String>,
+    /// Build target picker in Project Settings.
+    build_target: &'a mut bundle::BuildTarget,
+    /// A build is running (disables the Build Game button).
+    building_game: &'a bool,
+    /// SlimeVR server status (Project Settings > External tracking).
+    slimevr: &'a Option<crate::slimevr::SlimeVr>,
+    /// Face-tracking OSC status (Project Settings > External tracking).
+    face_input: &'a crate::face_input::FaceInput,
+    /// Set when Project Settings edits the project; saved after the dock pass.
+    project_settings_dirty: &'a mut bool,
 }
 
 impl egui_dock::TabViewer for EditorTabs<'_> {
@@ -9095,9 +9051,20 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     self.anim_clip_tab.ui(ui, self.scene, selected, self.project_root, self.playing);
                 }
             }
-            Tab::Environment => self.environment_ui(ui),
+            Tab::Environment => {
+                // Undo: compare the settings around the tab (RON: the type has
+                // no PartialEq); one drag coalesces into one step.
+                let before = self.scene.environment.clone();
+                let before_text = ron::to_string(&before).unwrap_or_default();
+                self.environment_ui(ui);
+                if ron::to_string(&self.scene.environment).unwrap_or_default() != before_text {
+                    let gesture = ui.input(|i| i.pointer.any_down());
+                    self.actions.push(EditorAction::EnvironmentEdited { before: Box::new(before), gesture });
+                }
+            }
             Tab::Baker => self.baker_ui(ui),
             Tab::Occlusion => self.occlusion_tab(ui),
+            Tab::ProjectSettings => self.project_settings_ui(ui),
             Tab::Scene => {
                 let rows: Vec<citrus_editor::SceneObjectRow> = self
                     .scene
@@ -9405,6 +9372,148 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
 }
 
 impl EditorTabs<'_> {
+    /// Project Settings dock tab: name, VR, boot scene, appearance, spatial
+    /// audio, physics, external tracking, input and the build target. Edits the
+    /// project in place; the caller saves once the dock pass ends.
+    fn project_settings_ui(&mut self, ui: &mut egui::Ui) {
+        let mut dirty = false;
+        egui::Grid::new("project-settings-grid").num_columns(2).show(ui, |ui| {
+            ui.label("Name");
+            dirty |= ui.text_edit_singleline(&mut self.project.name).changed();
+            ui.end_row();
+
+            ui.label("Start in VR")
+                .on_hover_text("A built game starts in VR when a headset and OpenXR runtime are present. Off: it always opens a flat window (Meta Quest builds always start in VR).");
+            dirty |= ui.checkbox(&mut self.project.vr, "").changed();
+            ui.end_row();
+
+            ui.label("Starting scene")
+                .on_hover_text("The scene a built game loads first (boot scene).");
+            let scenes = scan_project_files(self.project_root, "scene");
+            let current = self.project.boot_scene.clone().unwrap_or_else(|| "(none)".into());
+            egui::ComboBox::from_id_salt("boot-scene")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for rel in &scenes {
+                        if ui
+                            .selectable_label(self.project.boot_scene.as_deref() == Some(rel.as_str()), rel)
+                            .clicked()
+                        {
+                            self.project.boot_scene = Some(rel.clone());
+                            dirty = true;
+                        }
+                    }
+                    if scenes.is_empty() {
+                        ui.label(egui::RichText::new("no .scene files").small().weak());
+                    }
+                });
+            ui.end_row();
+        });
+        ui.add_space(8.0);
+        citrus_editor::widgets::eyebrow(ui, "Appearance");
+        citrus_editor::widgets::property_row(ui, "Accent", |ui| {
+            let current = citrus_editor::theme::accent();
+            for (name, c) in citrus_editor::theme::ACCENT_PRESETS {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                ui.painter().rect_filled(r, egui::CornerRadius::same(citrus_editor::theme::R_FIELD), c);
+                if c == current {
+                    ui.painter().rect_stroke(r.expand(2.0), egui::CornerRadius::same(citrus_editor::theme::R_ROW), egui::Stroke::new(1.5_f32, citrus_editor::theme::TEXT_STRONG), egui::StrokeKind::Outside);
+                }
+                if resp.on_hover_text(name).clicked() {
+                    self.project.settings.accent = Some([c.r(), c.g(), c.b()]);
+                    dirty = true;
+                }
+            }
+            let mut rgb = [current.r(), current.g(), current.b()];
+            if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Custom accent").changed() {
+                self.project.settings.accent = Some(rgb);
+                dirty = true;
+            }
+        });
+        if dirty {
+            apply_accent(ui.ctx(), self.project.settings.accent);
+        }
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Spatial Audio").id_salt("citrus-spatial-audio").show(ui, |ui| {
+            let r = citrus_editor::audio_settings_ui(ui, &mut self.project.spatial_audio);
+            dirty |= r.changed;
+            if r.bake {
+                self.actions.push(EditorAction::BakeAudio);
+            }
+        });
+        egui::CollapsingHeader::new("Physics").id_salt("citrus-physics-settings").show(ui, |ui| {
+            let root = self.project_root.to_path_buf();
+            dirty |= citrus_editor::physics_settings_ui(ui, &mut self.project.physics, || physmat_files(&root));
+        });
+        egui::CollapsingHeader::new("External tracking").id_salt("citrus-external-tracking").show(ui, |ui| {
+            let ft = &mut self.project.tracking_input;
+            citrus_editor::widgets::eyebrow(ui, "SlimeVR");
+            citrus_editor::widgets::property_row(ui, "Connect to server", |ui| dirty |= ui.checkbox(&mut ft.slimevr, "").changed());
+            let slime = match self.slimevr {
+                Some(s) if s.connected() => "Connected".to_owned(),
+                Some(_) => format!("Waiting for the server at {}", crate::slimevr::socket_path().display()),
+                None => "Off".to_owned(),
+            };
+            ui.label(egui::RichText::new(slime).small().weak());
+            citrus_editor::widgets::eyebrow(ui, "OSC (Open Sound Control)");
+            citrus_editor::widgets::property_row(ui, "Receive", |ui| dirty |= ui.checkbox(&mut ft.osc_enabled, "").changed());
+            citrus_editor::widgets::property_row(ui, "UDP port", |ui| {
+                dirty |= ui.add(egui::DragValue::new(&mut ft.osc_port).range(1024..=65535)).changed();
+            });
+            let status = match self.face_input.osc_port() {
+                Some(p) => format!("Listening on UDP {p}"),
+                None => "Not listening (starts with Play when enabled)".to_owned(),
+            };
+            ui.label(egui::RichText::new(status).small().weak());
+            citrus_editor::widgets::info_note(
+                ui,
+                "Only for tools that send over OSC (Open Sound Control): VRCFaceTracking, Babble, Steam Link. Headset face and eye tracking from WiVRn or Virtual Desktop is read directly through OpenXR and needs none of this.",
+            );
+        });
+        egui::CollapsingHeader::new("Input")
+            .id_salt("citrus-input-settings")
+            .show(ui, |ui| self.input_settings_ui(ui, "project-settings"));
+        ui.separator();
+        if let Some(status) = self.build_status {
+            ui.label(egui::RichText::new(status).small());
+        }
+        ui.horizontal(|ui| {
+            ui.label("Target");
+            egui::ComboBox::from_id_salt("citrus-build-target")
+                .selected_text(self.build_target.label())
+                .show_ui(ui, |ui| {
+                    for t in bundle::BuildTarget::available() {
+                        ui.selectable_value(&mut *self.build_target, t, t.label());
+                    }
+                });
+        });
+        if self.build_target.is_android() {
+            citrus_editor::widgets::info_note(
+                ui,
+                "Builds a signed APK with tools/android/build_apk.sh. Needs the Android SDK, NDK and build-tools (ANDROID_HOME, ANDROID_NDK_HOME) and `rustup target add aarch64-linux-android`. Meta Quest builds also bundle the Khronos OpenXR loader (OPENXR_LOADER_SO, or fetched once). Release signing: CITRUS_KEYSTORE / CITRUS_KEYSTORE_PASS.",
+            );
+        }
+        if ui
+            .add_enabled(!*self.building_game, egui::Button::new("Build Game"))
+            .on_hover_text(format!("Build and bundle into {}/", self.build_target.output_hint()))
+            .clicked()
+        {
+            self.actions.push(EditorAction::BuildGame(*self.build_target));
+        }
+        if dirty {
+            *self.project_settings_dirty = true;
+        }
+    }
+
+    /// Project Settings > Input: the bindings editor plus the Player-remaps
+    /// section (shared with the standalone Input Bindings window).
+    fn input_settings_ui(&mut self, ui: &mut egui::Ui, id: &str) {
+        if bindings_section_ui(ui, id, &mut *self.project, &mut *self.bindings_editor, &mut *self.input) {
+            self.input.set_project_bindings(self.project.bindings.clone());
+            *self.project_settings_dirty = true;
+        }
+    }
+
     /// Screen position of a world point (full-window NDC mapping, matching the
     /// scene swapchain). `None` if behind the camera.
     fn world_to_screen(&self, world: Vec3, full_rect: egui::Rect) -> Option<egui::Pos2> {
@@ -14318,6 +14427,39 @@ const INSPECTOR_MIN_WIDTH: f32 = 352.0;
 /// egui_dock has no per-leaf minimum: after each frame, widen the leaf holding
 /// `tab` back to `min` by moving its nearest horizontal split (dragging the
 /// divider past it just stops there).
+/// Render the bindings editor plus the "Player remaps" section, shared by the
+/// standalone Input Bindings window and the dockable Project Settings tab.
+/// Returns true when the project's bindings changed (the caller pushes them to
+/// the live input manager and persists the project).
+fn bindings_section_ui(
+    ui: &mut egui::Ui,
+    id: &str,
+    project: &mut citrus_assets::ProjectFile,
+    bindings_editor: &mut citrus_editor::BindingsEditor,
+    input: &mut crate::input_engine::InputManager,
+) -> bool {
+    let mut changed = false;
+    if citrus_editor::bindings_editor_ui(ui, id, &mut project.bindings, bindings_editor) {
+        changed = true;
+    }
+    ui.add_space(6.0);
+    citrus_editor::widgets::eyebrow(ui, "Player remaps");
+    let overrides = input.controls().overrides();
+    let note = if overrides.is_empty() {
+        "No Play-mode remaps. Games save their players' remaps (ctx.rebind, the Controls menu) to input.ron in the user's config folder, on top of these defaults.".to_owned()
+    } else {
+        format!(
+            "Play mode has {} remapped action(s) on top of these defaults (saved in .citrus/input_overrides.ron). Shipped games keep their players' remaps in input.ron in the user's config folder.",
+            overrides.actions.len()
+        )
+    };
+    citrus_editor::widgets::info_note(ui, &note);
+    if !overrides.is_empty() && ui.button("Clear Play-mode remaps").clicked() {
+        input.apply(citrus_core::InputCommand::ResetAll);
+    }
+    changed
+}
+
 fn tab_label(tab: &Tab) -> String {
     match tab {
         Tab::Viewport => format!("{}  Scene", ph::CUBE),
@@ -14330,6 +14472,7 @@ fn tab_label(tab: &Tab) -> String {
         Tab::Environment => "Environment".to_owned(),
         Tab::Baker => "FluxBaker".to_owned(),
         Tab::Occlusion => "Occlusion".to_owned(),
+        Tab::ProjectSettings => "Project Settings".to_owned(),
         Tab::Files => "Files".to_owned(),
         Tab::Log => {
             let warns = log_capture::store().lock().unwrap().entries.iter().filter(|e| e.level == tracing::Level::WARN).count();

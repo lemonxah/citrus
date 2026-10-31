@@ -26,3 +26,6 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 # Independent ASTC decoder: tests check the encoder's output decodes back.
 texture2ddecoder = "0.1"
+
+[build-dependencies]
+cc = "1"

@@ -35,7 +35,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 void main() {
-    mat4 model = mat4(a_model0, a_model1, a_model2, a_model3);
+    mat4 model = mat4(vec4(a_model0.xyz, 0.0), a_model1, a_model2, a_model3);
     // Inflate radially from the mesh center: the direction depends only on
     // position, so vertices duplicated across hard edges (per-face normals)
     // move together and the hull stays watertight, with no gaps at cube corners.

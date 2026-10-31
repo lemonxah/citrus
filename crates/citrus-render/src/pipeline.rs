@@ -407,6 +407,18 @@ impl PipelineCache {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Third reflection probe cube.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(11)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // Fourth reflection probe cube.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(12)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             // Each water body's ripple field (by body slot): the caustics on
             // what lies under it.
             vk::DescriptorSetLayoutBinding::default()
@@ -437,8 +449,9 @@ impl PipelineCache {
                     .binding(i)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(1)
-                    // 16 doubles as the water ripple field, read by the vertex stage.
-                    .stage_flags(if i == 16 {
+                    // 16 doubles as the water ripple field and 15 as its shore
+                    // depth, read by the vertex stage.
+                    .stage_flags(if i == 15 || i == 16 {
                         vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
                     } else {
                         vk::ShaderStageFlags::FRAGMENT

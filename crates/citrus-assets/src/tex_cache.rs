@@ -4,7 +4,8 @@
 //!
 //! Which encoding depends on what the device samples: BC (BC7 for LDR
 //! color/data, BC6H for HDR) on desktop GPUs, ASTC LDR on mobile / standalone
-//! VR GPUs without BC (HDR sources stay raw RGBA16F there), raw RGBA
+//! VR GPUs without BC (HDR sources as ASTC 4x4 HDR where the GPU samples it,
+//! raw RGBA16F otherwise), raw RGBA
 //! otherwise. The cache lives in a sibling `.citrus_texcache/` next to the
 //! source, keyed by (filename, srgb): `<name>.<srgb>.cbc` for the BC / raw
 //! tier and `<name>.<srgb>.castc` for the ASTC tier, so both coexist. It is
@@ -160,6 +161,32 @@ pub fn load_texture_bc(path: impl AsRef<Path>, srgb: bool) -> Result<CompressedT
     Ok(tex)
 }
 
+/// Compress texture `index` embedded in the model at `model` (BC on desktop,
+/// ASTC on mobile, like [`load_texture_bc`]), cached beside the model and
+/// re-encoded when the model file changes. Without a model file on disk (a
+/// model built in memory) it's encoded every time.
+pub fn compress_embedded_texture(model: Option<&Path>, index: usize, data: &citrus_render::TextureData) -> CompressedTexture {
+    let astc = astc_tier();
+    let encode = || if astc { encode_astc(data, astc_blocks()) } else { encode_texture(data) };
+    let Some(model) = model.filter(|m| m.is_file()) else { return encode() };
+    let (src_mtime, src_len) = source_stamp(model);
+    let key = model.with_file_name(format!("{}#{index}", model.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+    let cache = if astc { astc_cache_path(&key, data.srgb) } else { cache_path(&key, data.srgb) };
+    if let Some(cache) = &cache
+        && let Some(tex) = read_cache(cache, src_mtime, src_len)
+        && device_samples(tex.format)
+    {
+        return tex;
+    }
+    let tex = encode();
+    if let Some(cache) = &cache
+        && let Err(e) = write_cache(cache, &tex, src_mtime, src_len)
+    {
+        tracing::debug!("embedded texture cache write {}: {e:#}", cache.display());
+    }
+    tex
+}
+
 /// `<dir>/.citrus_texcache/<filename>.<srgb>.cbc`.
 fn cache_path(src: &Path, srgb: bool) -> Option<PathBuf> {
     let dir = src.parent()?.join(".citrus_texcache");
@@ -284,10 +311,15 @@ fn mip_chain_rgba8(pixels: &[u8], width: u32, height: u32) -> Vec<(Vec<u8>, u32,
 }
 
 /// ASTC-encode a decoded texture with a full mip chain down to 1x1 (ASTC has
-/// no size restriction; partial edge blocks are padded). HDR sources stay a
-/// single raw RGBA16F mip: there is no ASTC HDR encoder here.
+/// no size restriction; partial edge blocks are padded). HDR sources become a
+/// single ASTC 4x4 HDR mip where the device samples it, raw RGBA16F otherwise.
 fn encode_astc(data: &citrus_render::TextureData, blocks: AstcBlocks) -> CompressedTexture {
     if data.hdr {
+        if citrus_render::astc_hdr_supported()
+            && let Some(level) = encode_astc_hdr_level(&data.pixels, data.width, data.height)
+        {
+            return CompressedTexture { width: data.width, height: data.height, format: TexFormat::Astc4x4Hdr, mips: vec![level] };
+        }
         return raw(data, TexFormat::RgbaF16);
     }
     let block = blocks.for_slot(data.srgb);
@@ -310,35 +342,36 @@ fn encode_astc(data: &citrus_render::TextureData, blocks: AstcBlocks) -> Compres
     }
 }
 
-/// The ISPC texture compressor's ASTC entry points. They live in the C++
-/// archive `intel_tex_2` links (its Rust ASTC wrapper is unimplemented), with
-/// the layouts of `ispc_texcomp.h`.
-mod ispc_astc {
-    #[repr(C)]
-    pub struct RgbaSurface {
-        pub ptr: *mut u8,
-        pub width: i32,
-        pub height: i32,
-        pub stride: i32,
-    }
+unsafe extern "C" {
+    /// third_party/citrus_astc.cpp over the vendored ARM astcenc.
+    fn citrus_astc_ldr_encode(rgba: *const u8, w: u32, h: u32, bx: u32, by: u32, alpha: i32, out: *mut u8, out_len: usize) -> i32;
+    fn citrus_astc_hdr_encode(rgba_f16: *const u16, w: u32, h: u32, bx: u32, by: u32, out: *mut u8, out_len: usize) -> i32;
+    fn citrus_astc_hdr_decode(blocks: *const u8, len: usize, w: u32, h: u32, bx: u32, by: u32, rgba_f16: *mut u16) -> i32;
+}
 
-    #[repr(C)]
-    #[derive(Default)]
-    pub struct AstcEncSettings {
-        pub block_width: i32,
-        pub block_height: i32,
-        pub channels: i32,
-        pub fast_skip_threshold: i32,
-        pub refine_iterations: i32,
+/// RGBA16F texels (8 bytes each) of one ASTC 4x4 HDR level. `None` if the
+/// data isn't a whole level or the decoder fails.
+pub fn decode_astc_hdr_level(blocks: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    if blocks.len() != TexFormat::Astc4x4Hdr.level_bytes(w, h) {
+        return None;
     }
+    let mut halves = vec![0u16; (w * h * 4) as usize];
+    // SAFETY: `blocks` holds exactly the level's blocks and `halves` w*h RGBA halves.
+    let status = unsafe { citrus_astc_hdr_decode(blocks.as_ptr(), blocks.len(), w, h, 4, 4, halves.as_mut_ptr()) };
+    (status == 0).then(|| halves.iter().flat_map(|v| v.to_le_bytes()).collect())
+}
 
-    unsafe extern "C" {
-        /// `src` dimensions must be multiples of the block size; writes
-        /// `(w / bw) * (h / bh)` 16-byte blocks, row-major, to `dst`.
-        pub fn CompressBlocksASTC(src: *const RgbaSurface, dst: *mut u8, settings: *mut AstcEncSettings);
-        pub fn GetProfile_astc_fast(settings: *mut AstcEncSettings, block_width: i32, block_height: i32);
-        pub fn GetProfile_astc_alpha_fast(settings: *mut AstcEncSettings, block_width: i32, block_height: i32);
+/// ASTC 4x4 HDR blocks for one level of RGBA16F texels (`rgba_f16` bytes,
+/// 8 per texel). `None` if the encoder fails.
+pub fn encode_astc_hdr_level(rgba_f16: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let texels: Vec<u16> = rgba_f16.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    if texels.len() != (w * h * 4) as usize {
+        return None;
     }
+    let mut out = vec![0u8; TexFormat::Astc4x4Hdr.level_bytes(w, h)];
+    // SAFETY: `texels` holds w*h RGBA halves and `out` exactly the level's blocks.
+    let status = unsafe { citrus_astc_hdr_encode(texels.as_ptr(), w, h, 4, 4, out.as_mut_ptr(), out.len()) };
+    (status == 0).then_some(out)
 }
 
 /// ASTC LDR-encode one RGBA8 level of any size with square `block` edges (4,
@@ -348,27 +381,12 @@ mod ispc_astc {
 pub fn encode_astc_level(rgba: &[u8], w: u32, h: u32, block: u32, alpha: bool) -> Vec<u8> {
     assert!(TexFormat::ASTC_BLOCKS.contains(&block), "unsupported ASTC block {block}");
     let (padded, pw, ph) = pad_rgba8(rgba, w, h, block);
-    let mut settings = ispc_astc::AstcEncSettings::default();
-    let b = block as i32;
-    // SAFETY: the profile functions only write the settings struct.
-    unsafe {
-        if alpha {
-            ispc_astc::GetProfile_astc_alpha_fast(&mut settings, b, b);
-        } else {
-            ispc_astc::GetProfile_astc_fast(&mut settings, b, b);
-        }
-    }
-    let surface = ispc_astc::RgbaSurface {
-        ptr: padded.as_ptr().cast_mut(),
-        width: pw as i32,
-        height: ph as i32,
-        stride: (pw * 4) as i32,
-    };
     let mut out = vec![0u8; ((pw / block) * (ph / block) * 16) as usize];
-    // SAFETY: `padded` holds pw*ph RGBA8 texels at `stride` (only read), both
-    // dims are multiples of the <= 8 block (the encoder's asserted contract),
-    // and `out` has room for exactly one 16-byte block per footprint.
-    unsafe { ispc_astc::CompressBlocksASTC(&surface, out.as_mut_ptr(), &mut settings) };
+    // SAFETY: `padded` holds pw*ph RGBA8 texels (only read) and `out` exactly
+    // one 16-byte block per footprint.
+    let status =
+        unsafe { citrus_astc_ldr_encode(padded.as_ptr(), pw, ph, block, block, alpha as i32, out.as_mut_ptr(), out.len()) };
+    assert_eq!(status, 0, "astcenc rejected a {block}x{block} ASTC LDR encode");
     out
 }
 
@@ -496,6 +514,7 @@ fn format_byte(f: TexFormat) -> u8 {
         TexFormat::Astc6x6Unorm => 11,
         TexFormat::Astc8x8Srgb => 12,
         TexFormat::Astc8x8Unorm => 13,
+        TexFormat::Astc4x4Hdr => 14,
     }
 }
 
@@ -515,6 +534,7 @@ fn byte_format(b: u8) -> Option<TexFormat> {
         11 => TexFormat::Astc6x6Unorm,
         12 => TexFormat::Astc8x8Srgb,
         13 => TexFormat::Astc8x8Unorm,
+        14 => TexFormat::Astc4x4Hdr,
         _ => return None,
     })
 }
@@ -815,7 +835,7 @@ pub fn validate_compressed(tex: &CompressedTexture, max_dim: u32) -> Result<()> 
 mod tests {
     use super::*;
 
-    const ALL_FORMATS: [TexFormat; 14] = [
+    const ALL_FORMATS: [TexFormat; 15] = [
         TexFormat::Bc7Srgb,
         TexFormat::Bc7Unorm,
         TexFormat::Bc6h,
@@ -830,6 +850,7 @@ mod tests {
         TexFormat::Astc6x6Unorm,
         TexFormat::Astc8x8Srgb,
         TexFormat::Astc8x8Unorm,
+        TexFormat::Astc4x4Hdr,
     ];
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -868,7 +889,7 @@ mod tests {
         }
         // On-disk values of the original formats never move.
         assert_eq!(ALL_FORMATS[..6].iter().map(|&f| format_byte(f)).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
-        assert_eq!(byte_format(14), None);
+        assert_eq!(byte_format(15), None);
         for b in TexFormat::ASTC_BLOCKS {
             for srgb in [false, true] {
                 let f = TexFormat::astc(b, srgb).unwrap();
@@ -985,7 +1006,7 @@ mod tests {
         assert_eq!(wide.format, TexFormat::Astc8x8Srgb);
         assert_eq!(wide.mips[0].len(), 16 * 16);
         let hdr = citrus_render::TextureData { width: 4, height: 4, pixels: vec![0; 128], srgb: false, hdr: true };
-        assert_eq!(encode_astc(&hdr, blocks).format, TexFormat::RgbaF16, "no ASTC HDR encoder");
+        assert_eq!(encode_astc(&hdr, blocks).format, TexFormat::RgbaF16, "no device ASTC HDR support: raw halves");
     }
 
     #[test]
@@ -1094,5 +1115,39 @@ mod tests {
         image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255])).save(&png).unwrap();
         assert_eq!(texture_mean(&png, false), [1.0; 3]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn astc_hdr_round_trips_values_above_one() {
+        let (w, h) = (8u32, 8u32);
+        let texel = |x: u32, y: u32| [1.0 + x as f32 * 0.5, 4.0 + y as f32 * 0.25, 0.25, 1.0];
+        let halves: Vec<u16> =
+            (0..h).flat_map(|y| (0..w).flat_map(move |x| texel(x, y))).map(|v| half::f16::from_f32(v).to_bits()).collect();
+        let bytes: Vec<u8> = halves.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let blocks = encode_astc_hdr_level(&bytes, w, h).expect("encodes");
+        assert_eq!(blocks.len(), 4 * 16, "four 4x4 blocks");
+        let mut decoded = vec![0u16; (w * h * 4) as usize];
+        // SAFETY: `decoded` holds w*h RGBA halves for the blocks just encoded.
+        let status = unsafe { citrus_astc_hdr_decode(blocks.as_ptr(), blocks.len(), w, h, 4, 4, decoded.as_mut_ptr()) };
+        assert_eq!(status, 0);
+        for (k, (got, want)) in decoded.iter().zip(&halves).enumerate() {
+            let (got, want) = (half::f16::from_bits(*got).to_f32(), half::f16::from_bits(*want).to_f32());
+            assert!((got - want).abs() <= want.abs() * 0.08 + 0.02, "texel channel {k}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn embedded_textures_cache_beside_their_model() {
+        let dir = std::env::temp_dir().join(format!("citrus-embedded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("crate.glb");
+        std::fs::write(&model, b"model bytes").unwrap();
+        let data = ldr(8, 8, true, false);
+        let first = compress_embedded_texture(Some(&model), 2, &data);
+        let cached = dir.join(".citrus_texcache").join("crate.glb#2.1.cbc");
+        assert!(cached.is_file(), "cache written next to the model");
+        let second = compress_embedded_texture(Some(&model), 2, &data);
+        assert_eq!((first.format, first.mips.clone()), (second.format, second.mips), "second load reads the cache");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -233,8 +233,15 @@ pub struct Water {
     pub project_caustics: bool,
     /// Brightness of that projected light (1 = physical).
     pub projection_strength: f32,
+    /// Waves calm where the water is shallower than this (m) over the
+    /// ground under it (baked from the static geometry): gone at the
+    /// waterline, full from this depth on. 0 = full waves everywhere.
+    pub shore_depth: f32,
     #[serde(skip)]
     pub runtime: WaterRuntime,
+    /// The depth of water over the ground (engine-baked), for `shore_depth`.
+    #[serde(skip)]
+    pub shore: Option<std::sync::Arc<ShoreDepth>>,
     #[serde(skip)]
     pub ripples: Option<crate::RippleSim>,
     /// What this frame feeds the GPU simulation (window, displacers, field).
@@ -250,6 +257,63 @@ pub struct Water {
     /// around it; the editor does it and clears this.
     #[serde(skip)]
     pub fit_request: bool,
+}
+
+/// Depth baked where nothing lies under the water (m): open water.
+pub const SHORE_NO_GROUND: f32 = 1.0e4;
+
+/// The depth of water over the ground under a body, on an `n` x `n` grid of
+/// cells spanning local XZ -`half`..`half` (row-major, x fastest; cell
+/// centres at the texel centres the shader samples), clamped to
+/// 0..`SHORE_NO_GROUND`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShoreDepth {
+    pub n: usize,
+    pub half: f32,
+    pub depth: Vec<f32>,
+    /// Changes with every bake (what the renderer re-uploads on).
+    pub version: u64,
+}
+
+impl ShoreDepth {
+    pub fn new(n: usize, half: f32, mut depth: Vec<f32>) -> Self {
+        static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        for d in &mut depth {
+            *d = if d.is_nan() { SHORE_NO_GROUND } else { d.clamp(0.0, SHORE_NO_GROUND) };
+        }
+        Self { n, half, depth, version: VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+    }
+
+    /// The depth under local `xz`, bilinear between cell centres (as the
+    /// GPU filters it); None outside the grid.
+    pub fn depth_at(&self, xz: Vec2) -> Option<f32> {
+        if self.n == 0 || self.half <= 0.0 || self.depth.len() != self.n * self.n {
+            return None;
+        }
+        let uv = xz / (2.0 * self.half) + 0.5;
+        if !(0.0..=1.0).contains(&uv.x) || !(0.0..=1.0).contains(&uv.y) {
+            return None;
+        }
+        let n = self.n;
+        let p = (uv * n as f32 - 0.5).clamp(Vec2::ZERO, Vec2::splat((n - 1) as f32));
+        let (x0, z0) = (p.x.floor() as usize, p.y.floor() as usize);
+        let (x1, z1) = ((x0 + 1).min(n - 1), (z0 + 1).min(n - 1));
+        let f = p - Vec2::new(x0 as f32, z0 as f32);
+        let at = |x: usize, z: usize| self.depth[z * n + x];
+        let a = at(x0, z0) + (at(x1, z0) - at(x0, z0)) * f.x;
+        let b = at(x0, z1) + (at(x1, z1) - at(x0, z1)) * f.x;
+        Some(a + (b - a) * f.y)
+    }
+}
+
+/// Share of the waves left over water `depth` deep for a body's
+/// `shore_depth`: smoothstep(0, shore_depth, depth); 1 when it is off.
+pub fn shore_damping(depth: f32, shore_depth: f32) -> f32 {
+    if shore_depth <= 0.0 {
+        return 1.0;
+    }
+    let t = (depth / shore_depth).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Debug, Default)]
@@ -545,7 +609,9 @@ impl Default for Water {
             steam: 0.0,
             project_caustics: false,
             projection_strength: 1.0,
+            shore_depth: 2.0,
             runtime: WaterRuntime::default(),
+            shore: None,
             ripples: None,
             sim_feed: Default::default(),
             river_cache: Default::default(),
@@ -613,6 +679,22 @@ impl Water {
     /// Surface displacement of the rest point `xz` (local) at time `t`, and
     /// the surface normal there.
     pub fn displacement(&self, xz: Vec2, t: f32) -> (Vec3, Vec3) {
+        let (d, normal) = self.free_displacement(xz, t);
+        let calm = self.shore_damping(xz);
+        (d * calm, Vec3::Y.lerp(normal, calm).normalize_or(Vec3::Y))
+    }
+
+    /// How much of the waves shows at local `xz` (0..1): they calm over
+    /// water shallower than `shore_depth` (the shader's `water_shore`).
+    pub fn shore_damping(&self, xz: Vec2) -> f32 {
+        match &self.shore {
+            Some(s) if self.shore_depth > 0.0 => s.depth_at(xz).map_or(1.0, |d| shore_damping(d, self.shore_depth)),
+            _ => 1.0,
+        }
+    }
+
+    /// `displacement` without the shore calming (open water).
+    fn free_displacement(&self, xz: Vec2, t: f32) -> (Vec3, Vec3) {
         let mut d = Vec3::ZERO;
         let mut normal = Vec3::Y;
         for w in self.resolved_waves() {

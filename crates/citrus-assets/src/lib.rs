@@ -16,15 +16,18 @@ pub mod vrm;
 pub mod simplify;
 mod lightmap_uv;
 mod material_file;
+mod meshlet;
 mod post_file;
 mod procedural;
 mod project_file;
 mod scene_file;
 mod shader_file;
 mod shader_props;
+mod shader_graph;
 mod skeleton;
 mod tex_cache;
 pub mod package;
+pub mod game_pak;
 // Project Hub support: template catalogue, recent projects, sibling executables.
 pub mod launcher;
 pub mod project_templates;
@@ -56,6 +59,7 @@ pub use material_file::{
     MATERIAL_EXTENSION, MaterialFile, MaterialTextures, load_material_file, load_texture_file,
     save_material_file,
 };
+pub use meshlet::{Meshlet, build_meshlets};
 pub use bake_file::{
     LIGHTDATA_EXTENSION, LIGHTMAP_EXTENSION, LightDataFile, LightmapEntry, LightmapFile, LightmapFileInfo, LightmapLayers,
     ProbeVolumeData, load_lightdata, load_lightmap_layers, lightmap_file_info, load_lightmaps, read_lightmap_layers, save_lightdata,
@@ -75,7 +79,7 @@ pub use scene_file::{
     VoxelGridMode, WorldEnvironment, load_scene_file, save_scene_file,
 };
 pub use tex_cache::{
-    ASTC_CACHE_EXTENSION, AstcBlocks, astc_blocks, astc_cache_blob, encode_astc_level, load_texture_bc, seed_astc_cache,
+    ASTC_CACHE_EXTENSION, AstcBlocks, astc_blocks, astc_cache_blob, compress_embedded_texture, encode_astc_level, load_texture_bc, seed_astc_cache,
     seed_texture_cache, set_astc_blocks, texture_cache_blob, texture_mean, texture_mean_linear, validate_compressed,
 };
 pub use shader_file::{
@@ -89,6 +93,7 @@ pub use shader_file::{
     scoped_shader_target_env, shader_lang_for, shader_target_env, variant_path, ShaderTargetEnv,
     ShaderTargetEnvGuard,
 };
+pub use shader_graph::{ShaderGraph, ShaderNode, generate_glsl, topo_order};
 
 use std::path::{Path, PathBuf};
 

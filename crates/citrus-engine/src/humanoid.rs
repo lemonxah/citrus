@@ -165,6 +165,99 @@ impl HumanoidRig {
     }
 }
 
+/// The 20 humanoid roles as aligned (source, target) joint indices, `None`
+/// where a skeleton lacks that bone under a recognized name.
+fn role_pairs(src: &HumanoidRig, tgt: &HumanoidRig) -> [(Option<usize>, Option<usize>); 20] {
+    [
+        (src.hips, tgt.hips),
+        (src.head, tgt.head),
+        (src.l_upper_arm, tgt.l_upper_arm),
+        (src.l_lower_arm, tgt.l_lower_arm),
+        (src.l_hand, tgt.l_hand),
+        (src.r_upper_arm, tgt.r_upper_arm),
+        (src.r_lower_arm, tgt.r_lower_arm),
+        (src.r_hand, tgt.r_hand),
+        (src.l_upper_leg, tgt.l_upper_leg),
+        (src.l_lower_leg, tgt.l_lower_leg),
+        (src.l_foot, tgt.l_foot),
+        (src.r_upper_leg, tgt.r_upper_leg),
+        (src.r_lower_leg, tgt.r_lower_leg),
+        (src.r_foot, tgt.r_foot),
+        (src.chest, tgt.chest),
+        (src.neck, tgt.neck),
+        (src.l_eye, tgt.l_eye),
+        (src.r_eye, tgt.r_eye),
+        (src.l_shoulder, tgt.l_shoulder),
+        (src.r_shoulder, tgt.r_shoulder),
+    ]
+}
+
+/// Retarget a source humanoid's animated local pose onto a target humanoid by
+/// role: each mapped bone carries the source motion (its rotation relative to
+/// rest, in the source parent's rest frame), re-applied in the target parent's
+/// rest frame, so a clip authored for one skeleton plays on another with
+/// different names and proportions. The hips (root) translation is scaled by
+/// the target/source hip-to-head length; every other bone keeps its target rest
+/// translation and scale. Bones without a role mapping stay at the target rest
+/// pose.
+pub fn retarget_locals(
+    src_skel: &Skeleton,
+    src_rig: &HumanoidRig,
+    src_locals: &[Mat4],
+    tgt_skel: &Skeleton,
+    tgt_rig: &HumanoidRig,
+) -> Vec<Mat4> {
+    let src_rest = src_skel.world_matrices(&src_skel.rest_locals());
+    let src_anim = src_skel.world_matrices(src_locals);
+    let tgt_rest = tgt_skel.world_matrices(&tgt_skel.rest_locals());
+
+    // Rotation retargeting happens in GLOBAL space: each mapped bone carries the
+    // source's global rotation offset from rest (which already includes its
+    // parents' motion), re-applied to the target's rest global rotation. Local
+    // rotations are then extracted down the hierarchy so the parent's motion
+    // propagates once, not per child.
+    let mut tgt_glob_rot: Vec<Quat> = tgt_rest.iter().map(|m| m.to_scale_rotation_translation().1).collect();
+    for (s, t) in role_pairs(src_rig, tgt_rig).into_iter().filter_map(|(s, t)| s.zip(t)) {
+        let src_rest_rot = src_rest[s].to_scale_rotation_translation().1;
+        let src_anim_rot = src_anim[s].to_scale_rotation_translation().1;
+        let delta = (src_anim_rot * src_rest_rot.inverse()).normalize();
+        let tgt_rest_rot = tgt_rest[t].to_scale_rotation_translation().1;
+        tgt_glob_rot[t] = (tgt_rest_rot * delta).normalize();
+    }
+
+    // Uniform translation scale: the target/source hip-to-head rest length.
+    let height = |skel: &Skeleton, rig: &HumanoidRig| -> f32 {
+        let rest = skel.world_matrices(&skel.rest_locals());
+        match (rig.hips, rig.head) {
+            (Some(h), Some(d)) => (rest[d].w_axis.truncate() - rest[h].w_axis.truncate()).length(),
+            _ => 1.0,
+        }
+    };
+    let src_height = height(src_skel, src_rig).max(1e-4);
+    let tgt_height = height(tgt_skel, tgt_rig).max(1e-4);
+    let scale = tgt_height / src_height;
+
+    // Build target locals: the retargeted local rotation, the target's rest
+    // local translation (hips excepted), and the target's rest scale.
+    (0..tgt_skel.joints.len())
+        .map(|t| {
+            let rot = match tgt_skel.joints[t].parent {
+                Some(p) => (tgt_glob_rot[p].inverse() * tgt_glob_rot[t]).normalize(),
+                None => tgt_glob_rot[t],
+            };
+            let mut trans = tgt_skel.joints[t].rest_translation;
+            // The hips (root) carries the locomotion translation, scaled to the
+            // target's proportions.
+            if Some(t) == tgt_rig.hips
+                && let Some(h) = src_rig.hips
+            {
+                trans += (src_anim[h].w_axis.truncate() - src_rest[h].w_axis.truncate()) * scale;
+            }
+            Mat4::from_scale_rotation_translation(tgt_skel.joints[t].rest_scale, rot, trans)
+        })
+        .collect()
+}
+
 fn world_matrices(skel: &Skeleton, locals: &[Mat4]) -> Vec<Mat4> {
     skel.world_matrices(locals)
 }
@@ -903,6 +996,30 @@ mod tests {
         Skeleton { joints }
     }
 
+    /// A taller humanoid with Mixamo-style plain names (`Arm`/`ForeArm`/`Thigh`/
+    /// `Shin` instead of `UpperArm`/`LowerArm`/`UpperLeg`/`LowerLeg`), so
+    /// retargeting exercises the cross-convention bone matching.
+    fn alt_tpose() -> Skeleton {
+        let mut joints = vec![
+            joint_at("Hips", None, Vec3::new(0.0, 1.0, 0.0)),
+            joint_at("Spine", Some(0), Vec3::new(0.0, 0.18, 0.0)),
+            joint_at("Chest", Some(1), Vec3::new(0.0, 0.25, 0.0)),
+            joint_at("Neck", Some(2), Vec3::new(0.0, 0.2, 0.0)),
+            joint_at("Head", Some(3), Vec3::new(0.0, 0.12, 0.0)),
+        ];
+        for (side, x) in [("Left", 1.0f32), ("Right", -1.0)] {
+            let base = joints.len();
+            joints.push(joint_at(&format!("{side}Shoulder"), Some(2), Vec3::new(0.06 * x, 0.18, 0.0)));
+            joints.push(joint_at(&format!("{side}Arm"), Some(base), Vec3::new(0.15 * x, 0.0, 0.0)));
+            joints.push(joint_at(&format!("{side}ForeArm"), Some(base + 1), Vec3::new(0.35 * x, 0.0, 0.0)));
+            joints.push(joint_at(&format!("{side}Hand"), Some(base + 2), Vec3::new(0.35 * x, 0.0, 0.0)));
+            joints.push(joint_at(&format!("{side}Thigh"), Some(0), Vec3::new(0.12 * x, -0.06, 0.0)));
+            joints.push(joint_at(&format!("{side}Shin"), Some(base + 4), Vec3::new(0.0, -0.5, 0.0)));
+            joints.push(joint_at(&format!("{side}Foot"), Some(base + 5), Vec3::new(0.0, -0.45, 0.0)));
+        }
+        Skeleton { joints }
+    }
+
     fn at(skel: &Skeleton, locals: &[Mat4], name: &str) -> Vec3 {
         let i = skel.joints.iter().position(|j| j.name == name).unwrap();
         world_matrices(skel, locals)[i].w_axis.truncate()
@@ -915,6 +1032,47 @@ mod tests {
         assert_eq!((rig.chest, rig.neck, rig.l_shoulder, rig.r_shoulder), (Some(2), Some(3), Some(5), Some(12)));
         assert_eq!(spine_chain(&skel, &rig), vec![1, 2, 3]);
         assert!((rest_forward(&skel, &rig) - Vec3::Z).length() < 1e-5);
+    }
+
+    #[test]
+    fn retarget_rest_pose_matches_target_rest() {
+        let src = tpose();
+        let tgt = alt_tpose();
+        let out = retarget_locals(&src, &HumanoidRig::map(&src), &src.rest_locals(), &tgt, &HumanoidRig::map(&tgt));
+        let tgt_rest = tgt.rest_locals();
+        for (a, b) in out.iter().zip(&tgt_rest) {
+            let (ta, ra, sa) = a.to_scale_rotation_translation();
+            let (tb, rb, sb) = b.to_scale_rotation_translation();
+            assert!((ta - tb).length() < 1e-4, "translation mismatch");
+            assert!((ra - rb).length() < 1e-4, "rotation mismatch");
+            assert!((sa - sb).length() < 1e-4, "scale mismatch");
+        }
+    }
+
+    #[test]
+    fn retarget_transfers_arm_rotation_across_naming() {
+        let src = tpose();
+        let mut src_locals = src.rest_locals();
+        let upper = src.joints.iter().position(|j| j.name == "LeftUpperArm").unwrap();
+        src_locals[upper] = Mat4::from_rotation_translation(
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            src.joints[upper].rest_translation,
+        );
+        let tgt = alt_tpose();
+        let out = retarget_locals(&src, &HumanoidRig::map(&src), &src_locals, &tgt, &HumanoidRig::map(&tgt));
+
+        let upper = tgt.joints.iter().position(|j| j.name == "LeftArm").unwrap();
+        let hand = tgt.joints.iter().position(|j| j.name == "LeftHand").unwrap();
+        let rest = tgt.world_matrices(&tgt.rest_locals());
+        let anim = tgt.world_matrices(&out);
+        let upper_rest = rest[upper].w_axis.truncate();
+        let hand_rest = rest[hand].w_axis.truncate();
+        let upper_anim = anim[upper].w_axis.truncate();
+        let hand_anim = anim[hand].w_axis.truncate();
+        let rest_off = hand_rest - upper_rest;
+        let want = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) * rest_off;
+        let got = hand_anim - upper_anim;
+        assert!((got - want).length() < 1e-3, "got {got}, want {want}");
     }
 
     #[test]

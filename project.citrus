@@ -559,10 +559,15 @@
     ),
     audio_mixer: (
         buses: {
-            "music": (
+            "sfx": (
                 volume: 1.0,
                 muted: false,
                 parent: Some("master"),
+            ),
+            "master": (
+                volume: 1.0,
+                muted: false,
+                parent: None,
             ),
             "ui": (
                 volume: 1.0,
@@ -574,15 +579,10 @@
                 muted: false,
                 parent: Some("master"),
             ),
-            "sfx": (
+            "music": (
                 volume: 1.0,
                 muted: false,
                 parent: Some("master"),
-            ),
-            "master": (
-                volume: 1.0,
-                muted: false,
-                parent: None,
             ),
         },
     ),
@@ -615,4 +615,5 @@
         contact_damping: 5.0,
         solver_iterations: 4,
     ),
+    vr: false,
 )

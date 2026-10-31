@@ -39,6 +39,11 @@ pub struct ProjectFile {
     /// Gravity, contact stiffness and the default physics material.
     #[serde(default)]
     pub physics: citrus_core::PhysicsSettings,
+    /// A built game starts in VR when a headset and OpenXR runtime are
+    /// present. Off: it always opens a flat window (a Meta Quest build
+    /// starts in VR regardless).
+    #[serde(default)]
+    pub vr: bool,
 }
 
 impl Default for ProjectFile {
@@ -53,6 +58,7 @@ impl Default for ProjectFile {
             spatial_audio: citrus_core::SpatialAudioSettings::default(),
             tracking_input: citrus_core::TrackingInputSettings::default(),
             physics: citrus_core::PhysicsSettings::default(),
+            vr: false,
         }
     }
 }

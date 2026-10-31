@@ -81,6 +81,9 @@ pub struct WaterRenderer {
     spare_materials: Vec<MaterialHandle>,
     /// Ripple field texture (and its side) bound to each water material.
     ripple_textures: Vec<(MaterialHandle, TextureHandle, u32)>,
+    /// Shore-depth texture bound to each water material, its side and the
+    /// `ShoreDepth::version` last uploaded to it.
+    shore_textures: Vec<(MaterialHandle, TextureHandle, u32, u64)>,
     bodies: Vec<GpuWater>,
     edit_time: f32,
     time: f32,
@@ -145,6 +148,11 @@ impl WaterRenderer {
             };
             body.ripple = self.ripples(renderer, material, water, id.raw() as u64, local_cam, dt);
             body.ripple[3] = if water.look.foam_on { water.look.foam.max(0.0) } else { 0.0 };
+            if let Some(half) = self.shore(renderer, material, water) {
+                body.extra[1] = water.shore_depth;
+                body.extra[2] = half;
+                body.extra[3] = half;
+            }
             alive.push(id);
             renderer.set_material_water_slot(material, self.bodies.len() as u32);
             self.bodies.push(body);
@@ -210,16 +218,62 @@ impl WaterRenderer {
                         return None;
                     }
                 };
-                let mut slots = [None; 16];
-                slots[15] = Some(texture);
-                renderer.set_material_textures(material, &slots);
                 match k {
                     Some(k) => self.ripple_textures[k] = (material, texture, n),
                     None => self.ripple_textures.push((material, texture, n)),
                 }
+                self.bind_textures(renderer, material);
                 Some(texture)
             }
         }
+    }
+
+    /// Keep `water`'s shore-depth bake uploaded to `material`'s shore
+    /// texture; the bake's half extent (local XZ) when its waves calm over
+    /// it (`GpuWater::extra`).
+    fn shore(&mut self, renderer: &mut Renderer, material: MaterialHandle, water: &Water) -> Option<f32> {
+        let bake = water.shore.as_ref().filter(|_| water.shore_depth > 0.0)?;
+        let n = bake.n as u32;
+        let k = match self.shore_textures.iter().position(|s| s.0 == material) {
+            Some(k) if self.shore_textures[k].2 == n => k,
+            k => {
+                let texture = match renderer.create_ripple_texture(n) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!("water shore texture: {e:#}");
+                        return None;
+                    }
+                };
+                let k = match k {
+                    Some(k) => {
+                        self.shore_textures[k] = (material, texture, n, 0);
+                        k
+                    }
+                    None => {
+                        self.shore_textures.push((material, texture, n, 0));
+                        self.shore_textures.len() - 1
+                    }
+                };
+                self.bind_textures(renderer, material);
+                k
+            }
+        };
+        let s = &mut self.shore_textures[k];
+        if s.3 != bake.version {
+            // Depth in the red channel (the gradient it fills in goes unused).
+            renderer.update_ripple_texture(s.1, bake.n, &bake.depth, 2.0 * bake.half / bake.n as f32);
+            s.3 = bake.version;
+        }
+        Some(bake.half)
+    }
+
+    /// Bind `material`'s ripple field (slot 15) and shore depth (slot 14,
+    /// which the water path does not read as a metallic map).
+    fn bind_textures(&self, renderer: &mut Renderer, material: MaterialHandle) {
+        let mut slots = [None; 16];
+        slots[14] = self.shore_textures.iter().find(|s| s.0 == material).map(|s| s.1);
+        slots[15] = self.ripple_textures.iter().find(|r| r.0 == material).map(|r| r.1);
+        renderer.set_material_textures(material, &slots);
     }
 
     /// Queue this frame of `water`'s GPU simulation (writing its ripple

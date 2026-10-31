@@ -133,8 +133,15 @@ pub fn load_on_worker_checked(
         status("Uploading 3D models…");
         let mut map = HashMap::new();
         for (p, scene) in &models {
+            let model_path = root.join(p);
+            let textures: Vec<_> = scene
+                .textures
+                .iter()
+                .enumerate()
+                .map(|(k, t)| citrus_assets::compress_embedded_texture(Some(&model_path), k, t))
+                .collect();
             let prep = up
-                .prepare(&scene.meshes, &scene.textures, !scene.skeletons.is_empty())
+                .prepare(&scene.meshes, &textures, !scene.skeletons.is_empty())
                 .map_err(|e| format!("{e:#}"))?;
             map.insert(p.clone(), prep);
         }

@@ -17,7 +17,10 @@ pub struct NetWindowState {
     pub relay: String,
     /// Join secret (empty = the scene's Network Manager setting).
     pub secret: String,
+    pub account_name: String,
+    pub account_password: String,
     show_secret: bool,
+    show_account_password: bool,
     browser: Option<LanBrowser>,
     last_refresh: f64,
 }
@@ -28,7 +31,10 @@ impl Default for NetWindowState {
             player_name: std::env::var("CITRUS_NAME").unwrap_or_else(|_| "Editor".to_string()),
             relay: std::env::var("CITRUS_RELAY").unwrap_or_default(),
             secret: std::env::var("CITRUS_SECRET").unwrap_or_default(),
+            account_name: std::env::var("CITRUS_ACCOUNT").unwrap_or_default(),
+            account_password: std::env::var("CITRUS_PASSWORD").unwrap_or_default(),
             show_secret: false,
+            show_account_password: false,
             browser: None,
             last_refresh: -10.0,
         }
@@ -89,6 +95,27 @@ pub fn network_window(
                             st.show_secret = true;
                         }
                     })
+                });
+                widgets::property_row(ui, "Account", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut st.account_name)
+                            .hint_text("optional username"),
+                    )
+                    .on_hover_text("Hosts with account auth enabled require this");
+                });
+                widgets::property_row(ui, "Password", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut st.account_password)
+                                .password(!st.show_account_password)
+                                .hint_text("optional password")
+                                .desired_width(150.0),
+                        );
+                        let eye = if st.show_account_password { Icon::EyeOff } else { Icon::Eye };
+                        if widgets::icon_button(ui, eye, "Show / hide", st.show_account_password).clicked() {
+                            st.show_account_password = !st.show_account_password;
+                        }
+                    });
                 });
                 let me = crate::net::Identity::install().fingerprint();
                 widgets::property_row(ui, "Player ID", |ui| {
@@ -165,6 +192,8 @@ pub fn network_window(
     if !st.secret.is_empty() {
         cfg.secret = st.secret.clone();
     }
+    cfg.account_name = st.account_name.trim().to_string();
+    cfg.account_password = st.account_password.clone();
     match act? {
         Act::Disconnect => {
             if let Some(mut s) = net.take() {

@@ -51,15 +51,19 @@ pub enum KeyInterp {
     /// Smooth Hermite curve with automatic (Catmull-Rom) tangents, flat at the ends.
     #[default]
     Cubic,
+    /// Smooth Hermite curve with user-edited tangents (falls back to automatic
+    /// where a key leaves them unset).
+    Custom,
 }
 
 impl KeyInterp {
-    pub const ALL: [KeyInterp; 3] = [Self::Step, Self::Linear, Self::Cubic];
+    pub const ALL: [KeyInterp; 4] = [Self::Step, Self::Linear, Self::Cubic, Self::Custom];
     pub fn label(self) -> &'static str {
         match self {
             Self::Step => "Constant",
             Self::Linear => "Linear",
             Self::Cubic => "Auto (cubic)",
+            Self::Custom => "Custom (bezier)",
         }
     }
 }
@@ -71,6 +75,13 @@ pub struct Keyframe {
     pub time: f32,
     pub value: [f32; 4],
     pub interp: KeyInterp,
+    /// Outgoing tangent (derivative w.r.t. time, per lane) for a `Custom`
+    /// segment. `None` falls back to the automatic (Catmull-Rom) tangent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tangent_out: Option<[f32; 4]>,
+    /// Incoming tangent of the `Custom` segment ending at this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tangent_in: Option<[f32; 4]>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -94,7 +105,7 @@ impl AnimTrack {
             return i;
         }
         let interp = self.keys.last().map(|k| k.interp).unwrap_or_default();
-        self.keys.push(Keyframe { time, value, interp });
+        self.keys.push(Keyframe { time, value, interp, ..Default::default() });
         self.sort();
         self.keys.iter().position(|k| (k.time - time).abs() < 5e-4).unwrap_or(0)
     }
@@ -146,6 +157,31 @@ impl AnimTrack {
                 };
                 let m0 = tangent(i, p0);
                 let m1 = tangent(i + 1, p1);
+                let (s2, s3) = (s * s, s * s * s);
+                let h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
+                let h10 = s3 - 2.0 * s2 + s;
+                let h01 = -2.0 * s3 + 3.0 * s2;
+                let h11 = s3 - s2;
+                let v: [f32; 4] = std::array::from_fn(|c| h00 * p0[c] + h10 * h * m0[c] + h01 * p1[c] + h11 * h * m1[c]);
+                if rotation { Quat::from_array(v).normalize().to_array() } else { v }
+            }
+            KeyInterp::Custom => {
+                let align = |reference: [f32; 4], v: [f32; 4]| {
+                    if rotation && dot4(reference, v) < 0.0 { v.map(|x| -x) } else { v }
+                };
+                let p0 = k0.value;
+                let p1 = align(p0, k1.value);
+                let auto = |j: usize, pj: [f32; 4]| -> [f32; 4] {
+                    if j == 0 || j + 1 >= keys.len() {
+                        return [0.0; 4];
+                    }
+                    let prev = align(pj, keys[j - 1].value);
+                    let next = align(pj, keys[j + 1].value);
+                    let dt = (keys[j + 1].time - keys[j - 1].time).max(1e-6);
+                    std::array::from_fn(|c| (next[c] - prev[c]) / dt)
+                };
+                let m0 = k0.tangent_out.map(|t| align(p0, t)).unwrap_or_else(|| auto(i, p0));
+                let m1 = k1.tangent_in.map(|t| align(p1, t)).unwrap_or_else(|| auto(i + 1, p1));
                 let (s2, s3) = (s * s, s * s * s);
                 let h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
                 let h10 = s3 - 2.0 * s2 + s;
@@ -241,7 +277,7 @@ mod tests {
         AnimTrack {
             target: String::new(),
             property: TrackProperty::Translation,
-            keys: keys.iter().map(|&(time, v)| Keyframe { time, value: [v, 0.0, 0.0, 0.0], interp }).collect(),
+            keys: keys.iter().map(|&(time, v)| Keyframe { time, value: [v, 0.0, 0.0, 0.0], interp, ..Default::default() }).collect(),
         }
     }
 
@@ -273,6 +309,45 @@ mod tests {
     }
 
     #[test]
+    fn custom_tangents_shape_the_segment() {
+        let t = AnimTrack {
+            target: String::new(),
+            property: TrackProperty::Translation,
+            keys: vec![
+                Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Custom, tangent_out: Some([10.0, 0.0, 0.0, 0.0]), tangent_in: None },
+                Keyframe { time: 1.0, value: [0.0; 4], interp: KeyInterp::Custom, tangent_out: None, tangent_in: Some([10.0, 0.0, 0.0, 0.0]) },
+            ],
+        };
+        // Hermite with p0=p1=0 and m0=m1=10: v(s) = 10*(h10+h11) = 10*(2s^3-3s^2+s).
+        // At s=0.25 this is 0.9375 (a positive bump), proving the explicit
+        // tangents override the flat automatic tangents.
+        assert!((t.sample(0.25)[0] - 0.9375).abs() < 1e-4, "{}", t.sample(0.25)[0]);
+    }
+
+    #[test]
+    fn custom_falls_back_to_auto_tangents() {
+        let keys = |interp: KeyInterp| AnimTrack {
+            target: String::new(),
+            property: TrackProperty::Translation,
+            keys: (0..3)
+                .map(|i| Keyframe {
+                    time: i as f32,
+                    value: [i as f32, 0.0, 0.0, 0.0],
+                    interp,
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let cubic = keys(KeyInterp::Cubic);
+        let custom = keys(KeyInterp::Custom);
+        for t in [0.2, 0.5, 0.8, 1.2, 1.8] {
+            let a = cubic.sample(t);
+            let b = custom.sample(t);
+            assert!((a[0] - b[0]).abs() < 1e-5, "t={t}: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
     fn rotation_linear_slerps() {
         let q0 = Quat::IDENTITY;
         let q1 = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
@@ -280,8 +355,8 @@ mod tests {
             target: String::new(),
             property: TrackProperty::Rotation,
             keys: vec![
-                Keyframe { time: 0.0, value: q0.to_array(), interp: KeyInterp::Linear },
-                Keyframe { time: 1.0, value: q1.to_array(), interp: KeyInterp::Linear },
+                Keyframe { time: 0.0, value: q0.to_array(), interp: KeyInterp::Linear, ..Default::default() },
+                Keyframe { time: 1.0, value: q1.to_array(), interp: KeyInterp::Linear, ..Default::default() },
             ],
         };
         let mid = Quat::from_array(t.sample(0.5));

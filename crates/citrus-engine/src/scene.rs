@@ -130,6 +130,35 @@ impl SceneObject {
     }
 }
 
+/// Every scene object as plain data (components saved as RON): what a
+/// structural edit (delete, group, reorder, re-parent) changes, so undo can
+/// put the whole list back. Meshes and materials stay loaded across those
+/// edits, so render slots stay valid.
+#[derive(Clone)]
+pub struct ObjectsSnapshot {
+    objects: Vec<ObjectSnapshot>,
+    object_lightmap: Option<std::collections::HashMap<usize, usize>>,
+}
+
+#[derive(Clone)]
+struct ObjectSnapshot {
+    id: ObjectId,
+    name: String,
+    render: Option<RenderInfo>,
+    extra_render: Vec<RenderInfo>,
+    source: ObjectSource,
+    enabled: bool,
+    static_geometry: bool,
+    lightmap_scale: f32,
+    cast_shadows: citrus_core::ShadowCasting,
+    layer: u8,
+    parent: Option<usize>,
+    translation: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    components: Vec<citrus_assets::ComponentData>,
+}
+
 pub struct MaterialEntry {
     pub model: MaterialModel,
     pub default: MaterialModel,
@@ -1144,7 +1173,8 @@ impl LoadedScene {
         let textures: Vec<_> = scene
             .textures
             .iter()
-            .map(|t| renderer.upload_texture(t))
+            .enumerate()
+            .map(|(k, t)| renderer.upload_compressed_texture(&citrus_assets::compress_embedded_texture(source_path, k, t)))
             .collect::<Result<_>>()?;
         // Carry imported armatures + animation clips (skeletal rigging). Joint
         // indices on the vertices are skin-local, matching `skeletons[*].joints`;
@@ -4481,10 +4511,14 @@ impl LoadedScene {
         self.active_reflection_probes(camera_pos)[0]
     }
 
-    /// The two highest-priority reflection probes for `camera_pos`, best first
+    /// The highest-priority reflection probes for `camera_pos`, best first
     /// (see [`active_reflection_probe`](Self::active_reflection_probe) for the
-    /// ranking). The second one is blended per pixel with the first.
-    pub fn active_reflection_probes(&self, camera_pos: Vec3) -> [Option<citrus_render::ReflectionProbeBox>; 2] {
+    /// ranking). The renderer blends up to
+    /// [`citrus_render::MAX_REFLECTION_PROBES`] probes per pixel.
+    pub fn active_reflection_probes(
+        &self,
+        camera_pos: Vec3,
+    ) -> [Option<citrus_render::ReflectionProbeBox>; citrus_render::MAX_REFLECTION_PROBES] {
         use citrus_core::ReflectionProbe;
         // Unreal-style priority: among probes whose box CONTAINS the point, the
         // highest Importance wins, tie-broken by the smallest box (a small specific
@@ -4540,7 +4574,7 @@ impl LoadedScene {
                 .then_with(|| (b.2, b.3).partial_cmp(&(a.2, a.3)).unwrap_or(std::cmp::Ordering::Equal))
         });
         let mut it = ranked.into_iter().map(|(_, p)| p);
-        [it.next(), it.next()]
+        std::array::from_fn(|_| it.next())
     }
 
     /// Whether object `i` counts as a planar-reflection surface this frame:
@@ -4905,6 +4939,69 @@ impl LoadedScene {
         self.frame_cache_world = world;
     }
 
+    /// The object list as data, for structural undo.
+    pub fn snapshot_objects(&self) -> ObjectsSnapshot {
+        let objects = self
+            .objects
+            .iter()
+            .map(|o| ObjectSnapshot {
+                id: o.id,
+                name: o.name.clone(),
+                render: o.render,
+                extra_render: o.extra_render.clone(),
+                source: o.source.clone(),
+                enabled: o.enabled,
+                static_geometry: o.static_geometry,
+                lightmap_scale: o.lightmap_scale,
+                cast_shadows: o.cast_shadows,
+                layer: o.layer,
+                parent: o.parent,
+                translation: o.translation,
+                rotation: o.rotation,
+                scale: o.scale,
+                components: o.save_components(),
+            })
+            .collect();
+        ObjectsSnapshot { objects, object_lightmap: self.baked.as_ref().map(|b| b.object_lightmap.clone()) }
+    }
+
+    /// Put back an object list taken by [`Self::snapshot_objects`].
+    pub fn restore_objects(&mut self, snapshot: &ObjectsSnapshot, registry: &ComponentRegistry) {
+        self.objects = snapshot
+            .objects
+            .iter()
+            .map(|s| {
+                let mut o = SceneObject {
+                    id: s.id,
+                    name: s.name.clone(),
+                    render: s.render,
+                    extra_render: s.extra_render.clone(),
+                    source: s.source.clone(),
+                    enabled: s.enabled,
+                    static_geometry: s.static_geometry,
+                    lightmap_scale: s.lightmap_scale,
+                    cast_shadows: s.cast_shadows,
+                    layer: s.layer,
+                    parent: s.parent,
+                    translation: s.translation,
+                    rotation: s.rotation,
+                    scale: s.scale,
+                    components: Vec::new(),
+                };
+                o.load_components(&s.components, registry);
+                o
+            })
+            .collect();
+        if let (Some(baked), Some(map)) = (self.baked.as_mut(), snapshot.object_lightmap.as_ref()) {
+            baked.object_lightmap = map.clone();
+        }
+        if let Some(cam) = self.active_camera_override
+            && !self.objects.iter().any(|o| o.id == cam)
+        {
+            self.active_camera_override = None;
+        }
+    }
+
     /// Delete an object and its whole subtree, remapping the surviving
     /// objects' parent indices (objects are a positional Vec). Meshes and
     /// materials are left in place (slot GC is a separate concern).
@@ -4983,8 +5080,7 @@ impl LoadedScene {
     /// transform/source/render (mesh + material are shared, not copied) and its
     /// components (via save→load through the registry), assigns fresh ids, and
     /// re-parents the copies among themselves; the duplicated root becomes a
-    /// sibling of the original. Returns the new root index. Not undoable (like
-    /// object deletion).
+    /// sibling of the original. Returns the new root index.
     pub fn duplicate_object(
         &mut self,
         index: usize,
@@ -6694,6 +6790,28 @@ mod lod_tests {
 #[cfg(test)]
 mod group_tests {
     use super::*;
+
+    #[test]
+    fn structural_snapshots_restore_deleted_subtrees_and_order() {
+        let registry = ComponentRegistry::with_builtins();
+        let mut scene = LoadedScene::empty();
+        let root = obj(&mut scene, "Root", None, Vec3::X);
+        let child = obj(&mut scene, "Child", Some(root), Vec3::Y);
+        obj(&mut scene, "Other", None, Vec3::Z);
+        let mut pawn = citrus_core::Pawn::default();
+        pawn.move_speed = 9.0;
+        scene.objects[child].components.push(Box::new(pawn));
+        let before = scene.snapshot_objects();
+        scene.remove_object(root);
+        assert_eq!(scene.objects.len(), 1);
+        scene.restore_objects(&before, &registry);
+        let names: Vec<&str> = scene.objects.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["Root", "Child", "Other"]);
+        assert_eq!(scene.objects[child].parent, Some(root));
+        assert_eq!(scene.objects[child].translation, Vec3::Y);
+        let pawn = scene.objects[child].components[0].as_any().downcast_ref::<citrus_core::Pawn>().expect("component restored");
+        assert_eq!(pawn.move_speed, 9.0);
+    }
 
     fn obj(scene: &mut LoadedScene, name: &str, parent: Option<usize>, t: Vec3) -> usize {
         scene.objects.push(SceneObject {

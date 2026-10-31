@@ -17,6 +17,7 @@ mod viseme;
 mod voice_codec;
 mod bundle;
 mod humanoid;
+pub mod resource_tracker;
 mod body;
 pub mod audio_mixer;
 pub mod navmesh;

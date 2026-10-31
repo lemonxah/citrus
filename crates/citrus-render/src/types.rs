@@ -95,6 +95,8 @@ pub enum TexFormat {
     Astc6x6Unorm,
     Astc8x8Srgb,
     Astc8x8Unorm,
+    /// ASTC 4x4 HDR (float) — HDR sources on mobile GPUs with ASTC HDR support.
+    Astc4x4Hdr,
 }
 
 impl TexFormat {
@@ -128,7 +130,7 @@ impl TexFormat {
     /// Texel footprint of one block (1x1 for uncompressed formats).
     pub fn block_dims(self) -> (u32, u32) {
         match self {
-            Self::Bc7Srgb | Self::Bc7Unorm | Self::Bc6h | Self::Astc4x4Srgb | Self::Astc4x4Unorm => (4, 4),
+            Self::Bc7Srgb | Self::Bc7Unorm | Self::Bc6h | Self::Astc4x4Srgb | Self::Astc4x4Unorm | Self::Astc4x4Hdr => (4, 4),
             Self::Astc5x5Srgb | Self::Astc5x5Unorm => (5, 5),
             Self::Astc6x6Srgb | Self::Astc6x6Unorm => (6, 6),
             Self::Astc8x8Srgb | Self::Astc8x8Unorm => (8, 8),
@@ -393,6 +395,8 @@ impl MaterialFx {
 
 /// Water bodies the frame UBO holds (a water material picks one by slot).
 pub const MAX_WATER_BODIES: usize = 4;
+/// Reflection-probe cubes blended per pixel (slot 0 + extra slots).
+pub const MAX_REFLECTION_PROBES: usize = 4;
 /// Churned foam spots per water body (waterfall plunges, whirlpools).
 pub const MAX_WATER_FOAM: usize = 4;
 /// Waves summed per water body.
@@ -427,7 +431,9 @@ pub struct GpuWater {
     pub bounds: [f32; 4],
     /// Churned spots: xy centre (local XZ), z radius, w foam amount.
     pub foam: [[f32; 4]; MAX_WATER_FOAM],
-    /// x: lights under the surface throw caustics out of it (pools).
+    /// x: lights under the surface throw caustics out of it (pools); y:
+    /// shore depth (m) the waves calm under (0 = off), zw: half extents
+    /// (local XZ) of the shore-depth texture (material slot 14).
     pub extra: [f32; 4],
 }
 
@@ -776,16 +782,22 @@ pub struct RenderStats {
     pub indirect_draws: u32,
     /// Main-camera GPU cull counts, read back from the frame slot's previous
     /// submission (no CPU wait): instances tested, drawn, rejected by the
-    /// frustum / distance / size tests, and rejected by Hi-Z occlusion.
+    /// frustum / distance / size tests, and rejected by Hi-Z occlusion (after
+    /// the late pass).
     pub gpu_cull_tested: u32,
     pub gpu_cull_visible: u32,
     pub gpu_cull_frustum: u32,
     pub gpu_cull_occluded: u32,
+    /// Of the visible ones: instances last frame's depth hid that the late
+    /// Hi-Z pass found visible in this frame's depth and drew the same frame
+    /// (disocclusions a one-phase cull would have drawn a frame late).
+    pub gpu_cull_recovered: u32,
     /// Shadow-caster instances drawn by the GPU-culled shadow views.
     pub gpu_cull_shadow_visible: u32,
     /// Instances drawn by the last GPU-culled VR eye.
     pub gpu_cull_eye_visible: u32,
-    /// GPU time of the cull dispatch and of the Hi-Z pyramid build (ms).
+    /// GPU time of the cull dispatches (early + late pass, the late pass's
+    /// pyramid included) and of the next frame's Hi-Z pyramid build (ms).
     pub gpu_cull_ms: f32,
     pub gpu_hiz_ms: f32,
 }
@@ -852,6 +864,10 @@ pub struct FrameInput<'a> {
     /// intensity for the environment reflection. `None` = treat the env cube as
     /// distant/infinite (no parallax, intensity 1).
     pub reflection_probe: Option<ReflectionProbeBox>,
+    /// Reflection probes in priority order (best first), blended per pixel.
+    /// Slot 0 is always used as the fallback; additional slots are mixed in by
+    /// their box influence.
+    pub reflection_probes: [Option<ReflectionProbeBox>; MAX_REFLECTION_PROBES],
     /// Second probe (slot 1, binding 9), blended per pixel with `reflection_probe`.
     pub reflection_probe_b: Option<ReflectionProbeBox>,
     /// Which slot wins where both probe boxes cover a pixel (higher importance,

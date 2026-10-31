@@ -7,8 +7,8 @@
 use glam::{Mat4, Quat, Vec3};
 
 use crate::{
-    CharacterController, Climb, Component, ComponentCtx, FirstPersonController, InputState, NetworkObject, ObjectId,
-    ObjectRef, Pawn, RayFilter, RayHit, Swimmer, ThirdPersonController, VrPlayer,
+    CharacterController, Climb, Component, ComponentCtx, InputState, NetworkObject, ObjectId, ObjectRef, RayFilter, RayHit,
+    Swimmer,
 };
 
 /// A controller's movement state: what prediction rewinds to and replays
@@ -150,26 +150,13 @@ pub trait Predictable {
     }
 }
 
-macro_rules! predictables {
-    ($any:ident, $($t:ty),+) => {
-        $(
-            if $any.is::<$t>() {
-                return $any.downcast_mut::<$t>().map(|c| c as &mut dyn Predictable);
-            }
-        )+
-    };
-}
-
 /// The component as a [`Predictable`] controller, if it is one.
 pub fn as_predictable(c: &mut dyn Component) -> Option<&mut dyn Predictable> {
-    let any = c.as_any_mut();
-    predictables!(any, Pawn, FirstPersonController, ThirdPersonController, VrPlayer);
-    None
+    c.predictable_mut()
 }
 
 pub fn is_predictable(c: &dyn Component) -> bool {
-    let any = c.as_any();
-    any.is::<Pawn>() || any.is::<FirstPersonController>() || any.is::<ThirdPersonController>() || any.is::<VrPlayer>()
+    c.predictable().is_some()
 }
 
 /// A networked copy another peer drives (its owner, or the host simulating

@@ -188,6 +188,7 @@ impl Scene {
                 heights,
                 material: mat_path(material),
                 collider: true,
+                texture_weights: Vec::new(),
             },
         );
         self.entries[i].static_geometry = true;

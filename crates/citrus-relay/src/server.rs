@@ -97,6 +97,14 @@ pub struct RelayStats {
     pub unauthenticated_out: u64,
 }
 
+/// A member heard from within this many seconds (clients keepalive every 5 s)
+/// still outranks a worse-ranked claimant.
+const CLAIM_LIVE_WINDOW: f64 = 12.0;
+/// The host slot can be claimed after this much silence (hosts keepalive
+/// every 0.25 s). Sessions time a host out after at least 1 s, so an honest
+/// successor never waits on this; it only stops a member seizing a live room.
+const HOST_LIVE_WINDOW: f64 = 1.0;
+
 struct Member {
     addr: SocketAddr,
     nonce: u64,
@@ -120,6 +128,8 @@ struct Room {
     creator: IpAddr,
     /// Since when the room has no host.
     orphaned: Option<f64>,
+    /// The host's ranked successors (SUCCESSORS); empty until it sends them.
+    successors: Vec<u32>,
 }
 
 impl Room {
@@ -144,6 +154,9 @@ pub struct Relay {
     by_addr: HashMap<SocketAddr, (String, u32)>,
     throttle: HashMap<IpAddr, Throttle>,
     secret: [u8; 32],
+    /// X25519 secret hosts seal their room's join key to (public half in
+    /// every COOKIE).
+    seal_secret: [u8; 32],
     stats: RelayStats,
     start: Instant,
     last_gc: f64,
@@ -155,7 +168,10 @@ impl Relay {
         socket.set_nonblocking(true)?;
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|e| io::Error::other(format!("no OS randomness: {e}")))?;
+        let mut seal_secret = [0u8; 32];
+        getrandom::fill(&mut seal_secret).map_err(|e| io::Error::other(format!("no OS randomness: {e}")))?;
         Ok(Self {
+            seal_secret,
             socket,
             cfg,
             rooms: HashMap::new(),
@@ -307,24 +323,28 @@ impl Relay {
                 }
                 if !self.cookie_ok(src, &code_n, &cookie, now) {
                     let kdf = if role == ROLE_CLIENT { self.rooms.get(&code_n).map(|r| r.kdf.clone()).unwrap_or_default() } else { Vec::new() };
-                    let reply = Packet::Cookie { cookie: self.cookie(src, &code_n, now), kdf }.encode();
+                    let reply = Packet::Cookie { cookie: self.cookie(src, &code_n, now), kdf, relay_key: proto::relay_public(&self.seal_secret) }.encode();
                     self.send_bounded(&reply, src, data.len());
                     return;
                 }
                 match (role, auth) {
-                    (ROLE_HOST, RegisterAuth::Host { owner, join_key, kdf, token_proof }) => {
+                    (ROLE_HOST, RegisterAuth::Host { owner, sealed_join_key, kdf, token_proof }) => {
                         if let Some(token) = self.cfg.token.clone()
                             && !proto::tags_equal(&proto::token_proof(&token, &cookie, &code_n, nonce), &token_proof)
                         {
                             self.refuse(src, "relay token required", data.len(), true, now);
                             return;
                         }
+                        let Some(join_key) = proto::open_join_key(&self.seal_secret, &cookie, &sealed_join_key) else {
+                            self.refuse(src, "join key not sealed to this relay", data.len(), true, now);
+                            return;
+                        };
                         self.register_host(src, &code_n, nonce, locals, owner, join_key, kdf, now, data.len());
                     }
                     (ROLE_CLIENT, RegisterAuth::Client { proof }) => self.register_client(src, &code_n, nonce, locals, &cookie, &proof, now, data.len()),
                     (ROLE_CLIENT, RegisterAuth::None) => {
                         let kdf = self.rooms.get(&code_n).map(|r| r.kdf.clone()).unwrap_or_default();
-                        let reply = Packet::Cookie { cookie: self.cookie(src, &code_n, now), kdf }.encode();
+                        let reply = Packet::Cookie { cookie: self.cookie(src, &code_n, now), kdf, relay_key: proto::relay_public(&self.seal_secret) }.encode();
                         self.send_bounded(&reply, src, data.len());
                     }
                     _ => {
@@ -334,6 +354,7 @@ impl Relay {
             }
             Packet::Data { slot, payload } => self.forward(src, slot, payload, now),
             Packet::Claim { nonce, claim_nonce, sig } => self.claim(src, nonce, claim_nonce, &sig, now),
+            Packet::Successors { nonce, slots } => self.set_successors(src, nonce, slots, now),
             Packet::Keepalive { nonce } => {
                 if let Some(m) = self.member_mut(src)
                     && m.nonce == nonce
@@ -471,7 +492,7 @@ impl Relay {
             return;
         }
         let host = self.new_member(src, nonce, locals, now, self.cfg.host_rate);
-        let mut room = Room { members: BTreeMap::new(), next_slot: 1, owner, join_key, kdf, creator: src.ip(), orphaned: None };
+        let mut room = Room { members: BTreeMap::new(), next_slot: 1, owner, join_key, kdf, creator: src.ip(), orphaned: None, successors: Vec::new() };
         room.members.insert(HOST_SLOT, host);
         self.rooms.insert(code.clone(), room);
         self.by_addr.insert(src, (code.clone(), HOST_SLOT));
@@ -566,6 +587,19 @@ impl Relay {
             self.fail(src.ip(), now);
             return;
         }
+        // Every member holds the owner key, so the signature alone can't
+        // stop one from seizing the room: the host slot must be silent and
+        // no better-ranked successor still live. Not a failure: the claimant
+        // retries and gets in once its turn comes.
+        let live = |m: &Member| now - m.last_seen < CLAIM_LIVE_WINDOW;
+        let rank = |s: u32| room.successors.iter().position(|x| *x == s).unwrap_or(usize::MAX);
+        let mine = rank(slot);
+        let host_live = room.members.get(&HOST_SLOT).is_some_and(|m| now - m.last_seen < HOST_LIVE_WINDOW);
+        let better_live = room.members.iter().any(|(s, m)| *s != HOST_SLOT && *s != slot && rank(*s) < mine && live(m));
+        if host_live || better_live {
+            self.stats.dropped += 1;
+            return;
+        }
         let host_rate = self.cfg.host_rate;
         let room = self.rooms.get_mut(&code).expect("checked above");
         let previous = room.members.remove(&HOST_SLOT);
@@ -577,6 +611,7 @@ impl Relay {
         me.active = true;
         room.members.insert(HOST_SLOT, me);
         room.orphaned = None;
+        room.successors.clear();
         self.by_addr.insert(src, (code.clone(), HOST_SLOT));
         self.stats.claims += 1;
         if let Some(old) = previous {
@@ -587,6 +622,22 @@ impl Relay {
         let slots: Vec<u32> = self.rooms[&code].members.keys().copied().filter(|s| *s != HOST_SLOT).collect();
         for s in slots {
             self.introduce(&code, s);
+        }
+    }
+
+    /// Host: record the room's ranked successors.
+    fn set_successors(&mut self, src: SocketAddr, nonce: u64, slots: Vec<u32>, now: f64) {
+        let Some((code, slot)) = self.by_addr.get(&src).cloned() else {
+            self.stats.dropped += 1;
+            return;
+        };
+        let Some(room) = self.rooms.get_mut(&code) else { return };
+        match room.members.get_mut(&HOST_SLOT) {
+            Some(host) if slot == HOST_SLOT && host.nonce == nonce => {
+                host.last_seen = now;
+                room.successors = slots;
+            }
+            _ => self.stats.dropped += 1,
         }
     }
 
@@ -683,11 +734,16 @@ mod tests {
     const JOIN_KEY: [u8; 32] = [9; 32];
     const OWNER: [u8; 32] = [5; 32];
 
-    fn register_packet(role: u8, code: &str, nonce: u64, cookie: [u8; 16], key: &[u8; 32], token: Option<&str>) -> Vec<u8> {
+    /// The relay's sealing key, as its COOKIEs carry it.
+    fn relay_key(relay: &Relay) -> [u8; 32] {
+        proto::relay_public(&relay.seal_secret)
+    }
+
+    fn register_packet(relay_key: &[u8; 32], role: u8, code: &str, nonce: u64, cookie: [u8; 16], key: &[u8; 32], token: Option<&str>) -> Vec<u8> {
         let auth = if role == ROLE_HOST {
             RegisterAuth::Host {
                 owner: proto::owner_public(&OWNER),
-                join_key: JOIN_KEY,
+                sealed_join_key: proto::seal_join_key(relay_key, &cookie, &JOIN_KEY),
                 kdf: vec![1, 2, 3],
                 token_proof: token.map(|t| proto::token_proof(t, &cookie, code, nonce)).unwrap_or_default(),
             }
@@ -700,17 +756,18 @@ mod tests {
     /// Cookie round trip, then the real REGISTER. Returns the reply.
     fn register_with(relay: &mut Relay, s: &UdpSocket, role: u8, code: &str, nonce: u64, key: &[u8; 32], token: Option<&str>) -> Vec<u8> {
         let ra = relay.local_addr().unwrap();
-        let first = register_packet(role, code, nonce, [0; 16], key, token);
+        let first = register_packet(&relay_key(relay), role, code, nonce, [0; 16], key, token);
         s.send_to(&first, ra).unwrap();
         let reply = recv(relay, s);
         assert!(reply.len() <= first.len(), "amplification-safe cookie");
-        let Some(Packet::Cookie { cookie, kdf }) = Packet::decode(&reply) else {
+        let Some(Packet::Cookie { cookie, kdf, relay_key: offered }) = Packet::decode(&reply) else {
             panic!("expected COOKIE, got {:?}", Packet::decode(&reply));
         };
+        assert_eq!(offered, relay_key(relay), "every COOKIE carries the relay's sealing key");
         if role == ROLE_CLIENT && relay.room_info(code).is_some() {
             assert_eq!(kdf, vec![1, 2, 3], "joiners learn the room's stretching parameters");
         }
-        s.send_to(&register_packet(role, code, nonce, cookie, key, token), ra).unwrap();
+        s.send_to(&register_packet(&relay_key(relay), role, code, nonce, cookie, key, token), ra).unwrap();
         recv(relay, s)
     }
 
@@ -757,7 +814,7 @@ mod tests {
         stranger.send_to(&proto::data_packet(HOST_SLOT, b"spam"), ra).unwrap();
         relay.poll();
         assert_eq!(relay.stats().dropped, 2);
-        let first = register_packet(ROLE_CLIENT, "ZZZZZZ", 9, [0; 16], &JOIN_KEY, None);
+        let first = register_packet(&relay_key(&relay), ROLE_CLIENT, "ZZZZZZ", 9, [0; 16], &JOIN_KEY, None);
         stranger.send_to(&first, ra).unwrap();
         let reply = recv(&mut relay, &stranger);
         assert!(reply.len() <= first.len());
@@ -765,6 +822,7 @@ mod tests {
 
         // A second host (another owner key) can't take a live room's code.
         let other = peer();
+        let rk = relay_key(&relay);
         let auth = |cookie: [u8; 16]| Packet::Register {
             protocol: RELAY_PROTOCOL,
             role: ROLE_HOST,
@@ -772,7 +830,7 @@ mod tests {
             nonce: 10,
             locals: vec![],
             cookie,
-            auth: RegisterAuth::Host { owner: proto::owner_public(&[6; 32]), join_key: JOIN_KEY, kdf: vec![], token_proof: [0; 16] },
+            auth: RegisterAuth::Host { owner: proto::owner_public(&[6; 32]), sealed_join_key: proto::seal_join_key(&rk, &cookie, &JOIN_KEY), kdf: vec![], token_proof: [0; 16] },
         };
         other.send_to(&auth([0; 16]).encode(), ra).unwrap();
         let Some(Packet::Cookie { cookie, .. }) = Packet::decode(&recv(&mut relay, &other)) else { panic!("cookie") };
@@ -800,15 +858,15 @@ mod tests {
         assert_eq!(relay.room_info(&code), Some((true, 1)), "not admitted");
         // Keep failing: after a few attempts the address is ignored entirely.
         for k in 0..FREE_FAILURES + 2 {
-            let first = register_packet(ROLE_CLIENT, &code, 10 + k as u64, [0; 16], &[1; 32], None);
+            let first = register_packet(&relay_key(&relay), ROLE_CLIENT, &code, 10 + k as u64, [0; 16], &[1; 32], None);
             stranger.send_to(&first, ra).unwrap();
             if let Some(Packet::Cookie { cookie, .. }) = try_recv(&mut relay, &stranger).as_deref().and_then(Packet::decode) {
-                stranger.send_to(&register_packet(ROLE_CLIENT, &code, 10 + k as u64, cookie, &[1; 32], None), ra).unwrap();
+                stranger.send_to(&register_packet(&relay_key(&relay), ROLE_CLIENT, &code, 10 + k as u64, cookie, &[1; 32], None), ra).unwrap();
                 let _ = try_recv(&mut relay, &stranger);
             }
         }
         let before = relay.stats().throttled;
-        stranger.send_to(&register_packet(ROLE_CLIENT, &code, 99, [0; 16], &JOIN_KEY, None), ra).unwrap();
+        stranger.send_to(&register_packet(&relay_key(&relay), ROLE_CLIENT, &code, 99, [0; 16], &JOIN_KEY, None), ra).unwrap();
         assert!(try_recv(&mut relay, &stranger).is_none(), "backing off: not even a cookie");
         assert!(relay.stats().throttled > before);
         // Short (unpadded) registers get nothing: no amplification.
@@ -853,7 +911,7 @@ mod tests {
         let (sa, _, claim_nonce) = register(&mut relay, &a, ROLE_CLIENT, &code, 2);
         let _ = recv(&mut relay, &a);
         let _ = recv(&mut relay, &host);
-        register(&mut relay, &b, ROLE_CLIENT, &code, 3);
+        let (sb, _, _) = register(&mut relay, &b, ROLE_CLIENT, &code, 3);
         let _ = recv(&mut relay, &b);
         let _ = recv(&mut relay, &host);
         // A forged claim (wrong key) changes nothing.
@@ -861,8 +919,24 @@ mod tests {
         a.send_to(&Packet::Claim { nonce: 2, claim_nonce, sig: bad }.encode(), ra).unwrap();
         relay.poll();
         assert_eq!(relay.stats().claims, 0);
-        // The host crashes (no LEAVE); the successor claims with the owner key.
+        // Every member holds the owner key, yet none may seize a live host's room.
         let sig = proto::sign_claim(&OWNER, &code, sa, 2, claim_nonce);
+        a.send_to(&Packet::Claim { nonce: 2, claim_nonce, sig }.encode(), ra).unwrap();
+        assert!(try_recv(&mut relay, &a).is_none());
+        assert_eq!(relay.stats().claims, 0);
+        // The host ranks b first; a member can't rewrite that order.
+        host.send_to(&Packet::Successors { nonce: 1, slots: vec![sb, sa] }.encode(), ra).unwrap();
+        a.send_to(&Packet::Successors { nonce: 2, slots: vec![sa] }.encode(), ra).unwrap();
+        relay.poll();
+        assert_eq!(relay.rooms[&code].successors, vec![sb, sa]);
+        let age = |relay: &mut Relay, slot: u32| relay.rooms.get_mut(&code).unwrap().members.get_mut(&slot).unwrap().last_seen -= CLAIM_LIVE_WINDOW + 1.0;
+        // The host crashes (no LEAVE): a waits while the better-ranked b is live...
+        relay.rooms.get_mut(&code).unwrap().members.get_mut(&HOST_SLOT).unwrap().last_seen -= HOST_LIVE_WINDOW + 1.0;
+        a.send_to(&Packet::Claim { nonce: 2, claim_nonce, sig }.encode(), ra).unwrap();
+        assert!(try_recv(&mut relay, &a).is_none());
+        assert_eq!(relay.stats().claims, 0);
+        // ...and takes over once b has gone silent too.
+        age(&mut relay, sb);
         a.send_to(&Packet::Claim { nonce: 2, claim_nonce, sig }.encode(), ra).unwrap();
         assert!(matches!(Packet::decode(&recv(&mut relay, &a)), Some(Packet::Registered { slot: HOST_SLOT, .. })));
         assert_eq!(relay.stats().claims, 1);

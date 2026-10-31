@@ -435,10 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn astc_hdr_lightmaps_read_but_need_device_support() {
+    fn astc_hdr_lightmaps_load_with_or_without_device_support() {
         let path = tmp("astc_hdr");
         let format = HdrTextureFormat::AstcHdr4x4;
-        let layer = vec![0x5au8; format.level_bytes(30, 30)];
+        let half: Vec<u8> = (0..30 * 30).flat_map(|_| [1.5f32, 0.75, 0.25, 1.0]).flat_map(|v| half::f16::from_f32(v).to_bits().to_le_bytes()).collect();
+        let layer = crate::hdr_codec::transcode_level(&half, HdrTextureFormat::Rgba16f, format, 30, 30, 1).unwrap();
         let layers = LightmapLayers {
             objects: vec![1],
             sizes: vec![30],
@@ -449,10 +450,9 @@ mod tests {
         assert_eq!(lightmap_file_info(&path).unwrap().format, format);
         let stored = read_lightmap_layers(&path).unwrap();
         assert_eq!((stored.array.format, &stored.array.layers[0]), (format, &layer));
-        // No device here samples ASTC HDR and nothing decodes it: a load
-        // error, not a panic or garbage upload.
-        let err = load_lightmap_layers(&path, HdrFormatSupport { bc6h: true, rgb9e5: true }, 1).err().unwrap();
-        assert!(format!("{err:#}").contains("ASTC HDR"), "{err:#}");
+        // A device without ASTC HDR gets the data decoded to its compact format.
+        let loaded = load_lightmap_layers(&path, HdrFormatSupport { bc6h: true, rgb9e5: true }, 1).unwrap();
+        assert_eq!(loaded.array.format, HdrTextureFormat::Rgb9e5);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

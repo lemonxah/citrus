@@ -82,6 +82,17 @@ pub struct AnimState {
     /// clip events: `on_animation_event` + `AnimationEvent`). Empty = none.
     pub on_enter: String,
     pub on_exit: String,
+    /// Set = this is a sub-state machine node: it plays nothing itself, and
+    /// `motion`, `speed`, `looping` and the events are ignored. See
+    /// [`StateMachine::flatten`] for how it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_machine: Option<Box<StateMachine>>,
+}
+
+impl AnimState {
+    pub fn is_sub_machine(&self) -> bool {
+        self.sub_machine.is_some()
+    }
 }
 
 impl Default for AnimState {
@@ -95,6 +106,7 @@ impl Default for AnimState {
             position: [0.0, 0.0],
             on_enter: String::new(),
             on_exit: String::new(),
+            sub_machine: None,
         }
     }
 }
@@ -255,6 +267,146 @@ impl StateMachine {
         }
         (1..).map(|n| format!("{base} {n}")).find(|n| self.state_index(n).is_none()).unwrap()
     }
+
+    /// The machine reached by following sub-machine state indices from here.
+    pub fn nested(&self, path: &[usize]) -> Option<&StateMachine> {
+        match path.split_first() {
+            None => Some(self),
+            Some((&i, rest)) => self.states.get(i)?.sub_machine.as_deref()?.nested(rest),
+        }
+    }
+
+    pub fn nested_mut(&mut self, path: &[usize]) -> Option<&mut StateMachine> {
+        match path.split_first() {
+            None => Some(self),
+            Some((&i, rest)) => self.states.get_mut(i)?.sub_machine.as_deref_mut()?.nested_mut(rest),
+        }
+    }
+
+    /// This machine and every nested one, depth first.
+    pub fn for_each_machine_mut(&mut self, f: &mut impl FnMut(&mut StateMachine)) {
+        f(self);
+        for s in &mut self.states {
+            if let Some(sub) = s.sub_machine.as_deref_mut() {
+                sub.for_each_machine_mut(f);
+            }
+        }
+    }
+
+    /// Whether any state is a sub-state machine.
+    pub fn has_sub_machines(&self) -> bool {
+        self.states.iter().any(|s| s.sub_machine.is_some())
+    }
+
+    /// The equivalent machine without sub-state machines, which is what the
+    /// runtime plays. Every leaf state is named by its path, `Outer/Inner`
+    /// (recursively, `A/B/C`); top-level states keep their names, so a
+    /// machine without sub-machines flattens to itself. Within each machine
+    /// references stay local (a sub-machine's transitions name its own states;
+    /// the parent names the sub-machine node), so renames never cross levels.
+    ///
+    /// - Entering a sub-machine node (default state or transition target)
+    ///   enters its default state, recursively.
+    /// - A transition whose source is a sub-machine node applies from every
+    ///   leaf inside it.
+    /// - A sub-machine's Any State transitions apply from every leaf inside
+    ///   that sub-machine (not from outside it); the top level's stay global.
+    /// - Check order for a leaf: top-level Any State, then outer levels'
+    ///   transitions before inner ones, and within a sub-machine its Any
+    ///   State before the leaf's own transitions.
+    /// - Transitions whose target cannot be resolved (missing or empty
+    ///   sub-machine) are dropped.
+    pub fn flatten(&self) -> StateMachine {
+        if !self.has_sub_machines() {
+            return self.clone();
+        }
+        let mut out = StateMachine {
+            states: Vec::new(),
+            default_state: self.entry_leaf("").unwrap_or_default(),
+            transitions: Vec::new(),
+            entry_position: self.entry_position,
+            any_state_position: self.any_state_position,
+        };
+        self.flatten_into("", true, &mut out);
+        out
+    }
+
+    /// Full name of the leaf entered when this machine (named by `prefix`) starts.
+    fn entry_leaf(&self, prefix: &str) -> Option<String> {
+        self.enter(prefix, &self.states.get(self.default_index()?)?.name)
+    }
+
+    /// Full name of the leaf entered by targeting local state `name`.
+    fn enter(&self, prefix: &str, name: &str) -> Option<String> {
+        let s = &self.states[self.state_index(name)?];
+        let full = format!("{prefix}{}", s.name);
+        match s.sub_machine.as_deref() {
+            None => Some(full),
+            Some(sub) => sub.entry_leaf(&format!("{full}/")),
+        }
+    }
+
+    /// Full names of every leaf in this machine.
+    fn leaves(&self, prefix: &str, out: &mut Vec<String>) {
+        for s in &self.states {
+            let full = format!("{prefix}{}", s.name);
+            match s.sub_machine.as_deref() {
+                None => out.push(full),
+                Some(sub) => sub.leaves(&format!("{full}/"), out),
+            }
+        }
+    }
+
+    fn flatten_into(&self, prefix: &str, top: bool, out: &mut StateMachine) {
+        for s in &self.states {
+            if s.sub_machine.is_none() {
+                out.states.push(AnimState { name: format!("{prefix}{}", s.name), ..s.clone() });
+            }
+        }
+        // Sub-machine Any State first, then the rest in order.
+        let any_first = self.transitions.iter().filter(|t| t.from.is_none() && !top);
+        let rest = self.transitions.iter().filter(|t| t.from.is_some() || top);
+        for t in any_first.chain(rest) {
+            let Some(to) = self.enter(prefix, &t.to) else {
+                continue;
+            };
+            let sources: Option<Vec<String>> = match &t.from {
+                None if top => None,
+                None => {
+                    let mut v = Vec::new();
+                    self.leaves(prefix, &mut v);
+                    // An Any State transition only re-enters its target when allowed.
+                    v.retain(|l| t.can_transition_to_self || *l != to);
+                    Some(v)
+                }
+                Some(f) => {
+                    let Some(s) = self.state_index(f).map(|i| &self.states[i]) else {
+                        continue;
+                    };
+                    let full = format!("{prefix}{}", s.name);
+                    let mut v = Vec::new();
+                    match s.sub_machine.as_deref() {
+                        None => v.push(full),
+                        Some(sub) => sub.leaves(&format!("{full}/"), &mut v),
+                    }
+                    Some(v)
+                }
+            };
+            match sources {
+                None => out.transitions.push(AnimTransition { to, ..t.clone() }),
+                Some(v) => out.transitions.extend(v.into_iter().map(|from| AnimTransition {
+                    from: Some(from),
+                    to: to.clone(),
+                    ..t.clone()
+                })),
+            }
+        }
+        for s in &self.states {
+            if let Some(sub) = s.sub_machine.as_deref() {
+                sub.flatten_into(&format!("{prefix}{}/", s.name), false, out);
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -313,19 +465,31 @@ impl AnimatorController {
             }
         };
         for layer in &mut self.layers {
-            for t in &mut layer.machine.transitions {
-                for c in &mut t.conditions {
-                    fix(&mut c.parameter);
+            layer.machine.for_each_machine_mut(&mut |m| {
+                for t in &mut m.transitions {
+                    for c in &mut t.conditions {
+                        fix(&mut c.parameter);
+                    }
                 }
-            }
-            for s in &mut layer.machine.states {
-                fix(&mut s.speed_parameter);
-                if let Motion::BlendTree(tree) = &mut s.motion {
-                    fix(&mut tree.parameter);
-                    fix(&mut tree.parameter_y);
+                for s in &mut m.states {
+                    fix(&mut s.speed_parameter);
+                    if let Motion::BlendTree(tree) = &mut s.motion {
+                        fix(&mut tree.parameter);
+                        fix(&mut tree.parameter_y);
+                    }
                 }
-            }
+            });
         }
+    }
+
+    /// Every layer's machine flattened ([`StateMachine::flatten`]): what the
+    /// runtime evaluates. Parameters are shared by all levels.
+    pub fn flattened(&self) -> AnimatorController {
+        let mut c = self.clone();
+        for l in &mut c.layers {
+            l.machine = l.machine.flatten();
+        }
+        c
     }
 }
 
@@ -389,5 +553,151 @@ mod tests {
         assert_eq!(m.transitions[0].from.as_deref(), Some("Idle"));
         m.remove_state(1);
         assert!(m.transitions.is_empty());
+    }
+
+    fn leaf(name: &str) -> AnimState {
+        AnimState { name: name.into(), ..Default::default() }
+    }
+
+    fn sub(name: &str, machine: StateMachine) -> AnimState {
+        AnimState { name: name.into(), sub_machine: Some(Box::new(machine)), ..Default::default() }
+    }
+
+    fn tr(from: Option<&str>, to: &str) -> AnimTransition {
+        AnimTransition { from: from.map(Into::into), to: to.into(), has_exit_time: true, ..Default::default() }
+    }
+
+    fn names(m: &StateMachine) -> Vec<&str> {
+        m.states.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    fn pairs(m: &StateMachine) -> Vec<(Option<&str>, &str)> {
+        m.transitions.iter().map(|t| (t.from.as_deref(), t.to.as_str())).collect()
+    }
+
+    /// Idle -> Locomotion{Walk (default), Run}; Locomotion -> Idle.
+    fn locomotion() -> StateMachine {
+        StateMachine {
+            states: vec![
+                leaf("Idle"),
+                sub(
+                    "Locomotion",
+                    StateMachine {
+                        states: vec![leaf("Walk"), leaf("Run")],
+                        default_state: "Walk".into(),
+                        transitions: vec![tr(Some("Walk"), "Run"), tr(None, "Walk")],
+                        ..Default::default()
+                    },
+                ),
+            ],
+            default_state: "Idle".into(),
+            transitions: vec![tr(Some("Idle"), "Locomotion"), tr(Some("Locomotion"), "Idle"), tr(None, "Idle")],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn flatten_without_sub_machines_is_identity() {
+        let mut m = StateMachine::default();
+        m.states.push(leaf("A"));
+        m.transitions.push(tr(None, "A"));
+        assert_eq!(m.flatten(), m);
+    }
+
+    #[test]
+    fn flatten_enters_default_and_exits_from_every_inner_state() {
+        let f = locomotion().flatten();
+        assert_eq!(names(&f), ["Idle", "Locomotion/Walk", "Locomotion/Run"]);
+        assert_eq!(f.default_state, "Idle");
+        assert_eq!(
+            pairs(&f),
+            [
+                // Into the sub-machine = into its default state.
+                (Some("Idle"), "Locomotion/Walk"),
+                // Out of the sub-machine = from each inner state.
+                (Some("Locomotion/Walk"), "Idle"),
+                (Some("Locomotion/Run"), "Idle"),
+                // Top-level Any State stays global.
+                (None, "Idle"),
+                // Inner Any State: from every inner state but its target, first.
+                (Some("Locomotion/Run"), "Locomotion/Walk"),
+                (Some("Locomotion/Walk"), "Locomotion/Run"),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_nested_two_levels() {
+        let inner = StateMachine {
+            states: vec![leaf("Light"), leaf("Heavy")],
+            default_state: "Heavy".into(),
+            ..Default::default()
+        };
+        let middle = StateMachine {
+            states: vec![leaf("Draw"), sub("Swing", inner)],
+            default_state: "Swing".into(),
+            transitions: vec![tr(Some("Swing"), "Draw")],
+            ..Default::default()
+        };
+        let top = StateMachine {
+            states: vec![leaf("Idle"), sub("Attack", middle)],
+            default_state: "Attack".into(),
+            transitions: vec![tr(Some("Idle"), "Attack"), tr(Some("Attack"), "Idle")],
+            ..Default::default()
+        };
+        let f = top.flatten();
+        assert_eq!(names(&f), ["Idle", "Attack/Draw", "Attack/Swing/Light", "Attack/Swing/Heavy"]);
+        // Default resolves through both levels.
+        assert_eq!(f.default_state, "Attack/Swing/Heavy");
+        assert_eq!(
+            pairs(&f),
+            [
+                (Some("Idle"), "Attack/Swing/Heavy"),
+                (Some("Attack/Draw"), "Idle"),
+                (Some("Attack/Swing/Light"), "Idle"),
+                (Some("Attack/Swing/Heavy"), "Idle"),
+                (Some("Attack/Swing/Light"), "Attack/Draw"),
+                (Some("Attack/Swing/Heavy"), "Attack/Draw"),
+            ]
+        );
+    }
+
+    #[test]
+    fn flatten_follows_renames_and_drops_dangling_targets() {
+        let mut m = locomotion();
+        m.rename_state("Locomotion", "Move");
+        m.nested_mut(&[1]).unwrap().rename_state("Walk", "Jog");
+        let f = m.flatten();
+        assert_eq!(names(&f), ["Idle", "Move/Jog", "Move/Run"]);
+        assert!(pairs(&f).contains(&(Some("Idle"), "Move/Jog")));
+        assert!(pairs(&f).contains(&(Some("Move/Run"), "Idle")));
+        // Removing the inner default falls back to the first inner state.
+        m.nested_mut(&[1]).unwrap().remove_state(0);
+        assert!(pairs(&m.flatten()).contains(&(Some("Idle"), "Move/Run")));
+        // An empty sub-machine cannot be entered: transitions into it vanish.
+        m.nested_mut(&[1]).unwrap().remove_state(0);
+        assert!(!pairs(&m.flatten()).iter().any(|(f, _)| *f == Some("Idle")));
+    }
+
+    #[test]
+    fn sub_machines_round_trip_and_old_files_load() {
+        let mut c = AnimatorController::default();
+        c.layers[0].machine = locomotion();
+        let text = ron::ser::to_string_pretty(&c, ron::ser::PrettyConfig::default()).unwrap();
+        assert_eq!(ron::from_str::<AnimatorController>(&text).unwrap(), c);
+        // A plain state writes no sub_machine field, so old files are unchanged.
+        let plain = ron::to_string(&leaf("Idle")).unwrap();
+        assert!(!plain.contains("sub_machine"));
+        assert_eq!(ron::from_str::<AnimState>(&plain).unwrap(), leaf("Idle"));
+    }
+
+    #[test]
+    fn rename_parameter_reaches_nested_machines() {
+        let mut c = AnimatorController::default();
+        let mut m = locomotion();
+        m.nested_mut(&[1]).unwrap().transitions[0].conditions.push(AnimCondition { parameter: "Speed".into(), ..Default::default() });
+        c.layers[0].machine = m;
+        c.rename_parameter("Speed", "Velocity");
+        assert_eq!(c.layers[0].machine.nested(&[1]).unwrap().transitions[0].conditions[0].parameter, "Velocity");
     }
 }

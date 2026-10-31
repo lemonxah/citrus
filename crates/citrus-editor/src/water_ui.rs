@@ -300,6 +300,18 @@ impl Inspect for Water {
             ),
         );
 
+        if self.body != WaterBody::River {
+            drag_tip(
+                ui,
+                "Shore calm depth (m)",
+                "Waves calm where the water is shallower than this over the ground under it (baked from the static geometry, rebaked when it changes): gone at the waterline. 0 = full waves everywhere.",
+                &mut self.shore_depth,
+                0.05,
+                0.0..=50.0,
+                &mut c,
+            );
+        }
+
         widgets::eyebrow(ui, "Physics");
         widgets::property_row(ui, "Fluid", |ui| {
             ui.horizontal_wrapped(|ui| {

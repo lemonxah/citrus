@@ -273,6 +273,7 @@ impl Inspect for NetworkManager {
         });
         changed |= fingerprint_list(ui, "Allow List", &mut self.allow_list, "anyone with the secret");
         changed |= fingerprint_list(ui, "Ban List", &mut self.ban_list, "nobody");
+        changed |= account_list(ui, "Accounts", &mut self.account_list);
         widgets::info_note(ui, "Lists hold player ids (fingerprints like 1a2b-3c4d-...), one per line: copy them from the Network window.");
         widgets::eyebrow(ui, "Players");
         changed |= ctx.file_field(ui, "Player Prefab", &mut self.player_prefab, "prefabs/player.prefab", &["prefab"]);
@@ -303,6 +304,30 @@ fn fingerprint_list(ui: &mut Ui, label: &str, list: &mut Vec<String>, empty: &st
     });
     if changed {
         *list = text.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+    }
+    changed
+}
+
+/// One account per line: `name:password`.
+fn account_list(ui: &mut Ui, label: &str, list: &mut Vec<String>) -> bool {
+    let mut changed = false;
+    let mut text = list.join("\n");
+    property_row(ui, label, &mut changed, |ui| {
+        ui.add(
+            egui::TextEdit::multiline(&mut text)
+                .hint_text("name:password")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        )
+        .on_hover_text("When non-empty, joining requires one of these credentials")
+    });
+    if changed {
+        *list = text
+            .lines()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect();
     }
     changed
 }

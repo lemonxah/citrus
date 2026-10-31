@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use citrus_render::{
     BakedLightmap, HdrCube, HdrTextureArray, HdrTextureFormat, convert_uncompressed, lightmap_array_size,
     resample_rgba32f, rgba32f_to_rgba16f,
@@ -130,12 +130,12 @@ pub fn transcode_level(src: &[u8], from: HdrTextureFormat, to: HdrTextureFormat,
     }
     let half = match from {
         HdrTextureFormat::Bc6h => decode_bc6h(src, w, h)?,
-        HdrTextureFormat::AstcHdr4x4 => bail!("ASTC HDR data needs a device that samples it (no CPU decoder)"),
+        HdrTextureFormat::AstcHdr4x4 => crate::tex_cache::decode_astc_hdr_level(src, w, h).context("decoding ASTC HDR")?,
         f => convert_uncompressed(src, f, HdrTextureFormat::Rgba16f).unwrap_or_default(),
     };
     Ok(match to {
         HdrTextureFormat::Bc6h => encode_bc6h(&half, w, h, threads),
-        HdrTextureFormat::AstcHdr4x4 => bail!("no ASTC HDR encoder"),
+        HdrTextureFormat::AstcHdr4x4 => crate::tex_cache::encode_astc_hdr_level(&half, w, h).context("encoding ASTC HDR")?,
         t => convert_uncompressed(&half, HdrTextureFormat::Rgba16f, t).unwrap_or_default(),
     })
 }
@@ -351,17 +351,22 @@ mod tests {
     }
 
     #[test]
-    fn astc_hdr_transcodes_fail_cleanly() {
+    fn astc_hdr_transcodes_round_trip() {
         let astc = HdrTextureFormat::AstcHdr4x4;
-        let level = vec![0u8; astc.level_bytes(8, 8)];
-        assert!(transcode_level(&level, astc, astc, 8, 8, 1).is_ok(), "same format is a pass-through");
-        for to in [HdrTextureFormat::Rgb9e5, HdrTextureFormat::Rgba16f, HdrTextureFormat::Bc6h] {
-            assert!(transcode_level(&level, astc, to, 8, 8, 1).is_err());
-        }
-        let half = vec![0u8; 8 * 8 * 8];
-        assert!(transcode_level(&half, HdrTextureFormat::Rgba16f, astc, 8, 8, 1).is_err());
-        let array = HdrTextureArray { format: astc, size: 8, layers: vec![level] };
-        assert!(transcode_array(array, HdrTextureFormat::Rgba16f, 1).is_err());
+        let (w, h) = (12u32, 8u32);
+        let half: Vec<u8> = (0..w * h)
+            .flat_map(|i| [0.5 + (i % w) as f32 * 0.4, 2.0 + (i / w) as f32 * 0.25, 0.1, 1.0])
+            .flat_map(|v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let blocks = transcode_level(&half, HdrTextureFormat::Rgba16f, astc, w, h, 1).unwrap();
+        assert_eq!(blocks.len(), astc.level_bytes(w, h));
+        assert_eq!(transcode_level(&blocks, astc, astc, w, h, 1).unwrap(), blocks, "same format is a pass-through");
+        let back = transcode_level(&blocks, astc, HdrTextureFormat::Rgba16f, w, h, 1).unwrap();
+        let floats = |b: &[u8]| -> Vec<f32> { b.as_chunks::<2>().0.iter().map(|c| half::f16::from_bits(u16::from_le_bytes(*c)).to_f32()).collect() };
+        let mean = mean_rel_error(&floats(&half), &floats(&back), 1.0);
+        assert!(mean < 0.08, "mean relative error {mean}");
+        let array = HdrTextureArray { format: astc, size: 8, layers: vec![transcode_level(&half[..8 * 8 * 8], HdrTextureFormat::Rgba16f, astc, 8, 8, 1).unwrap()] };
+        assert_eq!(transcode_array(array, HdrTextureFormat::Rgb9e5, 1).unwrap().format, HdrTextureFormat::Rgb9e5);
     }
 
     /// Throughput of the bake preset on a 2048² layer (run with --ignored).

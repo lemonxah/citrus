@@ -878,7 +878,64 @@ mod tests {
         let mut r = ComponentRegistry::with_builtins();
         r.register::<TestSpawner>();
         r.register::<RpcProbe>();
+        r.register::<Glider>();
         r
+    }
+
+    /// A game's own movement component: not one of the built-in controllers,
+    /// predicted because it implements `Predictable`.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Glider {
+        possessed: bool,
+        #[serde(skip)]
+        vel: Vec3,
+    }
+
+    impl Glider {
+        const SPEED: f32 = 3.0;
+
+        fn advance(&mut self, host: &mut dyn citrus_core::MoveHost, input: &InputState, dt: f32) {
+            let axis = input.axis2("Move");
+            self.vel = Vec3::new(axis.x, 0.0, -axis.y) * Self::SPEED;
+            let t = host.translation() + self.vel * dt;
+            host.set_translation(t);
+        }
+    }
+
+    impl citrus_core::TypedComponent for Glider {
+        const NAME: &'static str = "Glider";
+
+        fn predictable(&self) -> Option<&dyn citrus_core::Predictable> {
+            Some(self)
+        }
+        fn predictable_mut(&mut self) -> Option<&mut dyn citrus_core::Predictable> {
+            Some(self)
+        }
+
+        fn update(&mut self, ctx: &mut citrus_core::ComponentCtx) {
+            if self.possessed {
+                let (input, dt) = (ctx.input, ctx.dt);
+                self.advance(ctx, input, dt);
+            }
+        }
+    }
+
+    impl citrus_core::Predictable for Glider {
+        fn motion(&self) -> citrus_core::MotionState {
+            citrus_core::MotionState { vel: self.vel, ..Default::default() }
+        }
+        fn set_motion(&mut self, m: &citrus_core::MotionState, _host: &mut dyn citrus_core::MoveHost) {
+            self.vel = m.vel;
+        }
+        fn frame_extra(&self) -> Vec<f32> {
+            Vec::new()
+        }
+        fn replay(&mut self, host: &mut dyn citrus_core::MoveHost, input: &InputState, _extra: &[f32], dt: f32) {
+            self.advance(host, input, dt);
+        }
+        fn locally_driven(&self) -> bool {
+            self.possessed
+        }
     }
 
     fn obj(scene: &mut LoadedScene, id: ObjectId, parent: Option<usize>, enabled: bool, components: Vec<Box<dyn Component>>) -> usize {
@@ -1214,6 +1271,7 @@ mod tests {
         FirstPerson,
         ThirdPerson,
         Vr,
+        Custom,
     }
 
     impl Mover {
@@ -1223,6 +1281,7 @@ mod tests {
                 Mover::FirstPerson => Box::new(citrus_core::FirstPersonController { lock_cursor: false, ..Default::default() }),
                 Mover::ThirdPerson => Box::new(citrus_core::ThirdPersonController { lock_cursor: false, ..Default::default() }),
                 Mover::Vr => Box::new(citrus_core::VrPlayer::default()),
+                Mover::Custom => Box::new(Glider::default()),
             }
         }
 
@@ -1232,6 +1291,7 @@ mod tests {
                 Mover::FirstPerson => citrus_core::FirstPersonController::default().walk_speed,
                 Mover::ThirdPerson => citrus_core::ThirdPersonController::default().walk_speed,
                 Mover::Vr => citrus_core::VrPlayer::default().move_speed,
+                Mover::Custom => Glider::SPEED,
             }
         }
     }
@@ -1268,6 +1328,71 @@ mod tests {
     #[test]
     fn predicted_vr_player_reconciles() {
         predicted_round_trip(Mover::Vr, false);
+    }
+
+    /// On a listen server the host sees a remote predicted pawn glide even
+    /// though its inputs arrive in bursts, and it settles on the true position.
+    #[test]
+    fn host_smooths_remote_predicted_pawns_through_input_bursts() {
+        let registry = registry();
+        let pawn_id = ObjectId::new();
+        let scene = || {
+            let mut s = LoadedScene::empty();
+            let net = NetworkObject { predicted: true, ..Default::default() };
+            obj(&mut s, pawn_id, None, true, vec![Box::new(net), Mover::Pawn.component()]);
+            s
+        };
+        let hub = MemHub::new();
+        let hs = session(&hub, None, "Host");
+        let cs = session(&hub, Some(&hs), "Client");
+        let mut host = Peer::with_scene(hs, scene());
+        let mut client = Peer::with_scene(cs, scene());
+        let frame = |host: &mut Peer, client: &mut Peer| {
+            hub.advance(DT as f64);
+            host.frame(&registry);
+            client.frame(&registry);
+        };
+        for _ in 0..10 {
+            frame(&mut host, &mut client);
+        }
+        client.net().request_ownership(pawn_id);
+        for _ in 0..30 {
+            frame(&mut host, &mut client);
+        }
+        let ci = client.index(pawn_id);
+        component_mut::<Pawn>(&mut client.scene.objects[ci]).unwrap().possessed = true;
+        // Jitter as large as the latency: input commands reach the host in clumps.
+        hub.set_latency(0.04, 0.04);
+        let step = Mover::Pawn.speed() * DT;
+        let mut prev = host.pos(pawn_id);
+        let (mut largest, mut lag) = (0.0f32, 0.0f32);
+        for k in 0..180 {
+            client.input = walk(1.0, false);
+            frame(&mut host, &mut client);
+            let shown = host.pos(pawn_id);
+            if k >= 30 {
+                largest = largest.max((shown - prev).length());
+                let hi = host.index(pawn_id);
+                lag = lag.max(component::<NetworkObject>(&host.scene.objects[hi]).unwrap().state.visual_offset.length());
+            }
+            prev = shown;
+        }
+        assert!(largest < step * 1.6, "the host shows an even walk: largest step {largest} m vs {step} m per frame");
+        assert!(lag < Mover::Pawn.speed() * 0.25, "smoothing trails by at most a quarter second: {lag} m");
+        client.input = InputState::default();
+        for _ in 0..90 {
+            frame(&mut host, &mut client);
+        }
+        let hi = host.index(pawn_id);
+        let offset = component::<NetworkObject>(&host.scene.objects[hi]).unwrap().state.visual_offset;
+        assert!(offset.length() < 1e-3, "settled on the true position: {offset}");
+    }
+
+    /// A game's own movement component that implements `Predictable` is
+    /// predicted and reconciled like the built-in controllers.
+    #[test]
+    fn predicted_custom_mover_reconciles() {
+        predicted_round_trip(Mover::Custom, false);
     }
 
     fn predicted_round_trip(mover: Mover, physical: bool) {
@@ -1312,6 +1437,9 @@ mod tests {
         let ci = client.index(pawn_id);
         if let Some(p) = component_mut::<Pawn>(&mut client.scene.objects[ci]) {
             p.possessed = true;
+        }
+        if let Some(g) = component_mut::<Glider>(&mut client.scene.objects[ci]) {
+            g.possessed = true;
         }
         let hi = host.index(pawn_id);
         if mover == Mover::Pawn {

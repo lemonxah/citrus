@@ -606,6 +606,13 @@ impl Predictable for VrPlayer {
 impl TypedComponent for VrPlayer {
     const NAME: &'static str = "VR Player";
 
+    fn predictable(&self) -> Option<&dyn Predictable> {
+        Some(self)
+    }
+    fn predictable_mut(&mut self) -> Option<&mut dyn Predictable> {
+        Some(self)
+    }
+
     fn start(&mut self, ctx: &mut ComponentCtx) {
         if !self.spawn_tag.is_empty() {
             let spots: Vec<usize> =

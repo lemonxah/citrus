@@ -199,12 +199,95 @@ pub(crate) fn apply_dab(
     changed
 }
 
+/// Paint one texture-weight layer (RGBA = 4 layers) under the brush. The
+/// selected layer approaches 1 and the others fade proportionally, so every
+/// vertex stays normalized.
+pub(crate) fn apply_texture_dab(
+    terrain: &mut Terrain,
+    center: Vec3,
+    radius: f32,
+    falloff: BrushFalloff,
+    strength: f32,
+    layer: usize,
+    dt: f32,
+) -> bool {
+    let res = terrain.resolution as usize;
+    let n = res + 1;
+    if terrain.heights.len() != n * n || radius <= 0.0 || dt <= 0.0 || layer > 3 {
+        return false;
+    }
+    if terrain.texture_weights.len() != n * n {
+        terrain.texture_weights = vec![[1.0, 0.0, 0.0, 0.0]; n * n];
+    }
+    let step = terrain.size / terrain.resolution as f32;
+    let half = terrain.size * 0.5;
+    let x0 = (((center.x - radius + half) / step).floor() as i64).clamp(0, res as i64) as usize;
+    let x1 = (((center.x + radius + half) / step).ceil() as i64).clamp(0, res as i64) as usize;
+    let z0 = (((center.z - radius + half) / step).floor() as i64).clamp(0, res as i64) as usize;
+    let z1 = (((center.z + radius + half) / step).ceil() as i64).clamp(0, res as i64) as usize;
+
+    let strength = strength.clamp(0.0, 1.0);
+    let dt = dt.min(0.1);
+    let mut changed = false;
+    for gz in z0..=z1 {
+        for gx in x0..=x1 {
+            let px = gx as f32 * step - half;
+            let pz = gz as f32 * step - half;
+            let d = ((px - center.x).powi(2) + (pz - center.z).powi(2)).sqrt();
+            let w = falloff.weight(d, radius);
+            if w <= 0.0 {
+                continue;
+            }
+            let t = (LERP_SPEED * strength * w * dt).clamp(0.0, 1.0);
+            if t <= 0.0 {
+                continue;
+            }
+            let idx = gz * n + gx;
+            let mut tw = terrain.texture_weights[idx];
+            let before = tw;
+            for (k, v) in tw.iter_mut().enumerate() {
+                if k == layer {
+                    *v = *v + (1.0 - *v) * t;
+                } else {
+                    *v *= 1.0 - t;
+                }
+            }
+            let sum: f32 = tw.iter().copied().sum();
+            if sum > 1e-6 {
+                for v in &mut tw {
+                    *v /= sum;
+                }
+            } else {
+                tw = [1.0, 0.0, 0.0, 0.0];
+            }
+            if tw
+                .iter()
+                .zip(before)
+                .any(|(a, b)| (*a - b).abs() > 1e-6)
+            {
+                terrain.texture_weights[idx] = tw;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 fn mode_color(mode: TerrainBrushMode) -> egui::Color32 {
     match mode {
         TerrainBrushMode::Raise => egui::Color32::from_rgb(255, 150, 90),
         TerrainBrushMode::Lower => egui::Color32::from_rgb(170, 190, 220),
         TerrainBrushMode::SetHeight => egui::Color32::from_rgb(250, 210, 90),
         TerrainBrushMode::Smooth => egui::Color32::from_rgb(120, 220, 140),
+    }
+}
+
+fn texture_layer_color(layer: usize) -> egui::Color32 {
+    match layer {
+        0 => egui::Color32::from_rgb(255, 120, 120),
+        1 => egui::Color32::from_rgb(130, 230, 130),
+        2 => egui::Color32::from_rgb(120, 170, 255),
+        _ => egui::Color32::from_rgb(250, 220, 120),
     }
 }
 
@@ -266,9 +349,9 @@ pub(crate) fn viewport(
         .or_else(|| response.interact_pointer_pos())
         .filter(|c| view.rect.contains(*c));
 
-    let mode = if mods.alt {
+    let mode = if mods.alt && !tool.texture_mode {
         TerrainBrushMode::Smooth
-    } else if mods.shift {
+    } else if mods.shift && !tool.texture_mode {
         match tool.mode {
             TerrainBrushMode::Raise => TerrainBrushMode::Lower,
             TerrainBrushMode::Lower => TerrainBrushMode::Raise,
@@ -308,16 +391,28 @@ pub(crate) fn viewport(
         && let Some((p, _)) = &hit
     {
         if let Some(t) = terrain_mut(scene, i) {
-            painted = apply_dab(
-                t,
-                *p,
-                radius,
-                mode,
-                tool.falloff,
-                tool.strength,
-                tool.height,
-                dt,
-            );
+            painted = if tool.texture_mode {
+                apply_texture_dab(
+                    t,
+                    *p,
+                    radius,
+                    tool.falloff,
+                    tool.strength,
+                    tool.texture_layer as usize,
+                    dt,
+                )
+            } else {
+                apply_dab(
+                    t,
+                    *p,
+                    radius,
+                    mode,
+                    tool.falloff,
+                    tool.strength,
+                    tool.height,
+                    dt,
+                )
+            };
         }
     }
     if painted {
@@ -333,22 +428,50 @@ pub(crate) fn viewport(
             wp,
             n,
             tool.radius,
-            egui::Stroke::new(1.5_f32, mode_color(mode)),
+            egui::Stroke::new(
+                1.5_f32,
+                if tool.texture_mode {
+                    texture_layer_color(tool.texture_layer as usize)
+                } else {
+                    mode_color(mode)
+                },
+            ),
         );
         if let Some(c) = view.project(wp) {
-            painter.circle_filled(c, 2.0, mode_color(mode));
+            painter.circle_filled(
+                c,
+                2.0,
+                if tool.texture_mode {
+                    texture_layer_color(tool.texture_layer as usize)
+                } else {
+                    mode_color(mode)
+                },
+            );
         }
     }
 
-    hint_bar(
-        &painter,
-        view.rect,
-        &format!(
-            "Sculpt terrain: {}   radius {:.2} m   Drag sculpt   Shift reverse   Alt smooth   [ ] or Ctrl+Scroll size   P / Esc done",
-            mode.label(),
-            tool.radius
-        ),
-    );
+    if tool.texture_mode {
+        let labels = ["R", "G", "B", "A"];
+        hint_bar(
+            &painter,
+            view.rect,
+            &format!(
+                "Paint terrain texture: layer {}   radius {:.2} m   Drag paint   [ ] or Ctrl+Scroll size   P / Esc done",
+                labels[tool.texture_layer as usize].to_string(),
+                tool.radius
+            ),
+        );
+    } else {
+        hint_bar(
+            &painter,
+            view.rect,
+            &format!(
+                "Sculpt terrain: {}   radius {:.2} m   Drag sculpt   Shift reverse   Alt smooth   [ ] or Ctrl+Scroll size   P / Esc done",
+                mode.label(),
+                tool.radius
+            ),
+        );
+    }
     if tool != before {
         tool.set(&ctx);
     }
@@ -368,6 +491,7 @@ mod tests {
             heights: vec![0.0; n],
             material: String::new(),
             collider: false,
+            texture_weights: Vec::new(),
         }
     }
 
@@ -434,5 +558,24 @@ mod tests {
         let (origin, dir) = view.ray(rect.center()).expect("ray through the viewport");
         let (t, _, _) = ray_triangles(origin, dir, &positions, &indices).expect("hits the field");
         assert!(t > 0.0);
+    }
+
+    #[test]
+    fn texture_brush_paints_a_selected_layer_and_keeps_weights_normalized() {
+        let mut t = flat(8, 40.0);
+        assert!(apply_texture_dab(
+            &mut t,
+            Vec3::ZERO,
+            10.0,
+            BrushFalloff::Constant,
+            1.0,
+            2,
+            0.1,
+        ));
+        let n = t.resolution as usize + 1;
+        let mid = t.texture_weights[4 * n + 4];
+        assert!(mid[2] > 0.4, "paint raises target layer: {:?}", mid);
+        let sum: f32 = mid.iter().copied().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "weights stay normalized: {sum}");
     }
 }

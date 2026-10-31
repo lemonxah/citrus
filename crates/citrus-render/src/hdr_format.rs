@@ -9,10 +9,10 @@
 //! E5B9G9R9 (4 B/texel) or, failing that, RGBA16F (8 B/texel). Uncompressed
 //! bakes (the per-scene opt-out) load as RGBA16F.
 //!
-//! ASTC 4x4 HDR is plumbed through (format code, sizes, upload) for mobile
-//! GPUs with `textureCompressionASTC_HDR`, but nothing encodes it yet: bakes
-//! stay BC6H and decode to E5B9G9R9 / RGBA16F there. Stored ASTC HDR data on
-//! a device without support is a load error (no CPU decoder).
+//! ASTC 4x4 HDR (vendored ARM astcenc) is what a Meta Quest build ships: its
+//! cook re-encodes BC6H bakes as ASTC HDR, which the headset samples directly.
+//! Stored ASTC HDR data on a device without support decodes to E5B9G9R9 /
+//! RGBA16F like BC6H does.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

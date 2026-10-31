@@ -100,8 +100,13 @@ impl GameConfig {
     /// scene and window title come from the project settings, assets resolve
     /// relative to `assets_root`. This keeps a generated `main.rs` tiny and lets
     /// the Project Settings boot-scene choice take effect without editing code.
+    /// A shipped build's `assets.pak` beside the executable takes precedence
+    /// over `assets_root`: it's extracted once and the game runs from there.
     pub fn from_project_dir(assets_root: impl Into<PathBuf>) -> Result<Self> {
-        let assets_root = assets_root.into();
+        let assets_root = match shipped_pak_root()? {
+            Some(root) => root,
+            None => assets_root.into(),
+        };
         let project = citrus_assets::load_project_file(&assets_root)
             .context("reading project.citrus")?;
         let boot_scene = project
@@ -117,9 +122,27 @@ impl GameConfig {
             spatial_audio: project.spatial_audio,
             tracking_input: project.tracking_input,
             physics: project.physics,
+            xr: if project.vr { XrMode::Auto } else { XrMode::Off },
             ..Default::default()
         })
     }
+}
+
+/// Extraction folder of the `assets.pak` next to the running executable, or
+/// `None` without one (development runs, Android).
+fn shipped_pak_root() -> Result<Option<PathBuf>> {
+    if cfg!(target_os = "android") {
+        return Ok(None);
+    }
+    let Some(exe) = std::env::current_exe().ok() else { return Ok(None) };
+    let pak = exe.with_file_name(citrus_assets::game_pak::GAME_PAK_NAME);
+    if !pak.is_file() {
+        return Ok(None);
+    }
+    let stem = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let cache = crate::content::content_cache_dir(&stem).with_file_name("assets");
+    let root = citrus_assets::game_pak::extract_game_pak(&pak, &cache).context("unpacking assets.pak")?;
+    Ok(Some(root))
 }
 
 /// Run a game to completion: open a window, load the boot scene, and run the
@@ -280,8 +303,10 @@ fn view_mode() -> u32 {
 /// Opt-in frame timing log (`CITRUS_FRAME_STATS=1`, vsync off): every 240
 /// frames, the mean frame interval and the renderer's GPU timestamp zones.
 fn frame_stats(renderer: &Renderer) {
-    type Acc = (u32, Option<Instant>, f64, [f64; 9]);
-    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 9]));
+    /// Frames, last frame time, frame ms sum, GPU zone ms sums, late Hi-Z
+    /// recoveries summed over the window.
+    type Acc = (u32, Option<Instant>, f64, [f64; 9], u64);
+    static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, None, 0.0, [0.0; 9], 0));
     if !frame_stats_on() {
         return;
     }
@@ -307,6 +332,7 @@ fn frame_stats(renderer: &Renderer) {
         for (acc, v) in a.3.iter_mut().zip(z) {
             *acc += v as f64;
         }
+        a.4 += s.gpu_cull_recovered as u64;
     }
     a.1 = Some(now);
     if a.0 >= 240 {
@@ -318,7 +344,16 @@ fn frame_stats(renderer: &Renderer) {
             a.2 / n, z[0], z[1], z[6], z[7], z[8], z[2], z[3], z[4], z[5],
             s.draw_calls, s.instanced_draws, s.opaque_draws + s.transparent_draws
         );
-        *a = (0, Some(now), 0.0, [0.0; 9]);
+        if s.gpu_culling {
+            tracing::info!(
+                target: "frame_stats",
+                "gpu cull {:.3} ms (hi-z {:.3}) | main view: {} tested, {} visible ({} recovered by the late pass), {} frustum/size culled, {} occluded | late-pass recoveries over {} frames: {} | {} indirect draws, {} shadow, {} eye instances",
+                s.gpu_cull_ms, s.gpu_hiz_ms, s.gpu_cull_tested, s.gpu_cull_visible, s.gpu_cull_recovered,
+                s.gpu_cull_frustum, s.gpu_cull_occluded, a.0, a.4,
+                s.indirect_draws, s.gpu_cull_shadow_visible, s.gpu_cull_eye_visible
+            );
+        }
+        *a = (0, Some(now), 0.0, [0.0; 9], 0);
     }
 }
 
@@ -1055,9 +1090,10 @@ impl GameApp {
             render_viewport: true,
             viewport_extent: None,
             postfx,
-            reflection_probe: refl.0,
-            reflection_probe_b: refl.1,
-            reflection_primary: refl.2,
+            reflection_probe: refl[0],
+            reflection_probes: refl,
+            reflection_probe_b: refl[1],
+            reflection_primary: 0,
             camera_targets: &camera_views,
             planar: &planar,
             fog: self.scene.fog_params(),

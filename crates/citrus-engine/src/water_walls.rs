@@ -14,6 +14,11 @@
 //! slow and shorten over shallows as they do in real water. Shapes are cached
 //! per object until it moves or its colliders change, and a water's cells
 //! are only rebuilt when its window or the geometry in it change.
+//!
+//! Every water with a `shore_depth` (lakes, pools, oceans; rivers calm at
+//! their banks already) gets the same floor baked over its whole area into
+//! a `ShoreDepth` grid, rebaked when the water or the geometry under it
+//! changes: its waves calm over the shallows near a shore.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -21,9 +26,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use citrus_core::{
-    BodyKind, BoxCollider, CapsuleCollider, CharacterController, MeshCollider, ObjectId, RigidBody, SimWindow, SphereCollider, Water,
+    BodyKind, BoxCollider, CapsuleCollider, CharacterController, MeshCollider, ObjectId, RigidBody, ShoreDepth, SimWindow, SphereCollider, Water,
+    WaterBody,
 };
-use glam::{Mat4, Vec2, Vec3};
+use glam::{IVec2, Mat4, Vec2, Vec3};
 
 use crate::physics::{Solid, solid_below, solid_contains, world_solids};
 use crate::scene::LoadedScene;
@@ -37,6 +43,13 @@ const STEEP: f32 = 0.6;
 /// there (a beach up to `RUNUP_HEIGHT`, a bank above); higher is an
 /// overhang the water ignores.
 const RISE: f32 = citrus_core::RUNUP_HEIGHT + 0.1;
+/// Cells per side of a shore-depth bake.
+const SHORE_CELLS: u32 = 128;
+/// Farthest (m) an endless water's shore bake reaches from its origin.
+const SHORE_REACH: f32 = 1024.0;
+/// Ground up to this far above the surface (m) is dry shore to a shore
+/// bake (so a beach reads as shore all the way up); higher is an overhang.
+const SHORE_RISE: f32 = 10.0;
 
 struct Cached {
     key: u64,
@@ -54,6 +67,8 @@ pub struct WaterWalls {
     moved: HashMap<ObjectId, ([f32; 16], u32)>,
     /// Each water's last wall set.
     masks: HashMap<ObjectId, u64>,
+    /// Each water's last shore bake (what it was baked from).
+    shores: HashMap<ObjectId, u64>,
 }
 
 impl WaterWalls {
@@ -63,14 +78,19 @@ impl WaterWalls {
     }
 
     /// Refresh the wall cells of every GPU-simulated water that has a
-    /// window from what stands in it now.
+    /// window from what stands in it now, and rebake the shore depth of
+    /// every water whose shore calms its waves when it or its ground changed.
     pub fn update(&mut self, scene: &mut LoadedScene, world: &[Mat4]) {
         let active = scene.active_flags();
         let waters: Vec<usize> = (0..scene.objects.len())
             .filter(|&i| active[i])
             .filter(|&i| water_of(scene, i).is_some_and(|w| w.interactive && w.sim_feed.window.is_some() && w.ripples.as_ref().is_some_and(|r| r.gpu)))
             .collect();
-        if waters.is_empty() {
+        let shores: Vec<usize> = (0..scene.objects.len())
+            .filter(|&i| active[i])
+            .filter(|&i| water_of(scene, i).is_some_and(|w| w.shore_depth > 0.0 && w.body != WaterBody::River))
+            .collect();
+        if waters.is_empty() && shores.is_empty() {
             return;
         }
         let mut walls = Vec::new();
@@ -128,7 +148,7 @@ impl WaterWalls {
             let mut ground = vec![f32::NEG_INFINITY; cells];
             for (id, _) in &here {
                 if let Some(c) = self.shapes.get(id) {
-                    mark(&mut mask, &mut ground, window, water, &to_local, water_world, &c.solids);
+                    mark(&mut mask, &mut ground, window, water, &to_local, water_world, &c.solids, RISE);
                 }
             }
             let bed: Vec<f32> = ground
@@ -146,7 +166,104 @@ impl WaterWalls {
                 w.sim_feed.bed = Some((window, Arc::new(bed)));
             }
         }
+        for wi in shores {
+            self.update_shore(scene, world, &walls, wi);
+        }
     }
+
+    /// Rebake water `wi`'s shore depth when it or the static geometry
+    /// under it (`walls`, object indices) changed.
+    fn update_shore(&mut self, scene: &mut LoadedScene, world: &[Mat4], walls: &[usize], wi: usize) {
+        let Some(water) = water_of(scene, wi) else { return };
+        let water_world = world[wi];
+        let to_local = water_world.inverse();
+        let below = (water.depth * 3.0).max(3.0);
+        let mine: Vec<(ObjectId, &Cached)> = walls
+            .iter()
+            .filter(|&&i| i != wi && crate::physics::layers_meet(scene, wi, i))
+            .filter_map(|&i| self.shapes.get(&scene.objects[i].id).map(|c| (scene.objects[i].id, c)))
+            .collect();
+        let overlapping = |window: SimWindow| {
+            let (lo, hi) = window_bounds(window, water_world, below);
+            mine.iter()
+                .filter(|(_, c)| c.hi.x >= lo.x && c.lo.x <= hi.x && c.hi.z >= lo.z && c.lo.z <= hi.z && c.hi.y >= lo.y && c.lo.y <= hi.y)
+                .collect::<Vec<_>>()
+        };
+        let half = match water.extent() {
+            Some((lo, hi)) => lo.abs().max(hi.abs()).max_element(),
+            // Endless: as far as the geometry near its surface reaches.
+            None => overlapping(shore_window(SHORE_REACH))
+                .iter()
+                .flat_map(|(_, c)| {
+                    (0..8).map(|k| {
+                        let p = to_local.transform_point3(Vec3::new(
+                            if k & 1 == 0 { c.lo.x } else { c.hi.x },
+                            if k & 2 == 0 { c.lo.y } else { c.hi.y },
+                            if k & 4 == 0 { c.lo.z } else { c.hi.z },
+                        ));
+                        p.x.abs().max(p.z.abs())
+                    })
+                })
+                .fold(0.0f32, f32::max)
+                .min(SHORE_REACH),
+        };
+        let id = scene.objects[wi].id;
+        if half <= 1e-3 {
+            self.shores.remove(&id);
+            if let Some(w) = water_mut(scene, wi) {
+                w.shore = None;
+            }
+            return;
+        }
+        let window = shore_window(half);
+        let mut here: Vec<(ObjectId, &Cached)> = overlapping(window).into_iter().copied().collect();
+        here.sort_by_key(|(id, _)| id.raw());
+        let mut h = DefaultHasher::new();
+        half.to_bits().hash(&mut h);
+        water_world.to_cols_array().map(f32::to_bits).hash(&mut h);
+        (format!("{:?}", water.body), water.depth.to_bits(), water.size.map(f32::to_bits)).hash(&mut h);
+        water.outline().iter().flatten().for_each(|v| v.to_bits().hash(&mut h));
+        here.iter().for_each(|(id, c)| (id.raw(), c.key).hash(&mut h));
+        let key = h.finish();
+        if self.shores.get(&id) == Some(&key) {
+            return;
+        }
+        let solids: Vec<&[Solid]> = here.iter().map(|(_, c)| c.solids.as_slice()).collect();
+        let bake = bake_shore(water, water_world, half, &solids);
+        self.shores.insert(id, key);
+        if let Some(w) = water_mut(scene, wi) {
+            w.shore = bake.map(Arc::new);
+        }
+    }
+}
+
+/// The square window a shore bake samples: `SHORE_CELLS` across local XZ
+/// -`half`..`half`.
+fn shore_window(half: f32) -> SimWindow {
+    let n = SHORE_CELLS;
+    SimWindow { origin: IVec2::splat(-(n as i32) / 2), n, cell: 2.0 * half / n as f32, closed: true }
+}
+
+/// The depth of `water` (posed at `water_world`) over the top of `solids`
+/// across local XZ -`half`..`half`; None when nothing lies under it.
+fn bake_shore(water: &Water, water_world: Mat4, half: f32, solids: &[&[Solid]]) -> Option<ShoreDepth> {
+    let window = shore_window(half);
+    let to_local = water_world.inverse();
+    let cells = (window.n * window.n) as usize;
+    let mut mask = vec![false; cells];
+    let mut ground = vec![f32::NEG_INFINITY; cells];
+    for s in solids {
+        mark(&mut mask, &mut ground, window, water, &to_local, water_world, s, SHORE_RISE);
+    }
+    if ground.iter().all(|y| !y.is_finite()) {
+        return None;
+    }
+    let depth = ground
+        .iter()
+        .enumerate()
+        .map(|(i, &y)| if y.is_finite() { water.column(cell_centre(window, i)).map_or(0.0, |c| c.surface) - y } else { f32::NAN })
+        .collect();
+    Some(ShoreDepth::new(window.n as usize, half, depth))
 }
 
 /// Directions the outline is sampled in when fitting a water to its basin.
@@ -289,13 +406,14 @@ fn cell_centre(window: SimWindow, i: usize) -> Vec2 {
 
 /// Mark the window's cells `solids` fill at the water's surface in `mask`,
 /// and raise `ground` (water-local height per cell) to the top of what lies
-/// under each cell.
-fn mark(mask: &mut [bool], ground: &mut [f32], window: SimWindow, water: &Water, to_local: &Mat4, water_world: Mat4, solids: &[Solid]) {
+/// under each cell (ground up to `rise` above the surface counts).
+#[allow(clippy::too_many_arguments)]
+fn mark(mask: &mut [bool], ground: &mut [f32], window: SimWindow, water: &Water, to_local: &Mat4, water_world: Mat4, solids: &[Solid], rise: f32) {
     let n = window.n as i32;
     let lo = window.lo();
     let cell = window.cell;
     let surface = |xz: Vec2| water.column(xz).map_or(0.0, |c| c.surface);
-    let reach = RISE + (water.depth * 3.0).max(3.0);
+    let reach = rise + (water.depth * 3.0).max(3.0);
     // Cells (x0..x1, z0..z1) whose centres the local XZ box a..b covers.
     let span = |a: Vec2, b: Vec2| {
         let x0 = (((a.x - lo.x) / cell - 0.5).ceil() as i32).max(0);
@@ -326,7 +444,7 @@ fn mark(mask: &mut [bool], ground: &mut [f32], window: SimWindow, water: &Water,
                         if solid_contains(col, water_world.transform_point3(Vec3::new(xz.x, level, xz.y))) {
                             mask[i] = true;
                         }
-                        let from = water_world.transform_point3(Vec3::new(xz.x, level + RISE, xz.y));
+                        let from = water_world.transform_point3(Vec3::new(xz.x, level + rise, xz.y));
                         if let Some(down) = solid_below(col, from, reach) {
                             let y = to_local.transform_point3(from - Vec3::Y * down).y;
                             ground[i] = ground[i].max(y);
@@ -365,7 +483,7 @@ fn mark(mask: &mut [bool], ground: &mut [f32], window: SimWindow, water: &Water,
                         continue;
                     }
                     // Floor: its height under each cell centre it covers.
-                    if p.iter().all(|v| v.y > level + RISE) {
+                    if p.iter().all(|v| v.y > level + rise) {
                         continue;
                     }
                     let q = p.map(|v| Vec2::new(v.x, v.z));
@@ -385,7 +503,7 @@ fn mark(mask: &mut [bool], ground: &mut [f32], window: SimWindow, water: &Water,
                                 continue;
                             }
                             let y = p[0].y * w0 + p[1].y * w1 + p[2].y * w2;
-                            if y <= surface(c) + RISE {
+                            if y <= surface(c) + rise {
                                 let i = (z * n + x) as usize;
                                 ground[i] = ground[i].max(y);
                             }
@@ -474,4 +592,70 @@ fn water_of(scene: &LoadedScene, i: usize) -> Option<&Water> {
 
 fn water_mut(scene: &mut LoadedScene, i: usize) -> Option<&mut Water> {
     scene.objects[i].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<Water>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 20 m lake over a floor 3 m down for x < 0 that slopes up 0.4 m/m
+    /// toward a shore (dry from x = 7.5).
+    fn beach() -> (Water, Vec<Solid>) {
+        let water = Water { size: [20.0, 20.0], ..Default::default() };
+        let v = |x: f32, z: f32| Vec3::new(x, -3.0 + 0.4 * x.max(0.0), z);
+        let verts = vec![v(-12.0, -12.0), v(0.0, -12.0), v(0.0, 12.0), v(-12.0, 12.0), v(12.0, -12.0), v(12.0, 12.0)];
+        let tris = vec![[0, 2, 1], [0, 3, 2], [1, 5, 4], [1, 2, 5]];
+        (water, vec![Solid::Mesh(verts, tris)])
+    }
+
+    #[test]
+    fn shore_bake_shallows_toward_the_shore_and_calms_the_waves() {
+        let (mut water, solids) = beach();
+        let bake = bake_shore(&water, Mat4::IDENTITY, 10.0, &[&solids]).expect("ground under the lake");
+        assert_eq!((bake.n, bake.half), (SHORE_CELLS as usize, 10.0));
+        let at = |x: f32| bake.depth_at(Vec2::new(x, 1.3)).unwrap();
+        assert!((at(-5.0) - 3.0).abs() < 0.05, "flat floor 3 m down: {}", at(-5.0));
+        for x in [1.0, 3.0, 5.0, 7.0] {
+            assert!((at(x) - (3.0 - 0.4 * x)).abs() < 0.05, "slope at {x}: {}", at(x));
+        }
+        let mut last = f32::MAX;
+        for k in 0..=90 {
+            let d = at(-5.0 + k as f32 * 0.15);
+            assert!(d <= last + 1e-4, "depth only falls toward the shore");
+            last = d;
+        }
+        assert_eq!(at(9.0), 0.0, "the dry beach is 0 deep");
+
+        // Damping: smoothstep(0, shore_depth, depth).
+        water.shore = Some(Arc::new(bake));
+        water.shore_depth = 2.0;
+        let damp = |x: f32| water.shore_damping(Vec2::new(x, 1.3));
+        assert_eq!(damp(-5.0), 1.0, "deeper than shore_depth: full waves");
+        let d = 3.0 - 0.4 * 4.0;
+        let t: f32 = d / 2.0;
+        assert!((damp(4.0) - t * t * (3.0 - 2.0 * t)).abs() < 0.03, "{}", damp(4.0));
+        assert!(damp(7.4) < 0.01 && damp(9.0) == 0.0, "calm at the waterline");
+        assert!(damp(2.0) > damp(4.0) && damp(4.0) > damp(6.0));
+        let open = Water { size: [20.0, 20.0], ..Default::default() };
+        let xz = Vec2::new(6.0, 1.3);
+        let ((d_shore, _), (d_open, _)) = (water.displacement(xz, 0.7), open.displacement(xz, 0.7));
+        assert!((d_shore - d_open * damp(6.0)).length() < 1e-5, "the waves scale by it");
+        water.shore_depth = 0.0;
+        assert_eq!(water.shore_damping(Vec2::new(9.0, 0.0)), 1.0, "0 turns it off");
+    }
+
+    #[test]
+    fn water_with_nothing_under_it_keeps_full_waves() {
+        let (water, _) = beach();
+        assert!(bake_shore(&water, Mat4::IDENTITY, 10.0, &[]).is_none());
+        // A floor only under half of it: open water elsewhere.
+        let half_floor = vec![Solid::Mesh(
+            vec![Vec3::new(-12.0, -0.5, -12.0), Vec3::new(-2.0, -0.5, -12.0), Vec3::new(-2.0, -0.5, 12.0), Vec3::new(-12.0, -0.5, 12.0)],
+            vec![[0, 2, 1], [0, 3, 2]],
+        )];
+        let bake = bake_shore(&water, Mat4::IDENTITY, 10.0, &[&half_floor]).unwrap();
+        assert!((bake.depth_at(Vec2::new(-6.0, 0.0)).unwrap() - 0.5).abs() < 1e-3);
+        assert_eq!(bake.depth_at(Vec2::new(6.0, 0.0)), Some(citrus_core::SHORE_NO_GROUND));
+        assert_eq!(citrus_core::shore_damping(citrus_core::SHORE_NO_GROUND, 2.0), 1.0);
+    }
 }

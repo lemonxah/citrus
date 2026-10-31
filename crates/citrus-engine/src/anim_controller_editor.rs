@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use citrus_assets::{
     AnimCondition, AnimLayer, AnimParamKind, AnimParameter, AnimState, AnimTransition, AnimatorController, CondOp,
-    LayerBlend, Motion,
+    LayerBlend, Motion, StateMachine,
 };
 use citrus_core::{Animator, BlendMotion, BlendTree};
 use citrus_editor::egui_phosphor::regular as ph;
@@ -37,8 +37,13 @@ enum Sel {
 pub struct AnimControllerTab {
     path: Option<String>,
     ctrl: AnimatorController,
+    /// Undo history of the open document.
+    history: crate::undo::DocHistory<AnimatorController>,
     dirty: bool,
     layer: usize,
+    /// Sub-state machine being edited: state indices from the layer's machine
+    /// down (empty = the layer itself).
+    sub: Vec<usize>,
     sel: Sel,
     pan: Vec2,
     zoom: f32,
@@ -64,7 +69,9 @@ impl Default for AnimControllerTab {
             path: None,
             ctrl: AnimatorController::default(),
             dirty: false,
+            history: Default::default(),
             layer: 0,
+            sub: Vec::new(),
             sel: Sel::None,
             pan: Vec2::ZERO,
             zoom: 1.0,
@@ -243,6 +250,26 @@ pub fn create_asset(dir: &Path, controller: bool, root: &Path, ctrl: &mut AnimCo
     }
 }
 
+/// The machine shown in the graph: `sub` followed down from the layer's
+/// machine (the layer's own when the path is stale).
+fn machine_of<'a>(ctrl: &'a AnimatorController, layer: usize, sub: &[usize]) -> &'a StateMachine {
+    let root = &ctrl.layers[layer].machine;
+    root.nested(sub).unwrap_or(root)
+}
+
+fn machine_of_mut<'a>(ctrl: &'a mut AnimatorController, layer: usize, sub: &[usize]) -> &'a mut StateMachine {
+    let root = &mut ctrl.layers[layer].machine;
+    if root.nested(sub).is_some() { root.nested_mut(sub).unwrap() } else { root }
+}
+
+/// Whether the runtime's flattened state name `full` is local state `local`
+/// of the level named `prefix`, or inside it when it is a sub-state machine.
+fn under(full: &str, prefix: &str, local: &str) -> bool {
+    full.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix(local))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 fn animator(scene: &LoadedScene, i: usize) -> Option<&Animator> {
     scene.objects.get(i)?.components.iter().find_map(|c| c.as_any().downcast_ref::<Animator>())
 }
@@ -270,6 +297,7 @@ impl AnimControllerTab {
                 self.path = Some(rel.to_owned());
                 self.dirty = false;
                 self.layer = 0;
+                self.sub.clear();
                 self.sel = Sel::None;
                 self.linking = None;
                 self.dragging = None;
@@ -310,6 +338,28 @@ impl AnimControllerTab {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, selected: Option<usize>, root: &Path, playing: bool) {
+        let (before, path) = (self.ctrl.clone(), self.path.clone());
+        self.ui_inner(ui, scene, selected, root, playing);
+        if self.path != path {
+            self.history.clear();
+        } else {
+            self.history.observe(before, &self.ctrl, ui.input(|i| i.pointer.any_down()));
+        }
+    }
+
+    /// Ctrl+Z / Ctrl+Shift+Z while this tab has focus.
+    pub fn history_step(&mut self, undo: bool) {
+        if self.history.step(&mut self.ctrl, undo) {
+            self.dirty = true;
+            // Selections are indices into the document: drop them.
+            self.sel = Sel::None;
+            self.dragging = None;
+            self.linking = None;
+            self.layer = self.layer.min(self.ctrl.layers.len().saturating_sub(1));
+        }
+    }
+
+    fn ui_inner(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, selected: Option<usize>, root: &Path, playing: bool) {
         scene.anim_assets.set_root(root);
         let selected = selected.filter(|&i| i < scene.objects.len());
         let live = self.live_object(scene, selected, playing);
@@ -318,6 +368,11 @@ impl AnimControllerTab {
         }
         if self.layer >= self.ctrl.layers.len() {
             self.layer = 0;
+            self.sel = Sel::None;
+        }
+        // Undo or a delete can remove the sub-machine being edited.
+        if self.ctrl.layers[self.layer].machine.nested(&self.sub).is_none() {
+            self.sub.clear();
             self.sel = Sel::None;
         }
 
@@ -354,6 +409,10 @@ impl AnimControllerTab {
             .frame(egui::Frame::new().fill(theme::BG_VIEWPORT))
             .show_inside(ui, |ui| {
                 let area = ui.max_rect();
+                egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(10, 4)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.breadcrumb(ui);
+                });
                 self.canvas(ui, scene, live);
                 self.panel_handles(ui, area);
             });
@@ -402,13 +461,7 @@ impl AnimControllerTab {
             });
             if self.path.is_some() {
                 if widgets::icon_button_sized(ui, Icon::Target, "Frame all states", false, Vec2::splat(theme::H_FIELD)).clicked() {
-                    self.pan = Vec2::ZERO;
-                    self.zoom = 1.0;
-                    let states = &self.ctrl.layers[self.layer].machine.states;
-                    if !states.is_empty() {
-                        let c = states.iter().fold(Vec2::ZERO, |a, s| a + Vec2::from(s.position)) / states.len() as f32;
-                        self.pan = -c;
-                    }
+                    self.frame_all();
                 }
                 if let Some(i) = live {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -454,6 +507,7 @@ impl AnimControllerTab {
                     let n = self.ctrl.layers.len();
                     self.ctrl.layers.push(AnimLayer { name: format!("Layer {n}"), ..Default::default() });
                     self.layer = n;
+                    self.sub.clear();
                     self.sel = Sel::None;
                     self.changed(scene);
                 }
@@ -472,6 +526,7 @@ impl AnimControllerTab {
         }
         if let Some(k) = pick {
             self.layer = k;
+            self.sub.clear();
             self.sel = Sel::None;
         }
     }
@@ -581,10 +636,10 @@ impl AnimControllerTab {
     fn inspector_ui(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, object: Option<usize>, root: &Path) {
         let mut edited = false;
         match self.sel {
-            Sel::Node(Node::State(s)) if s < self.ctrl.layers[self.layer].machine.states.len() => {
+            Sel::Node(Node::State(s)) if s < machine_of(&self.ctrl, self.layer, &self.sub).states.len() => {
                 edited |= self.state_inspector(ui, scene, s, object, root);
             }
-            Sel::Transition(t) if t < self.ctrl.layers[self.layer].machine.transitions.len() => {
+            Sel::Transition(t) if t < machine_of(&self.ctrl, self.layer, &self.sub).transitions.len() => {
                 edited |= self.transition_inspector(ui, t);
             }
             Sel::Node(Node::Any) => {
@@ -682,13 +737,14 @@ impl AnimControllerTab {
             if widgets::secondary_button(ui, Some(Icon::Trash), "Remove layer").clicked() {
                 self.ctrl.layers.remove(li);
                 self.layer = li - 1;
+                self.sub.clear();
                 edited = true;
             }
         }
         ui.add_space(10.0);
         widgets::info_note(
             ui,
-            "Right-click the canvas to create states. Drag with Shift from a state (or use Make Transition) to connect two states. Scroll to zoom, drag empty space to pan.",
+            "Right-click the canvas to create states or sub-state machines. Double-click a sub-state machine to edit inside it (the path above the graph goes back up). Drag with Shift from a state (or use Make Transition) to connect two states. Scroll to zoom, drag empty space to pan.",
         );
         edited
     }
@@ -707,10 +763,12 @@ impl AnimControllerTab {
             self.clip_files = scan_files(root, citrus_assets::ANIM_CLIP_EXTENSION);
         }
         let choices = self.clip_choices(scene, object);
-        let machine = &mut self.ctrl.layers[li].machine;
+        let machine = machine_of_mut(&mut self.ctrl, li, &self.sub);
         let is_default = machine.default_index() == Some(s);
+        let is_sub = machine.states[s].is_sub_machine();
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("State").font(theme::semibold(theme::SIZE_TITLE)).color(theme::TEXT_STRONG));
+            let title = if is_sub { "Sub-State Machine" } else { "State" };
+            ui.label(egui::RichText::new(title).font(theme::semibold(theme::SIZE_TITLE)).color(theme::TEXT_STRONG));
             if is_default {
                 widgets::chip(ui, "Default");
             }
@@ -720,11 +778,45 @@ impl AnimControllerTab {
         widgets::property_row(ui, "Name", |ui| {
             if let Some(new) = commit_text(ui, ui.id().with(("citrus-state-name", li, s)), &name, ui.available_width())
                 && machine.state_index(&new).is_none()
+                && !new.contains('/')
             {
                 machine.rename_state(&name, &new);
                 edited = true;
             }
         });
+        if let Some(inner) = machine.states[s].sub_machine.as_deref() {
+            let entry = inner.default_index().map(|i| inner.states[i].name.clone()).unwrap_or_else(|| "nothing (empty)".into());
+            ui.label(
+                egui::RichText::new(format!("{} states, enters {entry}", inner.states.len()))
+                    .size(theme::SIZE_META)
+                    .color(theme::TEXT_MUTED),
+            );
+            widgets::info_note(
+                ui,
+                "A transition into this node enters its default state; a transition from it leaves from whichever inner state is playing. Its Any State applies only inside it. Scripts name inner states by path, e.g. play_state(\"Locomotion/Walk\").",
+            );
+            ui.add_space(6.0);
+            let mut open = false;
+            ui.horizontal(|ui| {
+                open = widgets::secondary_button(ui, None, "Open").clicked();
+                if !is_default && widgets::secondary_button(ui, None, "Set as Default").clicked() {
+                    machine.default_state = name.clone();
+                    edited = true;
+                }
+                if widgets::secondary_button(ui, Some(Icon::Trash), "Delete").clicked() {
+                    machine.remove_state(s);
+                    self.sel = Sel::None;
+                    edited = true;
+                }
+            });
+            if open {
+                self.enter_sub(s);
+            } else if let Sel::Node(Node::State(_)) = self.sel {
+                widgets::section_gap(ui);
+                edited |= self.transition_list(ui, Some(name));
+            }
+            return edited;
+        }
         let st = &mut machine.states[s];
         let mut is_tree = matches!(st.motion, Motion::BlendTree(_));
         widgets::property_row(ui, "Motion", |ui| {
@@ -793,7 +885,7 @@ impl AnimControllerTab {
     /// Outgoing transitions of a state (None = Any State), click to select.
     fn transition_list(&mut self, ui: &mut egui::Ui, from: Option<String>) -> bool {
         widgets::eyebrow(ui, "Transitions");
-        let machine = &self.ctrl.layers[self.layer].machine;
+        let machine = machine_of(&self.ctrl, self.layer, &self.sub);
         let list: Vec<(usize, String)> = machine
             .transitions
             .iter()
@@ -815,7 +907,7 @@ impl AnimControllerTab {
     fn transition_inspector(&mut self, ui: &mut egui::Ui, t: usize) -> bool {
         let mut edited = false;
         let params = self.ctrl.parameters.clone();
-        let machine = &mut self.ctrl.layers[self.layer].machine;
+        let machine = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
         let tr = &mut machine.transitions[t];
         let from = tr.from.clone().unwrap_or_else(|| "Any State".into());
         ui.label(egui::RichText::new("Transition").font(theme::semibold(theme::SIZE_TITLE)).color(theme::TEXT_STRONG));
@@ -899,6 +991,90 @@ impl AnimControllerTab {
         edited
     }
 
+    // ------------------------------------------------------ sub-state machines
+
+    fn enter_sub(&mut self, state: usize) {
+        self.sub.push(state);
+        self.sel = Sel::None;
+        self.dragging = None;
+        self.linking = None;
+        self.frame_all();
+    }
+
+    /// Center the view on the shown machine's states.
+    fn frame_all(&mut self) {
+        self.pan = Vec2::ZERO;
+        self.zoom = 1.0;
+        let states = &machine_of(&self.ctrl, self.layer, &self.sub).states;
+        if !states.is_empty() {
+            let c = states.iter().fold(Vec2::ZERO, |a, s| a + Vec2::from(s.position)) / states.len() as f32;
+            self.pan = -c;
+        }
+    }
+
+    /// Runtime name prefix of the shown level ("" or "Outer/Inner/").
+    fn level_prefix(&self) -> String {
+        let mut m = &self.ctrl.layers[self.layer].machine;
+        let mut out = String::new();
+        for &i in &self.sub {
+            let Some(s) = m.states.get(i) else { break };
+            let Some(sub) = s.sub_machine.as_deref() else { break };
+            out.push_str(&s.name);
+            out.push('/');
+            m = sub;
+        }
+        out
+    }
+
+    /// Layer > Sub > Sub path above the graph; click a step to go back up.
+    fn breadcrumb(&mut self, ui: &mut egui::Ui) {
+        let mut names = vec![self.ctrl.layers[self.layer].name.clone()];
+        let mut m = &self.ctrl.layers[self.layer].machine;
+        for &i in &self.sub {
+            let Some(s) = m.states.get(i) else { break };
+            let Some(sub) = s.sub_machine.as_deref() else { break };
+            names.push(s.name.clone());
+            m = sub;
+        }
+        let mut go = None;
+        ui.horizontal(|ui| {
+            ui.set_min_height(theme::H_ROW);
+            for (k, n) in names.iter().enumerate() {
+                if k > 0 {
+                    ui.label(egui::RichText::new(ph::CARET_RIGHT).color(theme::TEXT_DIM));
+                }
+                let last = k + 1 == names.len();
+                let text = egui::RichText::new(n).color(if last { theme::TEXT_STRONG } else { theme::TEXT_MUTED });
+                let resp = ui.add(egui::Button::new(text).frame(false));
+                if !last && resp.on_hover_text("Go up to this level").clicked() {
+                    go = Some(k);
+                }
+            }
+        });
+        if let Some(k) = go {
+            self.sub.truncate(k);
+            self.sel = Sel::None;
+            self.dragging = None;
+            self.linking = None;
+            self.frame_all();
+        }
+    }
+
+    /// Whether runtime transition `ft` (flattened) came from transition `k` of
+    /// the shown level.
+    fn transition_matches(&self, k: usize, ft: &AnimTransition, prefix: &str) -> bool {
+        let Some(t) = machine_of(&self.ctrl, self.layer, &self.sub).transitions.get(k) else {
+            return false;
+        };
+        under(&ft.to, prefix, &t.to)
+            && match (&t.from, &ft.from) {
+                (None, None) => prefix.is_empty(),
+                (None, Some(f)) => !prefix.is_empty() && f.starts_with(prefix),
+                (Some(a), Some(f)) => under(f, prefix, a),
+                (Some(_), None) => false,
+            }
+    }
+
     // --------------------------------------------------------------- canvas
 
     fn to_screen(&self, rect: Rect, p: [f32; 2]) -> Pos2 {
@@ -906,7 +1082,7 @@ impl AnimControllerTab {
     }
 
     fn node_pos(&self, node: Node) -> [f32; 2] {
-        let m = &self.ctrl.layers[self.layer].machine;
+        let m = machine_of(&self.ctrl, self.layer, &self.sub);
         match node {
             Node::State(i) => m.states.get(i).map(|s| s.position).unwrap_or_default(),
             Node::Any => m.any_state_position,
@@ -923,7 +1099,7 @@ impl AnimControllerTab {
     }
 
     fn nodes(&self) -> Vec<Node> {
-        let n = self.ctrl.layers[self.layer].machine.states.len();
+        let n = machine_of(&self.ctrl, self.layer, &self.sub).states.len();
         let mut v: Vec<Node> = vec![Node::Entry, Node::Any];
         v.extend((0..n).map(Node::State));
         v
@@ -935,7 +1111,7 @@ impl AnimControllerTab {
 
     /// Screen segment of each transition (offset sideways when a reverse one exists).
     fn transition_segments(&self, rect: Rect) -> Vec<(usize, Pos2, Pos2)> {
-        let m = &self.ctrl.layers[self.layer].machine;
+        let m = machine_of(&self.ctrl, self.layer, &self.sub);
         let mut out = Vec::new();
         for (k, t) in m.transitions.iter().enumerate() {
             let Some(to) = m.state_index(&t.to) else {
@@ -1030,11 +1206,21 @@ impl AnimControllerTab {
 
         // Live playback of this layer.
         let lp = live.and_then(|i| animator(scene, i)).and_then(|a| a.state.layers.get(self.layer).cloned());
+        // The runtime plays the flattened machine (`Outer/Inner` names, its
+        // own indices): map those onto this level's nodes by name.
+        let flat = lp.as_ref().map(|_| self.ctrl.layers[self.layer].machine.flatten());
+        let flat_state = |i: usize| flat.as_ref().and_then(|f| f.states.get(i));
+        let prefix = self.level_prefix();
 
         // Transitions.
         for &(k, a, b) in &segments {
             let selected = self.sel == Sel::Transition(k);
-            let active = lp.as_ref().is_some_and(|l| l.transition == Some(k) && l.in_transition());
+            let active = lp.as_ref().is_some_and(|l| {
+                l.in_transition()
+                    && l.transition
+                        .and_then(|ft| flat.as_ref()?.transitions.get(ft))
+                        .is_some_and(|ft| self.transition_matches(k, ft, &prefix))
+            });
             let color = if selected || active {
                 theme::accent()
             } else if hovered_tr == Some(k) {
@@ -1051,7 +1237,7 @@ impl AnimControllerTab {
         }
 
         // Entry -> default state.
-        if let Some(d) = self.ctrl.layers[self.layer].machine.default_index() {
+        if let Some(d) = machine_of(&self.ctrl, self.layer, &self.sub).default_index() {
             let a = self.node_rect(rect, Node::Entry).center();
             let b = self.node_rect(rect, Node::State(d)).center();
             painter.line_segment([a, b], Stroke::new(1.5_f32, theme::with_alpha(theme::TYPE_LIGHT, 0.7)));
@@ -1059,22 +1245,32 @@ impl AnimControllerTab {
         }
 
         // Nodes.
-        let default = self.ctrl.layers[self.layer].machine.default_index();
+        let default = machine_of(&self.ctrl, self.layer, &self.sub).default_index();
         for node in self.nodes() {
             let r = self.node_rect(rect, node);
             if !rect.intersects(r) {
                 continue;
             }
+            let states = &machine_of(&self.ctrl, self.layer, &self.sub).states;
+            let is_sub = matches!(node, Node::State(i) if states[i].is_sub_machine());
             let (label, tint) = match node {
                 Node::Entry => ("Entry".to_owned(), theme::STATUS_OK),
                 Node::Any => ("Any State".to_owned(), theme::TYPE_UI),
                 Node::State(i) => (
-                    self.ctrl.layers[self.layer].machine.states[i].name.clone(),
-                    if default == Some(i) { theme::TYPE_LIGHT } else { theme::TEXT_MUTED },
+                    states[i].name.clone(),
+                    if default == Some(i) {
+                        theme::TYPE_LIGHT
+                    } else if is_sub {
+                        theme::TYPE_UI
+                    } else {
+                        theme::TEXT_MUTED
+                    },
                 ),
             };
-            let current = matches!(node, Node::State(i) if lp.as_ref().is_some_and(|l| l.state == i));
-            let previous = matches!(node, Node::State(i) if lp.as_ref().is_some_and(|l| l.previous.is_some_and(|(p, _)| p == i)));
+            let current = matches!(node, Node::State(i) if lp.as_ref().is_some_and(|l| under(&l.state_name, &prefix, &states[i].name)));
+            let previous = matches!(node, Node::State(i) if lp.as_ref().is_some_and(|l| {
+                l.previous.and_then(|(p, _)| flat_state(p)).is_some_and(|ps| under(&ps.name, &prefix, &states[i].name))
+            }));
             let fill = if current {
                 theme::accent_faint()
             } else if matches!(node, Node::State(_)) {
@@ -1092,7 +1288,21 @@ impl AnimControllerTab {
             } else {
                 Stroke::new(1.0_f32, theme::LINE_BUTTON)
             };
+            if is_sub {
+                // A stacked card: the node holds a machine of its own.
+                let back = r.translate(Vec2::splat(4.0 * self.zoom));
+                painter.rect(back, CornerRadius::same(theme::R_ROW), theme::BG_PANEL, Stroke::new(1.0_f32, theme::with_alpha(tint, 0.8)), StrokeKind::Inside);
+            }
             painter.rect(r, CornerRadius::same(theme::R_ROW), fill, stroke, StrokeKind::Inside);
+            if is_sub {
+                painter.text(
+                    r.right_center() - Vec2::new(10.0 * self.zoom, 0.0),
+                    egui::Align2::RIGHT_CENTER,
+                    ph::STACK,
+                    egui::FontId::proportional((14.0 * self.zoom).clamp(7.0, 22.0)),
+                    theme::with_alpha(tint, 0.9),
+                );
+            }
             if matches!(node, Node::State(_)) {
                 painter.rect_filled(
                     Rect::from_min_size(r.min, Vec2::new(4.0 * self.zoom, r.height())),
@@ -1108,7 +1318,7 @@ impl AnimControllerTab {
                 theme::TEXT_STRONG,
             );
             if current && let Some(l) = &lp {
-                let f = if self.ctrl.layers[self.layer].machine.states.get(l.state).is_some_and(|s| s.looping) {
+                let f = if flat_state(l.state).is_some_and(|s| s.looping) {
                     l.normalized_time.fract()
                 } else {
                     l.normalized_time.clamp(0.0, 1.0)
@@ -1135,7 +1345,7 @@ impl AnimControllerTab {
             let d = response.drag_delta() / self.zoom;
             match self.dragging {
                 Some(n) if response.dragged_by(egui::PointerButton::Primary) => {
-                    let m = &mut self.ctrl.layers[self.layer].machine;
+                    let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
                     let slot = match n {
                         Node::State(i) => m.states.get_mut(i).map(|s| &mut s.position),
                         Node::Any => Some(&mut m.any_state_position),
@@ -1164,7 +1374,7 @@ impl AnimControllerTab {
             let target = response.interact_pointer_pos().or(pointer).and_then(|p| self.node_at(rect, p));
             match target {
                 Some(Node::State(to)) if Some(Node::State(to)) != Some(from) || from == Node::Any => {
-                    let m = &mut self.ctrl.layers[self.layer].machine;
+                    let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
                     let to_name = m.states[to].name.clone();
                     match from {
                         Node::Entry => m.default_state = to_name,
@@ -1202,6 +1412,13 @@ impl AnimControllerTab {
         if released {
             self.dragging = None;
         }
+        if response.double_clicked_by(egui::PointerButton::Primary)
+            && self.linking.is_none()
+            && let Some(Node::State(i)) = hovered_node
+            && machine_of(&self.ctrl, self.layer, &self.sub).states.get(i).is_some_and(|s| s.is_sub_machine())
+        {
+            self.enter_sub(i);
+        }
         if response.secondary_clicked() {
             self.linking = None;
             if let Some(p) = response.interact_pointer_pos() {
@@ -1219,7 +1436,7 @@ impl AnimControllerTab {
                 ui.close();
                 return;
             };
-            let m = &self.ctrl.layers[self.layer].machine;
+            let m = machine_of(&self.ctrl, self.layer, &self.sub);
             if matches!(node, Some(Node::State(i)) if i >= m.states.len()) {
                 node = None;
             }
@@ -1228,18 +1445,23 @@ impl AnimControllerTab {
             }
             match (node, tr) {
                 (Some(n @ Node::State(i)), _) => {
+                    if m.states[i].is_sub_machine() && ui.button("Open Sub-State Machine").clicked() {
+                        self.enter_sub(i);
+                        ui.close();
+                        return;
+                    }
                     if ui.button("Make Transition").clicked() {
                         self.linking = Some(n);
                         ui.close();
                     }
-                    if ui.button("Set as Layer Default").clicked() {
-                        let m = &mut self.ctrl.layers[self.layer].machine;
+                    if ui.button(if self.sub.is_empty() { "Set as Layer Default" } else { "Set as Default" }).clicked() {
+                        let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
                         m.default_state = m.states[i].name.clone();
                         edited = true;
                         ui.close();
                     }
                     if ui.button("Duplicate").clicked() {
-                        let m = &mut self.ctrl.layers[self.layer].machine;
+                        let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
                         let mut copy = m.states[i].clone();
                         copy.name = m.unique_name(&copy.name);
                         copy.position[0] += 24.0;
@@ -1250,7 +1472,7 @@ impl AnimControllerTab {
                         ui.close();
                     }
                     if ui.button("Delete").clicked() {
-                        self.ctrl.layers[self.layer].machine.remove_state(i);
+                        machine_of_mut(&mut self.ctrl, self.layer, &self.sub).remove_state(i);
                         self.sel = Sel::None;
                         edited = true;
                         ui.close();
@@ -1265,7 +1487,7 @@ impl AnimControllerTab {
                 }
                 (None, Some(k)) => {
                     if ui.button("Delete Transition").clicked() {
-                        self.ctrl.layers[self.layer].machine.transitions.remove(k);
+                        machine_of_mut(&mut self.ctrl, self.layer, &self.sub).transitions.remove(k);
                         self.sel = Sel::None;
                         edited = true;
                         ui.close();
@@ -1276,7 +1498,7 @@ impl AnimControllerTab {
                         if ui.button(label).clicked() {
                             let params = &self.ctrl.parameters;
                             let float = params.iter().find(|p| p.kind == AnimParamKind::Float).map(|p| p.name.clone()).unwrap_or_default();
-                            let m = &mut self.ctrl.layers[self.layer].machine;
+                            let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
                             let name = m.unique_name(if tree { "Blend Tree" } else { "New State" });
                             let motion = if tree {
                                 Motion::BlendTree(BlendTree { name: name.clone(), parameter: float, ..Default::default() })
@@ -1292,6 +1514,22 @@ impl AnimControllerTab {
                             ui.close();
                         }
                     }
+                    if ui.button("Create Sub-State Machine").clicked() {
+                        let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
+                        let name = m.unique_name("Sub-State Machine");
+                        m.states.push(AnimState {
+                            name: name.clone(),
+                            position: [at.x, at.y],
+                            sub_machine: Some(Box::default()),
+                            ..Default::default()
+                        });
+                        if m.states.len() == 1 {
+                            m.default_state = name;
+                        }
+                        self.sel = Sel::Node(Node::State(m.states.len() - 1));
+                        edited = true;
+                        ui.close();
+                    }
                 }
             }
         });
@@ -1299,11 +1537,16 @@ impl AnimControllerTab {
         // Keyboard: Delete removes the selection, Escape cancels linking.
         if response.hovered() || response.has_focus() {
             let (del, esc) = ui.input(|i| (i.key_pressed(egui::Key::Delete), i.key_pressed(egui::Key::Escape)));
-            if esc {
-                self.linking = None;
+            if esc && !ui.ctx().wants_keyboard_input() {
+                if self.linking.is_some() {
+                    self.linking = None;
+                } else if self.sub.pop().is_some() {
+                    self.sel = Sel::None;
+                    self.frame_all();
+                }
             }
             if del && !ui.ctx().wants_keyboard_input() {
-                let m = &mut self.ctrl.layers[self.layer].machine;
+                let m = machine_of_mut(&mut self.ctrl, self.layer, &self.sub);
                 match self.sel {
                     Sel::Node(Node::State(i)) if i < m.states.len() => {
                         m.remove_state(i);
@@ -1322,7 +1565,7 @@ impl AnimControllerTab {
         let hint = if self.linking.is_some() {
             "Click a state to connect · Esc cancels"
         } else {
-            "Right-click: create · Shift-drag: transition · Scroll: zoom · Drag empty: pan"
+            "Right-click: create · Shift-drag: transition · Double-click sub-machine: open · Esc: up · Scroll: zoom · Drag empty: pan"
         };
         painter.text(
             rect.left_bottom() + Vec2::new(10.0, -8.0),

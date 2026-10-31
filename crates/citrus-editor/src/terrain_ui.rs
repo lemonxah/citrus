@@ -54,6 +54,10 @@ pub struct TerrainPaintTool {
     pub strength: f32,
     /// What Set height paints (and what "Flatten all" fills with), in metres.
     pub height: f32,
+    /// Paint texture-layer weights instead of sculpting heights.
+    pub texture_mode: bool,
+    /// Which RGBA layer texture painting writes (0..3).
+    pub texture_layer: u8,
     /// A stroke is in progress (one undo step).
     pub stroking: bool,
 }
@@ -68,6 +72,8 @@ impl Default for TerrainPaintTool {
             radius: 4.0,
             strength: 0.5,
             height: 0.0,
+            texture_mode: false,
+            texture_layer: 0,
             stroking: false,
         }
     }
@@ -142,6 +148,31 @@ fn note(ui: &mut Ui, text: &str) {
 /// The brush settings while sculpting, plus the Set-height controls.
 fn paint_panel(ui: &mut Ui, terrain: &mut Terrain, tool: &mut TerrainPaintTool) -> bool {
     let mut changed = false;
+    widgets::property_row(ui, "Mode", |ui| {
+        ui.horizontal(|ui| {
+            let sculpt = ui.selectable_label(!tool.texture_mode, "Sculpt");
+            if sculpt.clicked() {
+                tool.texture_mode = false;
+            }
+            let texture = ui.selectable_label(tool.texture_mode, "Texture");
+            if texture.clicked() {
+                tool.texture_mode = true;
+            }
+            changed |= sculpt.changed() || texture.changed();
+        });
+    });
+    ui.add_space(2.0);
+    if tool.texture_mode {
+        widgets::property_row(ui, "Layer", |ui| {
+            ui.horizontal(|ui| {
+                for (idx, label) in ["R", "G", "B", "A"].into_iter().enumerate() {
+                    changed |= ui
+                        .selectable_value(&mut tool.texture_layer, idx as u8, label)
+                        .changed();
+                }
+            });
+        });
+    } else {
     widgets::property_row(ui, "Brush", |ui| {
         egui::ComboBox::from_id_salt("citrus-terrain-brush")
             .width(ui.available_width())
@@ -152,6 +183,7 @@ fn paint_panel(ui: &mut Ui, terrain: &mut Terrain, tool: &mut TerrainPaintTool) 
                 }
             });
     });
+    }
     widgets::property_row(ui, "Radius", |ui| {
         changed |= ui
             .add(
@@ -183,7 +215,7 @@ fn paint_panel(ui: &mut Ui, terrain: &mut Terrain, tool: &mut TerrainPaintTool) 
                 }
             });
     });
-    if tool.mode == TerrainBrushMode::SetHeight {
+    if !tool.texture_mode && tool.mode == TerrainBrushMode::SetHeight {
         widgets::property_row(ui, "Height", |ui| {
             changed |= ui
                 .add(DragValue::new(&mut tool.height).speed(0.1).suffix(" m"))
@@ -199,9 +231,16 @@ fn paint_panel(ui: &mut Ui, terrain: &mut Terrain, tool: &mut TerrainPaintTool) 
             changed = true;
         }
     }
-    note(
-        ui,
-        "Drag to sculpt   Shift reverse   Alt smooth   [ ] or Ctrl+Scroll size   P / Esc done",
-    );
+    if tool.texture_mode {
+        note(
+            ui,
+            "Drag to paint texture layer weights   [ ] or Ctrl+Scroll size   P / Esc done",
+        );
+    } else {
+        note(
+            ui,
+            "Drag to sculpt   Shift reverse   Alt smooth   [ ] or Ctrl+Scroll size   P / Esc done",
+        );
+    }
     changed
 }

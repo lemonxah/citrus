@@ -56,6 +56,9 @@ pub struct SidecarStats {
     pub raw_bytes: u64,
     pub vram_bytes: u64,
     pub vram_format: Option<HdrTextureFormat>,
+    /// Mean relative RGB error of the stored data against the raw bake,
+    /// measured when it was compressed (None = not compressed / not measured).
+    pub error: Option<f32>,
 }
 
 impl SidecarStats {
@@ -72,6 +75,9 @@ impl SidecarStats {
             line += &format!(" (uncompressed {}, {:.1}x)", human_bytes(self.raw_bytes), self.raw_bytes as f64 / self.disk_bytes.max(1) as f64);
         }
         line += &format!(" · {} VRAM ({})", human_bytes(self.vram_bytes), fmt(self.vram_format));
+        if let Some(e) = self.error {
+            line += &format!(" · compression error {:.1}%", e * 100.0);
+        }
         line
     }
 }
@@ -111,6 +117,7 @@ pub fn measure(base: &Path, baked: Option<&crate::scene::BakedData>, refl: &Refl
         raw_bytes: info.raw_bytes(),
         vram_bytes: baked.map_or(0, |b| b.lightmap_vram_bytes()),
         vram_format: baked.map(|b| b.lightmap_format()),
+        error: None,
     });
     let reflections = crate::refl_slots::reflprobe_file_info(&base.with_extension("reflprobe")).ok().map(|info| {
         let mut formats: Vec<Option<HdrTextureFormat>> = info.cubes.iter().map(|c| c.0).collect();
@@ -124,6 +131,7 @@ pub fn measure(base: &Path, baked: Option<&crate::scene::BakedData>, refl: &Refl
             raw_bytes: info.raw_bytes(),
             vram_bytes: refl.vram_bytes(),
             vram_format: (vram.len() == 1).then(|| vram[0]),
+            error: None,
         }
     });
     BakeSizes { lightmaps, reflections }
@@ -178,6 +186,28 @@ fn set_progress(progress: &Mutex<TaskProgress>, done: f32, label: &str) {
 
 /// Worker: store a fresh bake's lightmaps (`maps` in layer order) as BC6H, or
 /// as v1 RGBA32F when `compress` is off or the task is cancelled (so a bake is
+/// Mean relative RGB error of compressed lightmap layers against the raw bake
+/// (|decoded - raw| / max(raw, 0.05), over each map's own texels).
+fn lightmap_error(maps: &[(u32, BakedLightmap)], array: &HdrTextureArray) -> Option<f32> {
+    let (mut sum, mut n) = (0.0f64, 0u64);
+    for ((_, map), layer) in maps.iter().zip(&array.layers) {
+        let decoded =
+            citrus_assets::hdr_codec::transcode_level(layer, array.format, HdrTextureFormat::Rgba32f, array.size, array.size, 1).ok()?;
+        let decoded: Vec<f32> = decoded.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        for y in 0..map.size as usize {
+            for x in 0..map.size as usize {
+                let raw = &map.pixels[(y * map.size as usize + x) * 4..][..3];
+                let got = &decoded[(y * array.size as usize + x) * 4..][..3];
+                for c in 0..3 {
+                    sum += ((got[c] - raw[c]).abs() / raw[c].abs().max(0.05)) as f64;
+                    n += 1;
+                }
+            }
+        }
+    }
+    (n > 0).then(|| (sum / n as f64) as f32)
+}
+
 /// never lost), and return the upload-ready array.
 pub fn save_lightmaps_job(
     serial: u64,
@@ -227,6 +257,7 @@ pub fn save_lightmaps_job(
     };
     set_progress(&progress, 1.0, label);
     let format = stored.format;
+    let stored_copy = stored.clone();
     let to = HdrFormatSupport::current().upload_format(format);
     let array = citrus_assets::hdr_codec::transcode_array(stored, to, threads).map_err(|e| format!("{e:#}"))?;
     let stats = SidecarStats {
@@ -236,6 +267,7 @@ pub fn save_lightmaps_job(
         raw_bytes: sizes.iter().map(|&s| s as u64 * s as u64 * 16).sum(),
         vram_bytes: array.byte_size(),
         vram_format: Some(array.format),
+        error: (format != HdrTextureFormat::Rgba32f).then(|| lightmap_error(&maps, &stored_copy)).flatten(),
     };
     tracing::info!("wrote {}: {}", path.display(), stats.describe("lightmaps"));
     Ok(TaskPayload::BakeSaved(Box::new(BakeSaved {
@@ -296,6 +328,7 @@ fn save_reflections(path: &Path, new: Vec<(u128, Faces)>, compress: bool, thread
         raw_bytes,
         vram_bytes: set.vram_bytes(),
         vram_format: (vram.len() == 1).then(|| vram[0]),
+        error: None,
     };
     tracing::info!("wrote {}: {}", path.display(), stats.describe("reflection probes"));
     Ok(ReflectionsSaved { path: path.to_owned(), seq, set, stats })
@@ -344,6 +377,7 @@ pub fn recompress_job(serial: u64, base: PathBuf, progress: Arc<Mutex<TaskProgre
                 raw_bytes,
                 vram_bytes: array.byte_size(),
                 vram_format: Some(array.format),
+                error: None,
             },
             array,
         });
@@ -370,6 +404,7 @@ mod tests {
             raw_bytes: 48 * 1024 * 1024,
             vram_bytes: 3 * 1024 * 1024,
             vram_format: Some(HdrTextureFormat::Bc6h),
+            error: None,
         };
         assert_eq!(
             s.describe("Lightmaps"),
@@ -419,5 +454,21 @@ mod tests {
         assert!(refl.set.cube(5).is_some());
         assert!(!measure(&base, None, &ReflProbeSet::default()).has_uncompressed());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compression_error_is_measured_against_the_raw_bake() {
+        let size = 16u32;
+        let pixels: Vec<f32> = (0..size * size).flat_map(|i| [0.2 + (i % size) as f32 * 0.1, 1.5, 0.05 * (i / size) as f32, 1.0]).collect();
+        let maps = vec![(3u32, BakedLightmap { size, pixels })];
+        let refs: Vec<&BakedLightmap> = maps.iter().map(|(_, m)| m).collect();
+        let cancel = AtomicBool::new(false);
+        let bc6h = citrus_assets::hdr_codec::encode_lightmaps(&refs, HdrTextureFormat::Bc6h, 1, &cancel, &|_| {}).unwrap();
+        let e = lightmap_error(&maps, &bc6h).unwrap();
+        assert!(e > 0.0 && e < 0.05, "BC6H error {e}");
+        let raw = citrus_assets::hdr_codec::encode_lightmaps(&refs, HdrTextureFormat::Rgba32f, 1, &cancel, &|_| {}).unwrap();
+        assert!(lightmap_error(&maps, &raw).unwrap() < 1e-6, "raw data has no error");
+        let stats = SidecarStats { count: 1, format: Some(HdrTextureFormat::Bc6h), disk_bytes: 1, raw_bytes: 16, vram_bytes: 1, vram_format: None, error: Some(e) };
+        assert!(stats.describe("Lightmaps").contains("compression error"));
     }
 }

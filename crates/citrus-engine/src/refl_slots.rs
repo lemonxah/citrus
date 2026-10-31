@@ -1,9 +1,8 @@
-//! Two-slot reflection probes. The renderer blends the two highest-priority
-//! probes around the camera per pixel (slot 0 = primary, binding 7; slot 1 =
-//! secondary, binding 9). This keeps each slot's cube matching its probe as the
-//! camera moves: baked probes upload their faces from the scene's
-//! `.reflprobe`, realtime probes (and baked ones without a cube yet) capture
-//! live, and two probes trading places swap slots instead of reloading.
+//! Reflection-probe slots. The renderer blends the highest-priority probes
+//! around the camera per pixel (slot 0 = binding 7, then bindings 9/11/12 for
+//! additional probes). This keeps each slot's cube matching its probe as the
+//! camera moves: baked probes upload their faces from the scene's `.reflprobe`,
+//! realtime probes (and baked ones without a cube yet) capture live.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -343,22 +342,15 @@ pub fn write_reflprobes(path: &Path, set: &ReflProbeSet) -> anyhow::Result<u64> 
     Ok(out.len() as u64)
 }
 
-/// Whether probe `a` wins over `b` where their boxes overlap: higher
-/// importance, then the smaller box.
-fn on_top(a: &ReflectionProbeBox, b: &ReflectionProbeBox) -> bool {
-    let volume = |p: &ReflectionProbeBox| p.half_extents.iter().product::<f32>();
-    (a.importance, -volume(a)) > (b.importance, -volume(b))
-}
-
 /// Which probe's cube each renderer slot holds.
 #[derive(Default)]
 pub struct ReflectionSlots {
     baked: ReflProbeSet,
-    held: [Option<u128>; 2],
+    held: [Option<u128>; citrus_render::MAX_REFLECTION_PROBES],
     /// Slot waiting for a live capture (realtime probe, or baked without a cube).
-    needs_capture: [bool; 2],
+    needs_capture: [bool; citrus_render::MAX_REFLECTION_PROBES],
     /// Slot's cube belongs to its probe (uploaded, or its capture finished).
-    ready: [bool; 2],
+    ready: [bool; citrus_render::MAX_REFLECTION_PROBES],
     /// Slot whose live capture is in flight.
     capturing: Option<usize>,
     /// Realtime refreshes alternate between the slots.
@@ -380,32 +372,24 @@ impl ReflectionSlots {
 
     /// Forget what the slots hold so the next `update` reloads / recaptures.
     pub fn reset(&mut self) {
-        self.held = [None; 2];
-        self.needs_capture = [false; 2];
-        self.ready = [false; 2];
+        self.held = [None; citrus_render::MAX_REFLECTION_PROBES];
+        self.needs_capture = [false; citrus_render::MAX_REFLECTION_PROBES];
+        self.ready = [false; citrus_render::MAX_REFLECTION_PROBES];
         self.capturing = None;
     }
 
     /// Per frame: fit the slots to `probes` (best first, from
-    /// `LoadedScene::active_reflection_probes`) and return the FrameInput
-    /// fields (slot 0 box, slot 1 box, primary slot). `allow_capture` is false
-    /// while a bake owns the capture.
+    /// `LoadedScene::active_reflection_probes`) and return the probe list for
+    /// `FrameInput::reflection_probes`. `allow_capture` is false while a bake
+    /// owns the capture.
     pub fn update(
         &mut self,
         renderer: &mut Renderer,
-        probes: [Option<ReflectionProbeBox>; 2],
+        probes: [Option<ReflectionProbeBox>; citrus_render::MAX_REFLECTION_PROBES],
         allow_capture: bool,
-    ) -> (Option<ReflectionProbeBox>, Option<ReflectionProbeBox>, u8) {
+    ) -> [Option<ReflectionProbeBox>; citrus_render::MAX_REFLECTION_PROBES] {
         let want = probes.map(|p| p.map(|p| p.id));
-        // The camera crossed from one probe's box into the other's: trade slots.
-        if want[0].is_some() && want[0] == self.held[1] && self.held[0] != want[0] {
-            renderer.swap_reflection_slots();
-            self.held.swap(0, 1);
-            self.ready.swap(0, 1);
-            self.needs_capture.swap(0, 1);
-            self.capturing = self.capturing.map(|s| 1 - s);
-        }
-        for s in 0..2 {
+        for s in 0..citrus_render::MAX_REFLECTION_PROBES {
             if want[s] == self.held[s] {
                 continue;
             }
@@ -443,10 +427,11 @@ impl ReflectionSlots {
         if allow_capture && self.capturing.is_none() && !renderer.reflection_capture_in_flight() {
             // A slot still waiting for its first cube goes first; then realtime
             // probes refresh, alternating so both track dynamic lighting.
-            let first = (0..2).find(|&s| self.needs_capture[s] && probes[s].is_some());
+            let first = (0..citrus_render::MAX_REFLECTION_PROBES)
+                .find(|&s| self.needs_capture[s] && probes[s].is_some());
             let refresh = || {
-                [self.next_refresh, 1 - self.next_refresh]
-                    .into_iter()
+                (0..citrus_render::MAX_REFLECTION_PROBES)
+                    .map(|i| (self.next_refresh + i) % citrus_render::MAX_REFLECTION_PROBES)
                     .find(|&s| probes[s].is_some_and(|p| p.realtime))
             };
             if let Some(s) = first.or_else(refresh) {
@@ -461,13 +446,16 @@ impl ReflectionSlots {
                 );
                 self.needs_capture[s] = false;
                 self.capturing = Some(s);
-                self.next_refresh = 1 - s;
+                self.next_refresh = (s + 1) % citrus_render::MAX_REFLECTION_PROBES;
             }
         }
-        // A secondary whose cube isn't its own yet would blend the wrong
-        // reflection in; leave it out until it is.
-        let second = probes[1].filter(|_| self.ready[1]);
-        (probes[0], second, second.map_or(0, |b| u8::from(probes[0].is_some_and(|a| on_top(&b, &a)))))
+        // Slot 0 is the fallback probe; extra slots are only used once their
+        // own cube is ready.
+        let mut out = probes;
+        for s in 1..citrus_render::MAX_REFLECTION_PROBES {
+            out[s] = out[s].filter(|_| self.ready[s]);
+        }
+        out
     }
 }
 

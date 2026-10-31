@@ -42,6 +42,9 @@ pub const PUNCH_RETRY: f64 = 20.0;
 const REGISTER_INTERVAL: f64 = 0.5;
 const REGISTER_GIVE_UP: f64 = 10.0;
 const KEEPALIVE: f64 = 5.0;
+/// A host keepalives faster: the relay hands its slot to a successor after
+/// a second of silence.
+const HOST_KEEPALIVE: f64 = 0.25;
 
 /// The virtual address standing for relay slot `slot`.
 pub fn virtual_addr(slot: u32) -> SocketAddr {
@@ -210,6 +213,9 @@ pub struct RelayClient {
     last_keepalive: f64,
     now: f64,
     cookie: Option<[u8; COOKIE_LEN]>,
+    /// The relay's sealing key (from its COOKIE): a host's join key goes to
+    /// the relay sealed to it, never in the clear.
+    relay_key: [u8; 32],
     /// The room's stretching parameters, from the relay's cookie (clients).
     room_kdf: Option<Vec<u8>>,
     join_key: Option<[u8; 32]>,
@@ -217,6 +223,10 @@ pub struct RelayClient {
     claim_nonce: u64,
     /// Taking over the host slot with this room owner seed.
     claiming: Option<[u8; 32]>,
+    /// Host: the ranked successor slots last handed to [`Self::set_successors`],
+    /// re-sent with each keepalive (UDP may drop one).
+    successors: Vec<u32>,
+    successors_dirty: bool,
 }
 
 impl RelayClient {
@@ -248,11 +258,14 @@ impl RelayClient {
             last_keepalive: 0.0,
             now: 0.0,
             cookie: None,
+            relay_key: [0; 32],
             room_kdf: None,
             join_key: None,
             host_auth: None,
             claim_nonce: 0,
             claiming: None,
+            successors: Vec::new(),
+            successors_dirty: false,
         }
     }
 
@@ -293,6 +306,15 @@ impl RelayClient {
         self.last_register = f64::NEG_INFINITY;
     }
 
+    /// Host: the session's migration order as relay slots, so the relay only
+    /// lets the best-ranked live member claim the room.
+    pub fn set_successors(&mut self, slots: Vec<u32>) {
+        if slots != self.successors {
+            self.successors = slots;
+            self.successors_dirty = true;
+        }
+    }
+
     pub fn is_host(&self) -> bool {
         matches!(self.role, RelayRole::Host { .. })
     }
@@ -324,7 +346,8 @@ impl RelayClient {
             (Some(c), true) => {
                 let h = self.host_auth.as_ref()?;
                 let token_proof = if h.token.is_empty() { [0; proto::PROOF_LEN] } else { proto::token_proof(&h.token, c, &self.code, self.nonce) };
-                RegisterAuth::Host { owner: proto::owner_public(&h.owner_seed), join_key: h.join_key, kdf: h.kdf.clone(), token_proof }
+                let sealed_join_key = proto::seal_join_key(&self.relay_key, c, &h.join_key);
+                RegisterAuth::Host { owner: proto::owner_public(&h.owner_seed), sealed_join_key, kdf: h.kdf.clone(), token_proof }
             }
             (Some(c), false) => RegisterAuth::Client { proof: proto::join_proof(&self.join_key?, c, &self.code, self.nonce) },
         };
@@ -385,9 +408,15 @@ impl RelayClient {
                         out.push((p, self.relay));
                     }
                 }
-                if now - self.last_keepalive >= KEEPALIVE {
+                let interval = if self.slot == Some(HOST_SLOT) { HOST_KEEPALIVE } else { KEEPALIVE };
+                let keepalive = now - self.last_keepalive >= interval;
+                if keepalive {
                     self.last_keepalive = now;
                     out.push((Packet::Keepalive { nonce: self.nonce }.encode(), self.relay));
+                }
+                if self.slot == Some(HOST_SLOT) && (self.successors_dirty || (keepalive && !self.successors.is_empty())) {
+                    self.successors_dirty = false;
+                    out.push((Packet::Successors { nonce: self.nonce, slots: self.successors.clone() }.encode(), self.relay));
                 }
             }
         }
@@ -414,9 +443,10 @@ impl RelayClient {
         let from_relay = src == self.relay;
         match Packet::decode(data)? {
             Packet::Data { slot, payload } if from_relay => return Some((payload, virtual_addr(slot))),
-            Packet::Cookie { cookie, kdf } if from_relay => {
-                let fresh = self.cookie != Some(cookie);
+            Packet::Cookie { cookie, kdf, relay_key } if from_relay => {
+                let fresh = self.cookie != Some(cookie) || self.relay_key != relay_key;
                 self.cookie = Some(cookie);
+                self.relay_key = relay_key;
                 if !kdf.is_empty() {
                     self.room_kdf = Some(kdf);
                 }
@@ -557,7 +587,7 @@ mod tests {
         out.clear();
         // The relay's cookie carries the room's stretching parameters; the
         // session derives the join key, then the proof goes out.
-        c.on_packet(&Packet::Cookie { cookie: [4; 16], kdf: vec![1, 2, 3] }.encode(), relay, &mut out);
+        c.on_packet(&Packet::Cookie { cookie: [4; 16], kdf: vec![1, 2, 3], relay_key: [0; 32] }.encode(), relay, &mut out);
         assert!(out.is_empty(), "no proof without the key");
         assert_eq!(c.needs_join_key(), Some(vec![1, 2, 3]));
         c.set_join_key([9; 32]);

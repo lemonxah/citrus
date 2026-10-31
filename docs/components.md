@@ -393,6 +393,22 @@ interruptible). Any State transitions are checked first. Extra layers blend
 over the base layer (Override with a weight, or Additive over the rest pose)
 and can be masked to bones or child paths (each with its children).
 
+**Sub-state machines** group states: right-click the canvas -> Create Sub-State
+Machine, then double-click it (or Open in the inspector) to edit its own states,
+Entry default, Any State and transitions; the path above the graph (or Esc)
+goes back up. At the parent level it is connected like any state: a transition
+into it enters its default state (recursively), and a transition from it leaves
+from whichever inner state is playing (exit time is that state's). A
+sub-machine's Any State only applies to states inside it. Parameters are
+shared by every level. Transitions inside a sub-machine name only its own
+states, so renames and deletes stay consistent per level. At runtime inner
+states are named by path, `Outer/Inner` (`Locomotion/Walk`, or
+`Combat/Attack/Heavy` two levels down): use that name with `play_animator_state`,
+`is_in_state`, and in `animator_state` / `AnimatorStateChanged`. Checked in
+order for a playing inner state: the top-level Any State, then outer levels'
+transitions before inner ones, then the sub-machine's Any State before the
+state's own. State names cannot contain `/`.
+
 ```rust
 ctx.set_animator_float(self.body, "Speed", speed);
 ctx.set_animator_bool(self.body, "Grounded", ctx.is_grounded());
@@ -701,7 +717,7 @@ in `citrus-core`; their inspectors/gizmos in `citrus-editor`.
 | `Voice Chat` | Scene voice settings: proximity / global, falloff, voice activity / push to talk, Opus bitrate |
 | `Humanoid IK` | Full-body tracking IK for a humanoid model: local trackers, a remote player's replicated trackers or scene objects; planted feet with procedural steps |
 | `Mesh Cloth`, `Wind Zone` | Simulates a skinned garment mesh; wind for cloth and water |
-| `Water`, `Buoyancy` | A body of water (Gerstner waves, wind seas, depth, current, look). Every Rigid Body floats by its density; `Buoyancy` optionally overrides the lift and sample points (`ctx.water_surface(p)`) |
+| `Water`, `Buoyancy` | A body of water (Gerstner waves, wind seas, depth, current, look). Waves calm over shallows near a shore: water shallower than `Shore calm depth` (default 2 m, 0 = off) over the static ground under it, baked automatically and rebaked when the ground or the water changes. Every Rigid Body floats by its density; `Buoyancy` optionally overrides the lift and sample points (`ctx.water_surface(p)`) |
 | `Wave Rider` | Rides the waves without a physics body: Float (sits on the surface at its draft) or Suspended (keeps its depth, orbital motion fading with depth); size, weight and tilt shape the response, steep waves push light things along. Deterministic from the anchor and the shared water clock, so networked clients agree; read `state.on_surface`, `state.depth`, `state.surface` |
 | `Waterfall`, `Whirlpool` | A sheet of water poured off a lip (drag the lip and speed handles) that lands in spray, mist, foam and a swirling plunge pool; a standalone swirl that carries floating bodies and foam |
 | `Bone Cloth`, `Cloth Colliders` | Secondary motion for joint chains (hair, skirts, tails) and the joint-following spheres / tapered capsules / planes it collides with, with capsule auto-fit |

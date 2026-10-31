@@ -5,8 +5,9 @@
 //! fields, material sliders, drag & drop assignment) is captured without
 //! per-widget bookkeeping. Continuous gestures coalesce into single entries.
 //!
-//! Deliberately NOT undoable (user decision): object deletion (when it
-//! exists).
+//! Structural edits (delete, group, reorder, re-parent) shift object indices,
+//! so they're recorded as whole object-list snapshots instead
+//! ([`UndoEntry::Structure`]).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -56,6 +57,16 @@ pub enum UndoEntry {
         before: Box<MaterialModel>,
         after: Box<MaterialModel>,
     },
+    /// An Environment tab edit (sun, ambient, fog, sky, bake settings...).
+    Environment {
+        before: Box<citrus_assets::WorldEnvironment>,
+        after: Box<citrus_assets::WorldEnvironment>,
+    },
+    /// A structural edit: the whole object list before and after.
+    Structure {
+        before: Box<crate::scene::ObjectsSnapshot>,
+        after: Box<crate::scene::ObjectsSnapshot>,
+    },
     /// One atomic multi-object edit (a multi-select gesture): all sub-entries are
     /// undone/redone together as a single history step, and coalesce as a unit so a
     /// continuous multi-object drag is ONE entry, not hundreds of interleaved ones.
@@ -68,6 +79,7 @@ impl UndoEntry {
         match (self, other) {
             (UndoEntry::Object { index: a, .. }, UndoEntry::Object { index: b, .. }) => a == b,
             (UndoEntry::Material { index: a, .. }, UndoEntry::Material { index: b, .. }) => a == b,
+            (UndoEntry::Environment { .. }, UndoEntry::Environment { .. }) => true,
             (UndoEntry::FileMaterial { path: a, .. }, UndoEntry::FileMaterial { path: b, .. }) => {
                 a == b
             }
@@ -87,6 +99,9 @@ impl UndoEntry {
                 *after = new;
             }
             (UndoEntry::Material { after, .. }, UndoEntry::Material { after: new, .. }) => {
+                *after = new;
+            }
+            (UndoEntry::Environment { after, .. }, UndoEntry::Environment { after: new, .. }) => {
                 *after = new;
             }
             (UndoEntry::FileMaterial { after, .. }, UndoEntry::FileMaterial { after: new, .. }) => {
@@ -184,6 +199,58 @@ impl UndoStack {
     }
 }
 
+/// Undo history of one document a tab edits on its own (an animation clip,
+/// an animator controller): snapshots of the document before each change.
+/// A drag (pointer held) is one step.
+pub struct DocHistory<T> {
+    undo: Vec<T>,
+    redo: Vec<T>,
+    /// A held gesture already pushed its starting state.
+    open: bool,
+}
+
+impl<T> Default for DocHistory<T> {
+    fn default() -> Self {
+        Self { undo: Vec::new(), redo: Vec::new(), open: false }
+    }
+}
+
+impl<T: Clone + PartialEq> DocHistory<T> {
+    /// After a frame: `before` is the document as the frame began, `now` as
+    /// it ended; `gesture` while the pointer is held.
+    pub fn observe(&mut self, before: T, now: &T, gesture: bool) {
+        if before == *now {
+            self.open &= gesture;
+            return;
+        }
+        if !(gesture && self.open) {
+            self.undo.push(before);
+            if self.undo.len() > 128 {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
+        self.open = gesture;
+    }
+
+    /// Step back (`undo`) or forward through the history. False when there
+    /// is nothing to step to.
+    pub fn step(&mut self, doc: &mut T, undo: bool) -> bool {
+        let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
+        let Some(state) = from.pop() else { return false };
+        to.push(std::mem::replace(doc, state));
+        self.open = false;
+        true
+    }
+
+    /// Another document was opened.
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.open = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +306,40 @@ mod tests {
         stack.pop_undo();
         assert!(!stack.can_undo());
         assert!(after_of(&stack.pop_redo().unwrap()).contains("\"b\""));
+    }
+
+    #[test]
+    fn structural_edits_are_single_steps_that_never_merge() {
+        let mut stack = UndoStack::default();
+        let snap = || Box::new(crate::scene::LoadedScene::empty().snapshot_objects());
+        stack.record(UndoEntry::Structure { before: snap(), after: snap() }, true);
+        stack.record(UndoEntry::Structure { before: snap(), after: snap() }, true);
+        assert!(matches!(stack.pop_undo(), Some(UndoEntry::Structure { .. })));
+        assert!(matches!(stack.pop_undo(), Some(UndoEntry::Structure { .. })), "two edits, two steps");
+        assert!(!stack.can_undo() && stack.can_redo());
+    }
+
+    #[test]
+    fn doc_history_steps_back_and_forth_and_a_drag_is_one_step() {
+        let mut h = DocHistory::default();
+        let mut doc = 0;
+        // A drag: 0 -> 1 -> 2 -> 3 with the pointer held.
+        for v in 1..=3 {
+            let before = doc;
+            doc = v;
+            h.observe(before, &doc, true);
+        }
+        h.observe(doc, &doc, false);
+        // A separate click: 3 -> 10.
+        let before = doc;
+        doc = 10;
+        h.observe(before, &doc, false);
+        assert!(h.step(&mut doc, true));
+        assert_eq!(doc, 3);
+        assert!(h.step(&mut doc, true));
+        assert_eq!(doc, 0, "the whole drag was one step");
+        assert!(!h.step(&mut doc, true));
+        assert!(h.step(&mut doc, false));
+        assert_eq!(doc, 3);
     }
 }

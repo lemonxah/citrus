@@ -1249,8 +1249,8 @@ mod tests {
                     target: "Arm".into(),
                     property: TrackProperty::Translation,
                     keys: vec![
-                        Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Linear },
-                        Keyframe { time: 1.0, value: [0.0, 6.0, 0.0, 0.0], interp: KeyInterp::Linear },
+                        Keyframe { time: 0.0, value: [0.0; 4], interp: KeyInterp::Linear, ..Default::default() },
+                        Keyframe { time: 1.0, value: [0.0, 6.0, 0.0, 0.0], interp: KeyInterp::Linear, ..Default::default() },
                     ],
                 }],
                 ..Default::default()

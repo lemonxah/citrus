@@ -19,6 +19,23 @@ layout(constant_id = 4) const bool FEAT_WATER = false;
 // Water: the interactive ripple field (r height, gb gradient), material slot
 // 15, with mips for reading it band-limited.
 layout(set = 1, binding = 16) uniform sampler2D t_water_ripple;
+// Water: the depth of water over the ground (r, metres), baked over the
+// body's local XZ -extra.zw..extra.zw; material slot 14.
+layout(set = 1, binding = 15) uniform sampler2D t_water_shore;
+
+// Share of the waves left at local `xz`: they calm over water shallower
+// than the body's shore depth (citrus_core::Water::shore_damping).
+float water_shore(int slot, vec2 xz) {
+    vec4 e = frame.water_bodies[slot].extra;
+    if (e.y <= 0.0 || e.z <= 0.0) {
+        return 1.0;
+    }
+    vec2 uv = xz / (2.0 * e.zw) + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        return 1.0;
+    }
+    return smoothstep(0.0, e.y, textureLod(t_water_shore, uv, 0.0).r);
+}
 
 // Per-instance model matrix (instance-rate vertex stream), so draws of one
 // mesh + material batch into a single instanced draw (pc.model is unused).
@@ -41,12 +58,17 @@ layout(location = 2) out vec2 v_uv;
 layout(location = 3) out vec4 v_color;
 layout(location = 4) out vec4 v_tangent;
 layout(location = 5) out vec2 v_uv1;
+// Baked-lightmap layer (-1 = none): the instance's own when it carries one
+// (GPU-culled batches pack layer + 1 into the model matrix's col0.w, so
+// lightmapped statics share a batch), else the draw's push lane.
+layout(location = 6) flat out float v_lightmap;
 // Bit-identical positions in the depth prepass and the main pass (the main
 // pass depth-tests EQUAL against the prepass).
 invariant gl_Position;
 
 void main() {
-    mat4 model = mat4(a_model0, a_model1, a_model2, a_model3);
+    mat4 model = mat4(vec4(a_model0.xyz, 0.0), a_model1, a_model2, a_model3);
+    v_lightmap = a_model0.w > 0.5 ? a_model0.w - 1.0 : pc.params1.w;
     vec3 position = a_position;
     vec3 normal = a_normal;
     vec4 tangent = a_tangent;
@@ -67,6 +89,10 @@ void main() {
         float crest;
         float lost;
         water_waves(slot, water_rest, frame.water.x, spacing, d, normal, crest, lost);
+        // Waves calm over the shallows near a shore (a_color.a out).
+        float shoal = water_shore(slot, water_rest);
+        d *= shoal;
+        normal = normalize(mix(vec3(0.0, 1.0, 0.0), normal, shoal));
         vec2 ruv = water_ripple_uv(slot, water_rest);
         float rfade = water_ripple_fade(ruv);
         if (rfade > 0.0) {
@@ -80,7 +106,7 @@ void main() {
         tangent = vec4(normalize(vec3(normal.y, -normal.x, 0.0)), 1.0);
         uv1 = vec2(d.y, spacing);
         vec3 flow = mat3(model) * vec3(a_color.r - 0.5, 0.0, a_color.g - 0.5) * 10.0;
-        color = vec4(flow.xz, a_color.b, 1.0);
+        color = vec4(flow.xz, a_color.b, shoal);
     }
     vec4 world = model * vec4(position, 1.0);
     v_world_pos = world.xyz;

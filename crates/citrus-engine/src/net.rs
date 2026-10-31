@@ -86,6 +86,10 @@ const HELLO_INTERVAL: f64 = 0.25;
 pub const HELLO_SIZE: usize = 128;
 /// How long an unauthenticated REJECT may stand before the client believes it.
 const REJECT_GRACE: f64 = 2.0;
+/// A JOIN unanswered this long moves on to the next spare CHALLENGE.
+const JOIN_PATIENCE: f64 = 1.0;
+/// Most other CHALLENGEs a client keeps while its JOIN is pending.
+const MAX_SPARE_CHALLENGES: usize = 4;
 /// Handshake cookies rotate this often (the previous one is accepted too).
 const COOKIE_PERIOD: f64 = 30.0;
 /// Accepted joins that haven't confirmed their key yet.
@@ -196,6 +200,8 @@ pub trait Transport {
     fn set_relay_join_key(&mut self, _key: [u8; 32]) {}
     /// Host migration: take over the room's host slot.
     fn relay_claim_host(&mut self, _owner_seed: [u8; 32]) {}
+    /// Host: the migration order as relay slots (see [`RelayClient::set_successors`]).
+    fn relay_set_successors(&mut self, _slots: Vec<u32>) {}
     /// Start using a relay mid-session (migration fallback). False when
     /// this transport can't.
     fn attach_relay(&mut self, _relay: SocketAddr, _role: RelayRole, _punch: bool) -> bool {
@@ -321,6 +327,11 @@ impl Transport for UdpTransport {
     fn relay_claim_host(&mut self, owner_seed: [u8; 32]) {
         if let Some(r) = self.relay.as_mut() {
             r.claim_host(owner_seed);
+        }
+    }
+    fn relay_set_successors(&mut self, slots: Vec<u32>) {
+        if let Some(r) = self.relay.as_mut() {
+            r.set_successors(slots);
         }
     }
     fn attach_relay(&mut self, relay: SocketAddr, role: RelayRole, punch: bool) -> bool {
@@ -494,6 +505,19 @@ pub struct NetConfig {
     /// Client: remember the host's identity per address / room code (trust
     /// on first use) and refuse a different one later.
     pub pin_host: bool,
+    /// Optional account name to log in as (empty = no account login).
+    pub account_name: String,
+    /// Password for `account_name` (sealed in JOIN).
+    pub account_password: String,
+    /// Host account list. Empty keeps identity+secret-only auth.
+    pub accounts: Vec<NetAccount>,
+}
+
+/// One host-side login accepted by [`NetConfig::accounts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetAccount {
+    pub name: String,
+    pub password: String,
 }
 
 impl Default for NetConfig {
@@ -519,6 +543,9 @@ impl Default for NetConfig {
             allow: Vec::new(),
             ban: Vec::new(),
             pin_host: false,
+            account_name: std::env::var("CITRUS_ACCOUNT").unwrap_or_default(),
+            account_password: std::env::var("CITRUS_PASSWORD").unwrap_or_default(),
+            accounts: parse_accounts(&std::env::var("CITRUS_ACCOUNTS").unwrap_or_default()),
         }
     }
 }
@@ -547,6 +574,9 @@ impl NetConfig {
         self.pin_host = m.pin_host;
         self.allow = m.allow_list.clone();
         self.ban = m.ban_list.clone();
+        if !m.account_list.is_empty() {
+            self.accounts = parse_accounts(&m.account_list.join("\n"));
+        }
         self
     }
 }
@@ -585,6 +615,28 @@ pub fn parse_relay(addr: &str) -> std::io::Result<SocketAddr> {
     } else {
         parse_addr(&format!("{addr}:{}", relay_proto::DEFAULT_PORT))
     }
+}
+
+fn parse_accounts(spec: &str) -> Vec<NetAccount> {
+    let mut out = Vec::new();
+    for entry in spec.split(['\n', ';', ',']) {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        let Some((name, password)) = e.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(NetAccount {
+            name: name.to_string(),
+            password: password.trim().to_string(),
+        });
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -824,6 +876,8 @@ struct Conn {
     view_delay: f32,
     /// Host: the client's verified player id and handshake transcript.
     identity: [u8; 32],
+    /// Account login used for this connection (empty = none).
+    account: String,
     transcript: [u8; 32],
     /// Host: the client has sent a sealed packet since its JOIN (until then
     /// it is a half-open join, not yet a member).
@@ -855,6 +909,7 @@ impl Conn {
             frag: Vec::new(),
             acks: Vec::new(),
             identity: [0; 32],
+            account: String::new(),
             transcript: [0; 32],
             confirmed: true,
             created: now,
@@ -938,7 +993,13 @@ struct Handshake {
     /// knows it by.
     expect: Option<(u64, Option<[u8; 32]>)>,
     challenge: Option<Challenge>,
+    /// Other answers to our HELLO, tried in turn when the chosen one's JOIN
+    /// gets no WELCOME: an on-path attacker can race a forged CHALLENGE
+    /// ahead of the host's, which would otherwise stall the join.
+    spare: Vec<(Challenge, SocketAddr)>,
     join: Option<Vec<u8>>,
+    /// When the JOIN was sealed.
+    join_sent: f64,
     sec: Option<SecureChannel>,
     /// An unauthenticated rejection (believed only if nothing better arrives).
     hint: Option<(String, f64)>,
@@ -1054,6 +1115,9 @@ pub struct NetSession {
     anchor_wait: HashMap<u128, f64>,
     /// Owner: prediction history of each predicted object.
     pub predictors: HashMap<u128, Predictor>,
+    /// Host: display offset of each remote predicted object, so it glides
+    /// while its owner's inputs arrive in bursts.
+    pub host_smoothing: HashMap<u128, Vec3>,
     /// Snapshot arrival jitter per origin peer.
     pub jitter: HashMap<u64, JitterMeter>,
     /// Per-object adaptive interpolation delay.
@@ -1221,6 +1285,7 @@ impl NetSession {
             anchors: HashMap::new(),
             anchor_wait: HashMap::new(),
             predictors: HashMap::new(),
+            host_smoothing: HashMap::new(),
             jitter: HashMap::new(),
             delays: HashMap::new(),
             view_delay: 0.0,
@@ -1643,7 +1708,9 @@ impl NetSession {
             last_hello: f64::NEG_INFINITY,
             expect,
             challenge: None,
+            spare: Vec::new(),
             join: None,
+            join_sent: 0.0,
             sec: None,
             hint: None,
         });
@@ -1686,7 +1753,7 @@ impl NetSession {
         let Some(hs) = self.hs.as_ref() else {
             return;
         };
-        if !hs.addrs.contains(&src) || hs.challenge.is_some() {
+        if !hs.addrs.contains(&src) {
             return;
         }
         let Some(ch) = parse_challenge(data, &hs.nonce) else {
@@ -1704,6 +1771,16 @@ impl NetSession {
             return;
         }
         if let Some(hs) = self.hs.as_mut() {
+            if hs.challenge.is_some() {
+                let seen = hs.challenge.iter().chain(hs.spare.iter().map(|(c, _)| c)).any(|c| c.transcript == ch.transcript);
+                if !seen {
+                    if hs.spare.len() == MAX_SPARE_CHALLENGES {
+                        hs.spare.remove(0);
+                    }
+                    hs.spare.push((ch, src));
+                }
+                return;
+            }
             hs.addr = Some(src);
             hs.challenge = Some(ch);
         }
@@ -1735,12 +1812,16 @@ impl NetSession {
         plain.extend_from_slice(&self.cfg.identity.sign(&join_message(&ch.transcript, rejoin)));
         put_u64(&mut plain, rejoin);
         put_u32(&mut plain, self.epoch);
+        put_str(&mut plain, &self.cfg.account_name);
+        put_str(&mut plain, &self.cfg.account_password);
         let join = sec.seal_at(&header, 0, &plain);
         sec.skip_to(1);
         self.kdf = ch.kdf;
+        let now = self.now();
         if let Some(hs) = self.hs.as_mut() {
             hs.sec = Some(sec);
             hs.join = Some(join);
+            hs.join_sent = now;
         }
         self.send_hello();
     }
@@ -1914,6 +1995,18 @@ impl NetSession {
                     }
                 }
             }
+        }
+        if let Some(hs) = self.hs.as_mut()
+            && hs.join.is_some()
+            && !hs.spare.is_empty()
+            && now - hs.join_sent > JOIN_PATIENCE
+        {
+            let (ch, addr) = hs.spare.remove(0);
+            tracing::debug!("net: no WELCOME for the chosen CHALLENGE; trying another answer");
+            hs.challenge = Some(ch);
+            hs.addr = Some(addr);
+            hs.join = None;
+            hs.sec = None;
         }
         let Some(hs) = self.hs.as_ref() else {
             return;
@@ -2535,6 +2628,8 @@ impl NetSession {
         let sig: [u8; 64] = c.arr();
         let rejoin = c.u64();
         let _their_epoch = c.u32();
+        let account_name = if c.p < plain.len() { c.string() } else { String::new() };
+        let account_password = if c.p < plain.len() { c.string() } else { String::new() };
         if c.bad || proto != PROTOCOL {
             sealed_reject(self, &mut sec, &format!("protocol version mismatch (host {PROTOCOL}, you {proto})"));
             return;
@@ -2553,6 +2648,24 @@ impl NetSession {
         if !self.cfg.allow.is_empty() && !self.cfg.allow.iter().any(|a| crate::net_identity::fingerprint_matches(a, &fp)) {
             sealed_reject(self, &mut sec, "not on this session's allow list");
             return;
+        }
+        if !self.cfg.accounts.is_empty() {
+            if account_name.trim().is_empty() {
+                sealed_reject(self, &mut sec, "account login required");
+                return;
+            }
+            let Some(acc) = self.cfg.accounts.iter().find(|a| a.name == account_name) else {
+                sealed_reject(self, &mut sec, "unknown account");
+                return;
+            };
+            if acc.password != account_password {
+                sealed_reject(self, &mut sec, "wrong account password");
+                return;
+            }
+            if self.conns.values().any(|c| c.account == account_name && c.confirmed) {
+                sealed_reject(self, &mut sec, "account already in use");
+                return;
+            }
         }
         let rejoined = rejoin != 0 && self.reconnecting.contains_key(&rejoin) && self.peer_ids.get(&rejoin) == Some(&pk);
         if !rejoined && self.peers.len() as u32 >= self.cfg.max_players {
@@ -2575,6 +2688,7 @@ impl NetSession {
         conn.sec = Some(sec);
         conn.client_nonce = nonce;
         conn.identity = pk;
+        conn.account = account_name;
         conn.transcript = transcript;
         conn.confirmed = false;
         conn.rejoined = rejoined;
@@ -2826,6 +2940,12 @@ impl NetSession {
 
     fn current_succession(&mut self) -> Succession {
         self.succession_version += 1;
+        let slots = self
+            .successors()
+            .iter()
+            .filter_map(|s| self.conns.get(&s.peer).and_then(|c| crate::net_relay::slot_of(c.addr)))
+            .collect();
+        self.transport.relay_set_successors(slots);
         let (relay, room) = match (self.room_key, self.transport.relay_status()) {
             (Some(_), Some(r)) if r.phase == RelayPhase::Registered => (self.relay_addr.clone(), r.code),
             _ => (String::new(), String::new()),
@@ -5272,7 +5392,17 @@ mod tests {
     const DT: f64 = 1.0 / 60.0;
 
     fn cfg(name: &str) -> NetConfig {
-        NetConfig { player_name: name.to_string(), discovery: false, secret: String::new(), relay: String::new(), punch: true, ..Default::default() }
+        NetConfig {
+            player_name: name.to_string(),
+            discovery: false,
+            secret: String::new(),
+            relay: String::new(),
+            punch: true,
+            account_name: String::new(),
+            account_password: String::new(),
+            accounts: Vec::new(),
+            ..Default::default()
+        }
     }
 
     fn host(hub: &MemHub) -> NetSession {
@@ -5340,6 +5470,65 @@ mod tests {
         step(&mut [&mut h, &mut a, &mut b], 10);
         assert!(a.is_connected());
         assert!(matches!(b.state(), ConnState::Disconnected(r) if r.contains("full")));
+    }
+
+    #[test]
+    fn host_accounts_require_valid_login() {
+        let hub = MemHub::new();
+        let mut host_cfg = cfg("Host");
+        host_cfg.accounts = vec![
+            NetAccount {
+                name: "ann".into(),
+                password: "pw1".into(),
+            },
+            NetAccount {
+                name: "bob".into(),
+                password: "pw2".into(),
+            },
+        ];
+        let mut h = NetSession::host_on(Box::new(hub.endpoint()), host_cfg);
+        h.use_manual_clock();
+
+        let mut missing = NetSession::join_on(Box::new(hub.endpoint()), h.local_addr().unwrap(), cfg("Missing"));
+        missing.use_manual_clock();
+        step(&mut [&mut h, &mut missing], 10);
+        assert!(matches!(missing.state(), ConnState::Disconnected(r) if r.contains("account login required")));
+
+        let mut wrong_cfg = cfg("Wrong");
+        wrong_cfg.account_name = "ann".into();
+        wrong_cfg.account_password = "nope".into();
+        let mut wrong = NetSession::join_on(Box::new(hub.endpoint()), h.local_addr().unwrap(), wrong_cfg);
+        wrong.use_manual_clock();
+        step(&mut [&mut h, &mut wrong], 10);
+        assert!(matches!(wrong.state(), ConnState::Disconnected(r) if r.contains("wrong account password")));
+
+        let mut ok_cfg = cfg("Ann");
+        ok_cfg.account_name = "ann".into();
+        ok_cfg.account_password = "pw1".into();
+        let mut ann = NetSession::join_on(Box::new(hub.endpoint()), h.local_addr().unwrap(), ok_cfg);
+        ann.use_manual_clock();
+        step(&mut [&mut h, &mut ann], 10);
+        assert!(ann.is_connected());
+
+        let mut reused_cfg = cfg("Ann2");
+        reused_cfg.account_name = "ann".into();
+        reused_cfg.account_password = "pw1".into();
+        let mut ann2 = NetSession::join_on(Box::new(hub.endpoint()), h.local_addr().unwrap(), reused_cfg);
+        ann2.use_manual_clock();
+        step(&mut [&mut h, &mut ann, &mut ann2], 12);
+        assert!(matches!(ann2.state(), ConnState::Disconnected(r) if r.contains("already in use")));
+    }
+
+    #[test]
+    fn network_manager_account_list_populates_host_accounts() {
+        let mut mgr = NetworkManager::default();
+        mgr.account_list = vec!["ann:pw1".into(), "bob:pw2".into()];
+        let cfg = NetConfig::from_manager(&mgr);
+        assert_eq!(cfg.accounts.len(), 2);
+        assert_eq!(cfg.accounts[0].name, "ann");
+        assert_eq!(cfg.accounts[0].password, "pw1");
+        assert_eq!(cfg.accounts[1].name, "bob");
+        assert_eq!(cfg.accounts[1].password, "pw2");
     }
 
     #[test]
@@ -6084,6 +6273,23 @@ mod tests {
         assert!(matches!(a.state(), ConnState::Disconnected(r) if r.contains("kicked by the host: bye")), "{:?}", a.state());
         assert!(a.migration_status().is_none(), "a kicked client doesn't look for a new host");
         assert!(b.is_connected() && h.peer_count() == 2);
+    }
+
+    /// An on-path attacker that races a forged CHALLENGE (a cookie the host
+    /// never issued) ahead of the host's only delays the join: the client
+    /// keeps the host's own CHALLENGE and joins with it.
+    #[test]
+    fn a_raced_forged_challenge_does_not_stall_the_join() {
+        let hub = MemHub::new();
+        hub.set_latency(0.05, 0.0);
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let forged = h.challenge_bytes(&[9u8; 16]);
+        hub.inject(ha, a.local_addr().unwrap(), &forged);
+        mstep(&hub, &mut [&mut h, &mut a], 0, 150);
+        assert!(a.is_connected(), "joined despite the forgery: {:?}", a.state());
+        assert_eq!(h.peer_count(), 2);
     }
 
     /// Passphrases go through Argon2id with the host's parameters (carried
