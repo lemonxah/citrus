@@ -894,6 +894,9 @@ impl ComponentRegistry {
         registry.register::<SphereCollider>();
         registry.register::<CapsuleCollider>();
         registry.register::<MeshCollider>();
+        registry.register::<Terrain>();
+        registry.register::<BoneAttach>();
+        registry.register::<WeaponHold>();
         registry.register::<Spin>();
         registry.register::<Bob>();
         registry.register::<LodComponent>();
@@ -2083,6 +2086,180 @@ impl Default for MeshCollider {
 
 impl TypedComponent for MeshCollider {
     const NAME: &'static str = "Mesh Collider";
+}
+
+/// Heightfield terrain: a square, procedurally tessellated mesh whose vertex
+/// heights come from a `(resolution + 1)²` grid. The engine builds the render
+/// mesh and (optionally) a heightfield collider from this in Play; the
+/// component itself stores only data, so it serializes cleanly.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Terrain {
+    /// World-space X/Z extent of the square, in meters.
+    pub size: f32,
+    /// Quads per side; the height grid has `(resolution + 1)²` entries.
+    pub resolution: u32,
+    /// Vertex heights in meters, row-major over Z then X
+    /// (`heights[z * (resolution + 1) + x]`), length `(resolution + 1)²`.
+    pub heights: Vec<f32>,
+    /// Project-relative `.material` path ("" = project default).
+    pub material: String,
+    /// Build a heightfield collider from `heights` so physics walks on it.
+    pub collider: bool,
+}
+
+impl Default for Terrain {
+    fn default() -> Self {
+        let resolution = 32;
+        Self {
+            size: 100.0,
+            resolution,
+            heights: vec![0.0; (resolution as usize + 1).pow(2)],
+            material: String::new(),
+            collider: true,
+        }
+    }
+}
+
+impl TypedComponent for Terrain {
+    const NAME: &'static str = "Terrain";
+}
+
+/// Places this object on a bone of an animated model every frame (a weapon in
+/// a hand). `avatar` is the model or any ancestor of it: the first enabled
+/// animated model under it with a joint named `bone` is used, so a switchable
+/// avatar keeps the attachment.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BoneAttach {
+    pub avatar: ObjectRef,
+    pub bone: String,
+    /// Offset in the bone's space, in meters.
+    pub position: [f32; 3],
+    /// Offset rotation in the bone's space (XYZ Euler, degrees).
+    pub rotation: [f32; 3],
+}
+
+impl Default for BoneAttach {
+    fn default() -> Self {
+        Self { avatar: ObjectRef::NONE, bone: "hand_r".into(), position: [0.0; 3], rotation: [0.0; 3] }
+    }
+}
+
+impl TypedComponent for BoneAttach {
+    const NAME: &'static str = "Bone Attach";
+}
+
+/// Which stored pose of a [`WeaponHold`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WeaponPoseSlot {
+    #[default]
+    Idle,
+    Aim,
+}
+
+/// What a [`WeaponPose`] is relative to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WeaponFollow {
+    /// The anchor bone: sways with the torso (idle breathing, run bob).
+    #[default]
+    Bone,
+    /// The avatar model: moves and turns with the player, no animation sway.
+    Avatar,
+    /// The world: stays put like a wall or a ledge; the hands reach for it.
+    World,
+}
+
+/// A weapon placement for a [`WeaponHold`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WeaponPose {
+    /// Meters, in the `follow` frame.
+    pub position: [f32; 3],
+    /// XYZ Euler, degrees, in the `follow` frame.
+    pub rotation: [f32; 3],
+    pub follow: WeaponFollow,
+}
+
+/// Editor request for a [`WeaponHold`], handled by the engine next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeaponPoseRequest {
+    /// Put the weapon at the pose being edited.
+    Load,
+    /// Save where the weapon is now as the pose being edited.
+    Store,
+}
+
+/// Holds this object (a weapon) in both hands of an animated avatar. In Play
+/// the weapon sits at the idle or aim pose (each relative to `anchor_bone`, the
+/// avatar or the world, see [`WeaponFollow`]), blending on the avatar
+/// Animator's `aim_parameter` bool.
+/// Outside Play the weapon stays where it is moved, so it can be posed with
+/// the transform gizmo and stored into a slot. Either way each arm reaches its
+/// hand target: a child of the weapon whose transform is where the hand bone
+/// goes.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WeaponHold {
+    /// The animated model, or any ancestor of it (a switchable avatar).
+    pub avatar: ObjectRef,
+    pub anchor_bone: String,
+    pub idle: WeaponPose,
+    pub aim: WeaponPose,
+    pub aim_parameter: String,
+    /// Seconds to blend between the idle and aim poses.
+    pub blend_time: f32,
+    pub right_hand: ObjectRef,
+    pub left_hand: ObjectRef,
+    /// The pose the editor's Load / Store work on.
+    pub editing: WeaponPoseSlot,
+    #[serde(skip)]
+    pub request: Option<WeaponPoseRequest>,
+    /// 0 = idle pose, 1 = aim pose.
+    #[serde(skip)]
+    pub blend: f32,
+    /// The weapon has been put at a pose since loading (the editor starts it
+    /// at the pose being edited, then leaves it where it is moved).
+    #[serde(skip)]
+    pub placed: bool,
+}
+
+impl Default for WeaponHold {
+    fn default() -> Self {
+        Self {
+            avatar: ObjectRef::NONE,
+            anchor_bone: "spine_03".into(),
+            idle: WeaponPose::default(),
+            aim: WeaponPose::default(),
+            aim_parameter: "Aiming".into(),
+            blend_time: 0.15,
+            right_hand: ObjectRef::NONE,
+            left_hand: ObjectRef::NONE,
+            editing: WeaponPoseSlot::Idle,
+            request: None,
+            blend: 0.0,
+            placed: false,
+        }
+    }
+}
+
+impl WeaponHold {
+    pub fn pose(&self, slot: WeaponPoseSlot) -> WeaponPose {
+        match slot {
+            WeaponPoseSlot::Idle => self.idle,
+            WeaponPoseSlot::Aim => self.aim,
+        }
+    }
+
+    pub fn pose_mut(&mut self, slot: WeaponPoseSlot) -> &mut WeaponPose {
+        match slot {
+            WeaponPoseSlot::Idle => &mut self.idle,
+            WeaponPoseSlot::Aim => &mut self.aim,
+        }
+    }
+}
+
+impl TypedComponent for WeaponHold {
+    const NAME: &'static str = "Weapon Hold";
 }
 
 /// How the physics engine simulates a body. Dynamic bodies fall and react to
@@ -3453,5 +3630,38 @@ mod blend_tree_tests {
         let w = t.weights([0.5, 0.5]);
         assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5);
         assert!(w[0] > w[1] && w[3] > w[2]);
+    }
+}
+
+#[cfg(test)]
+mod terrain_tests {
+    use super::*;
+
+    #[test]
+    fn default_terrain_is_a_flat_32_quad_grid() {
+        let t = Terrain::default();
+        assert_eq!(t.size, 100.0);
+        assert_eq!(t.resolution, 32);
+        assert_eq!(t.heights.len(), 33 * 33);
+        assert!(t.heights.iter().all(|h| *h == 0.0));
+        assert!(t.collider);
+    }
+
+    #[test]
+    fn terrain_round_trips_through_ron() {
+        let t = Terrain {
+            size: 64.0,
+            resolution: 4,
+            heights: (0..25).map(|i| i as f32).collect(),
+            material: "ground.mat".into(),
+            collider: false,
+        };
+        let s = ron::to_string(&t).expect("serialize");
+        let back: Terrain = ron::from_str(&s).expect("deserialize");
+        assert_eq!(back.size, t.size);
+        assert_eq!(back.resolution, t.resolution);
+        assert_eq!(back.heights, t.heights);
+        assert_eq!(back.material, "ground.mat");
+        assert!(!back.collider);
     }
 }

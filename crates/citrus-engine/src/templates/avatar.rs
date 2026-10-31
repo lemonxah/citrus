@@ -112,23 +112,16 @@ pub fn controller() -> AnimatorController {
                 .collect(),
         })
     };
-    // Directional locomotion: the free Quaternius Standard pack has no
-    // strafe/turn-in-place clips (see docs/default-assets.md), only
-    // forward-facing loops. Blending on Forward (Y axis) with Right (X axis)
-    // as the second parameter uses the Animator's existing 2D blend tree to
-    // fade toward Idle as motion becomes more lateral than forward, instead
-    // of always picking a forward gait off raw planar speed (which used to
-    // visibly slide the feet forward while the player strafed sideways).
-    let directional_tree = |name: &str, motions: &[(&str, f32)]| {
+    let directional_tree = |name: &str, motions: &[(&str, f32, f32)]| {
         Motion::BlendTree(BlendTree {
             name: name.into(),
             parameter: "Right".into(),
             parameter_y: "Forward".into(),
             motions: motions
                 .iter()
-                .map(|(clip, value)| BlendMotion {
+                .map(|(clip, x, y)| BlendMotion {
                     clip: (*clip).into(),
-                    position: [0.0, *value],
+                    position: [*x, *y],
                 })
                 .collect(),
         })
@@ -139,10 +132,13 @@ pub fn controller() -> AnimatorController {
             motion: directional_tree(
                 "Locomotion",
                 &[
-                    ("Idle_Loop", 0.0),
-                    ("Walk_Loop", 1.6),
-                    ("Jog_Fwd_Loop", 4.5),
-                    ("Sprint_Loop", 7.5),
+                    ("Idle_Loop", 0.0, 0.0),
+                    ("Walk_Loop", 0.0, 1.6),
+                    ("Jog_Fwd_Loop", 0.0, 4.5),
+                    ("Sprint_Loop", 0.0, 7.0),
+                    ("Walking_Backwards", 0.0, -1.6),
+                    ("Running_Strafe_Left", -4.5, 0.0),
+                    ("Running_Strafe_Right", 4.5, 0.0),
                 ],
             ),
             ..Default::default()
@@ -151,7 +147,7 @@ pub fn controller() -> AnimatorController {
             name: "Crouch".into(),
             motion: directional_tree(
                 "Crouch",
-                &[("Crouch_Idle_Loop", 0.0), ("Crouch_Fwd_Loop", 2.2)],
+                &[("Crouch_Idle_Loop", 0.0, 0.0), ("Crouch_Fwd_Loop", 0.0, 2.2)],
             ),
             ..Default::default()
         },
@@ -219,6 +215,8 @@ pub fn controller() -> AnimatorController {
         ("Vertical", AnimParamKind::Float, 0.0),
         ("Grounded", AnimParamKind::Bool, 1.0),
         ("Crouched", AnimParamKind::Bool, 0.0),
+        // Read by a Weapon Hold to switch its weapon to the aim pose.
+        ("Aiming", AnimParamKind::Bool, 0.0),
     ]
     .into_iter()
     .map(|(name, kind, default)| AnimParameter {

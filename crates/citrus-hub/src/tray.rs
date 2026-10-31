@@ -1,4 +1,6 @@
 //! Linux StatusNotifier tray, with the exact same orange icon as the window.
+use std::time::Duration;
+
 use ksni::blocking::TrayMethods;
 use winit::event_loop::EventLoopProxy;
 
@@ -22,6 +24,21 @@ pub fn start(proxy: EventLoopProxy<HubEvent>) -> Option<ksni::blocking::Handle<H
     }
 }
 
+impl HubTray {
+    /// Wayland only lets a window take focus with the XDG activation token
+    /// the tray host sends with the click, which KDE delivers just after it.
+    fn show(&self) {
+        let token = (0..100).find_map(|_| {
+            let token = ksni::current_xdg_activation_token();
+            if token.is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            token
+        });
+        let _ = self.proxy.send_event(HubEvent::Show(token));
+    }
+}
+
 impl ksni::Tray for HubTray {
     fn id(&self) -> String { "citrus-hub".into() }
     fn title(&self) -> String { "Citrus Project Hub".into() }
@@ -29,12 +46,12 @@ impl ksni::Tray for HubTray {
         vec![ksni::Icon { width: 256, height: 256, data: self.icon.clone() }]
     }
     fn activate(&mut self, _: i32, _: i32) {
-        let _ = self.proxy.send_event(HubEvent::Show);
+        self.show();
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
         vec![
-            StandardItem { label: "Open Citrus Hub".into(), activate: Box::new(|tray: &mut Self| { let _ = tray.proxy.send_event(HubEvent::Show); }), ..Default::default() }.into(),
+            StandardItem { label: "Open Citrus Hub".into(), activate: Box::new(|tray: &mut Self| tray.show()), ..Default::default() }.into(),
             StandardItem { label: "Quit Citrus Hub".into(), activate: Box::new(|tray: &mut Self| { let _ = tray.proxy.send_event(HubEvent::Quit); }), ..Default::default() }.into(),
         ]
     }

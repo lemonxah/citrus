@@ -3,7 +3,7 @@
 
 use citrus_assets::PrimitiveShape;
 use citrus_core::{
-    BodyKind, Grabbable, Key, NetworkAvatar, NetworkManager, PlanarReflection, RigidBody, SpawnPoint,
+    BodyKind, BoxCollider, Grabbable, Key, NetworkAvatar, NetworkManager, PlanarReflection, RigidBody, SpawnPoint,
     SphereCollider, Sync, UiAction, UiButton, UiPanel, UiRect, UiText,
 };
 use glam::Quat;
@@ -15,6 +15,8 @@ use super::vr_shooter::{vr_bindings, vr_rig, world_panel};
 const HELMET: &str = "models/DamagedHelmet.glb";
 const HELMET_META: &str = "models/DamagedHelmet.glb.meta";
 const AVATAR_PREFAB: &str = "prefabs/net_avatar.prefab";
+const TABLE: &str = "models/props/default/table.glb";
+const BALL: &str = "models/props/default/ball.glb";
 
 /// Head + hands + torso, spawned by the Network Manager for every player. The
 /// owner's copy mirrors the local VR Player and is hidden for them; everyone
@@ -113,11 +115,15 @@ pub fn build() -> TemplateContent {
 
     // Synced grabbables: anyone can pick them up; the holder owns them on the network.
     let table = s.empty("Table", None, [3.5, 0.0, 0.0]);
-    s.block("Table Top", Some(table), [0.0, 0.85, 0.0], [1.6, 0.08, 0.9], "wood");
-    s.block("Table Base", Some(table), [0.0, 0.42, 0.0], [0.2, 0.84, 0.2], "trim");
-    for (k, (x, z, mat)) in [(3.1, -0.2, "enemy"), (3.5, 0.2, "ally"), (3.9, -0.1, "glow")].into_iter().enumerate() {
-        let ball = s.prim(&format!("Ball {}", k + 1), PrimitiveShape::Sphere, None, [x, 1.0, z], [0.18; 3], mat);
-        s.with(ball, SphereCollider::default());
+    let table_model = s.model("Table Model", TABLE, Some(table), [0.0, 0.0, 0.0], 1.0);
+    s.with(table_model, BoxCollider { center: [0.0, 0.38, 0.0], size: [1.4, 0.76, 1.4], ..Default::default() });
+    s.entries[table_model].static_geometry = true;
+    for (k, (x, z, _)) in [(3.1, -0.2, "enemy"), (3.5, 0.2, "ally"), (3.9, -0.1, "glow")].into_iter().enumerate() {
+        let ball = s.model(&format!("Ball {}", k + 1), BALL, None, [x, 1.0, z], 1.0);
+        if let citrus_assets::ObjectSource::Model { extra_meshes, .. } = &mut s.entries[ball].source {
+            extra_meshes.extend(1..2);
+        }
+        s.with(ball, SphereCollider { radius: 0.11, ..Default::default() });
         s.with(ball, RigidBody { kind: BodyKind::Dynamic, mass: 0.4, restitution: 0.5, ..Default::default() });
         s.with(ball, Grabbable { radius: 0.12, throwable: true, return_after: 15.0, ..Default::default() });
         s.with(ball, local_sync());
@@ -145,5 +151,5 @@ pub fn build() -> TemplateContent {
     builder::pause_menu(&mut s, builder::MAIN_SCENE, true);
     let bindings = vr_bindings(vec![button("Voice", keys(&[Key::V]))]);
     let prefabs = vec![(AVATAR_PREFAB.to_string(), net_avatar_prefab())];
-    builder::content(s.finish(), prefabs, bindings, vec![HELMET, HELMET_META])
+    builder::content(s.finish(), prefabs, bindings, vec![HELMET, HELMET_META, TABLE, BALL])
 }

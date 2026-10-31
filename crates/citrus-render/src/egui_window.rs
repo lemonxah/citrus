@@ -48,6 +48,26 @@ impl EguiWindow {
         Ok(Self { target, ctx })
     }
 
+    /// Let go of `window` so it can be destroyed; the device and egui textures
+    /// stay, ready for [`Self::attach`] to a new window. Wayland can't hide or
+    /// un-minimise a window, so hiding to a tray means destroying it.
+    pub fn detach(&mut self) {
+        self.target.detach_surface(&self.ctx);
+        unsafe { self.ctx.surface_loader.destroy_surface(self.ctx.surface, None) };
+        self.ctx.surface = ash::vk::SurfaceKHR::null();
+    }
+
+    pub fn attach(&mut self, window: &Window) -> Result<()> {
+        let display = window.display_handle()?.as_raw();
+        let handle = window.window_handle()?.as_raw();
+        let surface = unsafe {
+            ash_window::create_surface(&self.ctx.entry, &self.ctx.instance, display, handle, None)
+        }
+        .context("creating window surface")?;
+        let size = window.inner_size();
+        self.target.attach_surface(&self.ctx, surface, true, size.width, size.height)
+    }
+
     /// Recreate the swapchain at the new size before the next frame.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.target.request_resize(width, height);

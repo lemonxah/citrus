@@ -140,6 +140,36 @@ fn unknown_template_is_rejected() {
 }
 
 #[test]
+fn weapon_hold_puts_the_rifle_on_its_pose_and_both_hands_on_it() {
+    use citrus_core::WeaponHold;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model = citrus_assets::load_gltf(root.join(super::avatar::MALE)).expect("avatar imports");
+    let skel = &model.skeletons[0];
+    let (scene, _) = load_template("tps");
+    let world = scene.world_transforms();
+    let find = |name: &str| scene.objects.iter().position(|o| o.name == name).unwrap();
+    let (avatar, rifle) = (find("Male"), find("Rifle"));
+    let hold = scene.objects[rifle].components.iter().find_map(|c| c.as_any().downcast_ref::<WeaponHold>()).unwrap().clone();
+    let mut locals = skel.rest_locals();
+    let update = crate::scene::hold_weapon(&scene.objects, &world, avatar, rifle, &hold, true, skel, &mut locals, 0.016).expect("holds");
+    let joints = skel.world_matrices(&locals);
+    let joint = |name: &str| world[avatar] * joints[skel.joints.iter().position(|j| j.name == name).unwrap()];
+    let anchor = joint("spine_03");
+    let [x, y, z] = hold.idle.rotation.map(f32::to_radians);
+    let idle = anchor * Mat4::from_rotation_translation(Quat::from_euler(glam::EulerRot::XYZ, x, y, z), Vec3::from(hold.idle.position));
+    assert!((update.world.w_axis - idle.w_axis).length() < 1e-3, "rifle sits at the idle pose");
+    for (bone, target) in [("hand_r", "Right Hand Target"), ("hand_l", "Left Hand Target")] {
+        let t = find(target);
+        let goal = update.world * scene.objects[t].local_transform();
+        let reached = joint(bone);
+        assert!((reached.w_axis - goal.w_axis).length() < 0.01, "{bone} reaches its target: {:?} vs {:?}", reached.w_axis, goal.w_axis);
+        let (_, rr, _) = reached.to_scale_rotation_translation();
+        let (_, gr, _) = goal.to_scale_rotation_translation();
+        assert!(rr.angle_between(gr) < 0.05, "{bone} turns to its target");
+    }
+}
+
+#[test]
 fn default_avatars_import_and_drive_the_real_animation_controller() {
     use crate::anim_graph::{ClipSet, Rig, advance};
     use citrus_core::Animator;
@@ -236,10 +266,44 @@ fn weapon_models_import_in_citrus() {
 }
 
 #[test]
+fn crate_model_imports_in_citrus() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model = citrus_assets::load_gltf(root.join(super::fps::CRATE))
+        .unwrap_or_else(|e| panic!("crate: {e:#}"));
+    assert_eq!(model.meshes.len(), 3, "crate mesh primitive count");
+    assert!(!model.textures.is_empty(), "crate has textures");
+    assert!(!model.materials.is_empty(), "crate has materials");
+}
+
+#[test]
+fn prop_models_import_in_citrus() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (path, expect_meshes) in [
+        ("models/props/default/tree.glb", 1),
+        ("models/props/default/base_building.glb", 24),
+        ("models/props/default/lamp_post.glb", 1),
+        ("models/props/default/metal_crate.glb", 5),
+        ("models/props/default/treasure_chest.glb", 1),
+        ("models/props/default/table.glb", 1),
+        ("models/props/default/wall_light.glb", 2),
+        ("models/props/default/ball.glb", 2),
+    ] {
+        let model =
+            citrus_assets::load_gltf(root.join(path)).unwrap_or_else(|e| panic!("{path}: {e:#}"));
+        assert_eq!(
+            model.meshes.len(),
+            expect_meshes,
+            "{path}: mesh primitive count"
+        );
+        assert!(!model.materials.is_empty(), "{path}: has materials");
+    }
+}
+
+#[test]
 fn gameplay_templates_have_switchable_avatars_and_controller_assets() {
     use citrus_core::{AvatarVariant, TemplateAvatar};
     let parent = temp_dir("avatar-assets");
-    for template in TEMPLATES.iter().filter(|t| t.id != "empty") {
+    for template in TEMPLATES.iter().filter(|t| t.gameplay) {
         let root = crate::bundle::scaffold_project(&parent, template.id, template.id).unwrap();
         let controller =
             citrus_assets::load_anim_controller(root.join(super::avatar::CONTROLLER)).unwrap();
@@ -1170,4 +1234,25 @@ fn invert_look_toggle_tunes_the_look_action_in_every_scheme() {
         "{got:?}"
     );
     assert!(tunes(tick(&mut scene)).is_empty(), "applied once");
+}
+
+#[test]
+fn walking_feeds_the_animator_a_steady_speed() {
+    use citrus_core::{Animator, Key};
+    let (mut scene, scheme) = load_template("tps");
+    let mut session = PlaySession::new(&scene, Path::new("."), None);
+    let mut raw = RawInput::default();
+    raw.keys_down.insert(Key::W);
+    let walk = citrus_core::resolve(&scheme, &raw, &InputState::default());
+    let mut forward = Vec::new();
+    for f in 0..120 {
+        run(&mut session, &mut scene, 1, |_| walk.clone());
+        let animator = scene.objects.iter().filter(|o| o.enabled).find_map(|o| o.components.iter().find_map(|c| c.as_any().downcast_ref::<Animator>()));
+        if f >= 60 {
+            forward.push(animator.and_then(|a| a.state.params.get("Forward").copied()).unwrap_or(0.0));
+        }
+    }
+    let (lo, hi) = forward.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    assert!(lo > 3.5, "walking speed never drops out of the walk blend: {lo}..{hi}");
+    assert!(hi - lo < 0.2, "steady: {lo}..{hi}");
 }

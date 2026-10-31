@@ -2,12 +2,23 @@
 
 use citrus_assets::PrimitiveShape;
 use citrus_core::{
-    CharacterController, HudBinding, HudValue, Key, MouseButton, NavAgent, NavMeshSurface, ResourceAmount, ResourceStore,
+    BoxCollider, CharacterController, HudBinding, HudValue, Key, MouseButton, NavAgent, NavMeshSurface, ResourceAmount, ResourceStore,
     RtsCamera, RtsSelection, Selectable, UiAlign, UiCanvas, UiPanel, UiRect, UiText,
 };
 
 use super::TemplateContent;
 use super::builder::{self, CHARACTER_LAYER, Scene, axis1, button, keys, mouse, wasd, wheel};
+
+const TREE: &str = "models/props/default/tree.glb";
+const BASE_BUILDING: &str = "models/props/default/base_building.glb";
+
+fn prop(s: &mut Scene, name: &str, parent: usize, position: [f32; 3], scale: f32, path: &'static str, meshes: usize) -> usize {
+    let i = s.model(name, path, Some(parent), position, scale);
+    if let citrus_assets::ObjectSource::Model { extra_meshes, .. } = &mut s.entries[i].source {
+        extra_meshes.extend(1..meshes);
+    }
+    i
+}
 
 /// A selectable unit: capsule body, a selection ring (hidden until selected),
 /// a character controller and a nav agent.
@@ -39,16 +50,17 @@ pub fn build() -> TemplateContent {
     s.with(nav, NavMeshSurface { size: [80.0, 6.0, 80.0], cell_size: 0.3, layer_mask: !(1u32 << CHARACTER_LAYER), ..Default::default() });
 
     let base = s.empty("Base", None, [0.0, 0.0, 16.0]);
-    s.block("Town Hall", Some(base), [0.0, 2.0, 0.0], [6.0, 4.0, 6.0], "wall");
-    s.block("Roof", Some(base), [0.0, 4.5, 0.0], [6.6, 1.0, 6.6], "enemy");
+    let town_hall = prop(&mut s, "Town Hall", base, [0.0, 0.0, 0.0], 1.0, BASE_BUILDING, 24);
+    s.with(town_hall, BoxCollider { center: [0.0, 1.8, 0.6], size: [8.0, 3.6, 9.2], ..Default::default() });
+    s.entries[town_hall].static_geometry = true;
     let mine = s.empty("Gold Mine", None, [-16.0, 0.0, -10.0]);
     s.block("Rock", Some(mine), [0.0, 1.2, 0.0], [5.0, 2.4, 4.0], "trim");
     s.prim("Gold", PrimitiveShape::Sphere, Some(mine), [0.0, 2.5, 0.0], [1.2; 3], "glow");
     let forest = s.empty("Forest", None, [0.0; 3]);
     for (k, (x, z)) in [(14.0, -8.0), (17.0, -5.0), (15.0, -2.0), (19.0, -10.0), (12.0, -13.0), (20.0, 0.0)].into_iter().enumerate() {
-        let tree = s.empty(&format!("Tree {}", k + 1), Some(forest), [x, 0.0, z]);
-        s.block("Trunk", Some(tree), [0.0, 1.0, 0.0], [0.5, 2.0, 0.5], "wood");
-        s.prim("Leaves", PrimitiveShape::Sphere, Some(tree), [0.0, 2.6, 0.0], [2.2; 3], "grass");
+        let tree = prop(&mut s, &format!("Tree {}", k + 1), forest, [x, 0.0, z], 0.5, TREE, 1);
+        s.with(tree, BoxCollider { center: [0.0, 0.9, 0.0], size: [0.6, 1.8, 0.6], ..Default::default() });
+        s.entries[tree].static_geometry = true;
     }
 
     for k in 0..8 {
@@ -111,5 +123,5 @@ pub fn build() -> TemplateContent {
         ],
         vec![builder::stick("Move", citrus_core::PadAxis::LeftStickX, citrus_core::PadAxis::LeftStickY, 1.0)],
     );
-    builder::content(s.finish(), prefabs, bindings, Vec::new())
+    builder::content(s.finish(), prefabs, bindings, vec![TREE, BASE_BUILDING])
 }

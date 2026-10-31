@@ -11,6 +11,8 @@
 mod audio_ui;
 mod cloth_ui;
 pub use cloth_ui::{CLOTH_PAINT_HINT, ClothPaintTool};
+mod terrain_ui;
+pub use terrain_ui::{TerrainBrushMode, TerrainPaintTool};
 mod ik_ui;
 mod face_ui;
 mod water_ui;

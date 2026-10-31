@@ -28,6 +28,9 @@ pub struct TemplateAvatar {
     pub previous: Option<(Vec3, Quat)>,
     #[serde(skip)]
     pub applied: Option<AvatarVariant>,
+    /// Smoothed position-delta velocity, for players without a local walker.
+    #[serde(skip)]
+    pub smoothed_velocity: Vec3,
 }
 
 impl Default for TemplateAvatar {
@@ -35,7 +38,7 @@ impl Default for TemplateAvatar {
         Self {
             variant: AvatarVariant::Male, male: ObjectRef::NONE, female: ObjectRef::NONE,
             player: ObjectRef::NONE, switch_action: "Switch Avatar".into(),
-            follow_local_player: false, previous: None, applied: None,
+            follow_local_player: false, previous: None, applied: None, smoothed_velocity: Vec3::ZERO,
         }
     }
 }
@@ -74,7 +77,7 @@ impl TypedComponent for TemplateAvatar {
         let (_, rotation, position) = ctx.world_transforms[index].to_scale_rotation_translation();
         let previous = self.previous.replace((position, rotation));
         if ctx.dt <= 0.0 { return }
-        let (velocity, turn) = previous.map(|(p, r)| {
+        let (moved, turn) = previous.map(|(p, r)| {
             let velocity = (position - p) / ctx.dt;
             let old = r * Vec3::NEG_Z;
             let new = rotation * Vec3::NEG_Z;
@@ -83,13 +86,26 @@ impl TypedComponent for TemplateAvatar {
         }).unwrap_or_default();
         let mut grounded = true;
         let mut crouched = false;
+        let mut aiming = false;
+        // A locally driven controller knows its velocity. The position delta
+        // doesn't: physics steps at a fixed rate, so frames alternate between
+        // moving and not, and the locomotion blend jumped every frame.
+        let mut walker_velocity = None;
         if let Some(fp) = ctx.get::<FirstPersonController>(self.player) {
             grounded = fp.walker.is_grounded();
             crouched = fp.crouched;
+            walker_velocity = Some(fp.walker.velocity());
         }
         if let Some(tp) = ctx.get::<ThirdPersonController>(self.player) {
             grounded = tp.walker.is_grounded();
+            aiming = tp.aiming;
+            walker_velocity = Some(tp.walker.velocity());
         }
+        self.smoothed_velocity = self.smoothed_velocity.lerp(moved, 1.0 - (-12.0 * ctx.dt).exp());
+        let velocity = match walker_velocity {
+            Some(v) if !remote => v,
+            _ => self.smoothed_velocity,
+        };
         let local = rotation.inverse() * velocity;
         let speed = velocity.with_y(0.0).length().min(12.0);
         for target in [self.male, self.female] {
@@ -101,6 +117,7 @@ impl TypedComponent for TemplateAvatar {
                 animator.set_float("Vertical", velocity.y);
                 animator.set_bool("Grounded", grounded);
                 animator.set_bool("Crouched", crouched);
+                animator.set_bool("Aiming", aiming);
             });
         }
     }

@@ -308,6 +308,15 @@ fn solve_limb(skel: &Skeleton, locals: &mut [Mat4], (a, b, c): (usize, usize, us
     apply_two_bone(skel, &world, locals, a, b, &sol);
 }
 
+/// Pose an arm (`upper` → `lower` → `hand`) so the hand joint lands on
+/// `target` (skeleton space: position and rotation), the elbow bending toward
+/// `pole`.
+pub fn reach_hand(skel: &Skeleton, locals: &mut [Mat4], arm: (usize, usize, usize), target: Mat4, pole: Vec3) {
+    let (_, rotation, position) = target.to_scale_rotation_translation();
+    solve_limb(skel, locals, arm, position, pole);
+    set_joint_rotation(skel, locals, arm.2, rotation);
+}
+
 /// Pose `locals` (the incoming animated or rest pose, in/out) from `targets`,
 /// given in the skeleton's own space. `world` is the avatar's world matrix
 /// (planted feet are held in world space) and `dt` the frame time.

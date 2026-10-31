@@ -73,6 +73,11 @@ impl Walker {
     pub fn is_grounded(&self) -> bool {
         self.grounded
     }
+    /// World-space velocity the walker is moving at (what it asked the
+    /// character to move by, per second).
+    pub fn velocity(&self) -> Vec3 {
+        self.vel
+    }
     /// Swimming (or climbing out of the water) this frame.
     pub fn swimming(&self) -> bool {
         self.swimming || self.climb.is_some()
@@ -843,6 +848,88 @@ mod tests {
         assert!((blocked - Vec3::new(0.0, 1.5, 1.8)).length() < 1e-5);
         let shoulder = boom_position(pivot, Quat::IDENTITY, 0.5, 2.0, None, 0.2);
         assert!(shoulder.x > 0.0 && shoulder.z > 0.0);
+    }
+
+    /// A root object with no Character Controller: moves freely on a flat floor.
+    struct FreeHost {
+        id: crate::ObjectId,
+        pos: Vec3,
+        rot: Quat,
+    }
+
+    impl MoveHost for FreeHost {
+        fn self_id(&self) -> crate::ObjectId {
+            self.id
+        }
+        fn translation(&self) -> Vec3 {
+            self.pos
+        }
+        fn set_translation(&mut self, t: Vec3) {
+            self.pos = t;
+        }
+        fn rotation(&self) -> Quat {
+            self.rot
+        }
+        fn set_rotation(&mut self, r: Quat) {
+            self.rot = r;
+        }
+        fn parent_world(&self) -> Option<Mat4> {
+            None
+        }
+        fn has_character(&self) -> bool {
+            false
+        }
+        fn move_character(&mut self, _: Vec3) {}
+        fn grounded(&self) -> bool {
+            true
+        }
+        fn capsule(&self) -> Option<(f32, f32, [f32; 3])> {
+            None
+        }
+        fn set_capsule(&mut self, _: f32, _: [f32; 3]) {}
+        fn swimmer(&self) -> super::super::swim::Swimmer {
+            Default::default()
+        }
+        fn water_surface(&self, _: Vec3) -> Option<f32> {
+            None
+        }
+        fn raycast(&self, _: Vec3, _: Vec3, _: f32, _: &RayFilter) -> Option<crate::RayHit> {
+            None
+        }
+        fn set_animator_bool(&mut self, _: &str, _: bool) {}
+    }
+
+    /// Ground speed after two seconds of holding forward (and Sprint when `sprint`).
+    fn settled_speed(sprint: bool, mut step: impl FnMut(&mut FreeHost, &InputState)) -> f32 {
+        let forward = crate::ActionValue { down: true, value: 1.0, axis2: glam::Vec2::Y, ..Default::default() };
+        let held = crate::ActionValue { down: true, value: 1.0, ..Default::default() };
+        let mut actions = vec![("Move".to_string(), forward)];
+        if sprint {
+            actions.push(("Sprint".to_string(), held));
+        }
+        let input = InputState::from_actions(actions, glam::Vec2::ZERO);
+        let mut host = FreeHost { id: crate::ObjectId::new(), pos: Vec3::ZERO, rot: Quat::IDENTITY };
+        for _ in 0..120 {
+            step(&mut host, &input);
+        }
+        let before = host.pos;
+        step(&mut host, &input);
+        Vec3::new(host.pos.x - before.x, 0.0, host.pos.z - before.z).length() * 60.0
+    }
+
+    #[test]
+    fn holding_sprint_runs_in_first_and_third_person() {
+        let mut fps = FirstPersonController::default();
+        let (walk, sprint) = (fps.walk_speed, fps.sprint_speed);
+        assert!((settled_speed(false, |h, i| fps.step(h, i, 1.0 / 60.0, false, None)) - walk).abs() < 0.1);
+        let mut fps = FirstPersonController::default();
+        assert!((settled_speed(true, |h, i| fps.step(h, i, 1.0 / 60.0, false, None)) - sprint).abs() < 0.1);
+
+        let mut tps = ThirdPersonController::default();
+        let (walk, sprint) = (tps.walk_speed, tps.sprint_speed);
+        assert!((settled_speed(false, |h, i| tps.step(h, i, 1.0 / 60.0, false, None)) - walk).abs() < 0.1);
+        let mut tps = ThirdPersonController::default();
+        assert!((settled_speed(true, |h, i| tps.step(h, i, 1.0 / 60.0, false, None)) - sprint).abs() < 0.1);
     }
 
     #[test]

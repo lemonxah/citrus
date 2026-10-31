@@ -120,6 +120,40 @@ impl ProfilerWindow {
         })
     }
 
+    /// Drop the swapchain and surface so the OS window can be destroyed while
+    /// the egui renderer (and its uploaded textures) stays alive.
+    pub fn detach_surface(&mut self, ctx: &GpuContext) {
+        unsafe {
+            let _ = ctx.device.device_wait_idle();
+            self.swapchain.destroy(&ctx.device);
+            if self.owns_surface {
+                ctx.surface_loader.destroy_surface(self.surface, None);
+            }
+        }
+        self.surface = vk::SurfaceKHR::null();
+        self.owns_surface = false;
+    }
+
+    /// Render to a new window's surface after [`Self::detach_surface`].
+    pub fn attach_surface(
+        &mut self,
+        ctx: &GpuContext,
+        surface: vk::SurfaceKHR,
+        owns_surface: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        self.detach_surface(ctx);
+        self.surface = surface;
+        self.owns_surface = owns_surface;
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.swapchain =
+            Swapchain::new_for_surface(ctx, surface, self.width, self.height, self.vsync)?;
+        self.needs_resize = false;
+        Ok(())
+    }
+
     pub fn request_resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
@@ -139,7 +173,7 @@ impl ProfilerWindow {
     /// silently on a zero-size window or an out-of-date swapchain (re-armed for
     /// the next frame).
     pub fn render(&mut self, ctx: &GpuContext, draw: &EguiDraw) -> Result<()> {
-        if self.width == 0 || self.height == 0 {
+        if self.width == 0 || self.height == 0 || self.surface == vk::SurfaceKHR::null() {
             return Ok(());
         }
         if self.needs_resize {

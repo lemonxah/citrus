@@ -16,6 +16,18 @@ not implemented: weapons are positioned near the body/camera but are not
 parented to or posed by a hand bone, so they visibly float. This remains open
 work, not a regression from this pass.
 
+**Shipped-asset determination (2026-10-31):** the only assets a scaffolded project
+copies are the BlenderKit mannequins and weapons (Royalty Free),
+`textures/sky_103_2k.png`, `models/DamagedHelmet.glb` + its `.meta` (VR Social only),
+and the code-authored palette materials. None of these are AI-generated, so there
+is no AI art to delete from the templates. The files most likely to read as
+AI-generated (`models/modern_gray_sofa__3d_model`,
+`models/stylized_traffic_cones_variants__-_low_poly`,
+`models/modern_glass_table.glb`, `models/leisure_area.FBX`,
+`textures/wood_floor_*`) are demo-scene props referenced by `scenes/world.scene`,
+not template defaults. They have no provenance record and must be replaced
+one-by-one per the checklist below, not bulk-deleted.
+
 ## Templates and required art
 
 | Template | Required assets |
@@ -95,9 +107,30 @@ The Standard pack has `Idle_Loop`, `Walk_Loop`, `Jog_Fwd_Loop`, `Sprint_Loop`,
 `Crouch_Idle_Loop`, `Crouch_Fwd_Loop`, `Jump_Start`, `Jump_Loop`, `Jump_Land`,
 pistol clips, interactions and death/hit reactions. It does **not** include
 separate strafing or turn-in-place clips. Do not relabel ordinary walking as a
-captured turn animation. See [Library 2](https://quaternius.itch.io/universal-animation-library-2)
-for additional movement, and [Mixamo](https://www.mixamo.com/) for individual
+captured turn animation. (Verified 2026-10-31 against `UAL1_Standard.glb`: 43
+clips, no backward / strafe / turn-in-place / pivot clips; online summaries that
+claim 8-directional locomotion describe the full paid tier, not the free
+Standard pack.) See [Library 2](https://quaternius.itch.io/universal-animation-library-2)
+for additional movement (verified 2026-10-31: 43 clips — combat, farming,
+slides, interactions — likewise no strafe / turn-in-place / backward clips).
+A CC0, no-login source for strafe / turn-in-place clips:
+[KayKit Character Animations](https://kaylousberg.itch.io/kaykit-character-animations)
+(150+ humanoid clips in FBX/GLTF, movement set, explicitly tagged "No
+generative AI was used"; free tier is the 14 MB "Free 1.1" upload,
+itch.io upload id `15799903`), and [Mixamo](https://www.mixamo.com/) for individual
 walk, strafe and turning clips. Adobe describes Mixamo as free with an Adobe ID
+
+KayKit 1.1 is downloaded to `animations/kaykit/` (provenance in its
+`source.json`). `Rig_Medium_MovementAdvanced` has the missing lateral/backward
+clips: `Running_Strafe_Left`, `Running_Strafe_Right`, `Walking_Backwards`,
+`Dodge_Left/Right/Forward/Backward`, `Crouching`, `Sneaking`; `MovementBasic` has
+`Walking_A/B/C`, `Running_A/B`, `Jump_*`, `T-Pose`. There is **no** dedicated
+turn-in-place clip. KayKit uses a Mixamo-style rig, unlike the VRM-style Citrus
+mannequins; the retarget bone map is `hips→pelvis, spine→spine_01, chest→spine_02,
+head→Head, upperarm.*→upperarm_*, lowerarm.*→lowerarm_*, wrist/hand.*→hand_*,
+upperleg.*→thigh_*, lowerleg.*→calf_*, foot.*→foot_*, toes.*→ball_*` (adapt
+`tools/prepare_template_avatars.py` to import the KayKit GLBs and use this map).
+Adobe describes Mixamo as free with an Adobe ID
 and royalty-free for games in its [FAQ](https://helpx.adobe.com/creative-cloud/faq/mixamo-faq.html).
 Review editable-asset redistribution separately before bundling Mixamo downloads.
 
@@ -145,7 +178,7 @@ left/right commands. Animation availability alone does not prove integration.
       visibly floats beside the body; this needs either per-clip static hand
       offsets or real two-bone arm IK onto the weapon grip, not done this pass.
 - [ ] Add shared locomotion/turning animation setup for TPS, top-down and RTS (Forward/Right directional blend done; dedicated turning/strafe clips not sourced, see Animation sources above).
-- [ ] Replace current scenery in small groups, retaining colliders and interactions.
+- [ ] Replace current scenery in small groups, retaining colliders and interactions. (Done so far: FPS/TPS wooden + metal crates, CC0; RTS tree + town hall; top-down lamp post + treasure chest; VR Social table + throwable ball. Converted but not wired: wall sconce. Unreachable with current Free-tier credential: concrete cover, lever, gate, rock. All in `models/props/`, provenance in `models/props/blenderkit/<name>/source.json`.)
 - [x] Verify each template scaffolds, loads and runs (`cargo test -p citrus-engine templates::tests`); desktop/VR fallback and multiplayer avatar selection still need manual/headset verification.
 - [ ] Visually check both genders, foot sliding, reversals, weapon grips, mirrors and VR body fit (muzzle position/forward sign checked by offline render; hand-grip attachment, in-headset VR fit and live reversal/sliding checks are not done). A real first-person bug was found and fixed by code review: FPS and VR Shooter's head cameras sat inside the avatar's own head model with no layer exclusion, so the player would see the inside of their own head mesh; both cameras now exclude `CHARACTER_LAYER` via a new `Scene::hide_own_body_from_camera`, covered by `first_person_cameras_exclude_the_avatar_body_layer`. TPS intentionally keeps the body layer visible (third person). This is a headless-test-verified fix, not an in-headset/GPU visual confirmation.
 

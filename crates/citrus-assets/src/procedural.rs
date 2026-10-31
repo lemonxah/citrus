@@ -313,6 +313,67 @@ fn plane(size: f32, uv_tiles: f32) -> MeshData {
     mesh_with_lightmap(vertices, vec![0, 2, 1, 0, 3, 2])
 }
 
+/// Tessellate a heightfield into a single square mesh. `heights` is a
+/// `(resolution + 1)²` row-major grid over Z (outer) then X (inner); `size_xz`
+/// is the world-space extent of the square in meters. Vertices sit on the XZ
+/// plane centred at the origin with Y from the grid, upward normals from
+/// central differences, and a whole-map 0..1 UV set that also serves as the
+/// lightmap (non-overlapping). Front faces are wound to follow the normals.
+pub fn heightfield_mesh(size_xz: f32, resolution: u32, heights: &[f32]) -> MeshData {
+    assert!(resolution >= 1, "heightfield resolution must be >= 1");
+    let n = (resolution + 1) as usize;
+    assert_eq!(heights.len(), n * n, "heights must be (resolution + 1)^2");
+
+    let step = size_xz / resolution as f32;
+    let half = size_xz * 0.5;
+    // Clamped central-difference sample so border vertices keep valid normals.
+    let sample = |x: i64, z: i64| {
+        let x = x.clamp(0, resolution as i64) as usize;
+        let z = z.clamp(0, resolution as i64) as usize;
+        heights[z * n + x]
+    };
+
+    let mut vertices = Vec::with_capacity(n * n);
+    for z in 0..n {
+        for x in 0..n {
+            let px = x as f32 * step - half;
+            let pz = z as f32 * step - half;
+            let py = heights[z * n + x];
+            let (xi, zi) = (x as i64, z as i64);
+            // Gradient of the implicit surface y - h(x, z) = 0.
+            let dh_dx = sample(xi + 1, zi) - sample(xi - 1, zi);
+            let dh_dz = sample(xi, zi + 1) - sample(xi, zi - 1);
+            let normal = Vec3::new(-dh_dx, 2.0 * step, -dh_dz).normalize_or(Vec3::Y);
+            // +X tangent, orthogonalized against the normal (heightfields never
+            // point exactly along X, so this is always non-zero).
+            let tangent = (Vec3::X - normal * normal.dot(Vec3::X)).normalize_or(Vec3::Z);
+            vertices.push(Vertex {
+                position: [px, py, pz],
+                normal: normal.to_array(),
+                uv: [x as f32 / resolution as f32, z as f32 / resolution as f32],
+                tangent: [tangent.x, tangent.y, tangent.z, 1.0],
+                ..Default::default()
+            });
+        }
+    }
+
+    let mut indices = Vec::with_capacity(resolution as usize * resolution as usize * 6);
+    for z in 0..resolution as usize {
+        for x in 0..resolution as usize {
+            let a = (z * n + x) as u32;
+            let b = a + 1;
+            let c = a + n as u32;
+            let d = c + 1;
+            // Wound so a flat grid's triangles face +Y (matches the normals).
+            indices.extend_from_slice(&[a, c, b, c, d, b]);
+        }
+    }
+    for v in &mut vertices {
+        v.uv1 = v.uv;
+    }
+    MeshData { vertices, indices, has_lightmap_uv: true }
+}
+
 fn cube(size: f32) -> MeshData {
     let h = size * 0.5;
     // (normal, tangent, four corners)
@@ -432,5 +493,62 @@ mod tests {
         let inner = 0.5 - BUCKET_WALL;
         let covers_mouth = m.vertices.iter().any(|v| v.position[1] > 0.49 && v.position[0].abs() < inner - 1e-3 && v.position[2].abs() < inner - 1e-3);
         assert!(!covers_mouth, "nothing across the opening");
+    }
+
+    #[test]
+    fn heightfield_counts_and_flat_geometry() {
+        let res = 4;
+        let m = heightfield_mesh(100.0, res, &vec![0.0; 25]);
+        assert_eq!(m.vertices.len(), 25);
+        assert_eq!(m.indices.len(), res as usize * res as usize * 6);
+        for v in &m.vertices {
+            assert_eq!(v.position[1], 0.0);
+            assert!((v.normal[1] - 1.0).abs() < 1e-5, "flat heightfield points up");
+            assert!(v.position[0].abs() <= 50.0 + 1e-4);
+            assert!(v.position[2].abs() <= 50.0 + 1e-4);
+        }
+        let min = m.vertices.iter().fold([f32::INFINITY; 2], |a, v| [a[0].min(v.position[0]), a[1].min(v.position[2])]);
+        let max = m.vertices.iter().fold([f32::NEG_INFINITY; 2], |a, v| [a[0].max(v.position[0]), a[1].max(v.position[2])]);
+        assert!((min[0] + 50.0).abs() < 1e-4 && (max[0] - 50.0).abs() < 1e-4, "x extent is size_xz");
+        assert!((min[1] + 50.0).abs() < 1e-4 && (max[1] - 50.0).abs() < 1e-4, "z extent is size_xz");
+    }
+
+    #[test]
+    fn heightfield_winding_follows_normals() {
+        let res = 8;
+        let n = (res + 1) as usize;
+        let heights: Vec<f32> = (0..n * n)
+            .map(|i| {
+                let (x, z) = (i % n, i / n);
+                ((x as f32 * 0.3).sin() * (z as f32 * 0.25).cos()) * 2.0
+            })
+            .collect();
+        let m = heightfield_mesh(64.0, res, &heights);
+        for t in m.indices.chunks(3) {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(m.vertices[i as usize].position));
+            let nrm = Vec3::from(m.vertices[t[0] as usize].normal);
+            assert!((b - a).cross(c - a).dot(nrm) > 0.0, "front faces follow the normals");
+        }
+        for v in &m.vertices {
+            let nrm = Vec3::from(v.normal);
+            assert!((nrm.length() - 1.0).abs() < 1e-4, "unit normals");
+            assert!(v.normal[1] > 0.0, "heightfield normals point up");
+        }
+    }
+
+    #[test]
+    fn heightfield_applies_heights_row_major() {
+        let m = heightfield_mesh(10.0, 1, &[0.0, 1.0, 2.0, 3.0]);
+        let y_at = |x: f32, z: f32| {
+            m.vertices
+                .iter()
+                .find(|v| (v.position[0] - x).abs() < 1e-4 && (v.position[2] - z).abs() < 1e-4)
+                .expect("grid corner")
+                .position[1]
+        };
+        assert_eq!(y_at(-5.0, -5.0), 0.0);
+        assert_eq!(y_at(5.0, -5.0), 1.0);
+        assert_eq!(y_at(-5.0, 5.0), 2.0);
+        assert_eq!(y_at(5.0, 5.0), 3.0);
     }
 }

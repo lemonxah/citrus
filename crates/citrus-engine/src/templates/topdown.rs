@@ -9,6 +9,9 @@ use citrus_core::{
 use super::TemplateContent;
 use super::builder::{self, CHARACTER_LAYER, Scene, button, keys, mouse, wasd, wheel};
 
+const LAMP_POST: &str = "models/props/default/lamp_post.glb";
+const TREASURE_CHEST: &str = "models/props/default/treasure_chest.glb";
+
 /// A lever on a base that toggles `target` when used.
 fn lever(s: &mut Scene, name: &str, t: [f32; 3], target: usize, rebake: bool, prompt: &str) -> usize {
     let root = s.empty(name, None, t);
@@ -49,11 +52,14 @@ pub fn build() -> TemplateContent {
     let mut bob = Bob::default();
     (bob.axis, bob.amplitude, bob.frequency) = ([0.0, 1.0, 0.0], 0.15, 0.5);
     s.with(treasure, bob);
+    let chest = s.model("Treasure Chest", TREASURE_CHEST, None, [2.0, 0.0, -12.0], 1.0);
+    s.with(chest, BoxCollider { center: [0.0, 0.32, 0.0], size: [0.54, 0.63, 0.93], ..Default::default() });
+    s.entries[chest].static_geometry = true;
     lever(&mut s, "Gate Lever", [4.0, 0.0, -5.5], gate, true, "Open gate");
 
     let lamp = s.empty("Lamp Post", None, [-9.0, 0.0, 1.0]);
-    s.block("Pole", Some(lamp), [0.0, 1.5, 0.0], [0.2, 3.0, 0.2], "trim");
-    s.prim("Bulb", PrimitiveShape::Sphere, Some(lamp), [0.0, 3.1, 0.0], [0.4; 3], "glow");
+    let lamp_model = s.model("Lamp Model", LAMP_POST, Some(lamp), [0.0, 0.0, 0.0], 1.6);
+    s.entries[lamp_model].static_geometry = true;
     let light = s.point_light("Lamp Light", Some(lamp), [0.0, 3.0, 0.0], [1.0, 0.8, 0.5], 6.0, 10.0);
     lever(&mut s, "Lamp Switch", [-7.5, 0.0, 2.5], light, false, "Toggle lamp");
 
@@ -96,5 +102,5 @@ pub fn build() -> TemplateContent {
             button("Click", vec![builder::pad(citrus_core::PadButton::South)]),
         ],
     );
-    builder::content(s.finish(), Vec::new(), bindings, Vec::new())
+    builder::content(s.finish(), Vec::new(), bindings, vec![LAMP_POST, TREASURE_CHEST])
 }

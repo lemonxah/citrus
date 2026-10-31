@@ -177,6 +177,7 @@ impl Swapchain {
             }
             self.loader.destroy_swapchain(self.handle, None);
         }
+        self.handle = vk::SwapchainKHR::null();
         self.views.clear();
         self.render_finished.clear();
         self.images.clear();

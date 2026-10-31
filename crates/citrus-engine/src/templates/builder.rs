@@ -9,7 +9,7 @@ use citrus_assets::{
 use citrus_core::{
     ActionBinding, ActionKind, BoxCollider, CameraComponent, Component, ControlScheme, InputSource,
     Key, LightComponent, LightKind, MouseAxis, MouseButton, ObjectId, ObjectRef, PadAxis,
-    PadButton, ParticleEmitter, UiAction, UiButton, UiPauseMenu, UiText,
+    PadButton, ParticleEmitter, Terrain, UiAction, UiButton, UiPauseMenu, UiText,
 };
 use citrus_render::{MaterialFeatures, MaterialParams};
 use glam::{Quat, Vec3};
@@ -159,6 +159,35 @@ impl Scene {
                 center: [0.0, -0.05, 0.0],
                 size: [2.0, 0.1, 2.0],
                 ..Default::default()
+            },
+        );
+        self.entries[i].static_geometry = true;
+        i
+    }
+
+    pub fn terrain(&mut self, size: f32, resolution: u32, height: f32, material: &str) -> usize {
+        let n = (resolution + 1) as usize;
+        let mut heights = Vec::with_capacity(n * n);
+        for z in 0..n {
+            for x in 0..n {
+                let fx = x as f32 / resolution as f32;
+                let fz = z as f32 / resolution as f32;
+                let wave = (fx * std::f32::consts::TAU * 2.0).sin()
+                    * (fz * std::f32::consts::TAU).cos()
+                    * 0.5
+                    + (fx * std::f32::consts::TAU * 4.0).cos() * 0.25;
+                heights.push(wave * height);
+            }
+        }
+        let i = self.empty("Terrain", None, [0.0; 3]);
+        self.with(
+            i,
+            Terrain {
+                size,
+                resolution,
+                heights,
+                material: mat_path(material),
+                collider: true,
             },
         );
         self.entries[i].static_geometry = true;

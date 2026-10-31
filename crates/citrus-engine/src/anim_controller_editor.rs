@@ -42,6 +42,10 @@ pub struct AnimControllerTab {
     sel: Sel,
     pan: Vec2,
     zoom: f32,
+    /// Side panel widths. Only the drag handles on the graph's edges change
+    /// them: a resizable egui panel adopts whatever width its contents report.
+    left_width: f32,
+    right_width: f32,
     dragging: Option<Node>,
     /// Drawing a new transition from this node (drag with Shift, or the
     /// context menu's Make Transition followed by a click).
@@ -64,6 +68,8 @@ impl Default for AnimControllerTab {
             sel: Sel::None,
             pan: Vec2::ZERO,
             zoom: 1.0,
+            left_width: 236.0,
+            right_width: 290.0,
             dragging: None,
             linking: None,
             context: None,
@@ -325,8 +331,8 @@ impl AnimControllerTab {
         }
 
         egui::SidePanel::left("citrus-animctrl-left")
-            .resizable(true)
-            .default_width(236.0)
+            .resizable(false)
+            .exact_width(self.left_width)
             .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::same(12)))
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("citrus-animctrl-left-scroll").show(ui, |ui| {
@@ -336,8 +342,8 @@ impl AnimControllerTab {
                 });
             });
         egui::SidePanel::right("citrus-animctrl-right")
-            .resizable(true)
-            .default_width(290.0)
+            .resizable(false)
+            .exact_width(self.right_width)
             .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::same(12)))
             .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("citrus-animctrl-right-scroll").show(ui, |ui| {
@@ -346,7 +352,11 @@ impl AnimControllerTab {
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG_VIEWPORT))
-            .show_inside(ui, |ui| self.canvas(ui, scene, live));
+            .show_inside(ui, |ui| {
+                let area = ui.max_rect();
+                self.canvas(ui, scene, live);
+                self.panel_handles(ui, area);
+            });
 
         // Save once an edit settles (no button held), like code tabs.
         if self.dirty && !ui.input(|i| i.pointer.any_down()) && !ui.ctx().wants_keyboard_input() {
@@ -948,6 +958,26 @@ impl AnimControllerTab {
         out
     }
 
+    /// Drag strips on the graph's left and right edges (added after the graph
+    /// so they take the pointer first): the only way the side panels resize.
+    fn panel_handles(&mut self, ui: &mut egui::Ui, area: egui::Rect) {
+        for (left, x) in [(true, area.left()), (false, area.right())] {
+            let strip = egui::Rect::from_x_y_ranges(x - 3.0..=x + 3.0, area.y_range());
+            let handle = ui.interact(strip, ui.id().with(("citrus-animctrl-panel-handle", left)), Sense::drag());
+            if handle.hovered() || handle.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if handle.dragged() {
+                let dx = handle.drag_delta().x;
+                if left {
+                    self.left_width = (self.left_width + dx).clamp(180.0, 420.0);
+                } else {
+                    self.right_width = (self.right_width - dx).clamp(240.0, 520.0);
+                }
+            }
+        }
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui, scene: &mut LoadedScene, live: Option<usize>) {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
@@ -1346,7 +1376,9 @@ fn arrow_head(painter: &egui::Painter, a: Pos2, b: Pos2, color: Color32, zoom: f
 fn clip_combo(ui: &mut egui::Ui, id: egui::Id, value: &mut String, choices: &[String]) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
-        let w = (ui.available_width() - 30.0).max(60.0);
+        // Leave exactly the button and the gap: a wider row makes the
+        // resizable side panel grow to fit it, every frame.
+        let w = (ui.available_width() - theme::H_FIELD - ui.spacing().item_spacing.x).max(60.0);
         changed |= ui.add(egui::TextEdit::singleline(value).hint_text("clip or .anim").desired_width(w)).changed();
         let pick = widgets::icon_button_sized(ui, Icon::Caret, "Choose a clip", false, Vec2::splat(theme::H_FIELD));
         egui::Popup::menu(&pick).id(id).show(|ui| {

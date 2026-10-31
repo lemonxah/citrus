@@ -344,6 +344,9 @@ pub struct LoadedScene {
     cloth_time: f32,
     /// Where cloth cull distances are measured from (None = the main camera).
     cloth_viewer: Option<Vec3>,
+    /// Weapon Holds put their weapon at the stored idle/aim pose (Play and
+    /// shipped games). Off while editing, so the weapon can be posed by hand.
+    pub weapon_poses_live: bool,
     /// Lip sync: the local mic's visemes, and remote players' by the object
     /// their peer owns.
     local_visemes: Option<citrus_core::VisemeFrame>,
@@ -369,6 +372,8 @@ pub struct LoadedScene {
     /// weight, effects its profile overrides). Shown by the Environment tab.
     pub postfx_overrides: Vec<(String, f32, Vec<&'static str>)>,
     primitive_meshes: HashMap<citrus_assets::PrimitiveShape, usize>,
+    /// Object index -> (Terrain snapshot, mesh index), for incremental rebuilds.
+    terrain_meshes: HashMap<usize, (citrus_core::Terrain, usize)>,
     default_material: Option<usize>,
     /// model path -> base index of its meshes in the scene arrays
     /// (a model's primitives are appended contiguously).
@@ -528,6 +533,104 @@ pub struct BakeGather {
     pub sky_color: [f32; 3],
 }
 
+/// What [`hold_weapon`] decided for one Weapon Hold this frame.
+pub(crate) struct HoldUpdate {
+    weapon: usize,
+    pub(crate) world: Mat4,
+    blend: f32,
+    stored: Option<(citrus_core::WeaponPoseSlot, citrus_core::WeaponPose)>,
+}
+
+fn pose_matrix(p: citrus_core::WeaponPose) -> Mat4 {
+    let [x, y, z] = p.rotation.map(f32::to_radians);
+    Mat4::from_rotation_translation(Quat::from_euler(glam::EulerRot::XYZ, x, y, z), Vec3::from(p.position))
+}
+
+fn matrix_pose(m: Mat4) -> citrus_core::WeaponPose {
+    let (_, r, t) = m.to_scale_rotation_translation();
+    let (x, y, z) = r.to_euler(glam::EulerRot::XYZ);
+    citrus_core::WeaponPose { position: t.to_array(), rotation: [x, y, z].map(f32::to_degrees), ..Default::default() }
+}
+
+/// Place Weapon Hold `k`'s weapon for the animated object `i` (when `i` is
+/// its avatar) and bend `i`'s arms onto the weapon's hand targets.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hold_weapon(
+    objects: &[SceneObject],
+    world: &[Mat4],
+    i: usize,
+    k: usize,
+    hold: &citrus_core::WeaponHold,
+    live: bool,
+    skel: &citrus_assets::Skeleton,
+    locals: &mut [Mat4],
+    dt: f32,
+) -> Option<HoldUpdate> {
+    let index = |r: citrus_core::ObjectRef| r.0.and_then(|id| objects.iter().position(|o| o.id == id));
+    let avatar = index(hold.avatar)?;
+    std::iter::successors(Some(i), |&o| objects[o].parent).find(|&o| o == avatar)?;
+    let descriptor = std::iter::successors(Some(i), |&o| objects[o].parent)
+        .find_map(|o| objects[o].components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::AvatarDescriptor>()));
+    let rig = match descriptor {
+        Some(desc) if !desc.bone_map.is_empty() => crate::humanoid::HumanoidRig::map_with_overrides(skel, &desc.bone_map).0,
+        _ => crate::humanoid::HumanoidRig::map(skel),
+    };
+    let anchor = skel.joints.iter().position(|j| j.name == hold.anchor_bone).or(rig.chest)?;
+    let joints = skel.world_matrices(locals);
+    let anchor_world = world[i] * joints[anchor];
+
+    let aiming = objects[i]
+        .components
+        .iter()
+        .find_map(|c| c.as_any().downcast_ref::<citrus_core::Animator>())
+        .and_then(|a| a.state.params.get(&hold.aim_parameter))
+        .is_some_and(|v| *v > 0.5);
+    let step = if hold.blend_time > 0.0 { dt / hold.blend_time } else { 1.0 };
+    let blend = if aiming { (hold.blend + step).min(1.0) } else { (hold.blend - step).max(0.0) };
+
+    let frame = |follow| match follow {
+        citrus_core::WeaponFollow::Bone => anchor_world,
+        citrus_core::WeaponFollow::Avatar => world[i],
+        citrus_core::WeaponFollow::World => Mat4::IDENTITY,
+    };
+    let placed = |pose: citrus_core::WeaponPose| frame(pose.follow) * pose_matrix(pose);
+    let mut stored = None;
+    let weapon_world = if live {
+        let (_, ri, ti) = placed(hold.idle).to_scale_rotation_translation();
+        let (_, ra, ta) = placed(hold.aim).to_scale_rotation_translation();
+        Mat4::from_rotation_translation(ri.slerp(ra, blend), ti.lerp(ta, blend))
+    } else {
+        let pose = hold.pose(hold.editing);
+        match hold.request {
+            Some(citrus_core::WeaponPoseRequest::Load) => placed(pose),
+            Some(citrus_core::WeaponPoseRequest::Store) => {
+                let saved = matrix_pose(frame(pose.follow).inverse() * world[k]);
+                stored = Some((hold.editing, citrus_core::WeaponPose { follow: pose.follow, ..saved }));
+                world[k]
+            }
+            None if !hold.placed => placed(pose),
+            None => world[k],
+        }
+    };
+
+    // Elbows bend down, back and out (skeleton space).
+    let forward = crate::humanoid::rest_forward(skel, &rig);
+    let right = forward.cross(Vec3::Y);
+    let to_skeleton = world[i].inverse();
+    for (target, arm, side) in [
+        (hold.right_hand, (rig.r_upper_arm, rig.r_lower_arm, rig.r_hand), 1.0),
+        (hold.left_hand, (rig.l_upper_arm, rig.l_lower_arm, rig.l_hand), -1.0),
+    ] {
+        let (Some(t), (Some(upper), Some(lower), Some(hand))) = (index(target), arm) else { continue };
+        // A hand target under the weapon moves with it this frame.
+        let target_world = if objects[t].parent == Some(k) { weapon_world * objects[t].local_transform() } else { world[t] };
+        let shoulder = skel.world_matrices(locals)[upper].w_axis.truncate();
+        let pole = shoulder + right * (0.3 * side) - Vec3::Y * 0.5 - forward * 0.3;
+        crate::humanoid::reach_hand(skel, locals, (upper, lower, hand), to_skeleton * target_world, pole);
+    }
+    Some(HoldUpdate { weapon: k, world: weapon_world, blend, stored })
+}
+
 impl LoadedScene {
     pub fn empty() -> Self {
         Self {
@@ -552,6 +655,7 @@ impl LoadedScene {
             local_face: None,
             cloth_time: 0.0,
             cloth_viewer: None,
+            weapon_poses_live: true,
             local_visemes: None,
             remote_visemes: HashMap::new(),
             mesh_geometry: Vec::new(),
@@ -563,6 +667,7 @@ impl LoadedScene {
             mesh_bounds: Vec::new(),
             mesh_has_lightmap_uv: Vec::new(),
             primitive_meshes: HashMap::new(),
+            terrain_meshes: HashMap::new(),
             default_material: None,
             model_mesh_base: HashMap::new(),
             model_templates: HashMap::new(),
@@ -3849,6 +3954,56 @@ impl LoadedScene {
         best.map(|y| (y, Vec3::Y))
     }
 
+    /// Move each Bone Attach object onto its avatar's bone in this frame's pose.
+    fn apply_bone_attaches(&mut self, attaches: &[(usize, citrus_core::BoneAttach)], posed: &HashMap<usize, (usize, Vec<Mat4>)>, world: &[Mat4]) {
+        for (k, attach) in attaches {
+            let Some(avatar) = attach.avatar.0.and_then(|id| self.index_of(id)) else { continue };
+            let bone_world = posed.iter().filter(|(i, _)| self.is_within(**i, avatar)).find_map(|(i, (skel, joints))| {
+                let j = self.skeletons[*skel].joints.iter().position(|j| j.name == attach.bone)?;
+                Some(world[*i] * joints[j])
+            });
+            let Some(bone_world) = bone_world else { continue };
+            let [rx, ry, rz] = attach.rotation.map(f32::to_radians);
+            let offset = Mat4::from_rotation_translation(Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz), Vec3::from(attach.position));
+            let parent = self.objects[*k].parent.map_or(Mat4::IDENTITY, |p| world[p]);
+            let (_, rotation, translation) = (parent.inverse() * bone_world * offset).to_scale_rotation_translation();
+            self.objects[*k].rotation = rotation;
+            self.objects[*k].translation = translation;
+        }
+    }
+
+    /// Move each held weapon and save the hold's blend / stored pose.
+    fn apply_weapon_holds(&mut self, updates: Vec<HoldUpdate>, world: &[Mat4]) {
+        for u in updates {
+            let parent = self.objects[u.weapon].parent.map_or(Mat4::IDENTITY, |p| world[p]);
+            let (_, rotation, translation) = (parent.inverse() * u.world).to_scale_rotation_translation();
+            self.objects[u.weapon].rotation = rotation;
+            self.objects[u.weapon].translation = translation;
+            if let Some(hold) = self.objects[u.weapon].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::WeaponHold>()) {
+                hold.blend = u.blend;
+                hold.placed = true;
+                hold.request = None;
+                if let Some((slot, pose)) = u.stored {
+                    *hold.pose_mut(slot) = pose;
+                }
+            }
+        }
+    }
+
+    /// True when `i` is `root` or one of its descendants.
+    fn is_within(&self, mut i: usize, root: usize) -> bool {
+        for _ in 0..=self.objects.len() {
+            if i == root {
+                return true;
+            }
+            match self.objects[i].parent {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
+        false
+    }
+
     pub fn update_skinning(&mut self, renderer: &mut Renderer, dt: f32) {
         if self.skinned_meshes.is_empty() {
             return;
@@ -3861,6 +4016,23 @@ impl LoadedScene {
             .collect();
         let active = self.active_flags();
         let world = self.world_transforms();
+        let attaches: Vec<(usize, citrus_core::BoneAttach)> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| active[*i])
+            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::BoneAttach>()).map(|a| (i, a.clone())))
+            .collect();
+        let holds: Vec<(usize, citrus_core::WeaponHold)> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| active[*i])
+            .filter_map(|(i, o)| o.components.iter().find_map(|c| c.as_any().downcast_ref::<citrus_core::WeaponHold>()).map(|h| (i, h.clone())))
+            .collect();
+        let mut hold_updates: Vec<HoldUpdate> = Vec::new();
+        // Animated objects' final joint matrices (model space), for Bone Attach.
+        let mut posed_joints: HashMap<usize, (usize, Vec<Mat4>)> = HashMap::new();
         // Source meshes still drawn by some object without an Animator; only
         // those need the shared (whole-scene) pose.
         let mut shared_users: std::collections::HashSet<usize> = Default::default();
@@ -4044,7 +4216,15 @@ impl LoadedScene {
                     .collect();
                 crate::cloth::step(&mut self.objects[i].components, skel, &verts, &mut locals, world[i], &cloth_shapes, &winds, viewer, cloth_time, dt);
             }
+            for (k, hold) in &holds {
+                if let Some(update) = hold_weapon(&self.objects, &world, i, *k, hold, self.weapon_poses_live, skel, &mut locals, dt) {
+                    hold_updates.push(update);
+                }
+            }
             let palette = skel.palette(&locals);
+            if !attaches.is_empty() {
+                posed_joints.insert(i, (skeleton, skel.world_matrices(&locals)));
+            }
 
             if self.anim_instances.get(&id).is_none_or(|inst| inst.gpu != gpu) {
                 let mut slots = Vec::new();
@@ -4107,6 +4287,8 @@ impl LoadedScene {
         self.anim_instances.retain(|id, _| alive.contains(id));
         self.body_ik_state.retain(|id, _| alive.contains(id));
         self.pose_bounds.retain(|(id, _), _| alive.contains(id));
+        self.apply_bone_attaches(&attaches, &posed_joints, &world);
+        self.apply_weapon_holds(hold_updates, &world);
 
         // Shared path (objects without an Animator): IK targets pose humanoid
         // avatars when present; otherwise the skeleton's first clip loops.
@@ -5126,6 +5308,74 @@ impl LoadedScene {
                 default_material
             }
         }
+    }
+
+    /// Upload (or re-upload) a render mesh for every object carrying a
+    /// `Terrain` component whose height grid changed since the last sync.
+    /// Runs every frame from the host; cheap once each mesh is current.
+    pub fn sync_terrain_meshes(&mut self, renderer: &mut Renderer, shaders: &mut ShaderLibrary, project_root: &Path) {
+        for i in 0..self.objects.len() {
+            let Some(terrain) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<citrus_core::Terrain>())
+                .cloned()
+            else {
+                continue;
+            };
+            if self.terrain_meshes.get(&i).is_some_and(|(snap, _)| *snap == terrain) {
+                continue;
+            }
+            let material = if terrain.material.is_empty() {
+                match self.default_material {
+                    Some(m) => m,
+                    None => match self.ensure_default_material(renderer) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("terrain material: {e:#}");
+                            continue;
+                        }
+                    },
+                }
+            } else {
+                let abs = citrus_core::asset_ref::resolve_path(project_root, &terrain.material);
+                self.material_from_file(renderer, shaders, &abs, project_root)
+            };
+            let mesh = match self.upload_terrain_mesh(renderer, &terrain) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("terrain mesh: {e:#}");
+                    continue;
+                }
+            };
+            self.objects[i].render = Some(RenderInfo { mesh, material });
+            self.terrain_meshes.insert(i, (terrain, mesh));
+        }
+    }
+
+    /// Generate and upload the heightfield mesh for a `Terrain` component,
+    /// mirroring the primitive-mesh upload path.
+    fn upload_terrain_mesh(&mut self, renderer: &mut Renderer, terrain: &citrus_core::Terrain) -> Result<usize> {
+        let data = citrus_assets::heightfield_mesh(terrain.size, terrain.resolution, &terrain.heights);
+        self.mesh_handles.push(renderer.upload_mesh(&data)?);
+        self.mesh_geometry.push((
+            data.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
+            data.indices.clone(),
+        ));
+        self.mesh_sdf.push(None);
+        self.mesh_infos.push(MeshInfo {
+            vertices: data.vertices.len() as u32,
+            triangles: data.indices.len() as u32 / 3,
+        });
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for v in &data.vertices {
+            min = min.min(Vec3::from(v.position));
+            max = max.max(Vec3::from(v.position));
+        }
+        self.mesh_bounds.push((min, max));
+        self.mesh_has_lightmap_uv.push(data.has_lightmap_uv);
+        Ok(self.mesh_handles.len() - 1)
     }
 
     /// Load any LOD-level models not uploaded yet (cheap when all are loaded).

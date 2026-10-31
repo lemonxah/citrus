@@ -104,6 +104,8 @@ mod river_edit;
 #[cfg(feature = "editor")]
 mod cloth_paint;
 #[cfg(feature = "editor")]
+mod terrain_paint;
+#[cfg(feature = "editor")]
 mod ui_edit;
 #[cfg(feature = "editor")]
 mod ui_editor;

@@ -9,7 +9,9 @@
 mod builder;
 mod avatar;
 mod weapons;
+mod cardgame;
 mod fps;
+mod novel;
 mod strategy;
 mod topdown;
 mod tps;
@@ -49,6 +51,8 @@ pub(crate) fn build(id: &str) -> Result<TemplateContent> {
         "strategy" => strategy::build(),
         "vr_shooter" => vr_shooter::build(),
         "vr_social" => vr_social::build(),
+        "novel" => novel::build(),
+        "cardgame" => cardgame::build(),
         other => anyhow::bail!(
             "unknown project template {other:?} (expected one of: {})",
             TEMPLATES.iter().map(|t| t.id).collect::<Vec<_>>().join(", ")

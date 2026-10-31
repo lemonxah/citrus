@@ -54,8 +54,9 @@ struct App {
     error: Option<anyhow::Error>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum HubEvent { Show, Quit }
+/// `Show` carries the tray click's XDG activation token, if the host sent one.
+#[derive(Clone, Debug)]
+pub(crate) enum HubEvent { Show(Option<String>), Quit }
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -65,6 +66,17 @@ impl App {
             tracing::debug!("installing app icon: {e}");
         }
         let hub = Hub::new(&self.egui_ctx);
+        let window = Self::create_window(event_loop, &hub, None)?;
+        #[cfg(target_os = "linux")]
+        { self.tray = crate::tray::start(self.proxy.clone()); }
+        let gpu = citrus_render::EguiWindow::new(&window, c"citrus hub", true).context("starting Vulkan for the hub window")?;
+        self.gpu = Some(gpu);
+        self.hub = Some(hub);
+        self.adopt_window(window);
+        Ok(())
+    }
+
+    fn create_window(event_loop: &ActiveEventLoop, hub: &Hub, token: Option<String>) -> Result<Arc<Window>> {
         let [w, h] = hub.settings.window_size_clamped();
         let (icon_w, icon_h, icon_rgba) = citrus_editor::icons::app_icon_rgba();
         let attrs = Window::default_attributes()
@@ -77,25 +89,63 @@ impl App {
         let attrs = {
             use winit::platform::{wayland, x11};
             let attrs = wayland::WindowAttributesExtWayland::with_name(attrs, "citrus", "citrus");
-            x11::WindowAttributesExtX11::with_name(attrs, "citrus", "citrus")
+            let attrs = x11::WindowAttributesExtX11::with_name(attrs, "citrus", "citrus");
+            match token {
+                Some(token) => winit::platform::startup_notify::WindowAttributesExtStartupNotify::with_activation_token(
+                    attrs,
+                    winit::window::ActivationToken::from_raw(token),
+                ),
+                None => attrs,
+            }
         };
-        let window = Arc::new(event_loop.create_window(attrs).context("creating the hub window")?);
-        #[cfg(target_os = "linux")]
-        { self.tray = crate::tray::start(self.proxy.clone()); }
-        let gpu = citrus_render::EguiWindow::new(&window, c"citrus hub", true).context("starting Vulkan for the hub window")?;
-        self.egui_state = Some(egui_winit::State::new(
-            self.egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        ));
+        #[cfg(not(target_os = "linux"))]
+        let _ = token;
+        Ok(Arc::new(event_loop.create_window(attrs).context("creating the hub window")?))
+    }
+
+    fn adopt_window(&mut self, window: Arc<Window>) {
+        // Kept across reopened windows: a new State restarts its input clock at
+        // zero, and egui panics when input time moves backwards.
+        if self.egui_state.is_none() {
+            self.egui_state = Some(egui_winit::State::new(
+                self.egui_ctx.clone(),
+                egui::ViewportId::ROOT,
+                &window,
+                Some(window.scale_factor() as f32),
+                None,
+                None,
+            ));
+        }
         window.request_redraw();
-        self.gpu = Some(gpu);
         self.window = Some(window);
-        self.hub = Some(hub);
-        Ok(())
+        self.minimized = false;
+    }
+
+    /// Bring the hub back from the tray: a new window, since the old one was
+    /// destroyed (see `minimize_to_tray`).
+    fn show(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
+        if let Some(window) = &self.window {
+            window.set_minimized(false);
+            window.focus_window();
+            self.wake();
+            return;
+        }
+        let (Some(hub), Some(gpu)) = (self.hub.as_ref(), self.gpu.as_mut()) else { return };
+        let window = match Self::create_window(event_loop, hub, token) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("reopening the hub window: {e:#}");
+                return;
+            }
+        };
+        if let Err(e) = gpu.attach(&window) {
+            tracing::error!("reopening the hub window: {e:#}");
+            return;
+        }
+        self.adopt_window(window);
+        if let Some(hub) = self.hub.as_mut() {
+            hub.refresh();
+        }
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
@@ -127,6 +177,7 @@ impl App {
             self.repaint_at = Some(Instant::now() + delay);
         }
         if requests.close {
+            tracing::info!("exiting: closing after opening a project");
             hub.save_settings();
             event_loop.exit();
         } else if requests.minimize {
@@ -138,33 +189,46 @@ impl App {
 impl App {
     fn minimize_to_tray(&mut self) {
         let Some(window) = &self.window else { return };
+        // Wayland can neither hide nor un-minimise a window, so the window is
+        // destroyed and the tray's Open makes a new one. The device and egui
+        // textures stay alive in `gpu`.
         #[cfg(target_os = "linux")]
-        if self.tray.as_ref().is_some_and(|tray| !tray.is_closed()) {
-            window.set_visible(false);
-            self.minimized = true;
+        if self.tray.as_ref().is_some_and(|tray| !tray.is_closed())
+            && let Some(gpu) = self.gpu.as_mut()
+        {
+            gpu.detach();
+            self.window = None;
+            self.repaint_at = None;
             return;
         }
+        // Rendering pauses while minimised. Wayland never reports un-minimising,
+        // so focus or input on the window (see `wake`) resumes it.
         window.set_minimized(true);
+        self.minimized = true;
+    }
+
+    fn wake(&mut self) {
+        if self.minimized {
+            self.minimized = false;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
     }
 }
 
 impl ApplicationHandler<HubEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: HubEvent) {
         match event {
-            HubEvent::Show => {
-                if let Some(window) = &self.window {
-                    window.set_visible(true);
-                    window.set_minimized(false);
-                    window.focus_window();
-                    self.minimized = false;
-                    window.request_redraw();
-                }
+            HubEvent::Show(token) => self.show(event_loop, token),
+            HubEvent::Quit => {
+                tracing::info!("exiting: Quit from the tray");
+                event_loop.exit();
             }
-            HubEvent::Quit => event_loop.exit(),
         }
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.hub.is_some() {
             return;
         }
         if let Err(e) = self.init(event_loop) {
@@ -182,6 +246,7 @@ impl ApplicationHandler<HubEvent> for App {
         }
         match event {
             WindowEvent::CloseRequested => {
+                tracing::info!("exiting: window closed");
                 if let Some(hub) = &self.hub {
                     hub.save_settings();
                 }
@@ -201,19 +266,24 @@ impl ApplicationHandler<HubEvent> for App {
                 window.request_redraw();
             }
             WindowEvent::Focused(true) => {
+                self.wake();
                 // The editor may have recorded a project, or been built, meanwhile.
                 if let Some(hub) = self.hub.as_mut() {
                     hub.refresh();
                 }
                 window.request_redraw();
             }
+            WindowEvent::CursorEntered { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::KeyboardInput { .. } => self.wake(),
             WindowEvent::RedrawRequested => self.frame(event_loop),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.as_ref().is_some_and(|w| w.is_visible() == Some(true) && w.is_minimized() == Some(true)) {
+        if !self.minimized && self.window.as_ref().is_some_and(|w| w.is_visible() == Some(true) && w.is_minimized() == Some(true)) {
             self.minimize_to_tray();
         }
         match self.repaint_at {

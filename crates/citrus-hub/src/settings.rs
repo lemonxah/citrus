@@ -13,8 +13,10 @@ pub const SETTINGS_FILE: &str = "hub.ron";
 /// What the hub does once it has started the editor on a project.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AfterOpen {
-    /// Stay running, minimised.
+    /// Keep the hub window open and interactive.
     #[default]
+    KeepOpen,
+    /// Stay running, minimised.
     Minimize,
     Close,
 }
@@ -110,7 +112,7 @@ mod tests {
         std::fs::write(&path, "(window_size: (900.0, 600.0))").unwrap();
         let partial = HubSettings::load(&path);
         assert_eq!(partial.window_size, [900.0, 600.0]);
-        assert_eq!(partial.after_open, AfterOpen::Minimize);
+        assert_eq!(partial.after_open, AfterOpen::KeepOpen);
         std::fs::write(&path, "{").unwrap();
         assert_eq!(HubSettings::load(&path), HubSettings::default());
         let tiny = HubSettings { window_size: [0.0, 0.0], ..Default::default() };

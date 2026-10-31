@@ -1,6 +1,5 @@
 //! First Person Shooter template.
 
-use citrus_assets::PrimitiveShape;
 use citrus_core::{
     BodyKind, BoxCollider, CharacterController, FirstPersonController, Health, HitscanWeapon,
     RigidBody,
@@ -9,6 +8,17 @@ use glam::Quat;
 
 use super::TemplateContent;
 use super::builder::{self, Scene};
+
+pub const CRATE: &str = "models/props/default/wooden_crate.glb";
+pub const METAL_CRATE: &str = "models/props/default/metal_crate.glb";
+
+fn crate_model(s: &mut Scene, name: &str, parent: usize, position: [f32; 3], path: &'static str, meshes: usize) -> usize {
+    let i = s.model(name, path, Some(parent), position, 1.0);
+    if let citrus_assets::ObjectSource::Model { extra_meshes, .. } = &mut s.entries[i].source {
+        extra_meshes.extend(1..meshes);
+    }
+    i
+}
 
 /// Walled arena with cover, a ramp up to a platform, a crate stack and a
 /// target range at the far end. Shared by the shooter templates.
@@ -89,14 +99,8 @@ pub(super) fn arena(s: &mut Scene) {
     .into_iter()
     .enumerate()
     {
-        let c = s.prim(
-            &format!("Crate {}", k + 1),
-            PrimitiveShape::Cube,
-            Some(crates),
-            p,
-            [1.0; 3],
-            "wood",
-        );
+        let (path, meshes) = if k % 2 == 0 { (CRATE, 3) } else { (METAL_CRATE, 5) };
+        let c = crate_model(s, &format!("Crate {}", k + 1), crates, p, path, meshes);
         s.with(c, BoxCollider::default());
         s.with(
             c,
@@ -197,5 +201,5 @@ pub fn build() -> TemplateContent {
     let mut p = Scene::new();
     let dummy = builder::target_dummy(&mut p, "Target Dummy", [0.0; 3], 0.0);
     let prefabs = vec![("prefabs/target_dummy.prefab".to_string(), p.prefab(dummy))];
-    builder::content(s.finish(), prefabs, builder::shooter_bindings(), Vec::new())
+    builder::content(s.finish(), prefabs, builder::shooter_bindings(), vec![CRATE, METAL_CRATE])
 }

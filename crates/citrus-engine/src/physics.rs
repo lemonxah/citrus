@@ -28,7 +28,7 @@ use rapier3d::prelude::*;
 
 use citrus_core::{
     BodyKind, BoxCollider, CharacterController, CombineMode, JointKind, MeshCollider, ObjectId, PhysicsJoint,
-    PhysicsMaterial, PhysicsSettings, RayFilter, RayHit, RigidBody as RbComponent, SphereCollider, CapsuleCollider,
+    PhysicsMaterial, PhysicsSettings, RayFilter, RayHit, RigidBody as RbComponent, SphereCollider, CapsuleCollider, Terrain,
     ColliderAxis,
 };
 
@@ -1646,6 +1646,15 @@ fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -
             && let Some(shape) = mesh_shape(scene, i, scale, mesh_shape_mode(scene, i, m, kind != BodyKind::Fixed))
         {
             out.push((shape, m.is_trigger, m.material.as_str()));
+        } else if let Some(t) = any.downcast_ref::<Terrain>()
+            && t.collider
+        {
+            let mesh = citrus_assets::heightfield_mesh(t.size, t.resolution, &t.heights);
+            let points: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from(v.position) * scale).collect();
+            let tris: Vec<[u32; 3]> = mesh.indices.chunks(3).map(|t| [t[0], t[1], t[2]]).collect();
+            if let Some(shape) = ColliderBuilder::trimesh(points.iter().map(|v| rv(*v)).collect(), tris).ok() {
+                out.push((shape, false, t.material.as_str()));
+            }
         }
     }
     out

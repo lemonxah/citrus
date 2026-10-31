@@ -588,11 +588,16 @@ pub fn resolve(scheme: &ControlScheme, raw: &RawInput, prev: &InputState) -> Inp
                     }
                 }
                 let mut axis = Vec2::new(x, y);
-                if axis.length() > 1.0 {
-                    axis = axis.normalize();
-                }
-                if axis.length() < a.deadzone {
-                    axis = Vec2::ZERO;
+                // Mouse deltas are pixels moved this frame, not a stick
+                // deflection: clamping them to a unit vector caps look speed.
+                let mouse = [&a.analog_x, &a.analog_y].iter().any(|s| matches!(s, Some(InputSource::MouseAxis(_))));
+                if !mouse {
+                    if axis.length() > 1.0 {
+                        axis = axis.normalize();
+                    }
+                    if axis.length() < a.deadzone {
+                        axis = Vec2::ZERO;
+                    }
                 }
                 if a.invert_x {
                     axis.x = -axis.x;
@@ -646,5 +651,13 @@ mod tests {
         raw.pad_axes.insert(PadAxis::LeftStickX, 0.9);
         let s = resolve(&scheme, &raw, &InputState::default());
         assert!(s.axis2("Move").x > 0.5, "left stick X drives Move.x");
+    }
+
+    #[test]
+    fn mouse_look_keeps_full_pixel_delta() {
+        let scheme = ControlScheme::default_kb_mouse();
+        let raw = RawInput { mouse_delta: Vec2::new(30.0, -12.0), ..Default::default() };
+        let s = resolve(&scheme, &raw, &InputState::default());
+        assert_eq!(s.axis2("Look"), Vec2::new(30.0, -12.0), "mouse look is not clamped like a stick");
     }
 }

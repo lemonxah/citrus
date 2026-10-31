@@ -105,7 +105,7 @@ pub(crate) fn exit(ctx: &egui::Context) -> bool {
 /// The Scene view's camera, for projecting and casting rays.
 pub(crate) struct View {
     view_proj: Mat4,
-    rect: egui::Rect,
+    pub(crate) rect: egui::Rect,
     eye: Vec3,
     right: Vec3,
 }
@@ -116,7 +116,7 @@ impl View {
         Self { view_proj: proj * view, rect, eye: inv.w_axis.truncate(), right: inv.x_axis.truncate().normalize_or(Vec3::X) }
     }
 
-    fn project(&self, p: Vec3) -> Option<egui::Pos2> {
+    pub(crate) fn project(&self, p: Vec3) -> Option<egui::Pos2> {
         let clip = self.view_proj * p.extend(1.0);
         if clip.w <= 0.001 {
             return None;
@@ -128,7 +128,7 @@ impl View {
         ))
     }
 
-    fn ray(&self, pos: egui::Pos2) -> Option<(Vec3, Vec3)> {
+    pub(crate) fn ray(&self, pos: egui::Pos2) -> Option<(Vec3, Vec3)> {
         if self.rect.width() < 1.0 || self.rect.height() < 1.0 {
             return None;
         }
@@ -344,7 +344,7 @@ pub(crate) fn viewport(ui: &mut egui::Ui, scene: &mut LoadedScene, i: usize, vie
 }
 
 /// A circle of world radius `r` around `center` in the plane facing `normal`.
-fn brush_circle(painter: &egui::Painter, view: &View, center: Vec3, normal: Vec3, r: f32, stroke: egui::Stroke) {
+pub(crate) fn brush_circle(painter: &egui::Painter, view: &View, center: Vec3, normal: Vec3, r: f32, stroke: egui::Stroke) {
     let up = if normal.y.abs() < 0.99 { Vec3::Y } else { Vec3::X };
     let a = up.cross(normal).normalize();
     let b = normal.cross(a);
@@ -396,7 +396,7 @@ fn draw_heat_map(painter: &egui::Painter, view: &View, world: Mat4, posed: &[Vec
 }
 
 /// The key reminder along the bottom of the Scene view while painting.
-fn hint_bar(painter: &egui::Painter, rect: egui::Rect, text: &str) {
+pub(crate) fn hint_bar(painter: &egui::Painter, rect: egui::Rect, text: &str) {
     let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(theme::SIZE_META), theme::TEXT_SECONDARY);
     let size = galley.size() + egui::vec2(20.0, 10.0);
     let bar = egui::Rect::from_center_size(rect.center_bottom() - egui::vec2(0.0, size.y * 0.5 + 12.0), size);

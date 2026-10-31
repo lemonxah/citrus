@@ -3,9 +3,9 @@
 //! click-to-move, RTS camera / selection and the VR rig.
 
 use citrus_core::{
-    ClickToMove, ConflictPolicy, ControlsMenu, DeathAction, FirstPersonController, FollowCamera, Grabbable, Health, HitscanWeapon, HudBinding, HudValue,
+    BoneAttach, ClickToMove, ConflictPolicy, ControlsMenu, DeathAction, FirstPersonController, FollowCamera, Grabbable, Health, HitscanWeapon, HudBinding, HudValue,
     Interactable, ResourceAmount, ResourceStore, RtsCamera, RtsSelection, Selectable, Swimmer, TargetDummy, ThirdPersonController,
-    VrAvatar, VrLocomotion, VrPlayer, WeaponTrigger,
+    VrAvatar, VrLocomotion, VrPlayer, WeaponFollow, WeaponHold, WeaponPoseRequest, WeaponPoseSlot, WeaponTrigger,
 };
 use egui::{DragValue, Ui};
 use glam::Vec3;
@@ -23,6 +23,8 @@ pub(crate) fn register(e: &mut EditorComponents) {
     e.register::<Swimmer>();
     e.register::<ThirdPersonController>();
     e.register::<FollowCamera>();
+    e.register::<BoneAttach>();
+    e.register::<WeaponHold>();
     e.register::<ClickToMove>();
     e.register::<Interactable>();
     e.register::<RtsCamera>();
@@ -326,6 +328,59 @@ impl Inspect for FollowCamera {
     }
 }
 impl Gizmo for FollowCamera {}
+
+impl Inspect for BoneAttach {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut c = false;
+        c |= ctx.object_ref(ui, "Avatar", &mut self.avatar);
+        text(ui, "Bone", &mut self.bone, &mut c);
+        vec3(ui, "Position", &mut self.position, &mut c);
+        vec3(ui, "Rotation", &mut self.rotation, &mut c);
+        c
+    }
+}
+impl Gizmo for BoneAttach {}
+
+impl Inspect for WeaponHold {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut c = false;
+        c |= ctx.object_ref(ui, "Avatar", &mut self.avatar);
+        c |= ctx.object_ref(ui, "Right hand target", &mut self.right_hand);
+        c |= ctx.object_ref(ui, "Left hand target", &mut self.left_hand);
+        text(ui, "Anchor bone", &mut self.anchor_bone, &mut c);
+        text(ui, "Aim parameter", &mut self.aim_parameter, &mut c);
+        drag(ui, "Blend time", &mut self.blend_time, 0.01, 0.0..=2.0, &mut c);
+        ui.add_space(6.0);
+        widgets::property_row(ui, "Edit pose", |ui| {
+            c |= widgets::segmented(ui, &mut self.editing, &[(WeaponPoseSlot::Idle, "Idle"), (WeaponPoseSlot::Aim, "Aim")]).changed();
+        });
+        widgets::property_row(ui, "", |ui| {
+            if widgets::secondary_button(ui, None, "Load pose").on_hover_text("Move the weapon to this pose").clicked() {
+                self.request = Some(WeaponPoseRequest::Load);
+                c = true;
+            }
+            if widgets::secondary_button(ui, None, "Store pose").on_hover_text("Save where the weapon is now as this pose").clicked() {
+                self.request = Some(WeaponPoseRequest::Store);
+                c = true;
+            }
+        });
+        let slot = self.editing;
+        let pose = self.pose_mut(slot);
+        combo(
+            ui,
+            "weapon-hold-follow",
+            "Follows",
+            &mut pose.follow,
+            &[(WeaponFollow::Bone, "Anchor bone (sways)"), (WeaponFollow::Avatar, "Avatar (no sway)"), (WeaponFollow::World, "World (fixed)")],
+            &mut c,
+        );
+        vec3(ui, "Position", &mut pose.position, &mut c);
+        vec3(ui, "Rotation", &mut pose.rotation, &mut c);
+        note(ui, "Outside Play the weapon stays where you put it and the arms reach its hand targets. Move the weapon and the two hand targets with the gizmo, then Store pose. In Play the weapon follows the idle pose, and the aim pose while the aim parameter is on.");
+        c
+    }
+}
+impl Gizmo for WeaponHold {}
 
 // ------------------------------------------------------------------ top-down
 

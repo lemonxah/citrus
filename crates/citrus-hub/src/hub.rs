@@ -61,7 +61,6 @@ struct Creating {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowAction {
     None,
-    Select,
     Open,
     Pin(bool),
     Reveal,
@@ -90,7 +89,6 @@ pub struct Hub {
     recents_path: Option<PathBuf>,
     page: Page,
     search: String,
-    selected: Option<PathBuf>,
     new_name: String,
     new_location: String,
     new_template: &'static str,
@@ -115,7 +113,6 @@ impl Hub {
             .map_or(project_templates::DEFAULT_TEMPLATE, |t| t.id);
         let new_location = settings.default_location.clone();
         let mut hub = Self {
-            selected: recents.last_opened.clone(),
             page: if recents.projects.is_empty() { Page::NewProject } else { Page::Projects },
             new_name: unique_name(Path::new(&new_location), "my-game"),
             new_location,
@@ -225,9 +222,9 @@ impl Hub {
         // The editor records it too; doing it here keeps the list right even
         // if the editor fails to start up.
         self.update_recents(|r| r.record(&key, &name, "", now_unix()));
-        self.selected = Some(citrus_assets::recent_projects::normalize_path(root));
         self.notify(format!("Opening {name}"), Level::Info);
         match self.settings.after_open {
+            AfterOpen::KeepOpen => {}
             AfterOpen::Minimize => self.requests.minimize = true,
             AfterOpen::Close => self.requests.close = true,
         }
@@ -539,12 +536,12 @@ impl Hub {
                 ui.add_space(6.0);
             }
         });
+        // Enter opens the top project: the most recent one unless one is pinned.
         if enter
             && action.is_none()
-            && let Some(sel) = self.selected.clone()
-            && list.iter().any(|p| p.path == sel)
+            && let Some(top) = list.first()
         {
-            action = Some((sel, RowAction::Open));
+            action = Some((top.path.clone(), if top.is_missing() { RowAction::Locate } else { RowAction::Open }));
         }
         if let Some((path, a)) = action {
             self.row_action(&path, a);
@@ -554,7 +551,6 @@ impl Hub {
     fn row_action(&mut self, path: &Path, action: RowAction) {
         match action {
             RowAction::None => {}
-            RowAction::Select => self.selected = Some(path.to_path_buf()),
             RowAction::Open => self.open_project(path),
             RowAction::Pin(on) => self.update_recents(|r| {
                 r.set_pinned(path, on);
@@ -569,9 +565,6 @@ impl Hub {
                 self.update_recents(|r| {
                     r.remove(path);
                 });
-                if self.selected.as_deref() == Some(path) {
-                    self.selected = None;
-                }
             }
         }
     }
@@ -579,13 +572,10 @@ impl Hub {
     fn project_row(&mut self, ui: &mut Ui, p: &RecentProject) -> RowAction {
         let missing = p.is_missing();
         let running = self.is_running(&p.path);
-        let selected = self.selected.as_deref() == Some(p.path.as_path());
         let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
         let mut action = RowAction::None;
-        if response.double_clicked() {
+        if response.clicked() {
             action = if missing { RowAction::Locate } else { RowAction::Open };
-        } else if response.clicked() {
-            action = RowAction::Select;
         }
         response.context_menu(|ui| {
             if let Some(a) = row_menu(ui, p, missing) {
@@ -596,10 +586,10 @@ impl Hub {
             return action;
         }
 
-        let hovered = response.hovered();
-        let (fill, stroke) = if selected {
-            (theme::accent_faint(), Stroke::new(1.0_f32, theme::accent()))
-        } else if hovered {
+        // The pointer anywhere in the row, the Open button and kebab included:
+        // `hovered()` turns false over the button, which then hid itself.
+        let hovered = response.contains_pointer();
+        let (fill, stroke) = if hovered {
             (theme::BG_PANEL, Stroke::new(1.0_f32, theme::LINE_BUTTON))
         } else {
             (theme::BG_PANEL, Stroke::new(1.0_f32, theme::LINE_PANEL))
@@ -634,7 +624,7 @@ impl Hub {
         });
         let info_right = kebab_rect.left() - 10.0;
         let mut text_right = info_right - 150.0;
-        if hovered || selected {
+        if hovered {
             let label = if missing { "Locate…" } else { "Open" };
             let w = 72.0;
             let btn_rect = Rect::from_min_size(egui::pos2(info_right - w, rect.center().y - theme::H_FIELD * 0.5), Vec2::new(w, theme::H_FIELD));
@@ -718,52 +708,46 @@ impl Hub {
 
     fn new_project_page(&mut self, ui: &mut Ui) {
         Self::page_header(ui, "New Project", "Pick a template, name the project and choose where it goes.", |_| {});
-        let detail_w = 320.0;
-        let grid_w = (ui.available_width() - detail_w - 20.0).max(CARD.x);
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(Vec2::new(grid_w, ui.available_height()), Layout::top_down(Align::Min), |ui| {
-                ui.horizontal(|ui| {
-                    widgets::eyebrow(ui, "Templates");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        widgets::segmented(
-                            ui,
-                            &mut self.template_filter,
-                            &[(None, "All"), (Some(TemplateCategory::Desktop), "Desktop"), (Some(TemplateCategory::Vr), "VR")],
-                        );
-                    });
-                });
-                ui.add_space(6.0);
-                let columns = (((grid_w + GAP) / (CARD.x + GAP)).floor() as usize).max(1);
-                let shown: Vec<&ProjectTemplate> =
-                    TEMPLATES.iter().filter(|t| self.template_filter.is_none_or(|f| t.category == f)).collect();
-                egui::ScrollArea::vertical().id_salt("templates").auto_shrink([false, false]).show(ui, |ui| {
-                    for row in shown.chunks(columns) {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = GAP;
-                            for t in row {
-                                let r = widgets::select_card(ui, CARD, template_icon(t.icon), t.name, t.category.label(), t.description, self.new_template == t.id)
-                                    .on_hover_text(t.description);
-                                if r.clicked() {
-                                    self.new_template = t.id;
-                                }
-                                if r.double_clicked() {
-                                    self.new_template = t.id;
-                                    self.start_create(ui.ctx());
-                                }
-                            }
-                        });
-                        ui.add_space(GAP);
-                    }
-                });
-            });
-            ui.add_space(20.0);
-            ui.allocate_ui_with_layout(Vec2::new(detail_w, ui.available_height()), Layout::top_down(Align::Min), |ui| {
-                self.new_project_detail(ui);
+        ui.horizontal(|ui| {
+            widgets::eyebrow(ui, "Templates");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                widgets::segmented(
+                    ui,
+                    &mut self.template_filter,
+                    &[(None, "All"), (Some(TemplateCategory::Desktop), "Desktop"), (Some(TemplateCategory::Vr), "VR")],
+                );
             });
         });
+        ui.add_space(6.0);
+        let columns = (((ui.available_width() + GAP) / (CARD.x + GAP)).floor() as usize).max(1);
+        let shown: Vec<&ProjectTemplate> =
+            TEMPLATES.iter().filter(|t| self.template_filter.is_none_or(|f| t.category == f)).collect();
+        let rows = shown.len().div_ceil(columns).max(1);
+        let grid_h = (rows as f32 * (CARD.y + GAP) + GAP).min(260.0);
+        egui::ScrollArea::vertical().id_salt("templates").max_height(grid_h).auto_shrink([false, false]).show(ui, |ui| {
+            for row in shown.chunks(columns) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    for t in row {
+                        let r = widgets::select_card(ui, CARD, template_icon(t.icon), t.name, t.category.label(), t.description, self.new_template == t.id)
+                            .on_hover_text(t.description);
+                        if r.clicked() {
+                            self.new_template = t.id;
+                        }
+                        if r.double_clicked() {
+                            self.new_template = t.id;
+                            self.start_create(ui.ctx());
+                        }
+                    }
+                });
+                ui.add_space(GAP);
+            }
+        });
+        ui.add_space(14.0);
+        self.new_project_preview(ui);
     }
 
-    fn new_project_detail(&mut self, ui: &mut Ui) {
+    fn new_project_preview(&mut self, ui: &mut Ui) {
         let Some(t) = project_templates::find(self.new_template) else { return };
         Frame::new()
             .fill(theme::BG_PANEL)
@@ -772,18 +756,21 @@ impl Hub {
             .inner_margin(Margin::same(16))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let (tile, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
-                    ui.painter().rect_filled(tile, theme::R_TOOLBAR, theme::with_alpha(theme::accent(), 0.14));
-                    icons::paint(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(26.0)), template_icon(t.icon), theme::accent());
-                    ui.add_space(6.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        ui.label(RichText::new(t.name).font(theme::semibold(15.0)).color(theme::TEXT_STRONG));
-                        widgets::chip(ui, t.category.label());
-                    });
+                ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 200.0), Layout::top_down(Align::Center), |ui| {
+                    ui.add_space(24.0);
+                    let (tile, _) = ui.allocate_exact_size(Vec2::splat(96.0), Sense::hover());
+                    ui.painter().rect_filled(tile, theme::R_TOOLBAR, theme::with_alpha(theme::accent(), 0.12));
+                    icons::paint(ui.painter(), Rect::from_center_size(tile.center(), Vec2::splat(52.0)), template_icon(t.icon), theme::accent());
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Template preview image").size(theme::SIZE_META).color(theme::TEXT_DIM));
                 });
-                ui.add_space(10.0);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t.name).font(theme::semibold(18.0)).color(theme::TEXT_STRONG));
+                    ui.add_space(8.0);
+                    widgets::chip(ui, t.category.label());
+                });
+                ui.add_space(6.0);
                 ui.label(RichText::new(t.description).color(theme::TEXT_SECONDARY));
                 ui.add_space(8.0);
                 for f in t.features {
@@ -882,7 +869,11 @@ impl Hub {
             widgets::eyebrow(ui, "Opening projects");
             widgets::property_row_w(ui, "After opening", label_w, |ui| {
                 let before = self.settings.after_open;
-                widgets::segmented(ui, &mut self.settings.after_open, &[(AfterOpen::Minimize, "Minimise the hub"), (AfterOpen::Close, "Close the hub")]);
+                widgets::segmented(
+                    ui,
+                    &mut self.settings.after_open,
+                    &[(AfterOpen::KeepOpen, "Keep the hub open"), (AfterOpen::Minimize, "Minimise the hub"), (AfterOpen::Close, "Close the hub")],
+                );
                 changed |= before != self.settings.after_open;
             });
 
@@ -998,7 +989,6 @@ impl Hub {
                     self.update_recents(|r| {
                         r.relocate(&old, &path);
                     });
-                    self.selected = Some(citrus_assets::recent_projects::normalize_path(&path));
                 } else {
                     self.notify(format!("No project.citrus in {}", path.display()), Level::Warn);
                 }

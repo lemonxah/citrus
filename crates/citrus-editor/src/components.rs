@@ -17,7 +17,7 @@ use citrus_core::{
     LightMode, LightProbeVolume, LodComponent, LodLevel, MeshCollider, ObjectId, ObjectRef, Pawn,
     PlanarReflection, ReflectionProbe, RigidBody, ShadowType,
     Spin, AvatarDescriptor, CapsuleCollider, ColliderAxis,
-    SpawnPoint, SphereCollider, Sync, TypedComponent, VolumeComponent,
+    SpawnPoint, SphereCollider, Sync, Terrain, TypedComponent, VolumeComponent,
     COLLISION_LAYERS,
 };
 use egui::{DragValue, RichText, ScrollArea, Sense, Ui};
@@ -585,6 +585,7 @@ impl EditorComponents {
         e.register::<SphereCollider>();
         e.register::<CapsuleCollider>();
         e.register::<MeshCollider>();
+        e.register::<Terrain>();
         e.register::<Spin>();
         e.register::<Bob>();
         e.register::<LodComponent>();

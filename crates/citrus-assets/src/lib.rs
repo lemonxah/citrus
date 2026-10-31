@@ -65,7 +65,7 @@ pub use post_file::{
     Bloom, ChromaticAberration, ColorGrading, POSTFX_EXTENSION, PostFxProfile, TonemapMode,
     Vignette, blend_over, blend_profiles, load_postfx, save_postfx,
 };
-pub use procedural::{BUCKET_FLOOR, BUCKET_WALL, primitive_mesh, test_scene};
+pub use procedural::{BUCKET_FLOOR, BUCKET_WALL, heightfield_mesh, primitive_mesh, test_scene};
 pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };

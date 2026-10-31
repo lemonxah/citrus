@@ -208,7 +208,17 @@ impl GpuSkinner {
             return;
         }
         let stride = (std::mem::size_of::<Vertex>() / 4) as u32;
-        unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline) };
+        // Each mesh has one skinned vertex buffer shared by every frame in
+        // flight: the previous frame's prepass, shadow, main and RT passes must
+        // finish reading it before this frame rewrites it, or the depth-EQUAL
+        // main pass sees different vertices than its prepass and drops them.
+        let war = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)];
+        unsafe {
+            device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(&war));
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+        }
         for (mesh, palette) in self.pending.drain(..) {
             let Some(skin) = self.skins.get_mut(&mesh) else {
                 continue;

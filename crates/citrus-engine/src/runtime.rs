@@ -918,6 +918,7 @@ impl GameApp {
         self.scene.visible_layers = self.scene.main_camera_culling_mask();
         self.update_world_ui(&mut renderer, screen_view, screen_proj, win_w, win_h, dt);
         let cam = screen_view.inverse();
+        self.scene.sync_terrain_meshes(&mut renderer, &mut self.shaders, &self.config.assets_root);
         self.scene.prepare_lods(&mut renderer, &self.config.assets_root);
         self.scene.lod_camera = Some(cam.w_axis.truncate());
         self.scene.occlusion_camera = Some(cam.w_axis.truncate());

@@ -153,6 +153,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         play_snapshot: None,
         play_session: None,
         play_game_camera: false,
+        focus_game_tab: false,
         occlusion_ui: OcclusionUi::default(),
         camera_rect: egui::Rect::NOTHING,
         post_load: None,
@@ -611,19 +612,18 @@ fn default_layout() -> DockState<Tab> {
     let tree = state.main_surface_mut();
     // Right (Inspector) node a touch wider (~30px at the 1600px default)
     // so the inspector's rows fit without clipping.
-    // At the 1600x960 reference: inspector 324 and the left column 264 run
-    // full height; the left column holds the Scene tree above Files, and the
-    // console sits under the viewport.
+    // At the 1600x960 reference: the inspector (324) runs full height on the
+    // right; the Log and Files share the bottom dock under the work area, and
+    // the Scene tree (264) sits left of the viewport above it.
     let [viewport, _right] = tree.split_right(
         NodeIndex::root(),
         1.0 - citrus_editor::theme::W_INSPECTOR / 1600.0,
         vec![Tab::Inspector, Tab::Environment, Tab::Baker, Tab::Occlusion],
     );
-    let [viewport, left] =
+    let [viewport, _bottom] =
+        tree.split_below(viewport, 1.0 - citrus_editor::theme::H_BOTTOM_DOCK / 894.0, vec![Tab::Log, Tab::Files]);
+    let [_viewport, _scene] =
         tree.split_left(viewport, citrus_editor::theme::W_HIERARCHY / (1600.0 - citrus_editor::theme::W_INSPECTOR), vec![Tab::Scene]);
-    let [_scene, _files] = tree.split_below(left, 0.55, vec![Tab::Files]);
-    let [_viewport, _bottom] =
-        tree.split_below(viewport, 1.0 - citrus_editor::theme::H_BOTTOM_DOCK / 894.0, vec![Tab::Log]);
     state
 }
 
@@ -796,8 +796,9 @@ struct WidgetFilter {
     /// The selected object's grey orientation cross (own toggle, separate from the
     /// transform handles). Hidden when the master toggle is off too.
     cross: bool,
-    /// Preview the scene's UI canvases over the viewport outside Play (always
-    /// drawn in Play). Not a gizmo, so the master toggle doesn't hide it.
+    /// Preview the scene's screen-space UI over the Scene view outside Play
+    /// (off by default: the Camera tab shows the game's HUD). Not a gizmo, so
+    /// the master toggle doesn't hide it.
     game_ui: bool,
 }
 
@@ -814,7 +815,7 @@ impl Default for WidgetFilter {
             ui_canvases: WidgetSetting::default(),
             post_volumes: WidgetSetting::default(),
             cross: true,
-            game_ui: true,
+            game_ui: false,
         }
     }
 }
@@ -957,6 +958,9 @@ struct EngineApp {
     /// While playing, render the viewport from the scene's active camera (the
     /// game's view) instead of the editor fly camera. Toolbar toggle.
     play_game_camera: bool,
+    /// Set when Play starts: bring the Camera tab (the game view) to the front
+    /// once, after the dock is laid out this frame.
+    focus_game_tab: bool,
     occlusion_ui: OcclusionUi,
     /// Screen rect of the Camera tab's image (the game view while playing).
     camera_rect: egui::Rect,
@@ -2452,6 +2456,7 @@ impl EngineApp {
             self.scene.update_wave_riders(self.water.time(), dt, self.playing, &owns);
             self.water_fx.update(renderer, &mut self.scene, view.inverse(), play_time, dt);
             self.carry_fx.update(renderer, &mut self.scene, view.inverse(), play_time.is_some(), dt, &mut self.water_fx.sim.particles);
+            self.scene.sync_terrain_meshes(renderer, &mut self.shaders, &self.project_root);
             self.scene.prepare_lods(renderer, &self.project_root);
         }
         self.scene.lod_camera = Some(view.inverse().w_axis.truncate());
@@ -2528,9 +2533,6 @@ impl EngineApp {
     /// controller.
     fn update_world_ui(&mut self) {
         self.scene.extra_draws.clear();
-        if !(self.playing || self.widget_filter.game_ui) {
-            return;
-        }
         let mut rays = Vec::new();
         let (mouse_down, vr_down) = (
             self.egui_ctx.input(|i| i.pointer.primary_down()),
@@ -5760,6 +5762,7 @@ impl EngineApp {
             self.play_scene_switched = false;
             self.play_origin_scene = None;
             self.playing = true;
+            self.focus_game_tab = true;
             self.play_time = 0.0;
             // Components start on the first tick.
             let mut session = crate::play::PlaySession::new(&self.scene, &self.project_root, self.audio.take());
@@ -8089,6 +8092,7 @@ impl EngineApp {
         };
         crate::river_edit::sync(&self.egui_ctx, &self.scene, selected_object, self.playing);
         crate::cloth_paint::sync(&self.egui_ctx, &mut self.scene, selected_object, self.playing);
+        crate::terrain_paint::sync(&self.egui_ctx, &self.scene, selected_object, self.playing);
         let shader_info = self.selected_shader_info();
         let can_bake = self.renderer.as_ref().is_some_and(|r| r.supports_baking());
         // Winit-based viewport-hover test: stays correct right after a
@@ -8255,6 +8259,17 @@ impl EngineApp {
             self.active_tabs = active_now;
             clamp_leaf_width(&mut dock_state, &Tab::Inspector, INSPECTOR_MIN_WIDTH);
             self.dock_state = dock_state;
+            if std::mem::take(&mut self.focus_game_tab) && self.playing {
+                match self.dock_state.find_tab(&Tab::Camera) {
+                    Some(loc) => self.dock_state.set_active_tab(loc),
+                    None => {
+                        if let Some((surface, node, _)) = self.dock_state.find_tab(&Tab::Viewport) {
+                            self.dock_state.set_focused_node_and_surface((surface, node));
+                        }
+                        self.dock_state.push_to_focused_leaf(Tab::Camera);
+                    }
+                }
+            }
             for controller in crate::anim_controller_editor::take_open_requests(
                 ctx,
                 &mut self.anim_ctrl_tab,
@@ -8521,7 +8536,7 @@ impl EngineApp {
             // Coalesce undo entries only while a pointer drag is in progress (one
             // slider/handle gesture = one entry); discrete edits each get their own.
             let gesture_active = self.egui_ctx.input(|i| i.pointer.any_down());
-            self.undo_stack.set_stroke(crate::cloth_paint::stroking(&self.egui_ctx));
+            self.undo_stack.set_stroke(crate::cloth_paint::stroking(&self.egui_ctx) || crate::terrain_paint::stroking(&self.egui_ctx));
             self.record_edits(pre_edit, gesture_active);
             // Not simulating → decay the play-only timings toward zero.
             FrameTimings::ema(&mut self.frame_timings.components, 0.0);
@@ -8673,6 +8688,7 @@ impl EngineApp {
             .set_ik_targets(self.xr_session.as_ref().map(|_| vr_targets));
         self.scene.update_water_wind(dt);
         self.scene.set_cloth_viewer(Some(game_view_now.map_or(self.camera.position, |g| g.2)));
+        self.scene.weapon_poses_live = self.playing;
         self.scene.update_skinning(renderer, dt);
         // Re-read the game camera after this frame's tick so it isn't a frame behind.
         let (view, proj, cam_pos) = game_view_now.unwrap_or((view, proj, self.camera.position));
@@ -9026,6 +9042,13 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 citrus_editor::theme::accent(),
             );
         }
+    }
+
+    /// Tabs that scroll their own panels: a dock scroll bar on top would
+    /// cover theirs (the Animator's side panels, the code editor).
+    fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
+        let own = matches!(tab, Tab::AnimController | Tab::AnimClip | Tab::Code(_));
+        [!own, !own]
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
@@ -9527,7 +9550,7 @@ impl EditorTabs<'_> {
 
         // Maybe start a drag: a primary press on a handle (gizmo wins over orbit;
         // the transform gizmo still wins over us). Painting cloth pins owns drags.
-        if !response.drag_started_by(egui::PointerButton::Primary) || alt || crate::cloth_paint::active(&response.ctx) {
+        if !response.drag_started_by(egui::PointerButton::Primary) || alt || crate::cloth_paint::active(&response.ctx) || crate::terrain_paint::active(&response.ctx) {
             return;
         }
         let Selection::Object(i) = *self.selection else {
@@ -10908,7 +10931,7 @@ impl EditorTabs<'_> {
         if self.pointer_in_viewport && response.contains_pointer() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             // Ctrl+Scroll sizes the cloth pin brush instead.
-            if scroll != 0.0 && !(crate::cloth_paint::active(ui.ctx()) && ui.input(|i| i.modifiers.command)) {
+            if scroll != 0.0 && !((crate::cloth_paint::active(ui.ctx()) || crate::terrain_paint::active(ui.ctx())) && ui.input(|i| i.modifiers.command)) {
                 self.actions.push(EditorAction::Dolly(scroll / 50.0));
             }
         }
@@ -10931,7 +10954,8 @@ impl EditorTabs<'_> {
             && crate::river_edit::building(ui.ctx());
         // Painting cloth pins: left drags paint (no orbit, no transform gizmo).
         let cloth_painting = !self.playing && crate::cloth_paint::active(ui.ctx());
-        let river_building = river_building || cloth_painting;
+        let terrain_painting = !self.playing && crate::terrain_paint::active(ui.ctx());
+        let river_building = river_building || cloth_painting || terrain_painting;
 
         // Claim a drag for the gizmo the instant it starts on a handle (using
         // the gizmo's own enlarged pick band), so orbit is suppressed for the
@@ -10944,7 +10968,7 @@ impl EditorTabs<'_> {
             // continues through the gesture even if the pointer leaves. The
             // winit-based check keeps it working right after mouse-look ends.
             *self.orbit_armed =
-                !cloth_painting && self.pointer_in_viewport && press.is_some_and(|p| rect.contains(p));
+                !cloth_painting && !terrain_painting && self.pointer_in_viewport && press.is_some_and(|p| rect.contains(p));
             *self.gizmo_drag = !alt
                 && !river_building
                 && matches!(self.selection, Selection::Object(_))
@@ -11781,6 +11805,7 @@ impl EditorTabs<'_> {
             river_click = crate::river_edit::viewport(ui, self.scene, i, &view, cursor, new_drag, click, dragging);
             let view = crate::cloth_paint::View::new(self.view, self.proj, *self.viewport_rect);
             river_click |= crate::cloth_paint::viewport(ui, self.scene, i, &view, &response);
+            river_click |= crate::terrain_paint::viewport(ui, self.scene, i, &view, &response);
         }
 
         // Click-to-pick on release-without-drag, unless the gizmo owns the
@@ -13878,8 +13903,19 @@ impl ApplicationHandler for EngineApp {
 
         let egui_wants =
             if let (Some(state), Some(window)) = (self.egui_state.as_mut(), self.window.as_ref()) {
-                // While looking, the cursor is locked: keep egui out of it.
-                if self.looking {
+                // While looking, the cursor is locked: keep egui out of it. The
+                // same while the game holds the cursor: egui's pointer is still
+                // where Play was clicked, so a Fire click (or Space on the
+                // focused button) would press Play again and stop the game.
+                let game_input = self.game_cursor_locked
+                    && matches!(
+                        event,
+                        WindowEvent::MouseInput { .. }
+                            | WindowEvent::MouseWheel { .. }
+                            | WindowEvent::CursorMoved { .. }
+                            | WindowEvent::KeyboardInput { .. }
+                    );
+                if self.looking || game_input {
                     false
                 } else {
                     let response = state.on_window_event(window, &event);
@@ -13952,7 +13988,7 @@ impl ApplicationHandler for EngineApp {
                 // ...but not while a code editor / text field has focus (there
                 // Escape is the vim Insert -> Normal key, not a deselect). The
                 // first Escape only ends river path editing.
-                if !crate::river_edit::exit(&self.egui_ctx) && !crate::cloth_paint::exit(&self.egui_ctx) {
+                if !crate::river_edit::exit(&self.egui_ctx) && !crate::cloth_paint::exit(&self.egui_ctx) && !crate::terrain_paint::exit(&self.egui_ctx) {
                     self.selection = Selection::None;
                     self.file_material = None;
                 }

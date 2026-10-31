@@ -48,6 +48,11 @@ def prepare(variant):
     rest = {b.name: b.head_local.copy() for b in original.data.bones}
     tails = {b.name: b.tail_local.copy() for b in original.data.bones}
     mesh_world = mesh.matrix_world.copy()
+    # The BlenderKit mesh models one side and builds the other with a Mirror
+    # modifier; apply it (mirroring the .L/.R groups) before the stack is cleared.
+    for mod in [m for m in mesh.modifiers if m.type == "MIRROR"]:
+        with bpy.context.temp_override(object=mesh, active_object=mesh):
+            bpy.ops.object.modifier_apply(modifier=mod.name)
     # Capture existing weights before removing the Rigify modifier and controls.
     group_names = {g.index: g.name for g in mesh.vertex_groups}
     weights = [[(group_names[g.group], g.weight) for g in v.groups] for v in mesh.data.vertices]
