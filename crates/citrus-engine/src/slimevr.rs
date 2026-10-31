@@ -72,6 +72,7 @@ impl SlimeVr {
         Self { shared, stop }
     }
 
+    #[cfg(feature = "editor")]
     pub fn connected(&self) -> bool {
         self.shared.lock().is_ok_and(|s| s.connected)
     }

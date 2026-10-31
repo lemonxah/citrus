@@ -3,8 +3,8 @@
 //! click-to-move, RTS camera / selection and the VR rig.
 
 use citrus_core::{
-    ClickToMove, DeathAction, FirstPersonController, FollowCamera, Grabbable, Health, HitscanWeapon, HudBinding, HudValue,
-    Interactable, ResourceAmount, ResourceStore, RtsCamera, RtsSelection, Selectable, TargetDummy, ThirdPersonController,
+    ClickToMove, ConflictPolicy, ControlsMenu, DeathAction, FirstPersonController, FollowCamera, Grabbable, Health, HitscanWeapon, HudBinding, HudValue,
+    Interactable, ResourceAmount, ResourceStore, RtsCamera, RtsSelection, Selectable, Swimmer, TargetDummy, ThirdPersonController,
     VrAvatar, VrLocomotion, VrPlayer, WeaponTrigger,
 };
 use egui::{DragValue, Ui};
@@ -19,6 +19,7 @@ pub(crate) fn register(e: &mut EditorComponents) {
     e.register::<HitscanWeapon>();
     e.register::<TargetDummy>();
     e.register::<FirstPersonController>();
+    e.register::<Swimmer>();
     e.register::<ThirdPersonController>();
     e.register::<FollowCamera>();
     e.register::<ClickToMove>();
@@ -31,6 +32,7 @@ pub(crate) fn register(e: &mut EditorComponents) {
     e.register::<VrPlayer>();
     e.register::<Grabbable>();
     e.register::<VrAvatar>();
+    e.register::<ControlsMenu>();
 }
 
 /// Header icon for kit components (None = not a kit component).
@@ -45,7 +47,7 @@ pub(crate) fn icon(name: &str) -> Option<(crate::icons::Icon, egui::Color32)> {
         "Click To Move" | "RTS Selection" | "Selectable" => (Icon::ToolSelect, theme::TYPE_MESH),
         "Interactable" => (Icon::ToolSelect, theme::TYPE_LIGHT),
         "Resource Store" => (Icon::Stats, theme::TYPE_GROUP),
-        "HUD Binding" => (Icon::UiText, theme::TYPE_UI),
+        "HUD Binding" | "Controls Menu" => (Icon::UiText, theme::TYPE_UI),
         "VR Player" | "VR Avatar" | "Grabbable" => (Icon::Gizmo, theme::TYPE_GI),
         _ => return None,
     };
@@ -180,6 +182,28 @@ impl Inspect for TargetDummy {
 impl Gizmo for TargetDummy {}
 
 // ------------------------------------------------------------------ controllers
+
+impl Inspect for Swimmer {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut c = false;
+        widgets::info_note(
+            ui,
+            "Tunes how the First / Third Person controllers swim: in water deeper than Swim depth they float with the head out, stroke where they look (dive by looking down; Jump rises, Crouch sinks), hold their breath under and climb out over an edge they swim into.",
+        );
+        drag(ui, "Swim depth (x height)", &mut self.swim_depth, 0.01, 0.2..=1.5, &mut c);
+        drag(ui, "Swim speed", &mut self.swim_speed, 0.05, 0.0..=20.0, &mut c);
+        drag(ui, "Sprint speed", &mut self.sprint_speed, 0.05, 0.0..=20.0, &mut c);
+        drag(ui, "Stroke acceleration", &mut self.stroke_accel, 0.05, 0.1..=50.0, &mut c);
+        drag(ui, "Water drag", &mut self.water_drag, 0.05, 0.0..=50.0, &mut c);
+        drag(ui, "Float height (m)", &mut self.float_height, 0.01, -1.0..=1.0, &mut c);
+        drag(ui, "Breath (s)", &mut self.breath, 0.5, 0.0..=600.0, &mut c);
+        drag(ui, "Climb height (m)", &mut self.climb_height, 0.01, 0.0..=3.0, &mut c);
+        drag(ui, "Climb time (s)", &mut self.climb_time, 0.01, 0.05..=5.0, &mut c);
+        c
+    }
+}
+
+impl Gizmo for Swimmer {}
 
 impl Inspect for FirstPersonController {
     fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
@@ -464,6 +488,43 @@ impl Inspect for HudBinding {
 }
 impl Gizmo for HudBinding {}
 
+// ------------------------------------------------------------------ controls menu
+
+impl Inspect for ControlsMenu {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut c = false;
+        text(ui, "Name prefix", &mut self.prefix, &mut c);
+        uint(ui, "Rows", &mut self.rows, 32, &mut c);
+        uint(ui, "Bindings per row", &mut self.columns, 2, &mut c);
+        let opts: Vec<(ConflictPolicy, &str)> = ConflictPolicy::ALL.iter().map(|p| (*p, p.label())).collect();
+        combo(ui, "citrus-controls-conflicts", "On conflict", &mut self.conflicts, &opts, &mut c);
+        widgets::eyebrow(ui, "Hidden actions");
+        let mut remove = None;
+        for (i, name) in self.hidden_actions.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                c |= ui.text_edit_singleline(name).changed();
+                if ui.small_button(egui_phosphor::regular::X).on_hover_text("Show this action again").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.hidden_actions.remove(i);
+            c = true;
+        }
+        if ui.small_button("Hide an action").clicked() {
+            self.hidden_actions.push("Look".into());
+            c = true;
+        }
+        note(
+            ui,
+            "Fills the rows named \"<prefix> Row N ...\" (see the Controls UI template) with the shown scheme's actions. Players click a binding, then press the new input; remaps save to their input.ron.",
+        );
+        c
+    }
+}
+impl Gizmo for ControlsMenu {}
+
 // ------------------------------------------------------------------ VR
 
 impl Inspect for VrPlayer {
@@ -493,6 +554,16 @@ impl Inspect for VrPlayer {
             ("Teleport", &mut self.teleport_action),
         ];
         actions(ui, "citrus-vr-actions", &mut fields, &mut c);
+        widgets::eyebrow(ui, "VR controller actions");
+        let mut fields = [
+            ("Turn", &mut self.turn_action),
+            ("Grab left", &mut self.grab_left_action),
+            ("Grab right", &mut self.grab_right_action),
+            ("Use left", &mut self.use_left_action),
+            ("Use right", &mut self.use_right_action),
+        ];
+        actions(ui, "citrus-vr-controller-actions", &mut fields, &mut c);
+        note(ui, "Move and Teleport are shared with the desktop fallback. Bind these in Project Settings > Input (VR Controllers scheme).");
         c
     }
 }

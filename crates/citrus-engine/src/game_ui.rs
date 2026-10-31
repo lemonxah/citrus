@@ -556,6 +556,7 @@ impl GameUi {
 /// Laid-out rects of the UI in `scope` (object index, rect in points,
 /// reference-pixel-to-point scale), in draw order. Used by the editor's
 /// rect handles.
+#[cfg(feature = "editor")]
 pub fn layout_rects(
     scene: &LoadedScene,
     view: Rect,
@@ -801,6 +802,7 @@ impl WorldUi {
                 static_geometry: false,
                 planar_index: -1,
                 occluded: false,
+                shadow_casting: citrus_render::ShadowCasting::On,
             });
         }
         (draws, frame)
@@ -885,6 +887,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent,
             translation: Vec3::ZERO,

@@ -628,6 +628,7 @@ fn extra_draw(mesh: citrus_render::MeshHandle, material: citrus_render::Material
         static_geometry: false,
         planar_index: -1,
         occluded: false,
+        shadow_casting: citrus_render::ShadowCasting::On,
     }
 }
 
@@ -781,6 +782,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: pos,

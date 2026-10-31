@@ -1,13 +1,16 @@
 //! Built-in gameplay kit: reusable components the project templates are made
 //! of (character controllers, hitscan weapons, health, HUD bindings,
-//! click-to-move, RTS camera + selection, VR player rig and grabbing). Every
+//! click-to-move, RTS camera + selection, VR player rig and grabbing, the
+//! in-game controls / remap menu). Every
 //! piece is an ordinary [`TypedComponent`], so games can use, tweak or replace
 //! them like any other component.
 
 mod combat;
 mod controllers;
+mod controls_menu;
 mod hud;
 mod rts;
+mod swim;
 mod topdown;
 mod vr_kit;
 
@@ -15,11 +18,13 @@ pub use combat::{
     DamageEvent, DeathAction, DeathEvent, Health, HitscanWeapon, ScoreEvent, TargetDummy, WeaponTrigger, spread_direction,
 };
 pub use controllers::{FirstPersonController, FollowCamera, ThirdPersonController, boom_position, look_rotation};
+pub use controls_menu::ControlsMenu;
 pub use hud::{HudBinding, HudValue, format_hud};
 pub use rts::{
     ResourceAmount, ResourceStore, RtsCamera, RtsSelection, Selectable, edge_pan, formation_offsets, formation_slots,
     rect_contains, rts_camera_pose, screen_rect,
 };
+pub use swim::{Climb, Swimmer, breathe, float_accel, stroke, swims};
 pub use topdown::{ClickToMove, InteractEvent, Interactable};
 pub use vr_kit::{Grabbable, VrAvatar, VrHand, VrLocomotion, VrPlayer, teleport_arc};
 
@@ -30,6 +35,7 @@ pub(crate) fn register_kit(registry: &mut ComponentRegistry) {
     registry.register::<HitscanWeapon>();
     registry.register::<TargetDummy>();
     registry.register::<FirstPersonController>();
+    registry.register::<Swimmer>();
     registry.register::<ThirdPersonController>();
     registry.register::<FollowCamera>();
     registry.register::<ClickToMove>();
@@ -42,6 +48,7 @@ pub(crate) fn register_kit(registry: &mut ComponentRegistry) {
     registry.register::<VrPlayer>();
     registry.register::<Grabbable>();
     registry.register::<VrAvatar>();
+    registry.register::<ControlsMenu>();
 }
 
 /// Ids of every object carrying a component of type `T`.

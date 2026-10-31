@@ -39,7 +39,7 @@ pub use physics_material::{CombineMode, PHYSMAT_EXTENSION, PhysicsMaterial, Phys
 pub use water_sim::{RippleSim, WaterPush};
 pub use water_ewave::{EwaveLayer, EwaveParams, SURFACE_TENSION, dispersive_share, ewave_omega, ewave_supported};
 pub use water_pipe::{
-    CELL_OBSTACLE, CELL_SHORE, CELL_WATER, MAX_SIM_SUBSTEPS, PipeParams, PipeSim, SimField, SimWindow, WaterDisplacer, WaterSimFeed, choose_window,
+    CELL_OBSTACLE, CELL_SHORE, CELL_WATER, MAX_SIM_SUBSTEPS, RUNUP_HEIGHT, PipeParams, PipeSim, SimField, SimWindow, WaterDisplacer, WaterSimFeed, choose_window,
     max_sim_dt, pipe_substeps, sim_resolution,
 };
 pub use water::{Buoyancy, FLUID_PRESETS, FluidPreset, GerstnerWave, OutlinePreset, ResolvedWave, RiverPoint, RiverSection, UnderwaterSettings, Water, WaterBody, WaterColumn, WaterLook, WaterRuntime};
@@ -60,6 +60,7 @@ mod spatial_audio;
 mod gameplay;
 mod ik;
 mod input;
+mod input_remap;
 mod localization;
 mod models;
 mod savegame;
@@ -83,19 +84,28 @@ pub use ui::{
 pub use vr::{Ray, VrFrame, VrRig, pointer_ray, ray_plane};
 mod net;
 pub use net::{
-    HOST_PEER, InterpolationMode, NetAutoStart, NetEvent, NetObjectState, NetRpc, NetSpawnSource, NetValue, NetVar,
-    NetView, NetWorldOp, NetworkAnimator, NetworkAvatar, NetworkManager, NetworkObject, NetworkVariables,
+    HOST_PEER, InterpolationMode, NetAutoStart, NetEvent, NetObjectState, NetQuality, NetRpc, NetSpawnSource, NetValue,
+    NetVar, NetView, NetWorldOp, NetworkAnimator, NetworkAvatar, NetworkManager, NetworkObject, NetworkVariables,
     OwnershipMode, PeerInfo, RpcTarget, WORN_AVATAR_VAR, WornAvatar,
 };
+mod net_rewind;
+pub use net_rewind::{HitHistory, HitPose, HitShape, MAX_REWIND, RewindHit};
 mod kit;
 pub use kit::*;
+mod motion;
+pub use motion::{MotionState, MoveHost, Predictable, as_predictable, driven_remotely, is_predictable};
 mod content;
 pub use content::{
     AvatarDescriptor, ContentCommand, ContentEvent, ContentInfo, ContentKind, ContentPlacement, ContentRequest,
 };
 pub use input::{
     ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
-    MouseAxis, MouseButton, PadAxis, PadButton, RawInput, resolve,
+    MouseAxis, MouseButton, PadAxis, PadButton, RawInput, VrAxis, VrButton, resolve,
+};
+pub use input_remap::{
+    ActionOverride, ActionTuning, BindingConflict, BindingOverrides, BindingSlot, CaptureKind, CaptureRequest,
+    CaptureResult, ConflictPolicy, ControlsInfo, ControlsRuntime, InputCapture, InputCommand, InputDevice, RebindError,
+    RemapEntry, active_sources, all_sources, device_activity, stick_name,
 };
 pub use models::{
     AlphaModeModel, MatcapBlend, MaterialModel, MaterialTexturePaths, ShaderCmpUi, ShaderCondUi,
@@ -334,6 +344,8 @@ pub enum ComponentCommand {
     NetHost { port: u16 },
     NetJoin { address: String },
     NetDisconnect,
+    /// Host: remove a player from the session (optionally banning its id).
+    NetKick { peer: u64, reason: String, ban: bool },
     /// Host-driven scene switch for every peer.
     NetLoadScene(String),
     /// Instantiate a `.prefab` (project-relative path). The first root gets
@@ -407,6 +419,8 @@ pub enum ComponentCommand {
     SetOscFaceTracking(Option<u16>),
     /// User-generated content request (load / spawn / enter world / unload).
     Content(ContentCommand),
+    /// Rebind / reset / capture request for the live input bindings.
+    Input(InputCommand),
 }
 
 /// Per-frame update context handed to components in Play mode. Transform
@@ -1118,6 +1132,42 @@ impl ShadowType {
     /// Whether the PCF kernel runs (soft penumbra) vs a single hard tap.
     pub fn soft(self) -> bool {
         matches!(self, Self::Soft)
+    }
+}
+
+/// How a rendered object takes part in shadows (Unity's MeshRenderer "Cast
+/// Shadows"). `Off` keeps it out of every shadow map and the bake's shadow
+/// rays; `ShadowsOnly` casts but is never drawn by a camera.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ShadowCasting {
+    #[default]
+    On,
+    Off,
+    TwoSided,
+    ShadowsOnly,
+}
+
+impl ShadowCasting {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::On => "On",
+            Self::Off => "Off",
+            Self::TwoSided => "Two Sided",
+            Self::ShadowsOnly => "Shadows Only",
+        }
+    }
+    pub const ALL: [ShadowCasting; 4] = [Self::On, Self::Off, Self::TwoSided, Self::ShadowsOnly];
+    /// The default; scene files skip writing it.
+    pub fn is_on(&self) -> bool {
+        *self == Self::On
+    }
+    /// Drawn into shadow maps.
+    pub fn casts(self) -> bool {
+        self != Self::Off
+    }
+    /// Drawn by cameras (main, prepass, captures, mirrors).
+    pub fn visible(self) -> bool {
+        self != Self::ShadowsOnly
     }
 }
 
@@ -1897,6 +1947,10 @@ pub struct MeshCollider {
     /// cost more to build and simulate).
     #[serde(default)]
     pub detail: ColliderDetail,
+    /// Use collision pieces modelled with the mesh (`UCX_`, `UBX_`, `USP_`,
+    /// `UCP_` objects) when it has any, instead of building from the mesh.
+    #[serde(default = "default_true")]
+    pub use_authored: bool,
     pub is_trigger: bool,
     pub layer: u32,
     /// Physics material (`.physmat`, project-relative; "" = the body's or project default).
@@ -1930,6 +1984,7 @@ impl Default for MeshCollider {
             convex: false,
             follow_shape: true,
             detail: ColliderDetail::Medium,
+            use_authored: true,
             is_trigger: false,
             layer: 0,
             material: String::new(),
@@ -2926,6 +2981,109 @@ impl Default for Pawn {
 }
 
 impl Pawn {
+    /// The body rotation this pawn writes (None in Strategy mode, which leaves it alone).
+    pub fn body_rotation(&self) -> Option<Quat> {
+        (!matches!(self.mode, ControlMode::Strategy)).then(|| Quat::from_rotation_y(self.yaw.to_radians()))
+    }
+
+    /// One movement step from an input frame (`dt` is the frame's scaled
+    /// delta). `view` replaces the look input with a recorded (yaw, pitch).
+    /// `physical` is `Some(grounded)` when a Character Controller moves the
+    /// pawn: the returned world delta goes to `move_character`. Otherwise the
+    /// pawn walks a flat floor and `pos` (local translation) moves in place.
+    pub fn step(&mut self, input: &InputState, dt: f32, pos: &mut Vec3, physical: Option<bool>, view: Option<(f32, f32)>) -> Option<Vec3> {
+        let dt = dt.min(0.1);
+        let mv = input.axis2("Move");
+
+        match view {
+            Some((yaw, pitch)) => {
+                self.yaw = yaw;
+                self.pitch = pitch;
+            }
+            None => {
+                // Look: mouse delta is per-frame (no dt); analog sticks pre-scaled.
+                let look = input.axis2("Look");
+                self.yaw -= look.x * self.look_sensitivity;
+                if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
+                    self.pitch = (self.pitch - look.y * self.look_sensitivity)
+                        .clamp(self.min_pitch, self.max_pitch);
+                }
+            }
+        }
+
+        // Movement direction per mode.
+        let yaw_rot = Quat::from_rotation_y(self.yaw.to_radians());
+        let (dir, face_move) = match self.mode {
+            ControlMode::FirstPerson | ControlMode::ThirdPerson => {
+                let fwd = yaw_rot * Vec3::NEG_Z;
+                let right = yaw_rot * Vec3::X;
+                (right * mv.x + fwd * mv.y, false)
+            }
+            // World-plane movement; body faces the move direction.
+            ControlMode::TopDown | ControlMode::Strategy => {
+                (Vec3::new(mv.x, 0.0, -mv.y), true)
+            }
+        };
+        let dir = dir.normalize_or_zero();
+
+        let horizontal = if dir.length_squared() > 1e-4 {
+            let target = dir * self.move_speed;
+            let cur = Vec3::new(self.vel.x, 0.0, self.vel.z);
+            let next = cur.lerp(target, (self.accel * dt).min(1.0));
+            if face_move && self.mode == ControlMode::TopDown {
+                self.yaw = (-dir.x).atan2(-dir.z).to_degrees();
+            }
+            next
+        } else {
+            let cur = Vec3::new(self.vel.x, 0.0, self.vel.z);
+            cur.lerp(Vec3::ZERO, (self.decel * dt).min(1.0))
+        };
+        self.vel.x = horizontal.x;
+        self.vel.z = horizontal.z;
+
+        let walking = matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson);
+        if let Some(grounded) = physical {
+            self.grounded = grounded;
+            if self.grounded && self.vel.y < 0.0 {
+                self.vel.y = 0.0;
+            }
+        }
+        if walking {
+            if self.grounded && input.pressed("Jump") {
+                self.vel.y = self.jump_power;
+                self.grounded = false;
+            }
+            self.vel.y -= self.gravity * dt;
+        } else {
+            self.vel.y = 0.0;
+        }
+
+        if physical.is_some() {
+            return Some(self.vel * dt);
+        }
+        *pos += self.vel * dt;
+        if walking && pos.y <= self.floor_y {
+            pos.y = self.floor_y;
+            self.vel.y = 0.0;
+            self.grounded = true;
+        }
+        None
+    }
+
+    /// One frame of movement through `host`: `update` runs exactly this, and
+    /// so do networked prediction's replays.
+    fn advance(&mut self, host: &mut dyn MoveHost, input: &InputState, dt: f32, view: Option<(f32, f32)>) {
+        let physical = host.has_character().then(|| host.grounded());
+        let mut pos = host.translation();
+        match self.step(input, dt, &mut pos, physical, view) {
+            Some(delta) => host.move_character(delta),
+            None => host.set_translation(pos),
+        }
+        if let Some(r) = self.body_rotation() {
+            host.set_rotation(r);
+        }
+    }
+
     fn place_camera(&self, ctx: &mut ComponentCtx) {
         let (trans, rot) = match self.mode {
             ControlMode::FirstPerson => (
@@ -2977,84 +3135,37 @@ impl TypedComponent for Pawn {
         if !self.started {
             TypedComponent::start(self, ctx);
         }
-        let dt = ctx.dt.min(0.1);
-        let look = ctx.input.axis2("Look");
-        let mv = ctx.input.axis2("Move");
-
-        // Look: mouse delta is per-frame (no dt); analog sticks pre-scaled.
-        self.yaw -= look.x * self.look_sensitivity;
-        if matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson) {
-            self.pitch = (self.pitch - look.y * self.look_sensitivity)
-                .clamp(self.min_pitch, self.max_pitch);
-        }
-
-        // Movement direction per mode.
-        let yaw_rot = Quat::from_rotation_y(self.yaw.to_radians());
-        let (dir, face_move) = match self.mode {
-            ControlMode::FirstPerson | ControlMode::ThirdPerson => {
-                let fwd = yaw_rot * Vec3::NEG_Z;
-                let right = yaw_rot * Vec3::X;
-                (right * mv.x + fwd * mv.y, false)
-            }
-            // World-plane movement; body faces the move direction.
-            ControlMode::TopDown | ControlMode::Strategy => {
-                (Vec3::new(mv.x, 0.0, -mv.y), true)
-            }
-        };
-        let dir = dir.normalize_or_zero();
-
-        let mut pos = *ctx.translation;
-        let horizontal = if dir.length_squared() > 1e-4 {
-            let target = dir * self.move_speed;
-            let cur = Vec3::new(self.vel.x, 0.0, self.vel.z);
-            let next = cur.lerp(target, (self.accel * dt).min(1.0));
-            if face_move && self.mode == ControlMode::TopDown {
-                self.yaw = (-dir.x).atan2(-dir.z).to_degrees();
-            }
-            next
-        } else {
-            let cur = Vec3::new(self.vel.x, 0.0, self.vel.z);
-            cur.lerp(Vec3::ZERO, (self.decel * dt).min(1.0))
-        };
-        self.vel.x = horizontal.x;
-        self.vel.z = horizontal.z;
-
-        let walking = matches!(self.mode, ControlMode::FirstPerson | ControlMode::ThirdPerson);
-        let physical = ctx.physics.is_some() && ctx.get_self::<CharacterController>().is_some();
-        if physical {
-            self.grounded = ctx.is_grounded();
-            if self.grounded && self.vel.y < 0.0 {
-                self.vel.y = 0.0;
-            }
-        }
-        if walking {
-            if self.grounded && ctx.input.pressed("Jump") {
-                self.vel.y = self.jump_power;
-                self.grounded = false;
-            }
-            self.vel.y -= self.gravity * dt;
-        } else {
-            self.vel.y = 0.0;
-        }
-
-        if physical {
-            ctx.move_character(self.vel * dt);
-        } else {
-            pos += self.vel * dt;
-            if walking && pos.y <= self.floor_y {
-                pos.y = self.floor_y;
-                self.vel.y = 0.0;
-                self.grounded = true;
-            }
-            *ctx.translation = pos;
-        }
-
-        if !matches!(self.mode, ControlMode::Strategy) {
-            *ctx.rotation = Quat::from_rotation_y(self.yaw.to_radians());
-        }
+        let (input, dt) = (ctx.input, ctx.dt);
+        self.advance(ctx, input, dt, None);
         // Strategy zoom on the wheel via the Look.y / wheel channel is omitted;
         // arm_length stays as authored.
         self.place_camera(ctx);
+    }
+}
+
+impl Predictable for Pawn {
+    fn motion(&self) -> MotionState {
+        MotionState { vel: self.vel, yaw: self.yaw, pitch: self.pitch, grounded: self.grounded, floor_y: self.floor_y, ..Default::default() }
+    }
+
+    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MoveHost) {
+        self.vel = m.vel;
+        self.yaw = m.yaw;
+        self.pitch = m.pitch;
+        self.grounded = m.grounded;
+        self.floor_y = m.floor_y;
+    }
+
+    fn frame_extra(&self) -> Vec<f32> {
+        vec![self.yaw, self.pitch]
+    }
+
+    fn replay(&mut self, host: &mut dyn MoveHost, input: &InputState, extra: &[f32], dt: f32) {
+        self.advance(host, input, dt, motion::view_of(extra));
+    }
+
+    fn locally_driven(&self) -> bool {
+        self.possessed
     }
 }
 

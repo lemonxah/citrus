@@ -52,6 +52,26 @@ pub struct GameConfig {
     pub content_cache: Option<PathBuf>,
     /// Enable the F8 user-content developer overlay (also `CITRUS_CONTENT_OVERLAY=1`).
     pub content_overlay: bool,
+    /// Whether to start OpenXR. A Meta Quest build uses [`XrMode::Required`].
+    pub xr: XrMode,
+    /// Display refresh rate to ask the headset for (`XR_FB_display_refresh_rate`,
+    /// Quest: 72 / 90 / 120 Hz); None keeps the runtime's default. The
+    /// `CITRUS_XR_REFRESH_HZ` environment variable overrides it.
+    pub xr_refresh_rate: Option<f32>,
+}
+
+/// How a game uses OpenXR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XrMode {
+    /// VR when a runtime and headset are present, flat otherwise. On Android
+    /// only builds that ship the OpenXR loader (Meta Quest) find a runtime.
+    #[default]
+    Auto,
+    /// Standalone headset: failing to start VR is a startup error rather
+    /// than a flat window nobody can see.
+    Required,
+    /// Never start OpenXR.
+    Off,
 }
 
 impl Default for GameConfig {
@@ -69,6 +89,8 @@ impl Default for GameConfig {
             physics: citrus_core::PhysicsSettings::default(),
             content_cache: None,
             content_overlay: false,
+            xr: XrMode::Auto,
+            xr_refresh_rate: None,
         }
     }
 }
@@ -125,7 +147,8 @@ pub fn run_game_android(
 /// Android: the game's assets ship inside the APK (`assets/`), listed one
 /// relative path per line in `assets/citrus_assets.txt` by the packager.
 /// Extract them into the app's internal storage on first run (or when that
-/// list changes) and return the directory to use as `GameConfig::assets_root`.
+/// list changes), install the cooked texture caches, and return the directory
+/// to use as `GameConfig::assets_root`.
 #[cfg(target_os = "android")]
 pub fn android_assets_root(app: &winit::platform::android::activity::AndroidApp) -> Result<PathBuf> {
     use std::io::Read;
@@ -149,6 +172,13 @@ pub fn android_assets_root(app: &winit::platform::android::activity::AndroidApp)
         }
         std::fs::write(&dest, read(rel)?).with_context(|| format!("extracting {rel}"))?;
     }
+    // The cook ships ASTC texture caches under a non-hidden folder (the APK
+    // packager drops dot-prefixed paths): bind them to the extracted files.
+    let (seeded, warnings) = citrus_assets::package::seed_cooked_texture_caches(&root);
+    for w in &warnings {
+        tracing::warn!("{w}");
+    }
+    tracing::info!("extracted assets ({seeded} cooked texture cache(s))");
     std::fs::write(&stamp, &manifest)?;
     Ok(root)
 }
@@ -156,7 +186,12 @@ pub fn android_assets_root(app: &winit::platform::android::activity::AndroidApp)
 fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnOnce(&mut ComponentRegistry)) -> Result<()> {
     let mut registry = ComponentRegistry::with_builtins();
     register(&mut registry);
-    let config_bindings = config.bindings.clone();
+    let mut input = InputManager::new(config.bindings.clone());
+    let bindings_path = crate::input_engine::player_bindings_path(&config.title);
+    if let Some(dir) = bindings_path.parent() {
+        crate::net::set_identity_dir(dir.to_path_buf());
+    }
+    input.set_overrides_path(Some(bindings_path));
     let slimevr = config.tracking_input.slimevr.then(crate::slimevr::SlimeVr::start);
     let mut face_input = crate::face_input::FaceInput::default();
     face_input.set_osc(config.tracking_input.osc_enabled.then_some(config.tracking_input.osc_port));
@@ -199,7 +234,7 @@ fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnO
         mouse: UiPointer::default(),
         rt_gi: crate::realtime_gi::RealtimeGiState::default(),
         refl_slots: crate::refl_slots::ReflectionSlots::default(),
-        input: InputManager::new(config_bindings),
+        input,
         // Optional networking via env vars: CITRUS_HOST=<port> or CITRUS_JOIN=<addr>.
         net: start_net_from_env(),
         voice: None,
@@ -208,6 +243,8 @@ fn run_game_on(event_loop: EventLoop<()>, config: GameConfig, register: impl FnO
         init_error: None,
         xr: None,
         xr_session: None,
+        xr_stereo: None,
+        xr_cull_camera: None,
         vr_targets: citrus_core::TrackerTargets::default(),
         face_input,
         slimevr,
@@ -336,6 +373,11 @@ struct GameApp {
     xr: Option<citrus_xr::XrContext>,
     /// Live VR session (poses/lifecycle), once the device is created.
     xr_session: Option<citrus_xr::XrSession>,
+    /// The eye swapchains (`setup_stereo`), once created.
+    xr_stereo: Option<citrus_xr::StereoSetup>,
+    /// Last view enclosing both eyes (XR-only frames whose XR frame is skipped
+    /// still run the shared per-frame work from it).
+    xr_cull_camera: Option<CameraData>,
     /// Latest VR tracker poses (head/hands/hips/feet) for the full-body IK solver.
     /// Consumed by the avatar-IK application step (humanoid bone mapping) — wired.
     #[allow(dead_code)]
@@ -358,7 +400,13 @@ impl GameApp {
                 self.config.height,
             ));
         let window = Arc::new(event_loop.create_window(attrs)?);
-        let mut renderer = Renderer::new(window.clone())?;
+        // OpenXR first: a VR session needs the Vulkan instance and device
+        // created through the runtime (it adds the extensions it requires).
+        let xr = self.start_xr()?;
+        let mut renderer = match &xr {
+            Some(xr) => Renderer::new_with_xr(window.clone(), Some((&xr.instance, xr.system)))?,
+            None => Renderer::new(window.clone())?,
+        };
         if frame_stats_on() {
             // Measure throughput, not the display's refresh rate.
             renderer.set_vsync(false);
@@ -368,27 +416,60 @@ impl GameApp {
         let boot = self.config.boot_scene.clone();
         self.load_scene(&renderer, &boot);
 
+        if let Some(xr) = xr {
+            // The VR session shares the renderer's Vulkan device.
+            let (vi, pd, dev, qfi) = renderer.vulkan_raw_handles();
+            match xr.create_session(vi, pd, dev, qfi) {
+                Ok(session) => self.xr_session = Some(session),
+                Err(e) if self.config.xr == XrMode::Required => {
+                    return Err(e.context("creating the OpenXR session (this build requires VR)"));
+                }
+                Err(e) => tracing::warn!("OpenXR session create failed: {e:#}"),
+            }
+            self.xr = Some(xr);
+            #[cfg(target_os = "android")]
+            if self.xr_session.is_some() {
+                request_android_permissions(&["com.oculus.permission.EYE_TRACKING", "com.oculus.permission.FACE_TRACKING"]);
+            }
+        }
         self.renderer = Some(renderer);
         self.window = Some(window);
-        // Start OpenXR (VR). Degrades gracefully to flat when unavailable.
-        match citrus_xr::XrContext::start(&self.config.title) {
-            Ok(Some(xr)) => {
-                tracing::info!("VR ready: {}", xr.system_name());
-                // Create the VR session sharing the renderer's Vulkan device.
-                let (vi, pd, dev, qfi) =
-                    self.renderer.as_ref().unwrap().vulkan_raw_handles();
-                match xr.create_session(vi, pd, dev, qfi) {
-                    Ok(session) => self.xr_session = Some(session),
-                    Err(e) => tracing::warn!("OpenXR session create failed: {e:#}"),
-                }
-                self.xr = Some(xr);
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("OpenXR start failed: {e:#}"),
-        }
         self.start = Instant::now();
         self.last_frame = Instant::now();
         Ok(())
+    }
+
+    /// Start OpenXR per [`GameConfig::xr`]. `None` runs flat; with
+    /// [`XrMode::Required`] a missing runtime or headset is an error.
+    fn start_xr(&self) -> Result<Option<citrus_xr::XrContext>> {
+        if self.config.xr == XrMode::Off {
+            return Ok(None);
+        }
+        let started = citrus_xr::XrContext::start(&self.config.title);
+        if self.config.xr == XrMode::Required {
+            return match started {
+                Ok(Some(xr)) => {
+                    tracing::info!("VR ready: {}", xr.system_name());
+                    Ok(Some(xr))
+                }
+                Ok(None) => anyhow::bail!(
+                    "this build requires VR but no OpenXR runtime or headset was found \
+                     (is libopenxr_loader.so in the APK, and is the headset awake?)"
+                ),
+                Err(e) => Err(e.context("starting OpenXR (this build requires VR)")),
+            };
+        }
+        match started {
+            Ok(Some(xr)) => {
+                tracing::info!("VR ready: {}", xr.system_name());
+                Ok(Some(xr))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                tracing::warn!("OpenXR start failed: {e:#}");
+                Ok(None)
+            }
+        }
     }
 
     /// Start replacing the current scene with the one at `rel` (relative to the
@@ -514,6 +595,7 @@ impl GameApp {
                 ComponentCommand::ClearTrackerCalibration => self.scene.clear_vr_calibration(),
                 ComponentCommand::SetOscFaceTracking(port) => self.face_input.set_osc(port),
                 ComponentCommand::Content(c) => self.content.queue(c),
+                ComponentCommand::Input(c) => self.input.apply(c),
                 other => tracing::warn!("unhandled component command {other:?}"),
             }
         }
@@ -676,6 +758,11 @@ impl GameApp {
         let Some(mut renderer) = self.renderer.take() else {
             return;
         };
+        let xr_running = self.xr_session.as_ref().is_some_and(|s| s.running);
+        if loop_mode(renderer.has_surface(), xr_running) == LoopMode::Idle {
+            self.renderer = Some(renderer);
+            return;
+        }
         if !self.finish_scene_switch(&mut renderer) {
             self.renderer = Some(renderer);
             event_loop.exit();
@@ -694,6 +781,8 @@ impl GameApp {
             net.pump();
         }
         let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+        let vr = vr_frame(self.xr_session.as_ref(), &self.vr_targets);
+        self.input.feed_vr(&vr);
         self.input.resolve_frame();
         let (win_w, win_h) = self
             .window
@@ -722,7 +811,8 @@ impl GameApp {
             ui_submits: std::mem::take(&mut self.ui_frame.submits),
             ui_text_editing: self.ui_frame.text_editing,
             ui_cancel: std::mem::take(&mut self.ui_frame.cancel),
-            vr: vr_frame(self.xr_session.as_ref(), &self.vr_targets),
+            vr,
+            controls: self.input.controls_info(),
         };
         let host = match self.play.as_mut() {
             Some(play) => play.tick(
@@ -766,8 +856,12 @@ impl GameApp {
         {
             play.structure_changed();
         }
-        // Replicate networked objects (owner sends, others apply).
+        // Replicate networked objects (owner sends, others apply), after
+        // predicting / simulating predicted pawns.
         if let Some(net) = self.net.as_mut() {
+            if let Some(play) = self.play.as_mut() {
+                play.net_predict(&mut self.scene, net, self.input.state(), dt);
+            }
             self.scene.network_sync(net, dt);
         }
 
@@ -782,6 +876,11 @@ impl GameApp {
         // the solve to a humanoid skeleton) is the remaining step.
         if let Some(session) = &mut self.xr_session {
             session.poll();
+            if session.exit_requested() {
+                self.renderer = Some(renderer);
+                event_loop.exit();
+                return;
+            }
             let b = session.body_poses();
             self.vr_targets = citrus_core::TrackerTargets {
                 head: b.head,
@@ -907,7 +1006,7 @@ impl GameApp {
         }
         let postfx = citrus_render::PostFx {
             underwater: crate::underwater::view_fx(&self.scene, cam_pos, self.water.time()),
-            ..self.scene.effective_postfx(cam_pos, &self.config.assets_root)
+            ..self.scene.effective_postfx(cam_pos, &self.config.assets_root, self.water.time())
         };
         let planar = self.scene.planar_surfaces();
         // Full light set (incl. baked) for the reflection cube capture, only
@@ -927,7 +1026,7 @@ impl GameApp {
         };
 
         let ui_draw = self.run_game_ui(win_w, win_h);
-        let frame = FrameInput {
+        let mut frame = FrameInput {
             clear_color: [0.016, 0.016, 0.024, 1.0],
             camera: CameraData {
                 view,
@@ -964,10 +1063,107 @@ impl GameApp {
             egui: Some(ui_draw),
             world_ui: std::mem::take(&mut self.world_ui_draws),
         };
-        if let Err(e) = renderer.render(&frame) {
+        // A standalone headset (Android with a running session) shows only the
+        // eyes: the window is never presented, so its pass is skipped and the
+        // eyes get their own frame update (render_xr_frame) from the head pose.
+        let xr_only = cfg!(target_os = "android") && self.xr_session.as_ref().is_some_and(|s| s.running);
+        if !xr_only
+            && renderer.has_surface()
+            && let Err(e) = renderer.render(&frame)
+        {
             tracing::error!("render failed: {e:#}");
             renderer.report_device_lost(&e);
             event_loop.exit();
+        }
+        // VR: the same frame into the headset's eyes, from the VR Player rig
+        // (or the main camera when the scene has none).
+        let mut xr_rendered = false;
+        if let Some(session) = self.xr_session.as_mut() {
+            let rig = self.scene.vr_player_rig().unwrap_or_else(|| camera_rig(view.inverse(), self.vr_targets.head));
+            let world_to_stage = rig.stage_to_world_mat().inverse();
+            if self.xr_stereo.is_none() {
+                // Desktop keeps the window's format when the runtime offers it;
+                // a standalone headset takes its own sRGB / half-float pick.
+                let preferred: Vec<u32> = if xr_only { Vec::new() } else { vec![renderer.color_format_raw()] };
+                match session.setup_stereo(&preferred, xr_only && renderer.xr_multiview()) {
+                    Ok(setup) => {
+                        tracing::info!(
+                            "XR stereo swapchains ready ({}x{}, VkFormat {}, multiview {})",
+                            setup.width, setup.height, setup.format, setup.multiview
+                        );
+                        self.xr_stereo = Some(setup);
+                        let hz = std::env::var("CITRUS_XR_REFRESH_HZ").ok().and_then(|v| v.parse().ok()).or(self.config.xr_refresh_rate);
+                        if let Some(hz) = hz
+                            && let Some(got) = session.request_refresh_rate(hz)
+                        {
+                            tracing::info!("XR display refresh rate {got} Hz");
+                        }
+                    }
+                    Err(e) => tracing::warn!("XR setup_stereo failed: {e:#}"),
+                }
+            }
+            if let Some(stereo) = self.xr_stereo {
+                match session.begin_frame() {
+                    Ok(Some(xr_frame)) => {
+                        let eyes: Vec<(Mat4, Mat4)> = xr_frame.eyes.iter().map(|e| (e.view * world_to_stage, e.proj)).collect();
+                        // One view around both eyes: shadow cascades and multiview culling.
+                        let cull = xr_frame
+                            .combined_view(0.05, 2000.0)
+                            .map(|(v, p)| (v * world_to_stage, p))
+                            .or_else(|| eyes.first().copied());
+                        if xr_only && let Some((cv, cp)) = cull {
+                            let cam = CameraData { view: cv, proj: cp, position: cv.inverse().w_axis.truncate() };
+                            self.xr_cull_camera = Some(cam);
+                            frame.camera = cam;
+                            xr_rendered = true;
+                            if let Err(e) = renderer.render_xr_frame(&frame) {
+                                tracing::error!("XR frame failed: {e:#}");
+                                renderer.report_device_lost(&e);
+                                event_loop.exit();
+                            }
+                        }
+                        let base_fx = frame.postfx;
+                        let eye_fx = |view: Mat4| citrus_render::PostFx {
+                            underwater: crate::underwater::view_fx(&self.scene, view.inverse().w_axis.truncate(), self.water.time()),
+                            ..base_fx
+                        };
+                        if stereo.multiview && eyes.len() == 2 && let Some(cull) = cull {
+                            let cams = [0, 1].map(|i| citrus_render::XrEyeCamera { view: eyes[i].0, proj: eyes[i].1, postfx: eye_fx(eyes[i].0) });
+                            if let Err(e) = renderer.render_xr_stereo(
+                                xr_frame.eyes[0].image, stereo.format, stereo.width, stereo.height, &cams, cull, &frame,
+                            ) {
+                                tracing::error!("XR stereo render: {e:#}");
+                            }
+                        } else {
+                            for (eye, &(world_view, proj)) in xr_frame.eyes.iter().zip(&eyes) {
+                                frame.postfx = eye_fx(world_view);
+                                if let Err(e) = renderer.render_xr_eye(
+                                    eye.image, stereo.format, eye.width, eye.height, world_view, proj, &frame, None,
+                                ) {
+                                    tracing::error!("XR eye render: {e:#}");
+                                }
+                            }
+                        }
+                        if let Err(e) = session.end_frame(xr_frame) {
+                            tracing::error!("XR end_frame: {e:#}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::error!("XR begin_frame: {e:#}"),
+                }
+            }
+        }
+        // XR-only frame the runtime asked not to render: still apply this
+        // frame's uploads (textures, world UI, skinning) so nothing is lost.
+        if xr_only && !xr_rendered {
+            if let Some(cam) = self.xr_cull_camera {
+                frame.camera = cam;
+            }
+            if let Err(e) = renderer.render_xr_frame(&frame) {
+                tracing::error!("XR frame failed: {e:#}");
+                renderer.report_device_lost(&e);
+                event_loop.exit();
+            }
         }
         frame_stats(&renderer);
 
@@ -996,7 +1192,7 @@ pub(crate) fn upload_probes(renderer: &mut Renderer, baked: Option<&crate::scene
                 })
                 .collect();
             renderer.set_baked_probes(&b.probe_sh, &volumes);
-            renderer.set_baked_lightmaps(&b.lightmaps);
+            b.upload_lightmaps(renderer);
         }
         None => {
             renderer.set_baked_probes(&[], &[]);
@@ -1045,9 +1241,26 @@ fn start_net_from_env() -> Option<NetSession> {
     None
 }
 
+impl Drop for GameApp {
+    fn drop(&mut self) {
+        // The XR swapchains live on the renderer's device: end the session
+        // before the device goes.
+        self.xr_session = None;
+    }
+}
+
 impl ApplicationHandler for GameApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
         if self.window.is_some() {
+            // Android: a new native window after a pause.
+            if let Some(renderer) = self.renderer.as_mut()
+                && let Err(e) = renderer.surface_recreated()
+            {
+                tracing::error!("recreating the window surface: {e:#}");
+                self.init_error = Some(e);
+                event_loop.exit();
+            }
             return;
         }
         if let Err(e) = self.init(event_loop) {
@@ -1055,6 +1268,17 @@ impl ApplicationHandler for GameApp {
             self.init_error = Some(e);
             event_loop.exit();
         }
+    }
+
+    /// Android pauses destroy the native window: drop the surface and idle
+    /// until `resumed` brings a new one. The XR session keeps being polled so
+    /// it can stop and restart with the app.
+    fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.surface_lost();
+        }
+        self.input.clear_held();
+        event_loop.set_control_flow(ControlFlow::wait_duration(std::time::Duration::from_millis(100)));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1130,6 +1354,17 @@ impl ApplicationHandler for GameApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let xr_running = self.xr_session.as_ref().is_some_and(|s| s.running);
+        let has_surface = self.renderer.as_ref().is_some_and(Renderer::has_surface);
+        if self.renderer.is_some() && loop_mode(has_surface, xr_running) == LoopMode::Idle {
+            if let Some(session) = self.xr_session.as_mut() {
+                session.poll();
+                if session.exit_requested() {
+                    event_loop.exit();
+                }
+            }
+            return;
+        }
         // Boot: install the first scene even if no redraw arrives before it.
         if self.play.is_none()
             && let Some(mut renderer) = self.renderer.take()
@@ -1153,7 +1388,13 @@ pub(crate) fn vr_frame(session: Option<&citrus_xr::XrSession>, poses: &citrus_co
     let Some(session) = session.filter(|s| s.running) else {
         return citrus_core::VrFrame::default();
     };
-    let input = session.input();
+    // No input focus (system menu, guardian): poses keep tracking, buttons
+    // and sticks read released.
+    let input = if session.focused() { session.input() } else { citrus_xr::VrInput::default() };
+    vr_frame_from(input, poses)
+}
+
+fn vr_frame_from(input: citrus_xr::VrInput, poses: &citrus_core::TrackerTargets) -> citrus_core::VrFrame {
     citrus_core::VrFrame {
         active: true,
         head: poses.head,
@@ -1163,8 +1404,192 @@ pub(crate) fn vr_frame(session: Option<&citrus_xr::XrSession>, poses: &citrus_co
         right_stick: glam::Vec2::from(input.right_stick),
         left_grip: input.left_grip,
         right_grip: input.right_grip,
-        left_trigger: false,
+        left_trigger: input.left_trigger,
         right_trigger: input.right_trigger,
         menu: input.menu,
+        left_trigger_value: input.left_trigger_value,
+        right_trigger_value: input.right_trigger_value,
+        a: input.a,
+        b: input.b,
+        x: input.x,
+        y: input.y,
+        left_stick_click: input.left_stick_click,
+        right_stick_click: input.right_stick_click,
+    }
+}
+
+/// What a game-loop iteration does, from the window surface and VR state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopMode {
+    /// Tick and render (the window frame when there is a surface, the eyes
+    /// when VR runs).
+    Run,
+    /// Paused with nothing to draw into: skip the frame.
+    Idle,
+}
+
+fn loop_mode(has_surface: bool, xr_running: bool) -> LoopMode {
+    if has_surface || xr_running { LoopMode::Run } else { LoopMode::Idle }
+}
+
+/// Play space for a scene without a VR Player: the tracked head lands on the
+/// main camera, facing its yaw.
+fn camera_rig(cam_world: Mat4, head_stage: Option<(Vec3, glam::Quat)>) -> citrus_core::VrRig {
+    let (_, rot, pos) = cam_world.to_scale_rotation_translation();
+    let f = rot * Vec3::NEG_Z;
+    let yaw = (-f.x).atan2(-f.z);
+    let head = head_stage.map_or(Vec3::ZERO, |(p, _)| p);
+    citrus_core::VrRig { origin: pos - glam::Quat::from_rotation_y(yaw) * head, yaw, scale: 1.0 }
+}
+
+/// tracing writer for logcat: one `__android_log_write` per formatted line,
+/// at the event's priority, under the tag `citrus`.
+#[cfg(target_os = "android")]
+pub(crate) struct Logcat;
+
+#[cfg(target_os = "android")]
+pub(crate) struct LogcatLine {
+    priority: i32,
+    buf: Vec<u8>,
+}
+
+#[cfg(target_os = "android")]
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_write(priority: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32;
+}
+
+#[cfg(target_os = "android")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logcat {
+    type Writer = LogcatLine;
+
+    fn make_writer(&'a self) -> LogcatLine {
+        LogcatLine { priority: 4, buf: Vec::new() }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> LogcatLine {
+        // android/log.h: VERBOSE 2, DEBUG 3, INFO 4, WARN 5, ERROR 6.
+        let priority = match *meta.level() {
+            tracing::Level::TRACE => 2,
+            tracing::Level::DEBUG => 3,
+            tracing::Level::INFO => 4,
+            tracing::Level::WARN => 5,
+            tracing::Level::ERROR => 6,
+        };
+        LogcatLine { priority, buf: Vec::new() }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl std::io::Write for LogcatLine {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for LogcatLine {
+    fn drop(&mut self) {
+        let text: Vec<u8> = self.buf.iter().copied().filter(|&b| b != 0).collect();
+        let text = String::from_utf8_lossy(&text);
+        if let Ok(line) = std::ffi::CString::new(text.trim_end()) {
+            unsafe { __android_log_write(self.priority, c"citrus".as_ptr(), line.as_ptr()) };
+        }
+    }
+}
+
+/// Ask for runtime permissions the manifest declares (Quest Pro eye and face
+/// tracking) that are not granted yet. The system prompt is asynchronous, so
+/// a grant takes effect on the next launch.
+#[cfg(target_os = "android")]
+fn request_android_permissions(permissions: &[&str]) {
+    use jni::objects::{JObject, JValue};
+    let ctx = ndk_context::android_context();
+    let run = || -> jni::errors::Result<()> {
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast())? };
+        let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
+        let mut env = vm.attach_current_thread()?;
+        let mut missing = Vec::new();
+        for p in permissions {
+            let name = env.new_string(p)?;
+            let state = env
+                .call_method(&activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[JValue::Object(&name)])?
+                .i()?;
+            if state != 0 {
+                missing.push(name);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let array = env.new_object_array(missing.len() as i32, "java/lang/String", JObject::null())?;
+        for (i, name) in missing.iter().enumerate() {
+            env.set_object_array_element(&array, i as i32, name)?;
+        }
+        env.call_method(&activity, "requestPermissions", "([Ljava/lang/String;I)V", &[JValue::Object(&array), JValue::Int(1)])?;
+        Ok(())
+    };
+    if let Err(e) = run() {
+        tracing::warn!("requesting Android permissions {permissions:?}: {e}");
+        if let Ok(vm) = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
+            && let Ok(env) = vm.attach_current_thread()
+        {
+            let _ = env.exception_clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idles_only_without_surface_or_vr() {
+        assert_eq!(loop_mode(true, false), LoopMode::Run);
+        assert_eq!(loop_mode(true, true), LoopMode::Run);
+        assert_eq!(loop_mode(false, true), LoopMode::Run);
+        assert_eq!(loop_mode(false, false), LoopMode::Idle);
+    }
+
+    #[test]
+    fn camera_rig_puts_the_head_on_the_camera() {
+        let cam = Mat4::from_rotation_translation(glam::Quat::from_rotation_y(0.7), Vec3::new(3.0, 1.8, -2.0));
+        let head = (Vec3::new(0.3, 1.65, -0.2), glam::Quat::IDENTITY);
+        let rig = camera_rig(cam, Some(head));
+        assert!((rig.stage_to_world(head.0) - Vec3::new(3.0, 1.8, -2.0)).length() < 1e-4);
+        assert!((rig.yaw - 0.7).abs() < 1e-4);
+        let untracked = camera_rig(cam, None);
+        assert!((untracked.origin - Vec3::new(3.0, 1.8, -2.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn controller_input_maps_to_the_vr_frame() {
+        let input = citrus_xr::VrInput {
+            left_stick: (0.5, -1.0),
+            right_stick: (0.0, 0.25),
+            left_grip: 0.8,
+            right_grip: 0.1,
+            left_trigger: true,
+            right_trigger: false,
+            menu: true,
+            right_trigger_value: 0.4,
+            a: true,
+            right_stick_click: true,
+            ..Default::default()
+        };
+        let poses = citrus_core::TrackerTargets { head: Some((Vec3::Y, glam::Quat::IDENTITY)), ..Default::default() };
+        let f = vr_frame_from(input, &poses);
+        assert!(f.active && f.left_trigger && !f.right_trigger && f.menu);
+        assert_eq!(f.left_stick, glam::Vec2::new(0.5, -1.0));
+        assert_eq!(f.right_stick, glam::Vec2::new(0.0, 0.25));
+        assert_eq!((f.left_grip, f.right_grip), (0.8, 0.1));
+        assert_eq!(f.right_trigger_value, 0.4);
+        assert!(f.a && !f.b && !f.x && !f.y && f.right_stick_click && !f.left_stick_click);
+        assert_eq!(f.head, poses.head);
     }
 }

@@ -246,6 +246,10 @@ pub struct Water {
     /// The outline as drawn and tested (`outline`), rebuilt when it changes.
     #[serde(skip)]
     pub outline_cache: std::sync::Arc<std::sync::Mutex<OutlineCache>>,
+    /// Asked (from the inspector) to fit the outline and depth to the basin
+    /// around it; the editor does it and clears this.
+    #[serde(skip)]
+    pub fit_request: bool,
 }
 
 #[derive(Debug, Default)]
@@ -458,8 +462,13 @@ pub struct UnderwaterSettings {
     pub volume: f32,
     /// How strongly everything else is muffled (0 = not at all).
     pub muffle: f32,
-    /// Multiplies how quickly the view fogs with distance.
-    pub fog_density: f32,
+    /// How far you can see under water (m): the view is nearly all fog
+    /// (95%) at this distance. Murky water: a couple of metres; a clear pool
+    /// or tropical sea: 20-40 m.
+    pub visibility: f32,
+    /// Post-processing profile (`.postfx`) blended over the camera's own
+    /// while it is under (colour grading, vignette, bloom...).
+    pub postfx: String,
     /// Screen wobble strength.
     pub distortion: f32,
     /// Soft blur of the view below the surface (screen pixels at 1080p).
@@ -471,7 +480,7 @@ pub struct UnderwaterSettings {
 
 impl Default for UnderwaterSettings {
     fn default() -> Self {
-        Self { enabled: true, sound: String::new(), volume: 0.8, muffle: 0.85, fog_density: 2.0, distortion: 1.0, blur: 2.5, caustics: 1.0 }
+        Self { enabled: true, sound: String::new(), volume: 0.8, muffle: 0.85, visibility: 12.0, postfx: String::new(), distortion: 1.0, blur: 2.5, caustics: 1.0 }
     }
 }
 
@@ -521,14 +530,14 @@ impl Default for Water {
             interactive: true,
             ripple_area: 32.0,
             ripple_resolution: 256,
-            ripple_damping: 0.35,
+            ripple_damping: 0.8,
             gpu_sim: true,
-            sim_wave_depth: 3.0,
-            sim_displacement: 0.5,
-            sim_momentum: 1.0,
+            sim_wave_depth: 1.0,
+            sim_displacement: 0.7,
+            sim_momentum: 0.43,
             sim_dispersion: 1.0,
-            sim_ripple_mix: 1.0,
-            sim_chop_smoothing: 0.3,
+            sim_ripple_mix: 0.45,
+            sim_chop_smoothing: 1.0,
             sim_wake_ripples: 0.2,
             sim_ripple_smoothing: 0.06,
             sim_fine_damping: 6.0,
@@ -541,6 +550,7 @@ impl Default for Water {
             sim_feed: Default::default(),
             river_cache: Default::default(),
             outline_cache: Default::default(),
+            fit_request: false,
         }
     }
 }

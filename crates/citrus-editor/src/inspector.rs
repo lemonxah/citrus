@@ -26,6 +26,7 @@ pub struct MixedInfo {
     pub name: bool,
     pub enabled: bool,
     pub static_geometry: bool,
+    pub cast_shadows: bool,
     pub translation: [bool; 3],
     pub rotation: [bool; 3],
     pub scale: [bool; 3],
@@ -40,6 +41,8 @@ pub struct ObjectInfoModel {
     pub static_geometry: bool,
     /// Per-object lightmap-resolution multiplier ("Scale In Lightmap").
     pub lightmap_scale: f32,
+    /// "Cast Shadows" (Unity's MeshRenderer setting).
+    pub cast_shadows: citrus_core::ShadowCasting,
     /// "Mesh" / "Empty" / "Camera" / "Primitive".
     pub kind: &'static str,
     pub transform: TransformModel,
@@ -379,10 +382,12 @@ impl InspectorPanel {
             });
         }
 
-        if let Some(material) = material {
+        // Shown for meshes with an embedded (read-only) material too, so their
+        // mesh settings stay reachable.
+        if info.mesh.is_some() || material.is_some() {
             // Collapsed by default so the components below stay in reach.
             crate::widgets::divider(ui);
-            let name = material.name.clone();
+            let name = material.as_ref().map(|m| m.name.clone()).unwrap_or_default();
             let (open, _) = crate::widgets::section_header_with(
                 ui,
                 ui.make_persistent_id("citrus-material-section"),
@@ -396,7 +401,14 @@ impl InspectorPanel {
             );
             if open {
                 egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 0, top: 0, bottom: 10 }).show(ui, |ui| {
-                    self.material_ui(ui, info, material, shader_info, shaders, response);
+                    let has_mesh = info.mesh.is_some();
+                    mesh_ui(ui, info, response);
+                    if let Some(material) = material {
+                        if has_mesh {
+                            ui.separator();
+                        }
+                        self.material_ui(ui, info, material, shader_info, shaders, response);
+                    }
                 });
             }
         }
@@ -417,29 +429,6 @@ impl InspectorPanel {
         shaders: &[&str],
         response: &mut InspectorResponse,
     ) {
-        if let Some((vertices, triangles)) = info.mesh {
-            ui.label(RichText::new("Mesh").strong());
-            ui.label(format!("{vertices} vertices · {triangles} triangles"));
-            ui.add_enabled_ui(info.static_geometry, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Scale In Lightmap");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut info.lightmap_scale)
-                                .speed(0.05)
-                                .range(0.0..=16.0),
-                        )
-                        .on_hover_text(
-                            "Per-object lightmap-resolution multiplier (needs Contribute GI)",
-                        )
-                        .changed()
-                    {
-                        response.object_changed = true;
-                    }
-                });
-            });
-            ui.separator();
-        }
         // The active material slot (the slot selector, when an object has more
         // than one, is drawn by the engine above the inspector body). Dropping a
         // `.material` here assigns it to the selected slot.
@@ -480,6 +469,62 @@ impl InspectorPanel {
 }
 
 /// `Label  [X ....] [Y ....] [Z ....]` with axis tiles (scrub on the tile).
+/// The mesh block of "Mesh & Material": counts, Scale In Lightmap, Cast Shadows.
+fn mesh_ui(ui: &mut Ui, info: &mut ObjectInfoModel, response: &mut InspectorResponse) {
+    let Some((vertices, triangles)) = info.mesh else {
+        return;
+    };
+    ui.label(RichText::new("Mesh").strong());
+    ui.label(format!("{vertices} vertices · {triangles} triangles"));
+    ui.add_enabled_ui(info.static_geometry, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Scale In Lightmap");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut info.lightmap_scale)
+                        .speed(0.05)
+                        .range(0.0..=16.0),
+                )
+                .on_hover_text(
+                    "Per-object lightmap-resolution multiplier (needs Contribute GI)",
+                )
+                .changed()
+            {
+                response.object_changed = true;
+            }
+        });
+    });
+    if cast_shadows_row(ui, &mut info.cast_shadows, info.mixed.cast_shadows) {
+        response.object_changed = true;
+    }
+}
+
+/// "Cast Shadows" dropdown. `mixed` shows an em dash until a value is picked.
+fn cast_shadows_row(ui: &mut Ui, value: &mut citrus_core::ShadowCasting, mixed: bool) -> bool {
+    let mut changed = false;
+    crate::widgets::property_row(ui, "Cast Shadows", |ui| {
+        let text = if mixed { "\u{2014}" } else { value.label() };
+        egui::ComboBox::from_id_salt("citrus-object-cast-shadows")
+            .width(ui.available_width())
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                for mode in citrus_core::ShadowCasting::ALL {
+                    // Picking the shown value over a mixed selection still applies it.
+                    if ui.selectable_label(!mixed && *value == mode, mode.label()).clicked() {
+                        changed |= mixed || *value != mode;
+                        *value = mode;
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "On: casts shadows. Off: casts none. Two Sided: casts from both faces. \
+                 Shadows Only: invisible, but still casts (and occludes in the bake).",
+            );
+    });
+    changed
+}
+
 fn transform_row(ui: &mut Ui, label: &str, values: &mut [f32; 3], speed: f64, decimals: usize, mixed: [bool; 3]) -> bool {
     crate::widgets::property_row_w(ui, label, 64.0, |ui| crate::widgets::vec3_field_mixed(ui, values, decimals, speed, mixed))
         .iter()

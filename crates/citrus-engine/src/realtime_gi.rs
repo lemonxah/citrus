@@ -264,12 +264,14 @@ impl RealtimeGiState {
     /// Force the next trace even if the input hash is unchanged. Use after an
     /// edit that affects bounce light but may not be captured by the hash
     /// (e.g. a material reassignment or a non-hashed property change).
+    #[cfg(feature = "editor")]
     pub fn invalidate(&mut self) {
         self.force = true;
     }
 
     /// Drop the cached FluxVoxel static base so the next `update_flux_voxel` reseeds it
     /// (from a freshly completed build-time bake, or from the analytic fallback).
+    #[cfg(feature = "editor")]
     pub fn invalidate_flux_voxel(&mut self) {
         self.flux_voxel_hash = 0;
     }
@@ -473,6 +475,8 @@ impl RealtimeGiState {
         // The realtime GI backend the scene selected: Flux (software SDF march),
         // FluxRT (hardware ray-query), or FluxVoxel (analytic voxel volume).
         let mut gi = scene.environment.realtime_gi;
+        // The mobile tier runs baked lighting only (lightmaps + probes).
+        gi.enabled &= renderer.tier().realtime_gi();
         let backend = gi.mode;
         // The GDF + emitter feed Flux samples must refresh every frame so moving
         // emitters track without lag (the field is no longer user-facing).
@@ -1004,6 +1008,8 @@ fn hash_inputs(gather: &BakeGather, gi: &citrus_assets::RealtimeGi) -> u64 {
         for v in inst.emission.iter().chain(inst.albedo.iter()) {
             f(*v, &mut h);
         }
+        // Cast Shadows changes which rays the instance blocks.
+        inst.shadow_casting.hash(&mut h);
     }
     for v in [
         gather.sky_color[0],

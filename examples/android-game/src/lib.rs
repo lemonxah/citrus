@@ -1,6 +1,8 @@
 //! Android entry point for a citrus game. The APK carries the game's assets
 //! (built by tools/android/build_apk.sh); they're extracted to internal storage
-//! on first run and the boot scene comes from their project.citrus.
+//! on first run and the boot scene comes from their project.citrus. Packaged
+//! with `--quest`, the APK carries the OpenXR loader and VR starts on its own
+//! (`XrMode::Auto`); a phone build has no loader and runs flat.
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]

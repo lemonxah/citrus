@@ -83,6 +83,8 @@ pub struct SceneObject {
     pub static_geometry: bool,
     /// Per-object lightmap-resolution multiplier ("Scale In Lightmap").
     pub lightmap_scale: f32,
+    /// "Cast Shadows": On / Off / Two Sided / Shadows Only.
+    pub cast_shadows: citrus_core::ShadowCasting,
     /// Layer index (0..32, Unity-style). Drives the camera culling mask
     /// (rendering) and the layer-collision matrix (physics). 0 = "Default".
     pub layer: u8,
@@ -220,6 +222,16 @@ fn lod_template_key(level: &citrus_core::LodLevel, base: Option<&str>) -> Option
     }
     let base = base?;
     (level.keep > 0.0 && level.keep < 1.0).then(|| format!("{base}#lod{:.3}", level.keep))
+}
+
+/// The renderer's copy of an object's "Cast Shadows" setting.
+pub fn render_shadow_casting(c: citrus_core::ShadowCasting) -> citrus_render::ShadowCasting {
+    match c {
+        citrus_core::ShadowCasting::On => citrus_render::ShadowCasting::On,
+        citrus_core::ShadowCasting::Off => citrus_render::ShadowCasting::Off,
+        citrus_core::ShadowCasting::TwoSided => citrus_render::ShadowCasting::TwoSided,
+        citrus_core::ShadowCasting::ShadowsOnly => citrus_render::ShadowCasting::ShadowsOnly,
+    }
 }
 
 /// Object-space AABB of a skinned mesh in the pose `palette`: each joint's
@@ -381,6 +393,8 @@ pub struct LoadedScene {
     pub ride_offsets: HashMap<usize, (Vec3, Quat)>,
     /// Mesh Collider shapes built from render meshes (decomposition is slow).
     pub collider_shapes: std::sync::Mutex<HashMap<crate::physics::ColliderShapeKey, std::sync::Arc<crate::physics::MeshColliderShape>>>,
+    /// Authored collision pieces (`UCX_` etc.) of the loaded models.
+    pub authored_collision: crate::authored_collision::AuthoredCollision,
     /// Their wire edges for the editor gizmo.
     pub collider_wires: std::sync::Mutex<HashMap<crate::physics::ColliderShapeKey, ColliderWire>>,
     /// Camera position for LOD selection (set by the host before `sync_draws`).
@@ -416,9 +430,51 @@ pub struct ProbeVolumeMeta {
 pub struct BakedData {
     /// Object index → lightmap layer in the renderer's lightmap array.
     pub object_lightmap: std::collections::HashMap<usize, usize>,
+    /// Raw RGBA32F maps of a fresh bake (and the live bake preview); emptied
+    /// once `lightmap_array` holds the encoded layers.
     pub lightmaps: Vec<citrus_render::BakedLightmap>,
+    /// GPU-ready lightmap layers (loaded from `.lightmap`, or the encoded
+    /// fresh bake), in this device's upload format. Wins over `lightmaps`.
+    pub lightmap_array: Option<std::sync::Arc<citrus_render::HdrTextureArray>>,
     pub probe_volumes: Vec<ProbeVolumeMeta>,
     pub probe_sh: Vec<citrus_render::ProbeSh>,
+}
+
+impl BakedData {
+    pub fn lightmap_count(&self) -> usize {
+        self.lightmap_array.as_ref().map_or(self.lightmaps.len(), |a| a.layers.len())
+    }
+
+    /// Edge of the largest lightmap (the array's common layer size once encoded).
+    pub fn lightmap_max_size(&self) -> u32 {
+        match &self.lightmap_array {
+            Some(a) => a.size,
+            None => self.lightmaps.iter().map(|l| l.size).max().unwrap_or(0),
+        }
+    }
+
+    /// VRAM of the lightmap array as uploaded (raw maps upload as RGBA32F).
+    pub fn lightmap_vram_bytes(&self) -> u64 {
+        match &self.lightmap_array {
+            Some(a) => a.byte_size(),
+            None => {
+                let size = citrus_render::lightmap_array_size(self.lightmaps.iter().map(|l| l.size)) as u64;
+                self.lightmaps.len() as u64 * size * size * 16
+            }
+        }
+    }
+
+    pub fn lightmap_format(&self) -> citrus_render::HdrTextureFormat {
+        self.lightmap_array.as_ref().map_or(citrus_render::HdrTextureFormat::Rgba32f, |a| a.format)
+    }
+
+    /// Push the lightmaps to the renderer (encoded array when present).
+    pub fn upload_lightmaps(&self, renderer: &mut citrus_render::Renderer) {
+        match &self.lightmap_array {
+            Some(a) => renderer.set_lightmap_array(a),
+            None => renderer.set_baked_lightmaps(&self.lightmaps),
+        }
+    }
 }
 
 /// Owned bake inputs gathered from the scene; `BakeInput` borrows from this.
@@ -482,6 +538,7 @@ impl LoadedScene {
             ride_offsets: HashMap::new(),
             collider_shapes: Default::default(),
             collider_wires: Default::default(),
+            authored_collision: Default::default(),
             lod_camera: None,
             lod_state: HashMap::new(),
             lod_failed: Default::default(),
@@ -675,6 +732,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent,
             translation: parent_world.inverse().transform_point3(centre),
@@ -914,6 +972,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: position,
@@ -936,6 +995,7 @@ impl LoadedScene {
         if let Some(path) = source_path {
             self.model_mesh_base.insert(path.to_owned(), mesh_base);
         }
+        self.authored_collision.register(scene, mesh_base, source_path.map(|p| p.to_string_lossy()).as_deref());
 
         let textures: Vec<_> = scene
             .textures
@@ -1048,6 +1108,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: Vec3::ZERO,
@@ -1092,6 +1153,7 @@ impl LoadedScene {
                 enabled: true,
                 static_geometry: false,
                 lightmap_scale: 1.0,
+                cast_shadows: citrus_core::ShadowCasting::On,
                 layer: 0,
                 parent: Some(root_index),
                 translation,
@@ -1121,6 +1183,7 @@ impl LoadedScene {
         if let Some(path) = source_path {
             self.model_mesh_base.insert(path.to_owned(), mesh_base);
         }
+        self.authored_collision.register(scene, mesh_base, source_path.map(|p| p.to_string_lossy()).as_deref());
         let textures: &[TextureHandle] = tex_handles;
         let skel_base = self.skeletons.len();
         self.skeletons.extend(scene.skeletons.iter().cloned());
@@ -1212,6 +1275,7 @@ impl LoadedScene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: Vec3::ZERO,
@@ -1254,6 +1318,7 @@ impl LoadedScene {
                 enabled: true,
                 static_geometry: false,
                 lightmap_scale: 1.0,
+                cast_shadows: citrus_core::ShadowCasting::On,
                 layer: 0,
                 parent: Some(root_index),
                 translation,
@@ -2491,15 +2556,16 @@ impl LoadedScene {
             return None;
         }
         let mut baked = BakedData::default();
-        if let Ok(lm) = citrus_assets::load_lightmaps(&lm_path) {
-            for entry in lm.entries {
-                let layer = baked.lightmaps.len();
-                baked.object_lightmap.insert(entry.object as usize, layer);
-                baked.lightmaps.push(citrus_render::BakedLightmap {
-                    size: entry.size,
-                    pixels: entry.pixels,
-                });
+        // v1 (raw) or v2 (BC6H) .lightmap, transcoded for this GPU.
+        match citrus_assets::load_lightmap_layers(&lm_path, citrus_render::HdrFormatSupport::current(), 1) {
+            Ok(lm) => {
+                for (layer, &object) in lm.objects.iter().enumerate() {
+                    baked.object_lightmap.insert(object as usize, layer);
+                }
+                baked.lightmap_array = Some(std::sync::Arc::new(lm.array));
             }
+            Err(e) if lm_path.exists() => tracing::error!("loading {}: {e:#}", lm_path.display()),
+            Err(_) => {}
         }
         if let Ok(ld) = citrus_assets::load_lightdata(&ld_path) {
             baked.probe_volumes = ld
@@ -2531,8 +2597,9 @@ impl LoadedScene {
                 .collect();
         }
         tracing::info!(
-            "loaded baked lighting: {} lightmap(s), {} probe(s)",
-            baked.lightmaps.len(),
+            "loaded baked lighting: {} lightmap(s) ({}), {} probe(s)",
+            baked.lightmap_count(),
+            baked.lightmap_format().label(),
             baked.probe_sh.len()
         );
         Some(baked)
@@ -2589,7 +2656,13 @@ impl LoadedScene {
             let density = settings.texel_density * obj.lightmap_scale.max(0.0);
             let size = (density * max_extent).round() as u32;
             // Floor at 64 so multi-chart atlases (cube) keep ≥2-texel gutters.
-            let lightmap_size = size.clamp(64, settings.max_lightmap.max(64));
+            // A Shadows Only object is never drawn: it stays in the bake as a
+            // shadow caster, with a token lightmap to keep layers index-aligned.
+            let lightmap_size = if obj.cast_shadows.visible() {
+                size.clamp(64, settings.max_lightmap.max(64))
+            } else {
+                8
+            };
 
             let entry = &self.materials[render.material];
             let model = &entry.model;
@@ -2618,6 +2691,7 @@ impl LoadedScene {
                 emission,
                 metallic: entry.bake_metallic,
                 roughness: model.roughness,
+                shadow_casting: render_shadow_casting(obj.cast_shadows),
             });
             instance_objects.push(i);
         }
@@ -3279,6 +3353,7 @@ impl LoadedScene {
                     emission,
                     metallic: model.metallic,
                     roughness: model.roughness,
+                    shadow_casting: render_shadow_casting(self.objects[i].cast_shadows),
                 });
                 instance_objects.push(i);
                 instance_static.push(is_static);
@@ -4218,6 +4293,7 @@ impl LoadedScene {
     fn planar_surface_eligible(&self, i: usize) -> bool {
         self.objects[i].render.is_some()
             && self.frame_active(i)
+            && self.objects[i].cast_shadows.visible()
             && self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) != 0
             && self.objects[i]
                 .components
@@ -4266,10 +4342,15 @@ impl LoadedScene {
         })
     }
 
+    /// The post-processing at `camera_pos`: the scene's profile, the
+    /// volumes around it by priority, and on top of all of them the water's
+    /// underwater profile while the camera is below a surface (`water_t` the
+    /// water clock).
     pub fn effective_postfx(
         &mut self,
         camera_pos: Vec3,
         project_root: &std::path::Path,
+        water_t: f32,
     ) -> citrus_render::PostFx {
         use citrus_core::VolumeComponent;
 
@@ -4331,6 +4412,21 @@ impl LoadedScene {
             .filter_map(|(on, name)| on.then_some(name))
             .collect();
             overrides.push((self.objects[i].name.clone(), weight.clamp(0.0, 1.0), effects));
+        }
+        if let Some(under) = crate::underwater::probe(self, camera_pos, water_t, 0.0)
+            && !under.settings.postfx.trim().is_empty()
+            && under.depth > 0.0
+        {
+            let key = under.settings.postfx.clone();
+            if !self.postfx_cache.contains_key(&key) {
+                let path = citrus_core::asset_ref::resolve_path(project_root, &key);
+                let profile = citrus_assets::load_postfx(&path).unwrap_or_default();
+                self.postfx_cache.insert(key.clone(), profile);
+            }
+            // Eases in over the first few centimetres below the surface.
+            let weight = (under.depth / 0.05).clamp(0.0, 1.0);
+            stack.push((f32::INFINITY, self.postfx_cache[&key], weight));
+            overrides.push(("Under water".to_owned(), weight, Vec::new()));
         }
         self.postfx_overrides = overrides;
 
@@ -4544,6 +4640,7 @@ impl LoadedScene {
                     static_geometry: self.objects[i].static_geometry,
                     planar_index: planar_idx[i],
                     occluded,
+                    shadow_casting: render_shadow_casting(self.objects[i].cast_shadows),
                 });
             }
         }
@@ -4682,6 +4779,7 @@ impl LoadedScene {
                 enabled: src.enabled,
                 static_geometry: src.static_geometry,
                 lightmap_scale: src.lightmap_scale,
+                cast_shadows: src.cast_shadows,
                 layer: src.layer,
                 parent,
                 translation: src.translation,
@@ -4836,6 +4934,7 @@ impl LoadedScene {
                     enabled: object.enabled,
                     static_geometry: object.static_geometry,
                     lightmap_scale: object.lightmap_scale,
+                    cast_shadows: object.cast_shadows,
                     layer: object.layer,
                     material,
                     extra_materials,
@@ -5160,6 +5259,7 @@ impl LoadedScene {
                 enabled: entry.enabled,
                 static_geometry: entry.static_geometry,
                 lightmap_scale: entry.lightmap_scale,
+                cast_shadows: entry.cast_shadows,
                 layer: entry.layer,
                 parent: None,
                 translation: Vec3::from(entry.translation),
@@ -5972,6 +6072,7 @@ mod tests {
                 enabled: true,
                 static_geometry: false,
                 lightmap_scale: 1.0,
+                cast_shadows: citrus_core::ShadowCasting::On,
                 layer: 0,
                 parent: None,
                 translation: Vec3::ZERO,
@@ -6229,6 +6330,7 @@ mod lod_tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: Vec3::ZERO,
@@ -6281,6 +6383,7 @@ mod group_tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent,
             translation: t,
@@ -6332,6 +6435,32 @@ mod group_tests {
         assert_eq!(s.objects.iter().filter(|o| o.parent == Some(g)).count(), 6);
         for (i, o) in s.objects.iter().enumerate() {
             assert!(o.parent.is_none_or(|p| p < i));
+        }
+    }
+
+    #[test]
+    fn cast_shadows_survives_duplicate_and_save() {
+        use citrus_core::ShadowCasting;
+        let mut s = LoadedScene::empty();
+        let leaf = obj(&mut s, "Leaf", None, Vec3::ZERO);
+        let caster = obj(&mut s, "Caster", Some(leaf), Vec3::ZERO);
+        s.objects[leaf].cast_shadows = ShadowCasting::TwoSided;
+        s.objects[caster].cast_shadows = ShadowCasting::ShadowsOnly;
+        let copy = s.duplicate_object(leaf, &ComponentRegistry::with_builtins()).unwrap();
+        assert_eq!(s.objects[copy].cast_shadows, ShadowCasting::TwoSided);
+        assert_eq!(s.objects[copy + 1].cast_shadows, ShadowCasting::ShadowsOnly, "descendants keep theirs");
+        let file = s.to_scene_file(Path::new("."), &ShaderLibrary::default());
+        let saved: Vec<ShadowCasting> = file.entries.iter().map(|e| e.cast_shadows).collect();
+        assert_eq!(saved, s.objects.iter().map(|o| o.cast_shadows).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cast_shadows_maps_to_the_renderer() {
+        use citrus_core::ShadowCasting as C;
+        use citrus_render::ShadowCasting as R;
+        for (c, r) in [(C::On, R::On), (C::Off, R::Off), (C::TwoSided, R::TwoSided), (C::ShadowsOnly, R::ShadowsOnly)] {
+            assert_eq!(render_shadow_casting(c), r);
+            assert_eq!((c.casts(), c.visible()), (r.casts(), r.visible()));
         }
     }
 }

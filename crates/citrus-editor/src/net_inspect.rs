@@ -39,6 +39,11 @@ impl Inspect for NetworkObject {
         });
         property_row(ui, "Parent", &mut changed, |ui| ui.checkbox(&mut self.sync_parent, ""));
         property_row(ui, "Active", &mut changed, |ui| ui.checkbox(&mut self.sync_active, ""));
+        property_row(ui, "Predicted", &mut changed, |ui| {
+            ui.checkbox(&mut self.predicted, "").on_hover_text(
+                "For a Pawn, First / Third Person Controller or VR Player: the host simulates it from its owner's input (server authority); the owner moves at once and reconciles with the host's state",
+            )
+        });
         widgets::eyebrow(ui, "Smoothing");
         enum_row(
             ui,
@@ -51,7 +56,11 @@ impl Inspect for NetworkObject {
         );
         property_row(ui, "Delay", &mut changed, |ui| {
             ui.add(DragValue::new(&mut self.interp_delay).speed(0.005).range(0.0..=1.0).suffix(" s"))
-                .on_hover_text("How far behind the newest snapshot remote peers render (absorbs jitter)")
+                .on_hover_text("How far behind the newest snapshot remote peers render (absorbs jitter); the minimum when Adaptive")
+        });
+        property_row(ui, "Adaptive", &mut changed, |ui| {
+            ui.checkbox(&mut self.adaptive_delay, "")
+                .on_hover_text("Raise the delay when the measured jitter and packet loss need it, and lower it back when the link calms down")
         });
         widgets::eyebrow(ui, "Bandwidth");
         property_row(ui, "Send Rate", &mut changed, |ui| {
@@ -240,6 +249,31 @@ impl Inspect for NetworkManager {
             ui.add(DragValue::new(&mut self.timeout).speed(0.1).range(1.0..=120.0).suffix(" s"))
         });
         property_row(ui, "LAN Discovery", &mut changed, |ui| ui.checkbox(&mut self.discovery, ""));
+        widgets::eyebrow(ui, "Online");
+        property_row(ui, "Relay", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.relay).hint_text("none (LAN / direct only)"))
+                .on_hover_text("Relay server (host:port, default port 47800): hosting also opens a room there, and players join by room code without port forwarding")
+        });
+        property_row(ui, "Room Code", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.room_code).hint_text("assigned by the relay"))
+                .on_hover_text("A fixed room code for hosts (empty = the relay picks one)")
+        });
+        property_row(ui, "Secret", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.secret).password(true).hint_text("none (open session)"))
+                .on_hover_text("Peers must know it to join; it also keys the session encryption. Use a long random value.")
+        });
+        widgets::eyebrow(ui, "Security");
+        property_row(ui, "Host Migration", &mut changed, |ui| {
+            ui.checkbox(&mut self.host_migration, "")
+                .on_hover_text("When the host leaves, the next player in line takes over and the session goes on")
+        });
+        property_row(ui, "Pin Host Identity", &mut changed, |ui| {
+            ui.checkbox(&mut self.pin_host, "")
+                .on_hover_text("Clients remember the host's player id for this address / room code and refuse a different one later")
+        });
+        changed |= fingerprint_list(ui, "Allow List", &mut self.allow_list, "anyone with the secret");
+        changed |= fingerprint_list(ui, "Ban List", &mut self.ban_list, "nobody");
+        widgets::info_note(ui, "Lists hold player ids (fingerprints like 1a2b-3c4d-...), one per line: copy them from the Network window.");
         widgets::eyebrow(ui, "Players");
         changed |= ctx.file_field(ui, "Player Prefab", &mut self.player_prefab, "prefabs/player.prefab", &["prefab"]);
         property_row(ui, "Spawn Tag", &mut changed, |ui| ui.text_edit_singleline(&mut self.spawn_tag));
@@ -250,10 +284,25 @@ impl Inspect for NetworkManager {
         widgets::eyebrow(ui, "Built game");
         enum_row(ui, "Auto Start", "citrus-net-auto", &mut self.auto_start, &NetAutoStart::ALL, NetAutoStart::label, &mut changed);
         if self.auto_start == NetAutoStart::Join {
-            property_row(ui, "Address", &mut changed, |ui| ui.text_edit_singleline(&mut self.address));
+            property_row(ui, "Address", &mut changed, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.address).hint_text("host:port or room code"))
+            });
         }
         widgets::info_note(ui, "The editor's Network window (Tools) hosts and joins with these settings.");
         changed
     }
 }
 impl Gizmo for NetworkManager {}
+
+/// One fingerprint per line.
+fn fingerprint_list(ui: &mut Ui, label: &str, list: &mut Vec<String>, empty: &str) -> bool {
+    let mut changed = false;
+    let mut text = list.join("\n");
+    property_row(ui, label, &mut changed, |ui| {
+        ui.add(egui::TextEdit::multiline(&mut text).hint_text(empty).desired_rows(2).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace))
+    });
+    if changed {
+        *list = text.lines().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty()).collect();
+    }
+    changed
+}

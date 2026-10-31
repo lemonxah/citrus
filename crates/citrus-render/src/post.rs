@@ -47,6 +47,12 @@ pub(crate) struct PostPass {
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    /// Format `pipeline` writes (the window swapchain's).
+    format: vk::Format,
+    /// Pipelines for other output formats (XR eye images), built on demand.
+    extra: Vec<(vk::Format, vk::Pipeline)>,
+    vert: vk::ShaderModule,
+    frag: vk::ShaderModule,
     sampler: vk::Sampler,
     pool: vk::DescriptorPool,
     sets: Vec<vk::DescriptorSet>,
@@ -55,6 +61,9 @@ pub(crate) struct PostPass {
     bloom: BloomPass,
     /// Bloom chain for the swapchain path (the viewport / preview own theirs).
     chain: Option<BloomChain>,
+    /// Every bloom chain is built for the view extent divided by this (the
+    /// render tier's; 2 on mobile).
+    bloom_divisor: u32,
 }
 
 impl PostPass {
@@ -64,6 +73,7 @@ impl PostPass {
         swapchain_format: vk::Format,
         extent: vk::Extent2D,
         frames: usize,
+        bloom_divisor: u32,
     ) -> Result<Self> {
         let set_bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
@@ -106,10 +116,6 @@ impl PostPass {
             )?
         };
         let pipeline = Self::build_pipeline(device, pipeline_layout, vert, frag, swapchain_format)?;
-        unsafe {
-            device.destroy_shader_module(vert, None);
-            device.destroy_shader_module(frag, None);
-        }
 
         let sampler = unsafe {
             device.create_sampler(
@@ -139,6 +145,10 @@ impl PostPass {
             set_layout,
             pipeline_layout,
             pipeline,
+            format: swapchain_format,
+            extra: Vec::new(),
+            vert,
+            frag,
             sampler,
             pool,
             sets: Vec::new(),
@@ -146,6 +156,7 @@ impl PostPass {
             extent,
             bloom: BloomPass::new(device, set_layout)?,
             chain: None,
+            bloom_divisor: bloom_divisor.max(1),
         };
         pass.create_targets(device, allocator, extent, frames)?;
         pass.chain = Some(pass.new_bloom_chain(device, allocator, extent)?);
@@ -307,6 +318,8 @@ impl PostPass {
         allocator: &mut Allocator,
         extent: vk::Extent2D,
     ) -> Result<BloomChain> {
+        let d = self.bloom_divisor;
+        let extent = vk::Extent2D { width: (extent.width / d).max(1), height: (extent.height / d).max(1) };
         self.bloom.new_chain(device, allocator, extent, self.set_layout, self.sampler)
     }
 
@@ -323,6 +336,17 @@ impl PostPass {
         self.bloom.record(device, cb, chain, src_set, post);
     }
 
+    /// Build the pipeline writing `format` if it isn't the swapchain's and
+    /// doesn't exist yet (the XR eye images may use another format).
+    pub fn ensure_format(&mut self, device: &ash::Device, format: vk::Format) -> Result<()> {
+        if format == self.format || self.extra.iter().any(|(f, _)| *f == format) {
+            return Ok(());
+        }
+        let pipeline = Self::build_pipeline(device, self.pipeline_layout, self.vert, self.frag, format)?;
+        self.extra.push((format, pipeline));
+        Ok(())
+    }
+
     /// Run the post pass sampling an externally-provided descriptor set (binding
     /// 0 = the HDR source). Used by the editor viewport, which owns its own HDR
     /// target + set.
@@ -337,6 +361,24 @@ impl PostPass {
         post: &PostFx,
         wobble: Option<Wobble>,
     ) {
+        self.record_set_as(device, cb, set, bloom_set, extent, post, wobble, self.format);
+    }
+
+    /// [`Self::record_set`] into an attachment of `format` (see
+    /// [`Self::ensure_format`]; an unknown format falls back to the swapchain's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_set_as(
+        &self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        bloom_set: vk::DescriptorSet,
+        extent: vk::Extent2D,
+        post: &PostFx,
+        wobble: Option<Wobble>,
+        format: vk::Format,
+    ) {
+        let pipeline = self.extra.iter().find(|(f, _)| *f == format).map_or(self.pipeline, |(_, p)| *p);
         let w = wobble.unwrap_or(Wobble { strength: 0.0, blur: 0.0, time: 0.0, line: [0.0; 3] });
         let push = PostPush {
             p0: [post.tonemap as f32, post.exposure, post.grade_exposure, post.contrast],
@@ -363,7 +405,7 @@ impl PostPass {
             p6: [w.line[0], w.line[1], w.line[2], w.blur],
         };
         unsafe {
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -441,6 +483,11 @@ impl PostPass {
             device.destroy_descriptor_pool(self.pool, None);
             device.destroy_sampler(self.sampler, None);
             device.destroy_pipeline(self.pipeline, None);
+            for (_, p) in self.extra.drain(..) {
+                device.destroy_pipeline(p, None);
+            }
+            device.destroy_shader_module(self.vert, None);
+            device.destroy_shader_module(self.frag, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_set_layout(self.set_layout, None);
         }

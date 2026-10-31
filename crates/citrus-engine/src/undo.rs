@@ -23,6 +23,7 @@ pub struct ObjectState {
     pub translation: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
+    pub cast_shadows: citrus_core::ShadowCasting,
     /// Components as (registry name, RON). Diffable and restorable.
     pub components: Vec<(String, String)>,
 }

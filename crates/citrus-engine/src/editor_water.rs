@@ -144,7 +144,7 @@ fn is_round(scene: &LoadedScene, i: usize) -> bool {
         a.is::<SphereCollider>()
             || a.is::<CapsuleCollider>()
             || a.downcast_ref::<MeshCollider>().is_some_and(|m| {
-                let mode = crate::physics::MeshShapeMode::of(m, true);
+                let mode = crate::physics::mesh_shape_mode(scene, i, m, true);
                 crate::physics::mesh_collider_shape(scene, i, mode)
                     .is_some_and(|s| matches!(*s, crate::physics::MeshColliderShape::Ball(..)))
             })

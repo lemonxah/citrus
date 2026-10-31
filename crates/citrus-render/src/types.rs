@@ -68,9 +68,11 @@ pub struct TextureData {
     pub hdr: bool,
 }
 
-/// Pixel format of a (possibly block-compressed) prepared texture. BC variants
-/// carry one byte per texel (4x4 blocks, 16 bytes each); raw variants are the
-/// fallback for non-multiple-of-4 dimensions BC can't tile cleanly.
+/// Pixel format of a (possibly block-compressed) prepared texture. Every
+/// block format stores 16 bytes per block: BC uses 4x4 blocks (desktop), ASTC
+/// LDR the named footprint (mobile / standalone VR, which lack BC). Raw
+/// variants are the fallback for sizes BC can't tile and for devices with
+/// neither.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexFormat {
     /// BC7 sRGB — color maps (albedo, emission).
@@ -85,6 +87,70 @@ pub enum TexFormat {
     RgbaUnorm,
     /// Uncompressed RGBA f16 linear (8 bytes/texel).
     RgbaF16,
+    Astc4x4Srgb,
+    Astc4x4Unorm,
+    Astc5x5Srgb,
+    Astc5x5Unorm,
+    Astc6x6Srgb,
+    Astc6x6Unorm,
+    Astc8x8Srgb,
+    Astc8x8Unorm,
+}
+
+impl TexFormat {
+    /// ASTC LDR block edges with a `TexFormat` variant (square footprints).
+    pub const ASTC_BLOCKS: [u32; 4] = [4, 5, 6, 8];
+
+    /// The ASTC LDR format for a square `block` footprint (one of
+    /// [`Self::ASTC_BLOCKS`]).
+    pub fn astc(block: u32, srgb: bool) -> Option<Self> {
+        Some(match (block, srgb) {
+            (4, true) => Self::Astc4x4Srgb,
+            (4, false) => Self::Astc4x4Unorm,
+            (5, true) => Self::Astc5x5Srgb,
+            (5, false) => Self::Astc5x5Unorm,
+            (6, true) => Self::Astc6x6Srgb,
+            (6, false) => Self::Astc6x6Unorm,
+            (8, true) => Self::Astc8x8Srgb,
+            (8, false) => Self::Astc8x8Unorm,
+            _ => return None,
+        })
+    }
+
+    pub fn is_bc(self) -> bool {
+        matches!(self, Self::Bc7Srgb | Self::Bc7Unorm | Self::Bc6h)
+    }
+
+    pub fn is_astc(self) -> bool {
+        self.block_dims() != (1, 1) && !self.is_bc()
+    }
+
+    /// Texel footprint of one block (1x1 for uncompressed formats).
+    pub fn block_dims(self) -> (u32, u32) {
+        match self {
+            Self::Bc7Srgb | Self::Bc7Unorm | Self::Bc6h | Self::Astc4x4Srgb | Self::Astc4x4Unorm => (4, 4),
+            Self::Astc5x5Srgb | Self::Astc5x5Unorm => (5, 5),
+            Self::Astc6x6Srgb | Self::Astc6x6Unorm => (6, 6),
+            Self::Astc8x8Srgb | Self::Astc8x8Unorm => (8, 8),
+            Self::RgbaSrgb | Self::RgbaUnorm | Self::RgbaF16 => (1, 1),
+        }
+    }
+
+    /// Bytes per block (per texel for uncompressed formats).
+    pub fn block_bytes(self) -> usize {
+        match self {
+            Self::RgbaSrgb | Self::RgbaUnorm => 4,
+            Self::RgbaF16 => 8,
+            _ => 16,
+        }
+    }
+
+    /// Exact byte size of one `w`×`h` level; partial edge blocks count whole,
+    /// matching Vulkan's buffer layout for block formats.
+    pub fn level_bytes(self, w: u32, h: u32) -> usize {
+        let (bw, bh) = self.block_dims();
+        w.max(1).div_ceil(bw) as usize * h.max(1).div_ceil(bh) as usize * self.block_bytes()
+    }
 }
 
 /// A texture decoded + (optionally) block-compressed off the main thread, with a
@@ -496,6 +562,31 @@ pub struct LightInstance {
     pub baked: bool,
 }
 
+/// How a draw takes part in shadows (the object's "Cast Shadows" setting).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ShadowCasting {
+    #[default]
+    On,
+    /// Never drawn into a shadow map; renders normally.
+    Off,
+    /// Casts from both faces. The shadow pass already rasterizes with culling
+    /// off, so this casts exactly like `On`.
+    TwoSided,
+    /// Drawn into shadow maps only, never by a camera.
+    ShadowsOnly,
+}
+
+impl ShadowCasting {
+    /// Drawn into shadow maps (and blocks bake / RT shadow rays).
+    pub fn casts(self) -> bool {
+        self != Self::Off
+    }
+    /// Drawn by cameras: main pass, prepass, captures, mirrors, previews.
+    pub fn visible(self) -> bool {
+        self != Self::ShadowsOnly
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct DrawCmd {
     pub mesh: MeshHandle,
@@ -527,6 +618,8 @@ pub struct DrawCmd {
     /// Hidden by baked occlusion culling from the culling camera's cell: skipped
     /// in the main camera pass, still drawn into shadows / probes / captures.
     pub occluded: bool,
+    /// Which passes draw it: shadow maps, cameras, or both.
+    pub shadow_casting: ShadowCasting,
 }
 
 pub struct EguiDraw {
@@ -558,6 +651,9 @@ pub struct BakeInstance {
     /// bounce magnitude is roughness-independent (Lambert), so it only modulates
     /// the (future) specular trace, not the diffuse albedo.
     pub roughness: f32,
+    /// `Off` instances don't block shadow rays; `ShadowsOnly` ones block only
+    /// shadow rays (invisible to bounce rays).
+    pub shadow_casting: ShadowCasting,
 }
 
 /// A light contributing to the bake. Baked lights contribute their full
@@ -673,6 +769,25 @@ pub struct RenderStats {
     pub gpu_gi_gather_ms: f32,
     pub gpu_gi_denoise_ms: f32,
     pub gpu_gi_integrate_ms: f32,
+    /// GPU-driven culling is on: the main camera's opaque / alpha-test draws,
+    /// the shadow views and VR eyes are culled by compute and drawn indirect.
+    pub gpu_culling: bool,
+    /// Indirect draw calls recorded since the previous frame (one per batch).
+    pub indirect_draws: u32,
+    /// Main-camera GPU cull counts, read back from the frame slot's previous
+    /// submission (no CPU wait): instances tested, drawn, rejected by the
+    /// frustum / distance / size tests, and rejected by Hi-Z occlusion.
+    pub gpu_cull_tested: u32,
+    pub gpu_cull_visible: u32,
+    pub gpu_cull_frustum: u32,
+    pub gpu_cull_occluded: u32,
+    /// Shadow-caster instances drawn by the GPU-culled shadow views.
+    pub gpu_cull_shadow_visible: u32,
+    /// Instances drawn by the last GPU-culled VR eye.
+    pub gpu_cull_eye_visible: u32,
+    /// GPU time of the cull dispatch and of the Hi-Z pyramid build (ms).
+    pub gpu_cull_ms: f32,
+    pub gpu_hiz_ms: f32,
 }
 
 pub struct FrameInput<'a> {

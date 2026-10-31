@@ -22,6 +22,9 @@ const OUTLINE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/outlin
 const SKYBOX_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.vert.spv"));
 const SKYBOX_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.frag.spv"));
 const SHADOW_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shadow.vert.spv"));
+const VERT_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.vert.mv.spv"));
+const FRAG_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.mv.spv"));
+const SKYBOX_VERT_MV_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/skybox.vert.mv.spv"));
 
 pub(crate) const PUSH_CONSTANT_SIZE: u32 = 128;
 /// Keyword specialization constants per custom shader (ids 0..N).
@@ -78,6 +81,10 @@ pub(crate) struct PipelineKey {
     /// Each distinct set is its own lazily built, cached pipeline in which the
     /// driver folds the constants and strips disabled feature code.
     pub spec: [u8; CUSTOM_KEYWORDS],
+    /// Multiview pass (view mask 0b11, both XR eyes) and its sample count.
+    /// Filled by [`PipelineCache::get`] from the current pass target.
+    pub multiview: bool,
+    pub samples: u8,
 }
 
 impl PipelineKey {
@@ -105,6 +112,8 @@ impl PipelineKey {
             prepass: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
+            multiview: false,
+            samples: 1,
         }
     }
 
@@ -128,6 +137,8 @@ impl PipelineKey {
             prepass: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
+            multiview: false,
+            samples: 1,
         }
     }
 
@@ -151,6 +162,8 @@ impl PipelineKey {
             prepass: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
+            multiview: false,
+            samples: 1,
         }
     }
 
@@ -174,6 +187,8 @@ impl PipelineKey {
             prepass: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
+            multiview: false,
+            samples: 1,
         }
     }
 
@@ -197,6 +212,8 @@ impl PipelineKey {
             prepass: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
+            multiview: false,
+            samples: 1,
         }
     }
 
@@ -220,6 +237,8 @@ impl PipelineKey {
             prepass: false,
             depth_equal: false,
             spec: [0; CUSTOM_KEYWORDS],
+            multiview: false,
+            samples: 1,
         }
     }
 }
@@ -233,6 +252,10 @@ pub(crate) struct PipelineCache {
     skybox_vert: vk::ShaderModule,
     skybox_frag: vk::ShaderModule,
     shadow_vert: vk::ShaderModule,
+    /// Multiview (gl_ViewIndex) variants of the standard / skybox shaders.
+    vert_mv: vk::ShaderModule,
+    frag_mv: vk::ShaderModule,
+    skybox_vert_mv: vk::ShaderModule,
     /// Runtime-registered custom fragment shaders, indexed by `ShaderId`.
     custom_frags: Vec<vk::ShaderModule>,
     pub set0_layout: vk::DescriptorSetLayout,
@@ -247,6 +270,9 @@ pub(crate) struct PipelineCache {
     pipelines: HashMap<PipelineKey, vk::Pipeline>,
     /// Color format of the pass being recorded (see `set_target_format`).
     target_format: vk::Format,
+    /// Multiview + sample count of the pass being recorded (`set_target_views`).
+    target_multiview: bool,
+    target_samples: u8,
 }
 
 impl PipelineCache {
@@ -312,6 +338,13 @@ impl PipelineCache {
                 None,
             )?
         };
+        let module = |spv: &[u8]| -> Result<vk::ShaderModule> {
+            let code = ash::util::read_spv(&mut Cursor::new(spv))?;
+            Ok(unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)? })
+        };
+        let vert_mv = module(VERT_MV_SPV)?;
+        let frag_mv = module(FRAG_MV_SPV)?;
+        let skybox_vert_mv = module(SKYBOX_VERT_MV_SPV)?;
 
         // set 0: per-frame UBO (binding 0), shadow-map array (binding 1), and
         // the baked light-probe SH storage buffer (binding 2, runtime GI).
@@ -475,6 +508,9 @@ impl PipelineCache {
             skybox_vert,
             skybox_frag,
             shadow_vert,
+            vert_mv,
+            frag_mv,
+            skybox_vert_mv,
             custom_frags: Vec::new(),
             set0_layout,
             set1_layout,
@@ -485,6 +521,8 @@ impl PipelineCache {
             gbuf_format,
             pipelines: HashMap::new(),
             target_format: color_format,
+            target_multiview: false,
+            target_samples: 1,
         })
     }
 
@@ -511,11 +549,23 @@ impl PipelineCache {
         self.target_format = format;
     }
 
+    /// Set the view layout of the pass about to be recorded: multiview (both
+    /// XR eyes, view mask 0b11) and the colour/depth sample count. Reset to
+    /// `(false, 1)` once that pass ends.
+    pub fn set_target_views(&mut self, multiview: bool, samples: u8) {
+        self.target_multiview = multiview;
+        self.target_samples = samples.max(1);
+    }
+
     pub fn get(&mut self, device: &ash::Device, mut key: PipelineKey) -> Result<vk::Pipeline> {
         if key.shadow || key.prepass {
             key.color_format = vk::Format::UNDEFINED;
         } else if key.color_format == vk::Format::UNDEFINED {
             key.color_format = self.target_format;
+        }
+        if !key.shadow && !key.prepass {
+            key.multiview = self.target_multiview;
+            key.samples = self.target_samples;
         }
         if let Some(&pipeline) = self.pipelines.get(&key) {
             return Ok(pipeline);
@@ -565,9 +615,11 @@ impl PipelineCache {
         let vert_module = if key.shadow {
             self.shadow_vert
         } else if key.skybox {
-            self.skybox_vert
+            if key.multiview { self.skybox_vert_mv } else { self.skybox_vert }
         } else if key.outline {
             self.outline_vert
+        } else if key.multiview {
+            self.vert_mv
         } else {
             self.vert
         };
@@ -600,7 +652,7 @@ impl PipelineCache {
         } else {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.frag)
+                .module(if key.multiview { self.frag_mv } else { self.frag })
                 .name(c"main")
                 .specialization_info(&spec)
         };
@@ -608,7 +660,7 @@ impl PipelineCache {
             .stage(vk::ShaderStageFlags::VERTEX)
             .module(vert_module)
             .name(c"main");
-        if vert_module == self.vert {
+        if vert_module == self.vert || vert_module == self.vert_mv {
             vertex_stage = vertex_stage.specialization_info(&spec);
         }
         // The shadow pass is depth-only: vertex stage alone, no fragment. So is
@@ -691,14 +743,10 @@ impl PipelineCache {
             },
         ];
         let instanced_attributes: Vec<_> = attributes.iter().chain(&instance_attributes).copied().collect();
-        // The skybox is a vertex-buffer-less fullscreen triangle; the shadow
-        // vertex shader still takes its model matrix from push constants.
+        // The skybox is a vertex-buffer-less fullscreen triangle; every other
+        // variant (shadow included) reads the instance stream.
         let vertex_input = if key.skybox {
             vk::PipelineVertexInputStateCreateInfo::default()
-        } else if key.shadow {
-            vk::PipelineVertexInputStateCreateInfo::default()
-                .vertex_binding_descriptions(&bindings[..1])
-                .vertex_attribute_descriptions(&attributes)
         } else {
             vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(&bindings)
@@ -731,8 +779,12 @@ impl PipelineCache {
             .front_face(if key.mirrored { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE })
             .line_width(1.0);
 
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let samples = match key.samples {
+            4 => vk::SampleCountFlags::TYPE_4,
+            2 => vk::SampleCountFlags::TYPE_2,
+            _ => vk::SampleCountFlags::TYPE_1,
+        };
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
 
         let transparent = key.alpha_mode == 2;
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
@@ -794,6 +846,7 @@ impl PipelineCache {
             vk::PipelineRenderingCreateInfo::default()
                 .color_attachment_formats(&color_formats)
                 .depth_attachment_format(self.depth_format)
+                .view_mask(if key.multiview { 0b11 } else { 0 })
         };
 
         let info = vk::GraphicsPipelineCreateInfo::default()
@@ -860,6 +913,9 @@ impl PipelineCache {
             device.destroy_shader_module(self.skybox_vert, None);
             device.destroy_shader_module(self.skybox_frag, None);
             device.destroy_shader_module(self.shadow_vert, None);
+            device.destroy_shader_module(self.vert_mv, None);
+            device.destroy_shader_module(self.frag_mv, None);
+            device.destroy_shader_module(self.skybox_vert_mv, None);
             for module in self.custom_frags.drain(..) {
                 device.destroy_shader_module(module, None);
             }

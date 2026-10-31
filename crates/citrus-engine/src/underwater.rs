@@ -77,13 +77,11 @@ pub fn view_fx(scene: &LoadedScene, pos: Vec3, t: f32) -> Option<UnderwaterFx> {
 pub fn fx_for(s: &Submersion) -> UnderwaterFx {
     let look = &s.look;
     let absorb = look.absorption_depth.max(0.25);
-    // Clear water sees further; the absorption depth sets the scale.
-    let murk = (1.25 - look.clarity.clamp(0.0, 1.0)).max(0.1);
     UnderwaterFx {
         surface: s.surface,
         shallow_color: look.shallow_color,
         deep_color: look.deep_color,
-        density: s.settings.fog_density.max(0.0) * murk / absorb,
+        density: visibility_density(s.settings.visibility),
         light_falloff: 0.35 / absorb,
         distortion: s.settings.distortion.max(0.0),
         blur: s.settings.blur.max(0.0),
@@ -93,6 +91,12 @@ pub fn fx_for(s: &Submersion) -> UnderwaterFx {
         rest_surface: s.rest_surface,
         clock: s.clock,
     }
+}
+
+/// Extinction per metre (green; red fades sooner, blue later) that leaves 5%
+/// of the view at `visibility` metres: ln 20 / visibility.
+pub fn visibility_density(visibility: f32) -> f32 {
+    20f32.ln() / visibility.max(0.1)
 }
 
 /// Move `current` toward `target` by at most `step`.
@@ -218,6 +222,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: at,
@@ -256,14 +261,14 @@ mod tests {
     }
 
     #[test]
-    fn murkier_water_fogs_faster() {
+    fn the_view_fades_out_at_the_visibility_distance() {
         let scene = scene_with(calm(), Vec3::ZERO);
         let mut s = probe(&scene, Vec3::new(0.0, -1.0, 0.0), 0.0, 0.0).unwrap();
-        let clear = fx_for(&s).density;
-        s.look.clarity = 0.1;
-        assert!(fx_for(&s).density > clear);
-        s.settings.fog_density = 0.0;
-        assert_eq!(fx_for(&s).density, 0.0);
+        s.settings.visibility = 8.0;
+        let left = (-fx_for(&s).density * 8.0).exp();
+        assert!((left - 0.05).abs() < 1e-3, "5% of the view left at 8 m: {left}");
+        s.settings.visibility = 30.0;
+        assert!(fx_for(&s).density < visibility_density(8.0), "clearer water sees further");
     }
 
     #[test]

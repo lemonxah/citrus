@@ -86,11 +86,16 @@ vec3 cosine_hemisphere(vec3 n, inout uint rng) {
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
 }
 
+// TLAS instance masks (bake.rs): bounce rays see visible geometry, shadow
+// rays only casters ("Cast Shadows" Off / Shadows Only clear one bit).
+const uint BAKE_MASK_VISIBLE = 0x01u;
+const uint BAKE_MASK_CASTER = 0x02u;
+
 bool occluded(vec3 origin, vec3 dir, float dist) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, tlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-        0xFF, origin, 1e-3, dir, dist - 2e-3);
+        BAKE_MASK_CASTER, origin, 1e-3, dir, dist - 2e-3);
     while (rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true)
         != gl_RayQueryCommittedIntersectionNoneEXT;
@@ -211,7 +216,7 @@ void main() {
         for (uint b = 0u; b < pc.bounces; ++b) {
             vec3 dir = cosine_hemisphere(rn, rng);
             rayQueryEXT rq;
-            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF,
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, BAKE_MASK_VISIBLE,
                 ro + rn * 1e-3, 1e-3, dir, 1e16);
             while (rayQueryProceedEXT(rq)) {}
             if (rayQueryGetIntersectionTypeEXT(rq, true)

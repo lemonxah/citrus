@@ -131,6 +131,10 @@ pub struct SceneEntry {
     /// texels.
     #[serde(default = "default_lightmap_scale")]
     pub lightmap_scale: f32,
+    /// "Cast Shadows" (Unity's MeshRenderer setting). Omitted when On, so
+    /// older scenes load as On.
+    #[serde(default, skip_serializing_if = "citrus_core::ShadowCasting::is_on")]
+    pub cast_shadows: citrus_core::ShadowCasting,
     /// Object layer index (0..32, Unity-style): camera culling mask (rendering)
     /// + layer-collision matrix (physics). 0 = "Default".
     #[serde(default)]
@@ -298,6 +302,7 @@ impl SceneFile {
                     && e.enabled
                     && !e.static_geometry
                     && e.lightmap_scale == 1.0
+                    && e.cast_shadows.is_on()
                     && e.layer == 0
                     && matches!(e.material, MaterialRef::Model)
                     && e.extra_materials.iter().all(|m| matches!(m, MaterialRef::Model))
@@ -361,6 +366,7 @@ impl SceneFile {
                     enabled: true,
                     static_geometry: false,
                     lightmap_scale: 1.0,
+                    cast_shadows: citrus_core::ShadowCasting::On,
                     layer: 0,
                     material: MaterialRef::Model,
                     extra_materials: vec![MaterialRef::Model; p.extra_meshes.len()],
@@ -792,6 +798,11 @@ pub struct BakeSettings {
     /// GPU), 1 = ~50% duty cycle (≈2× slower bake, system stays usable).
     #[serde(default = "default_gpu_throttle")]
     pub gpu_throttle: f32,
+    /// Store baked lightmaps as BC6H (~16x smaller on disk and in VRAM than
+    /// RGBA32F). Off writes the raw v1 format.
+    pub compress_lightmaps: bool,
+    /// Store baked reflection-probe cubes (full mip chain) as BC6H.
+    pub compress_reflections: bool,
 }
 
 fn default_gpu_throttle() -> f32 {
@@ -814,6 +825,8 @@ impl Default for BakeSettings {
             samples: 512,
             max_lightmap: 2048,
             gpu_throttle: default_gpu_throttle(),
+            compress_lightmaps: true,
+            compress_reflections: true,
         }
     }
 }
@@ -975,6 +988,7 @@ mod model_instance_tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             material: MaterialRef::Model,
             extra_materials: Vec::new(),
@@ -1040,5 +1054,37 @@ mod model_instance_tests {
         file.entries[3].components.push(ComponentData { kind: "Spin".into(), data: "()".into() });
         file.compact_models(&|_| Some(parts()));
         assert_eq!(file.entries.len(), 3, "root + the two edited parts");
+    }
+
+    #[test]
+    fn cast_shadows_keeps_a_part_stored() {
+        let mut file = SceneFile::default();
+        file.entries.push(entry("House", ObjectSource::Empty, None, [0.0; 3]));
+        for k in 0..4 {
+            file.entries.push(entry(&format!("Part{k}"), model(k), Some(0), [k as f32, 0.0, 0.0]));
+        }
+        file.entries[2].cast_shadows = citrus_core::ShadowCasting::ShadowsOnly;
+        file.compact_models(&|_| Some(parts()));
+        assert_eq!(file.entries.len(), 2, "root + the part that no longer casts like the model");
+        assert_eq!(file.entries[1].cast_shadows, citrus_core::ShadowCasting::ShadowsOnly);
+    }
+
+    #[test]
+    fn cast_shadows_is_omitted_when_on_and_round_trips() {
+        let mut file = SceneFile::default();
+        file.entries.push(entry("Plane", ObjectSource::Empty, None, [0.0; 3]));
+        // On is not written, so this text is also what older scenes look like.
+        let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default()).unwrap();
+        assert!(!text.contains("cast_shadows"));
+        let back: SceneFile = ron::from_str(&text).unwrap();
+        assert_eq!(back.entries[0].cast_shadows, citrus_core::ShadowCasting::On);
+
+        for mode in [citrus_core::ShadowCasting::Off, citrus_core::ShadowCasting::TwoSided, citrus_core::ShadowCasting::ShadowsOnly] {
+            file.entries[0].cast_shadows = mode;
+            let text = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default()).unwrap();
+            assert!(text.contains("cast_shadows"));
+            let back: SceneFile = ron::from_str(&text).unwrap();
+            assert_eq!(back.entries[0].cast_shadows, mode);
+        }
     }
 }

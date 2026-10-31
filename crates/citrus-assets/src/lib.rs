@@ -8,8 +8,10 @@ mod anim_clip;
 mod anim_controller;
 mod asset_meta;
 mod bake_file;
+mod collision;
 mod fbx_loader;
 mod gltf_loader;
+pub mod hdr_codec;
 pub mod vrm;
 pub mod simplify;
 mod lightmap_uv;
@@ -37,6 +39,9 @@ pub use anim_controller::{
     AnimTransition, AnimatorController, CondOp, LayerBlend, Motion, StateMachine,
     load_anim_controller, save_anim_controller,
 };
+pub use collision::{
+    CollisionKind, CollisionPiece, extract_collision, match_collision_target, parse_collision_name,
+};
 pub use fbx_loader::{load_fbx, load_fbx_with};
 pub use gltf_loader::load_gltf;
 pub use lightmap_uv::generate_lightmap_uv;
@@ -48,8 +53,9 @@ pub use material_file::{
     save_material_file,
 };
 pub use bake_file::{
-    LIGHTDATA_EXTENSION, LIGHTMAP_EXTENSION, LightDataFile, LightmapEntry, LightmapFile,
-    ProbeVolumeData, load_lightdata, load_lightmaps, save_lightdata, save_lightmaps,
+    LIGHTDATA_EXTENSION, LIGHTMAP_EXTENSION, LightDataFile, LightmapEntry, LightmapFile, LightmapFileInfo, LightmapLayers,
+    ProbeVolumeData, load_lightdata, load_lightmap_layers, lightmap_file_info, load_lightmaps, read_lightmap_layers, save_lightdata,
+    save_lightmap_layers, save_lightmaps, write_atomic,
 };
 pub use post_file::{
     Bloom, ChromaticAberration, ColorGrading, POSTFX_EXTENSION, PostFxProfile, TonemapMode,
@@ -65,7 +71,8 @@ pub use scene_file::{
     VoxelGridMode, WorldEnvironment, load_scene_file, save_scene_file,
 };
 pub use tex_cache::{
-    load_texture_bc, seed_texture_cache, texture_cache_blob, texture_mean, texture_mean_linear, validate_compressed,
+    ASTC_CACHE_EXTENSION, AstcBlocks, astc_blocks, astc_cache_blob, encode_astc_level, load_texture_bc, seed_astc_cache,
+    seed_texture_cache, set_astc_blocks, texture_cache_blob, texture_mean, texture_mean_linear, validate_compressed,
 };
 pub use shader_file::{
     ALPHA_MODE_CONSTANT_ID, HLSL_SHADER_EXTENSION, ShaderCondOp, ShaderCondTerm, ShaderCondition,
@@ -75,7 +82,8 @@ pub use shader_file::{
     ShaderPropKind, ShaderSource, TextureDefault, assemble_shader, bake_shader_variant,
     compile_shader, compile_shader_variant, is_shader_path, keyword_hash, load_baked_variant,
     load_shader_file, parse_shader_source, parse_shader_source_lang, precompile_shader_file,
-    shader_lang_for, variant_path,
+    scoped_shader_target_env, shader_lang_for, shader_target_env, variant_path, ShaderTargetEnv,
+    ShaderTargetEnvGuard,
 };
 
 use std::path::{Path, PathBuf};
@@ -145,6 +153,9 @@ pub struct Scene {
     pub skeletons: Vec<Skeleton>,
     /// Imported skeletal animation clips (shared across the file's skeletons).
     pub animations: Vec<AnimationClip>,
+    /// Authored collision pieces (`UCX_` / `UBX_` / `USP_` / `UCP_` objects),
+    /// filled by [`extract_collision`] on load; not in `instances`.
+    pub collision: Vec<CollisionPiece>,
 }
 
 /// True if the extension is an importable model format.
@@ -186,8 +197,9 @@ fn apply_lightmap_uv_marker(path: &Path, scene: &mut Scene) {
     if !lightmap_uv_marker_path(path).exists() {
         return;
     }
-    for mesh in &mut scene.meshes {
-        if !mesh.has_lightmap_uv {
+    let rendered = collision::rendered_meshes(scene);
+    for (mesh, rendered) in scene.meshes.iter_mut().zip(rendered) {
+        if rendered && !mesh.has_lightmap_uv {
             *mesh = generate_lightmap_uv(mesh);
         }
     }
@@ -206,6 +218,7 @@ pub fn load_model(path: impl AsRef<Path>) -> Result<Scene> {
         Some("fbx") => load_fbx(path),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }?;
+    extract_collision(&mut scene);
     apply_lightmap_uv_marker(path, &mut scene);
     Ok(scene)
 }
@@ -228,6 +241,7 @@ pub fn load_model_with_meta(path: impl AsRef<Path>) -> Result<Scene> {
         Some("fbx") => load_fbx_with(path, &model),
         other => bail!("unsupported model format {other:?} (gltf, glb, fbx)"),
     }?;
+    extract_collision(&mut scene);
     apply_lightmap_uv_marker(path, &mut scene);
     Ok(scene)
 }

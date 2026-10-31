@@ -47,6 +47,7 @@ pub fn load_fbx_with(path: impl AsRef<Path>, settings: &ModelImport) -> Result<S
         morphs: Vec::new(),
         springs: Default::default(),
         animations: Vec::new(),
+        collision: Vec::new(),
     };
 
     // Default material for parts without one.

@@ -126,6 +126,8 @@ pub enum TaskPayload {
     Occlusion { scene_path: PathBuf, data: Box<crate::occlusion::OcclusionData>, secs: f32 },
     /// A finished game build: the executable, or the failure text.
     GameBuilt(Result<PathBuf, String>),
+    /// Bake sidecars encoded + written (already on disk); GPU-ready data to swap in.
+    BakeSaved(Box<crate::bake_store::BakeSaved>),
 }
 
 pub struct TaskResult {

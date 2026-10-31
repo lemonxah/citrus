@@ -52,6 +52,8 @@ struct GpuWater {
 
 // TLAS instance masks (rt_reflect.rs).
 const uint RT_MASK_SOLID = 0x01u;
+const uint RT_MASK_WATER = 0x02u;
+const uint RT_MASK_CASTER = 0x04u;
 
 layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D u_out;
 layout(set = 0, binding = 1) uniform sampler2D u_color;
@@ -103,7 +105,7 @@ bool occluded(vec3 o, vec3 d, float dist) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, tlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-        RT_MASK_SOLID, o, 1e-3, d, dist - 2e-3);
+        RT_MASK_CASTER, o, 1e-3, d, dist - 2e-3);
     while (rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true)
         != gl_RayQueryCommittedIntersectionNoneEXT;
@@ -248,7 +250,7 @@ vec3 trace_path(vec3 o, vec3 d, float t_min, float cone0, float spread, int boun
     float cone = cone0;
     for (int b = 0; b < bounces; ++b) {
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, o, t_min, d, b == 0 ? u.quality.z : 1e16);
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, RT_MASK_SOLID | RT_MASK_WATER, o, t_min, d, b == 0 ? u.quality.z : 1e16);
         while (rayQueryProceedEXT(rq)) {}
         if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
             radiance += tp * sample_env(env_origin, d, env_rough);

@@ -160,6 +160,7 @@ impl WaterRenderer {
                 static_geometry: false,
                 planar_index: -1,
                 occluded: false,
+                shadow_casting: citrus_render::ShadowCasting::On,
             });
         }
         let gone: Vec<ObjectId> = self.surfaces.keys().filter(|id| !alive.contains(id)).copied().collect();

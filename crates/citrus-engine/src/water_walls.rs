@@ -7,9 +7,13 @@
 //!
 //! Closed shapes mark the cells whose centres at the surface lie inside them;
 //! triangle meshes (which need not be closed: a pool's single-sided walls)
-//! mark the cells along the line where they cross the surface. Shapes are
-//! cached per object until it moves or its colliders change, and a water's
-//! cells are only rebuilt when its window or the walls in it change.
+//! mark the cells along the line where their steep faces cross the surface.
+//! The same static geometry is the water's floor: under each cell, the top
+//! of what lies below the surface (a pool's basin, terrain, a sloped beach)
+//! sets its depth, and ground at or above the surface is dry shore, so waves
+//! slow and shorten over shallows as they do in real water. Shapes are cached
+//! per object until it moves or its colliders change, and a water's cells
+//! are only rebuilt when its window or the geometry in it change.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -21,11 +25,18 @@ use citrus_core::{
 };
 use glam::{Mat4, Vec2, Vec3};
 
-use crate::physics::{Solid, solid_contains, world_solids};
+use crate::physics::{Solid, solid_below, solid_contains, world_solids};
 use crate::scene::LoadedScene;
 
 /// Updates a collider counts as moving for after it last moved.
 const SETTLE_UPDATES: u32 = 10;
+/// Faces steeper than this (|normal.y| below it) are walls; flatter ones
+/// are floor.
+const STEEP: f32 = 0.6;
+/// Ground up to this far above the surface (m) still counts as the floor
+/// there (a beach up to `RUNUP_HEIGHT`, a bank above); higher is an
+/// overhang the water ignores.
+const RISE: f32 = citrus_core::RUNUP_HEIGHT + 0.1;
 
 struct Cached {
     key: u64,
@@ -46,6 +57,7 @@ pub struct WaterWalls {
 }
 
 impl WaterWalls {
+    #[cfg(feature = "editor")]
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -92,7 +104,7 @@ impl WaterWalls {
             let Some(window) = water.sim_feed.window else { continue };
             let water_world = world[wi];
             let to_local = water_world.inverse();
-            let (wlo, whi) = window_bounds(window, water_world);
+            let (wlo, whi) = window_bounds(window, water_world, (water.depth * 3.0).max(3.0));
             let mut here: Vec<(ObjectId, u64)> = walls
                 .iter()
                 .filter(|&&i| i != wi && crate::physics::layers_meet(scene, wi, i))
@@ -111,32 +123,186 @@ impl WaterWalls {
             if self.masks.get(&scene.objects[wi].id) == Some(&key) && water.sim_feed.blocked.as_ref().is_some_and(|(w, _)| *w == window) {
                 continue;
             }
-            let mut mask = vec![false; (window.n * window.n) as usize];
+            let cells = (window.n * window.n) as usize;
+            let mut mask = vec![false; cells];
+            let mut ground = vec![f32::NEG_INFINITY; cells];
             for (id, _) in &here {
                 if let Some(c) = self.shapes.get(id) {
-                    mark(&mut mask, window, water, &to_local, water_world, &c.solids);
+                    mark(&mut mask, &mut ground, window, water, &to_local, water_world, &c.solids);
                 }
             }
+            let bed: Vec<f32> = ground
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| {
+                    let xz = cell_centre(window, i);
+                    if y.is_finite() { water.column(xz).map_or(0.0, |c| c.surface) - y } else { f32::NAN }
+                })
+                .collect();
             let id = scene.objects[wi].id;
             self.masks.insert(id, key);
             if let Some(w) = water_mut(scene, wi) {
                 w.sim_feed.blocked = Some((window, Arc::new(mask)));
+                w.sim_feed.bed = Some((window, Arc::new(bed)));
             }
         }
     }
 }
 
-/// Mark the window's cells `solids` fill at the water's surface.
-fn mark(mask: &mut [bool], window: SimWindow, water: &Water, to_local: &Mat4, water_world: Mat4, solids: &[Solid]) {
+/// Directions the outline is sampled in when fitting a water to its basin.
+#[cfg(any(feature = "editor", test))]
+const FIT_RAYS: usize = 96;
+/// Farthest a fitted outline reaches from the water's origin (m).
+#[cfg(any(feature = "editor", test))]
+const FIT_REACH: f32 = 200.0;
+/// Outline points closer than this (m) to the line through their
+/// neighbours are dropped.
+#[cfg(any(feature = "editor", test))]
+const FIT_TOLERANCE: f32 = 0.04;
+
+/// The outline and depth of the basin around water `wi`'s origin: the static
+/// geometry (on layers the water meets) sliced at its surface, seen from the
+/// origin in every direction, and the floor under the origin. None when
+/// nothing surrounds it.
+#[cfg(any(feature = "editor", test))]
+pub fn fit_basin(scene: &LoadedScene, wi: usize, world: &[Mat4]) -> Option<(Vec<[f32; 2]>, Option<f32>)> {
+    let water = water_of(scene, wi)?;
+    let to_local = world[wi].inverse();
+    let level = water.column(Vec2::ZERO).map_or(0.0, |c| c.surface);
+    let mut segments: Vec<(Vec2, Vec2)> = Vec::new();
+    let mut shapes = Vec::new();
+    let mut floor = f32::NEG_INFINITY;
+    for (i, o) in scene.objects.iter().enumerate() {
+        if i == wi || !scene.is_active(i) || moves(o) || !(has_collider(o) || (o.static_geometry && o.render.is_some())) {
+            continue;
+        }
+        if !crate::physics::layers_meet(scene, wi, i) {
+            continue;
+        }
+        for solid in world_solids(scene, i, world[i]) {
+            match solid {
+                Solid::Mesh(verts, tris) => {
+                    let local: Vec<Vec3> = verts.iter().map(|v| to_local.transform_point3(*v)).collect();
+                    for t in &tris {
+                        let p = [local[t[0] as usize], local[t[1] as usize], local[t[2] as usize]];
+                        let d = p.map(|v| v.y - level);
+                        let mut ends = Vec::with_capacity(2);
+                        for k in 0..3 {
+                            let (a, b) = (k, (k + 1) % 3);
+                            if (d[a] <= 0.0) != (d[b] <= 0.0) {
+                                let q = p[a].lerp(p[b], d[a] / (d[a] - d[b]));
+                                ends.push(Vec2::new(q.x, q.z));
+                            }
+                        }
+                        if let [a, b] = ends[..] {
+                            segments.push((a, b));
+                        }
+                        // The floor right under the origin.
+                        let q = p.map(|v| Vec2::new(v.x, v.z));
+                        let area = (q[1] - q[0]).perp_dot(q[2] - q[0]);
+                        if area.abs() > 1e-9 {
+                            let w0 = (q[1]).perp_dot(q[2]) / area;
+                            let w1 = (q[2]).perp_dot(q[0]) / area;
+                            let w2 = 1.0 - w0 - w1;
+                            let y = p[0].y * w0 + p[1].y * w1 + p[2].y * w2;
+                            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 && y < level {
+                                floor = floor.max(y);
+                            }
+                        }
+                    }
+                }
+                Solid::Shape(col) => shapes.push(col),
+            }
+        }
+    }
+    let origin = world[wi].transform_point3(Vec3::new(0.0, level, 0.0));
+    for col in &shapes {
+        if let Some(down) = solid_below(col, origin, FIT_REACH)
+            && down > 0.0
+        {
+            floor = floor.max(to_local.transform_point3(origin - Vec3::Y * down).y);
+        }
+    }
+    let mut outline = Vec::new();
+    for k in 0..FIT_RAYS {
+        let a = k as f32 / FIT_RAYS as f32 * std::f32::consts::TAU;
+        let dir = Vec2::new(a.cos(), a.sin());
+        let mut best = FIT_REACH;
+        for (p, q) in &segments {
+            // Ray from the origin against the segment p..q.
+            let e = *q - *p;
+            let den = dir.perp_dot(e);
+            if den.abs() < 1e-9 {
+                continue;
+            }
+            let t = p.perp_dot(e) / den;
+            let u = p.perp_dot(dir) / den;
+            if t > 1e-3 && (0.0..=1.0).contains(&u) {
+                best = best.min(t);
+            }
+        }
+        for col in &shapes {
+            let from = world[wi].transform_point3(Vec3::new(0.0, level, 0.0));
+            let along = world[wi].transform_vector3(Vec3::new(dir.x, 0.0, dir.y)).normalize_or_zero();
+            if let Some(t) = crate::physics::solid_along(col, from, along, FIT_REACH)
+                && t > 1e-3
+            {
+                best = best.min(t);
+            }
+        }
+        if best < FIT_REACH {
+            outline.push(dir * best);
+        }
+    }
+    if outline.len() < 3 {
+        return None;
+    }
+    // Drop points on (nearly) straight runs.
+    loop {
+        let n = outline.len();
+        let mut drop = None;
+        for k in 0..n {
+            let (a, b, c) = (outline[(k + n - 1) % n], outline[k], outline[(k + 1) % n]);
+            let e = c - a;
+            let off = if e.length() > 1e-6 { (b - a).perp_dot(e).abs() / e.length() } else { (b - a).length() };
+            if off < FIT_TOLERANCE {
+                drop = Some(k);
+                break;
+            }
+        }
+        match drop {
+            Some(k) if n > 3 => {
+                outline.remove(k);
+            }
+            _ => break,
+        }
+    }
+    let depth = floor.is_finite().then_some(level - floor).filter(|d| *d > 0.0);
+    Some((outline.into_iter().map(|p| p.to_array()).collect(), depth))
+}
+
+/// Centre (water-local XZ) of window cell `i` (row-major).
+fn cell_centre(window: SimWindow, i: usize) -> Vec2 {
+    let n = window.n as usize;
+    window.lo() + (Vec2::new((i % n) as f32, (i / n) as f32) + 0.5) * window.cell
+}
+
+/// Mark the window's cells `solids` fill at the water's surface in `mask`,
+/// and raise `ground` (water-local height per cell) to the top of what lies
+/// under each cell.
+fn mark(mask: &mut [bool], ground: &mut [f32], window: SimWindow, water: &Water, to_local: &Mat4, water_world: Mat4, solids: &[Solid]) {
     let n = window.n as i32;
     let lo = window.lo();
     let cell = window.cell;
     let surface = |xz: Vec2| water.column(xz).map_or(0.0, |c| c.surface);
-    let set = |mask: &mut [bool], xz: Vec2| {
-        let c = ((xz - lo) / cell).floor().as_ivec2();
-        if c.x >= 0 && c.y >= 0 && c.x < n && c.y < n {
-            mask[(c.y * n + c.x) as usize] = true;
-        }
+    let reach = RISE + (water.depth * 3.0).max(3.0);
+    // Cells (x0..x1, z0..z1) whose centres the local XZ box a..b covers.
+    let span = |a: Vec2, b: Vec2| {
+        let x0 = (((a.x - lo.x) / cell - 0.5).ceil() as i32).max(0);
+        let x1 = (((b.x - lo.x) / cell - 0.5).floor() as i32 + 1).min(n);
+        let z0 = (((a.y - lo.y) / cell - 0.5).ceil() as i32).max(0);
+        let z1 = (((b.y - lo.y) / cell - 0.5).floor() as i32 + 1).min(n);
+        (x0, x1, z0, z1)
     };
     for s in solids {
         match s {
@@ -151,16 +317,19 @@ fn mark(mask: &mut [bool], window: SimWindow, water: &Water, to_local: &Mat4, wa
                     ))
                 });
                 let (fl, fh) = corners.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(p, q), c| (p.min(*c), q.max(*c)));
-                let x0 = (((fl.x - lo.x) / cell).floor() as i32).max(0);
-                let x1 = (((fh.x - lo.x) / cell).ceil() as i32).min(n);
-                let z0 = (((fl.z - lo.y) / cell).floor() as i32).max(0);
-                let z1 = (((fh.z - lo.y) / cell).ceil() as i32).min(n);
+                let (x0, x1, z0, z1) = span(Vec2::new(fl.x, fl.z) - cell * 0.5, Vec2::new(fh.x, fh.z) + cell * 0.5);
                 for z in z0..z1 {
                     for x in x0..x1 {
+                        let i = (z * n + x) as usize;
                         let xz = lo + (Vec2::new(x as f32, z as f32) + 0.5) * cell;
-                        let p = water_world.transform_point3(Vec3::new(xz.x, surface(xz), xz.y));
-                        if solid_contains(col, p) {
-                            mask[(z * n + x) as usize] = true;
+                        let level = surface(xz);
+                        if solid_contains(col, water_world.transform_point3(Vec3::new(xz.x, level, xz.y))) {
+                            mask[i] = true;
+                        }
+                        let from = water_world.transform_point3(Vec3::new(xz.x, level + RISE, xz.y));
+                        if let Some(down) = solid_below(col, from, reach) {
+                            let y = to_local.transform_point3(from - Vec3::Y * down).y;
+                            ground[i] = ground[i].max(y);
                         }
                     }
                 }
@@ -169,23 +338,57 @@ fn mark(mask: &mut [bool], window: SimWindow, water: &Water, to_local: &Mat4, wa
                 let local: Vec<Vec3> = verts.iter().map(|v| to_local.transform_point3(*v)).collect();
                 for t in tris {
                     let p = [local[t[0] as usize], local[t[1] as usize], local[t[2] as usize]];
+                    let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
                     let mid = (p[0] + p[1] + p[2]) / 3.0;
                     let level = surface(Vec2::new(mid.x, mid.z));
-                    let d = p.map(|v| v.y - level);
-                    // The line where the triangle crosses the level.
-                    let mut ends = Vec::with_capacity(2);
-                    for k in 0..3 {
-                        let (a, b) = (k, (k + 1) % 3);
-                        if (d[a] <= 0.0) != (d[b] <= 0.0) {
-                            let f = d[a] / (d[a] - d[b]);
-                            let q = p[a].lerp(p[b], f);
-                            ends.push(Vec2::new(q.x, q.z));
+                    if normal.y.abs() < STEEP {
+                        // A wall: the line where it crosses the level.
+                        let d = p.map(|v| v.y - level);
+                        let mut ends = Vec::with_capacity(2);
+                        for k in 0..3 {
+                            let (a, b) = (k, (k + 1) % 3);
+                            if (d[a] <= 0.0) != (d[b] <= 0.0) {
+                                let f = d[a] / (d[a] - d[b]);
+                                let q = p[a].lerp(p[b], f);
+                                ends.push(Vec2::new(q.x, q.z));
+                            }
                         }
+                        if let [a, b] = ends[..] {
+                            let steps = ((b - a).length() / (cell * 0.5)).ceil().max(1.0) as usize;
+                            for k in 0..=steps {
+                                let c = ((a.lerp(b, k as f32 / steps as f32) - lo) / cell).floor().as_ivec2();
+                                if c.x >= 0 && c.y >= 0 && c.x < n && c.y < n {
+                                    mask[(c.y * n + c.x) as usize] = true;
+                                }
+                            }
+                        }
+                        continue;
                     }
-                    if let [a, b] = ends[..] {
-                        let steps = ((b - a).length() / (cell * 0.5)).ceil().max(1.0) as usize;
-                        for k in 0..=steps {
-                            set(mask, a.lerp(b, k as f32 / steps as f32));
+                    // Floor: its height under each cell centre it covers.
+                    if p.iter().all(|v| v.y > level + RISE) {
+                        continue;
+                    }
+                    let q = p.map(|v| Vec2::new(v.x, v.z));
+                    let (a, b) = (q[0].min(q[1]).min(q[2]), q[0].max(q[1]).max(q[2]));
+                    let (x0, x1, z0, z1) = span(a, b);
+                    let area = (q[1] - q[0]).perp_dot(q[2] - q[0]);
+                    if area.abs() < 1e-9 {
+                        continue;
+                    }
+                    for z in z0..z1 {
+                        for x in x0..x1 {
+                            let c = lo + (Vec2::new(x as f32, z as f32) + 0.5) * cell;
+                            let w0 = (q[1] - c).perp_dot(q[2] - c) / area;
+                            let w1 = (q[2] - c).perp_dot(q[0] - c) / area;
+                            let w2 = 1.0 - w0 - w1;
+                            if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 {
+                                continue;
+                            }
+                            let y = p[0].y * w0 + p[1].y * w1 + p[2].y * w2;
+                            if y <= surface(c) + RISE {
+                                let i = (z * n + x) as usize;
+                                ground[i] = ground[i].max(y);
+                            }
                         }
                     }
                 }
@@ -214,11 +417,12 @@ fn bounds(solids: &[Solid]) -> (Vec3, Vec3) {
     (lo, hi)
 }
 
-/// World bounds of a water's window, a little above and below its surface.
-fn window_bounds(window: SimWindow, water_world: Mat4) -> (Vec3, Vec3) {
+/// World bounds of a water's window, from `below` under its surface to a
+/// little above it.
+fn window_bounds(window: SimWindow, water_world: Mat4, below: f32) -> (Vec3, Vec3) {
     let (a, b) = (window.lo(), window.lo() + Vec2::splat(window.size()));
     let corners: [Vec3; 8] = std::array::from_fn(|k| {
-        water_world.transform_point3(Vec3::new(if k & 1 == 0 { a.x } else { b.x }, if k & 2 == 0 { -2.0 } else { 2.0 }, if k & 4 == 0 { a.y } else { b.y }))
+        water_world.transform_point3(Vec3::new(if k & 1 == 0 { a.x } else { b.x }, if k & 2 == 0 { -below } else { 2.0 }, if k & 4 == 0 { a.y } else { b.y }))
     });
     corners.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(p, q), c| (p.min(*c), q.max(*c)))
 }

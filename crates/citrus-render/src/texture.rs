@@ -6,6 +6,7 @@ use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 
 use crate::alloc::{Buffer, one_time_submit};
+use crate::hdr_format::HdrTextureArray;
 use crate::types::{CompressedTexture, TexFormat, TextureData};
 
 pub(crate) struct GpuTexture {
@@ -256,7 +257,7 @@ impl GpuTexture {
         })
     }
 
-    /// Upload a pre-compressed (BC7/BC6H) or raw texture with a full mip chain.
+    /// Upload a pre-compressed (BC7/BC6H/ASTC) or raw texture with a full mip chain.
     /// All CPU work (decode, mip generation, block compression) already happened
     /// off the main thread; this just stages each mip and copies it in.
     pub fn upload_compressed(
@@ -273,7 +274,28 @@ impl GpuTexture {
             TexFormat::RgbaSrgb => vk::Format::R8G8B8A8_SRGB,
             TexFormat::RgbaUnorm => vk::Format::R8G8B8A8_UNORM,
             TexFormat::RgbaF16 => vk::Format::R16G16B16A16_SFLOAT,
+            TexFormat::Astc4x4Srgb => vk::Format::ASTC_4X4_SRGB_BLOCK,
+            TexFormat::Astc4x4Unorm => vk::Format::ASTC_4X4_UNORM_BLOCK,
+            TexFormat::Astc5x5Srgb => vk::Format::ASTC_5X5_SRGB_BLOCK,
+            TexFormat::Astc5x5Unorm => vk::Format::ASTC_5X5_UNORM_BLOCK,
+            TexFormat::Astc6x6Srgb => vk::Format::ASTC_6X6_SRGB_BLOCK,
+            TexFormat::Astc6x6Unorm => vk::Format::ASTC_6X6_UNORM_BLOCK,
+            TexFormat::Astc8x8Srgb => vk::Format::ASTC_8X8_SRGB_BLOCK,
+            TexFormat::Astc8x8Unorm => vk::Format::ASTC_8X8_UNORM_BLOCK,
         };
+        // A block format the device can't sample would fail image creation
+        // (or worse); the import cache never hands one over, so this is a
+        // last line of defence against stale / foreign data.
+        if (tex.format.is_bc() && !crate::bc_supported()) || (tex.format.is_astc() && !crate::astc_supported()) {
+            anyhow::bail!("{:?} texture is not supported by this device", tex.format);
+        }
+        // Every mip must hold exactly its level's bytes: the copies below read
+        // that many from the staging buffer.
+        for (i, mip) in tex.mips.iter().enumerate() {
+            let (w, h) = ((tex.width >> i).max(1), (tex.height >> i).max(1));
+            let want = tex.format.level_bytes(w, h);
+            anyhow::ensure!(mip.len() == want, "{:?} mip {i} is {} bytes, expected {want}", tex.format, mip.len());
+        }
         let mip_levels = tex.mips.len().max(1) as u32;
         let extent = vk::Extent3D {
             width: tex.width.max(1),
@@ -614,23 +636,26 @@ impl GpuTexture {
         })
     }
 
-    /// Upload baked lightmaps as a sampled `R32G32B32A32_SFLOAT` 2D array, one
-    /// layer per object. Every `layer` must already be `size*size*4` floats
-    /// (RGBA32F, resampled to a common size by the caller). Sampled in the
-    /// standard shader by `uv1` + per-object layer for static GI.
+    /// Upload a baked lightmap array as a sampled 2D array in its own format
+    /// (BC6H, ASTC HDR, E5B9G9R9, RGBA16F or RGBA32F), one layer per object. Short or
+    /// long layers are padded / truncated to the exact layer size. Sampled in
+    /// the standard shader by `uv1` + per-object layer for static GI.
     pub fn upload_lightmap_array(
         device: &ash::Device,
         allocator: &mut Allocator,
         pool: vk::CommandPool,
         queue: vk::Queue,
-        layers: &[Vec<f32>],
-        size: u32,
+        array: &HdrTextureArray,
     ) -> Result<Self> {
-        let format = vk::Format::R32G32B32A32_SFLOAT;
-        let n = layers.len().max(1) as u32;
+        if !crate::HdrFormatSupport::current().can_sample(array.format, crate::astc_hdr_supported()) {
+            anyhow::bail!("{} lightmaps are not supported by this device", array.format.label());
+        }
+        let format = array.format.vk_format();
+        let size = array.size.max(1);
+        let n = array.layers.len().max(1) as u32;
         let extent = vk::Extent3D {
-            width: size.max(1),
-            height: size.max(1),
+            width: size,
+            height: size,
             depth: 1,
         };
         let info = vk::ImageCreateInfo::default()
@@ -654,8 +679,7 @@ impl GpuTexture {
         })?;
         unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
 
-        let layer_floats = (extent.width * extent.height * 4) as usize;
-        let layer_bytes = layer_floats * std::mem::size_of::<f32>();
+        let layer_bytes = array.format.level_bytes(size, size);
         let mut staging = Buffer::new(
             device,
             allocator,
@@ -664,12 +688,15 @@ impl GpuTexture {
             MemoryLocation::CpuToGpu,
             "lightmap staging",
         )?;
-        for (i, layer) in layers.iter().enumerate() {
-            // Pad/truncate to exactly one layer's worth (defensive).
-            let mut buf = vec![0f32; layer_floats];
-            let k = layer.len().min(layer_floats);
-            buf[..k].copy_from_slice(&layer[..k]);
-            staging.write(i * layer_bytes, bytemuck::cast_slice(&buf));
+        for (i, layer) in array.layers.iter().enumerate() {
+            if layer.len() == layer_bytes {
+                staging.write(i * layer_bytes, layer);
+            } else {
+                let mut buf = vec![0u8; layer_bytes];
+                let k = layer.len().min(layer_bytes);
+                buf[..k].copy_from_slice(&layer[..k]);
+                staging.write(i * layer_bytes, &buf);
+            }
         }
 
         let range = vk::ImageSubresourceRange::default()

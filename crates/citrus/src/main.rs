@@ -5,7 +5,7 @@ fn main() -> Result<()> {
 
     // Headless project tooling (the same logic the editor's File menu runs):
     //   citrus --new-project <parent-dir> <name> [template]   (fps, tps, topdown, strategy, vr_shooter, vr_social)
-    //   citrus --build [project-dir] [--target host|windows]   (defaults to the current directory, host)
+    //   citrus --build [project-dir] [--target host|windows|android|quest]   (defaults to the current directory, host)
     match args.get(1).map(String::as_str) {
         Some("--new-project") => {
             citrus_engine::init_logging();
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
         }
         Some("--build") => {
             citrus_engine::init_logging();
-            // citrus --build [dir] [--target host|windows]
+            // citrus --build [dir] [--target host|windows|android|quest]
             let mut dir = None;
             let mut target = citrus_engine::BuildTarget::Host;
             let mut rest = args[2..].iter();
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
                 if arg == "--target" {
                     let name = rest.next().map(String::as_str).unwrap_or("");
                     target = citrus_engine::BuildTarget::parse(name)
-                        .ok_or_else(|| anyhow::anyhow!("unknown build target '{name}' (host | windows)"))?;
+                        .ok_or_else(|| anyhow::anyhow!("unknown build target '{name}' (host | windows | android | quest)"))?;
                 } else {
                     dir = Some(std::path::PathBuf::from(arg));
                 }

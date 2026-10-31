@@ -72,7 +72,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         face_input: crate::face_input::FaceInput::default(),
         slimevr: None,
         vr_rig: citrus_core::VrRig::default(),
-        xr_stereo_ready: false,
+        xr_stereo: None,
         vr_grab_anchor: None,
         vr_drag_hand: None,
         vr_panel_anchor: None,
@@ -201,7 +201,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_layers: false,
         show_mixer: false,
         mixer_changed: false,
-        rebinding: None,
+        bindings_editor: citrus_editor::BindingsEditor::default(),
         last_cursor: None,
         viewport_rect: egui::Rect::EVERYTHING,
         project_root,
@@ -236,6 +236,10 @@ pub fn run(config: AppConfig) -> Result<()> {
         refl_slots: crate::refl_slots::ReflectionSlots::default(),
         refl_bake_queue: Vec::new(),
         refl_bake_current: None,
+        refl_unsaved: Vec::new(),
+        refl_applied_seq: 0,
+        bake_serial: 0,
+        bake_sizes: None,
         selected_material_slot: 0,
         frame_timings: FrameTimings::default(),
         gi_debug: 0,
@@ -494,6 +498,8 @@ enum EditorAction {
     SpawnBucket,
     SpawnWaterfall,
     SpawnWhirlpool,
+    /// A global Wind Zone (waves, cloth, steam) ahead of the camera.
+    SpawnWindZone,
     /// Add a Mesh Collider to every selected object that draws a mesh.
     AddMeshCollider,
     /// (child, new parent, before-sibling) reorder/move.
@@ -540,6 +546,8 @@ enum EditorAction {
     BakeLighting,
     /// Discard the baked lighting result.
     ClearBake,
+    /// Re-encode the scene's uncompressed bake sidecars as BC6H.
+    RecompressBake,
     /// Re-run lightmap-UV generation for every model with a `.lmuv` marker (picks
     /// up the current unwrapper) by reloading the scene.
     RegenerateLightmapUvs,
@@ -812,8 +820,8 @@ struct EngineApp {
     slimevr: Option<crate::slimevr::SlimeVr>,
     /// VR play-space rig (fly / scale / drag locomotion); identity until driven.
     vr_rig: citrus_core::VrRig,
-    /// True once the per-eye XR swapchains have been created (`setup_stereo`).
-    xr_stereo_ready: bool,
+    /// The per-eye XR swapchains (`setup_stereo`), once created.
+    xr_stereo: Option<citrus_xr::StereoSetup>,
     /// Grab-drag anchor (world point under the grabbing controller at grab start).
     vr_grab_anchor: Option<glam::Vec3>,
     /// Which hand currently owns the grab-drag (`Some(true)` = left, `Some(false)`
@@ -1039,9 +1047,9 @@ struct EngineApp {
     /// The Audio Mixer panel edited the project's buses this frame.
     mixer_changed: bool,
     /// Audio bus mixer (volumes/mutes per bus). Drives playback gains.
-    /// Action currently being rebound in the Bindings window (scheme, action,
-    /// slot). The next key/mouse press is captured into it.
-    rebinding: Option<(usize, String)>,
+    /// The project bindings editor (Project Settings > Input and the Input
+    /// Bindings window); a pending rebind captures the next input.
+    bindings_editor: citrus_editor::BindingsEditor,
     last_cursor: Option<(f64, f64)>,
     /// Viewport tab rect in egui points (updated每 frame by the tab).
     viewport_rect: egui::Rect,
@@ -1150,6 +1158,14 @@ struct EngineApp {
     refl_bake_queue: Vec<(u128, glam::Vec3, u32)>,
     /// Probe whose static capture is being baked right now.
     refl_bake_current: Option<u128>,
+    /// Captured probe faces waiting for the background encode + save.
+    refl_unsaved: Vec<(u128, crate::refl_slots::Faces)>,
+    /// Newest reflection save applied (older results arriving late are dropped).
+    refl_applied_seq: u64,
+    /// Bumped per lighting bake; a lightmap save only applies to its own bake.
+    bake_serial: u64,
+    /// Cached sidecar size stats for the Baker's Man tab (None = re-measure).
+    bake_sizes: Option<crate::bake_store::BakeSizes>,
     /// Which material slot of the selected object the inspector edits (for
     /// multi-material meshes). Clamped to the object's slot count.
     selected_material_slot: usize,
@@ -1708,7 +1724,7 @@ impl EngineApp {
         }
         window.set_title(&format!("{} — citrus", self.project.name));
         // Load the project's input bindings (2C) into the live input manager.
-        self.input.bindings = self.project.bindings.clone();
+        self.sync_input_bindings();
         renderer.set_vsync(self.project.settings.vsync);
         self.show_stats = self.project.settings.show_stats;
         self.show_stats_overlay = self.project.settings.show_stats_overlay;
@@ -1963,6 +1979,7 @@ impl EngineApp {
             self.set_load_status("Loading reflection probes…");
         }
         self.refl_slots.set_baked(set);
+        self.bake_sizes = None;
     }
 
     fn set_looking(&mut self, looking: bool) {
@@ -2090,7 +2107,7 @@ impl EngineApp {
         let in_camera_tab = self.playing && self.camera_tab_visible && self.camera_rect.is_positive();
         let rect = self.game_rect().unwrap_or(self.viewport_rect);
         if !rect.is_finite() || rect.width() < 1.0 || rect.height() < 1.0 {
-            return citrus_core::ScreenInfo::default();
+            return citrus_core::ScreenInfo { controls: self.input.controls_info(), ..Default::default() };
         }
         let size = glam::Vec2::new(rect.width() * ppp, rect.height() * ppp);
         let aspect = rect.width() / rect.height();
@@ -2114,6 +2131,7 @@ impl EngineApp {
             ui_text_editing: self.game_ui_frame.text_editing,
             ui_cancel: std::mem::take(&mut self.game_ui_frame.cancel),
             vr: crate::runtime::vr_frame(self.xr_session.as_ref(), &self.vr_targets),
+            controls: self.input.controls_info(),
         }
     }
 
@@ -2341,6 +2359,7 @@ impl EngineApp {
                 s.set_shared_clock(self.net.as_ref().and_then(|n| n.shared_clock()));
             }
             let play_time = self.play_session.as_ref().map(|s| s.water_time());
+            fit_water_requests(&mut self.scene, &mut self.scene_dirty);
             // Not playing: bodies dragged in the editor still push the water.
             if !self.playing {
                 self.editor_water.feed(&mut self.scene, dt);
@@ -2419,6 +2438,7 @@ impl EngineApp {
                 static_geometry: false,
                 planar_index: -1,
                 occluded: false,
+                shadow_casting: citrus_render::ShadowCasting::On,
             });
         }
     }
@@ -3791,6 +3811,16 @@ impl EngineApp {
                         Err(e) => tracing::error!("spawning {name}: {e:#}"),
                     }
                 }
+                EditorAction::SpawnWindZone => {
+                    let ahead = self.camera.position + self.camera.forward() * 6.0;
+                    match self.scene.spawn(renderer!(), citrus_assets::ObjectSource::Empty, "Wind Zone".to_owned(), ahead) {
+                        Ok(index) => {
+                            self.scene.objects[index].components.push(Box::new(citrus_core::ClothWind::default()));
+                            self.select_object(Some(index));
+                        }
+                        Err(e) => tracing::error!("spawning Wind Zone: {e:#}"),
+                    }
+                }
                 EditorAction::AddMeshCollider => {
                     let targets: Vec<usize> = match self.selection {
                         Selection::Object(i) if self.multi_objects.len() > 1 && self.multi_objects.contains(&i) => self.multi_objects.clone(),
@@ -3993,8 +4023,10 @@ impl EngineApp {
                     self.pending_job = Some(PendingJob::ReloadPlugins);
                 }
                 EditorAction::BakeLighting => self.start_bake(),
+                EditorAction::RecompressBake => self.recompress_bake(),
                 EditorAction::ClearBake => {
                     self.scene.baked = None;
+                    self.bake_sizes = None;
                     self.upload_baked_probes();
                     tracing::info!("cleared baked lighting");
                 }
@@ -4458,6 +4490,12 @@ impl EngineApp {
                         self.actions.push(EditorAction::SpawnAudioSource);
                         ui.close();
                     }
+                    ui.menu_button("Create Physics", |ui| {
+                        if ui.button("Wind Zone").on_hover_text("Wind for water waves, cloth and steam").clicked() {
+                            self.actions.push(EditorAction::SpawnWindZone);
+                            ui.close();
+                        }
+                    });
                     ui.menu_button("Create Collider", |ui| {
                         if ui.button("Box Collider").clicked() {
                             self.actions.push(EditorAction::SpawnBoxCollider);
@@ -4623,6 +4661,28 @@ impl EngineApp {
                                 .changed()
                             {
                                 renderer.set_vsync(vsync);
+                            }
+                            let supported = renderer.gpu_cull_supported();
+                            let mut cull = renderer.gpu_cull_settings();
+                            let mut changed = ui
+                                .add_enabled(supported, egui::Checkbox::new(&mut cull.enabled, "GPU culling"))
+                                .on_hover_text(
+                                    "Cull and draw opaque objects and shadow casters on the GPU \
+                                     (indirect draws). Off = CPU frustum culling",
+                                )
+                                .changed();
+                            changed |= ui
+                                .add_enabled(
+                                    supported && cull.enabled,
+                                    egui::Checkbox::new(&mut cull.hiz_occlusion, "Hi-Z occlusion"),
+                                )
+                                .on_hover_text(
+                                    "Also skip objects hidden behind the previous frame's depth. \
+                                     Objects coming into view can appear one frame late",
+                                )
+                                .changed();
+                            if changed {
+                                renderer.set_gpu_cull_settings(cull);
                             }
                         }
                         if ui
@@ -5006,7 +5066,7 @@ impl EngineApp {
                     })
                     .collect();
                 renderer.set_baked_probes(&b.probe_sh, &vols);
-                renderer.set_baked_lightmaps(&b.lightmaps);
+                b.upload_lightmaps(renderer);
             }
             None => {
                 renderer.set_baked_probes(&[], &[]);
@@ -5111,6 +5171,7 @@ impl EngineApp {
         // Live preview: switch to baked mode with no lightmaps yet, so the
         // viewport darkens immediately and then lights up object-by-object as
         // each lightmap finishes (see `step_bake`).
+        self.bake_serial += 1;
         self.scene.baked = Some(scene::BakedData::default());
         self.upload_baked_probes();
         // Paint the bake modal once before the first lightmap step locks the UI.
@@ -5189,6 +5250,7 @@ impl EngineApp {
                         Some(scene::BakedData {
                             object_lightmap,
                             lightmaps,
+                            lightmap_array: None,
                             probe_volumes: Vec::new(),
                             probe_sh: Vec::new(),
                         })
@@ -5235,6 +5297,7 @@ impl EngineApp {
                 let baked = scene::BakedData {
                     object_lightmap: std::mem::take(&mut runner.object_lightmap),
                     lightmaps: output.lightmaps,
+                    lightmap_array: None,
                     probe_volumes: std::mem::take(&mut runner.probe_volumes),
                     probe_sh: output.probes,
                 };
@@ -5280,6 +5343,7 @@ impl EngineApp {
                 let mut baked = runner.baked.take().unwrap_or_else(|| scene::BakedData {
                     object_lightmap: std::collections::HashMap::new(),
                     lightmaps: Vec::new(),
+                    lightmap_array: None,
                     probe_volumes: Vec::new(),
                     probe_sh: Vec::new(),
                 });
@@ -5302,6 +5366,7 @@ impl EngineApp {
         self.rt_gi.invalidate_flux_voxel();
         self.upload_baked_probes();
         self.save_bake();
+        self.bake_sizes = None;
         self.tasks.complete_stepped(task_id);
         self.tasks
             .notify(format!("Bake complete: {n} lightmaps"), crate::tasks::NotifyLevel::Info);
@@ -5408,44 +5473,103 @@ impl EngineApp {
         let Ok(faces) = <[citrus_render::TextureData; 6]>::try_from(faces) else {
             return;
         };
-        // Merge into the scene's sidecar: one cube per probe.
-        let path = self.bake_base_path().with_extension("reflprobe");
-        let mut set = crate::refl_slots::read_reflprobes(&path);
-        set.legacy = None;
-        set.entries.insert(id, faces);
-        if let Err(e) = crate::refl_slots::write_reflprobes(&path, &set) {
-            tracing::error!("saving .reflprobe: {e:#}");
-            self.set_status("Reflection bake failed (write)", false);
-            return;
-        }
+        self.refl_unsaved.push((id, faces));
         if self.refl_bake_queue.is_empty() {
-            // The bake drew into slot 0: reload both slots from the new cubes.
-            self.refl_slots.set_baked(set);
-            self.set_status("Baked reflection probes", false);
+            self.flush_reflection_saves();
         }
     }
 
-    /// Write the baked lightmaps (`.lightmap`) and probe data (`.lightdata`).
-    fn save_bake(&self) {
+    /// Encode (BC6H unless the scene opts out) and merge the captured cubes
+    /// into the scene's `.reflprobe` on a worker; `apply_bake_saved` reloads
+    /// the slots from the result.
+    fn flush_reflection_saves(&mut self) {
+        if self.refl_unsaved.is_empty() {
+            return;
+        }
+        let new = std::mem::take(&mut self.refl_unsaved);
+        let path = self.bake_base_path().with_extension("reflprobe");
+        let compress = self.scene.environment.bake.compress_reflections;
+        let label = if compress { "Compressing reflection probes" } else { "Saving reflection probes" };
+        self.tasks.spawn(label, crate::tasks::TaskKind::Bake, false, move |_, _| {
+            crate::bake_store::save_reflections_job(path, new, compress)
+        });
+        self.set_status("Saving reflection probes…", true);
+    }
+
+    /// Re-encode the scene's existing uncompressed sidecars as BC6H.
+    fn recompress_bake(&mut self) {
+        let base = self.bake_base_path();
+        let serial = self.bake_serial;
+        self.tasks.spawn("Compressing bake", crate::tasks::TaskKind::Bake, false, move |_, progress| {
+            crate::bake_store::recompress_job(serial, base, progress)
+        });
+    }
+
+    /// A background sidecar save finished: swap the encoded data in if it still
+    /// belongs to the current scene / bake.
+    fn apply_bake_saved(&mut self, saved: crate::bake_store::BakeSaved) {
+        use crate::tasks::NotifyLevel;
+        let base = self.bake_base_path();
+        if let Some(lm) = saved.lightmaps {
+            if lm.serial == self.bake_serial
+                && lm.base == base
+                && let Some(b) = self.scene.baked.as_mut()
+            {
+                b.object_lightmap = lm.object_lightmap;
+                b.lightmap_array = Some(std::sync::Arc::new(lm.array));
+                b.lightmaps = Vec::new();
+                if let Some(r) = self.renderer.as_mut() {
+                    b.upload_lightmaps(r);
+                }
+            }
+            self.tasks.notify(lm.stats.describe("Lightmaps saved"), NotifyLevel::Info);
+        }
+        if let Some(rs) = saved.reflections {
+            if rs.seq > self.refl_applied_seq && rs.path == base.with_extension("reflprobe") {
+                self.refl_applied_seq = rs.seq;
+                // The bake drew into slot 0: reload both slots from the new cubes.
+                self.refl_slots.set_baked(rs.set);
+            }
+            self.set_status("Baked reflection probes", false);
+            self.tasks.notify(rs.stats.describe("Reflection probes saved"), NotifyLevel::Info);
+        }
+        self.bake_sizes = None;
+    }
+
+    /// Write the probe data (`.lightdata`, small) now and hand the lightmaps to
+    /// a background task that encodes (BC6H unless the scene opts out) and
+    /// writes the `.lightmap`, then swaps the encoded array in.
+    fn save_bake(&mut self) {
         let Some(baked) = &self.scene.baked else {
             return;
         };
         let base = self.bake_base_path();
 
-        // .lightmap: static GI, one entry per lit object.
-        let mut lm = citrus_assets::LightmapFile::default();
-        for (&object, &layer) in &baked.object_lightmap {
-            if let Some(map) = baked.lightmaps.get(layer) {
-                lm.entries.push(citrus_assets::LightmapEntry {
-                    object: object as u32,
-                    size: map.size,
-                    pixels: map.pixels.clone(),
-                });
-            }
+        // .lightmap: static GI, one layer per lit object, in layer order.
+        let mut layers: Vec<(usize, usize)> = baked
+            .object_lightmap
+            .iter()
+            .filter(|&(_, &layer)| layer < baked.lightmaps.len())
+            .map(|(&o, &l)| (o, l))
+            .collect();
+        layers.sort_by_key(|&(_, l)| l);
+        let maps: Vec<(u32, citrus_render::BakedLightmap)> =
+            layers.iter().map(|&(o, l)| (o as u32, baked.lightmaps[l].clone())).collect();
+        let (serial, compress) = (self.bake_serial, self.scene.environment.bake.compress_lightmaps);
+        crate::bake_store::begin_lightmap_save(serial);
+        if maps.is_empty() {
+            // Probes-only bake: replace any older lightmaps with an empty file.
+            crate::bake_store::write_empty_lightmaps(&base);
+        } else {
+            let lm_base = base.clone();
+            let label = if compress { "Compressing lightmaps" } else { "Saving lightmaps" };
+            self.tasks.spawn(label, crate::tasks::TaskKind::Bake, false, move |cancel, progress| {
+                crate::bake_store::save_lightmaps_job(serial, lm_base, maps, compress, cancel, progress)
+            });
         }
-        if let Err(e) = citrus_assets::save_lightmaps(base.with_extension("lightmap"), &lm) {
-            tracing::error!("saving .lightmap: {e:#}");
-        }
+        let Some(baked) = &self.scene.baked else {
+            return;
+        };
 
         // .lightdata: probe volumes + SH for dynamic objects.
         let ld = citrus_assets::LightDataFile {
@@ -5475,11 +5599,7 @@ impl EngineApp {
         if let Err(e) = citrus_assets::save_lightdata(base.with_extension("lightdata"), &ld) {
             tracing::error!("saving .lightdata: {e:#}");
         }
-        tracing::info!(
-            "wrote {} / {}",
-            base.with_extension("lightmap").display(),
-            base.with_extension("lightdata").display()
-        );
+        tracing::info!("wrote {}", base.with_extension("lightdata").display());
     }
 
     fn toggle_play(&mut self) {
@@ -5670,6 +5790,7 @@ impl EngineApp {
                 ComponentCommand::ClearTrackerCalibration => self.scene.clear_vr_calibration(),
                 ComponentCommand::SetOscFaceTracking(port) => self.face_input.set_osc(port),
                 ComponentCommand::Content(c) => self.content.queue(c),
+                ComponentCommand::Input(c) => self.input.apply(c),
                 other => tracing::warn!("unhandled component command {other:?}"),
             }
         }
@@ -5992,88 +6113,64 @@ impl EngineApp {
         }
     }
 
+    /// The Input Bindings window: the same editor as Project Settings > Input.
     /// Saves to `project.citrus` on every change.
     fn bindings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_bindings;
-        let mut dirty = false;
-        let mut cancel_rebind = false;
         egui::Window::new("Input Bindings")
             .open(&mut open)
             .resizable(true)
-            .default_width(380.0)
+            .default_width(460.0)
             .show(ctx, |ui| {
-                let b = &mut self.input.bindings;
-                ui.horizontal(|ui| {
-                    ui.label("Scheme");
-                    let cur = b.active_scheme().map(|s| s.name.clone()).unwrap_or_default();
-                    egui::ComboBox::from_id_salt("citrus-scheme")
-                        .selected_text(cur)
-                        .show_ui(ui, |ui| {
-                            for i in 0..b.schemes.len() {
-                                let name = b.schemes[i].name.clone();
-                                if ui.selectable_label(b.active == i, name).clicked() {
-                                    b.active = i;
-                                    dirty = true;
-                                }
-                            }
-                        });
-                });
-                ui.separator();
-                if let Some(rb) = &self.rebinding {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        format!("Press a key/mouse button for \"{}\" (Esc cancels)", rb.1),
-                    );
-                }
-                let active = b.active;
-                if let Some(scheme) = b.schemes.get_mut(active) {
-                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                        for (ai, act) in scheme.actions.iter_mut().enumerate() {
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.strong(&act.name);
-                                    ui.label(
-                                        egui::RichText::new(format!("{:?}", act.kind)).weak().small(),
-                                    );
-                                });
-                                dirty |= binding_slot_row(ui, "Buttons", &mut act.buttons, ai, "button", &mut self.rebinding);
-                                if matches!(act.kind, citrus_core::ActionKind::Axis1 | citrus_core::ActionKind::Axis2) {
-                                    dirty |= binding_slot_row(ui, "+X", &mut act.pos_x, ai, "pos_x", &mut self.rebinding);
-                                    dirty |= binding_slot_row(ui, "-X", &mut act.neg_x, ai, "neg_x", &mut self.rebinding);
-                                }
-                                if matches!(act.kind, citrus_core::ActionKind::Axis2) {
-                                    dirty |= binding_slot_row(ui, "+Y", &mut act.pos_y, ai, "pos_y", &mut self.rebinding);
-                                    dirty |= binding_slot_row(ui, "-Y", &mut act.neg_y, ai, "neg_y", &mut self.rebinding);
-                                }
-                                if let Some(a) = &act.analog_x {
-                                    ui.label(egui::RichText::new(format!("analog X: {}", a.label())).weak().small());
-                                }
-                                if let Some(a) = &act.analog_y {
-                                    ui.label(egui::RichText::new(format!("analog Y: {}", a.label())).weak().small());
-                                }
-                            });
-                        }
-                    });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Reset to defaults").clicked() {
-                        self.input.bindings = citrus_core::Bindings::default();
-                        dirty = true;
-                    }
-                    if self.rebinding.is_some() && ui.button("Cancel rebind").clicked() {
-                        cancel_rebind = true;
-                    }
-                });
+                egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| self.input_settings_ui(ui, "bindings-window"));
             });
-        if cancel_rebind {
-            self.rebinding = None;
+        if !open {
+            self.bindings_editor.cancel_rebind();
         }
         self.show_bindings = open;
-        if dirty {
-            self.project.bindings = self.input.bindings.clone();
-            self.save_project();
+    }
+
+    /// Project Settings > Input: the bindings editor plus where players'
+    /// own remaps live. Saves the project when the bindings change.
+    fn input_settings_ui(&mut self, ui: &mut egui::Ui, id: &str) {
+        if citrus_editor::bindings_editor_ui(ui, id, &mut self.project.bindings, &mut self.bindings_editor) {
+            self.bindings_changed();
         }
+        ui.add_space(6.0);
+        citrus_editor::widgets::eyebrow(ui, "Player remaps");
+        let overrides = self.input.controls().overrides();
+        let note = if overrides.is_empty() {
+            "No Play-mode remaps. Games save their players' remaps (ctx.rebind, the Controls menu) to input.ron in the user's config folder, on top of these defaults.".to_owned()
+        } else {
+            format!(
+                "Play mode has {} remapped action(s) on top of these defaults (saved in .citrus/input_overrides.ron). Shipped games keep their players' remaps in input.ron in the user's config folder.",
+                overrides.actions.len()
+            )
+        };
+        citrus_editor::widgets::info_note(ui, &note);
+        if !overrides.is_empty() && ui.button("Clear Play-mode remaps").clicked() {
+            self.input.apply(citrus_core::InputCommand::ResetAll);
+        }
+    }
+
+    /// The project's bindings were edited: push them to the live input
+    /// manager (Play mode picks them up at once) and save.
+    fn bindings_changed(&mut self) {
+        self.input.set_project_bindings(self.project.bindings.clone());
+        self.save_project();
+    }
+
+    /// Load the project's bindings (upgrading old ones) and its Play-mode
+    /// remaps into the input manager.
+    fn sync_input_bindings(&mut self) {
+        self.project.bindings.upgrade();
+        self.input.set_project_bindings(self.project.bindings.clone());
+        self.input.set_overrides_path(Some(crate::input_engine::editor_bindings_path(&self.project_root)));
+        // The editor's player identity: one per install, like a game's.
+        if let Some(dir) = crate::input_engine::player_bindings_path("Citrus Editor").parent() {
+            crate::net::set_identity_dir(dir.to_path_buf());
+        }
+        self.bindings_editor = citrus_editor::BindingsEditor::default();
     }
 
     /// Network panel (2G): host or join a session, see status, disconnect.
@@ -6256,6 +6353,9 @@ impl EngineApp {
                         "Only for tools that send over OSC (Open Sound Control): VRCFaceTracking, Babble, Steam Link. Headset face and eye tracking from WiVRn or Virtual Desktop is read directly through OpenXR and needs none of this.",
                     );
                 });
+                egui::CollapsingHeader::new("Input")
+                    .id_salt("citrus-input-settings")
+                    .show(ui, |ui| self.input_settings_ui(ui, "project-settings"));
                 ui.separator();
                 if let Some(status) = &self.build_status {
                     ui.label(egui::RichText::new(status).small());
@@ -6265,17 +6365,20 @@ impl EngineApp {
                     egui::ComboBox::from_id_salt("citrus-build-target")
                         .selected_text(self.build_target.label())
                         .show_ui(ui, |ui| {
-                            for t in bundle::BuildTarget::ALL {
-                                if t == bundle::BuildTarget::Windows && cfg!(windows) {
-                                    continue;
-                                }
+                            for t in bundle::BuildTarget::available() {
                                 ui.selectable_value(&mut self.build_target, t, t.label());
                             }
                         });
                 });
+                if self.build_target.is_android() {
+                    citrus_editor::widgets::info_note(
+                        ui,
+                        "Builds a signed APK with tools/android/build_apk.sh. Needs the Android SDK, NDK and build-tools (ANDROID_HOME, ANDROID_NDK_HOME) and `rustup target add aarch64-linux-android`. Meta Quest builds also bundle the Khronos OpenXR loader (OPENXR_LOADER_SO, or fetched once). Release signing: CITRUS_KEYSTORE / CITRUS_KEYSTORE_PASS.",
+                    );
+                }
                 if ui
                     .add_enabled(!self.building_game, egui::Button::new("Build Game"))
-                    .on_hover_text("cargo build --release + bundle into build/ (build-windows/ for a Windows cross-build)")
+                    .on_hover_text(format!("Build and bundle into {}/", self.build_target.output_hint()))
                     .clicked()
                 {
                     self.actions.push(EditorAction::BuildGame(self.build_target));
@@ -6348,6 +6451,7 @@ impl EngineApp {
             }
 
         self.project = citrus_assets::load_project_file(&root).unwrap_or_default();
+        self.sync_input_bindings();
         let boot = self
             .project
             .boot_scene
@@ -6612,29 +6716,32 @@ impl EngineApp {
         );
     }
 
-    /// Apply a captured input to the slot/action currently being rebound (2C),
-    /// then persist bindings. Called from the window-event handler.
-    fn apply_rebind(&mut self, src: citrus_core::InputSource) {
-        let Some((ai, slot)) = self.rebinding.take() else {
+    /// Apply a captured input to the binding slot being rebound (2C), then
+    /// persist bindings. Fed from the window-event handler (keys / mouse) and
+    /// [`Self::poll_rebind_capture`] (gamepad / VR).
+    fn apply_rebind(&mut self, result: citrus_core::CaptureResult) {
+        if self.bindings_editor.finish_rebind(&mut self.project.bindings, result) {
+            self.bindings_changed();
+        }
+    }
+
+    /// While a binding slot is armed, poll gamepads and VR controllers for it
+    /// (keys and mouse buttons arrive as window events).
+    fn poll_rebind_capture(&mut self) {
+        if self.bindings_editor.rebinding().is_none() {
+            return;
+        }
+        self.input.feed_vr(&crate::runtime::vr_frame(self.xr_session.as_ref(), &self.vr_targets));
+        let Some(capture) = self.bindings_editor.capture_mut() else {
             return;
         };
-        if let Some(scheme) = self.input.bindings.active_scheme_mut()
-            && let Some(act) = scheme.actions.get_mut(ai)
-        {
-            let list = match slot.as_str() {
-                "button" => &mut act.buttons,
-                "pos_x" => &mut act.pos_x,
-                "neg_x" => &mut act.neg_x,
-                "pos_y" => &mut act.pos_y,
-                "neg_y" => &mut act.neg_y,
-                _ => return,
-            };
-            if !list.contains(&src) {
-                list.push(src);
-            }
+        let result = match self.input.poll_capture(capture) {
+            Some(citrus_core::CaptureResult::Captured(src)) if src.device() == citrus_core::InputDevice::KeyboardMouse => None,
+            r => r,
+        };
+        if let Some(r) = result {
+            self.apply_rebind(r);
         }
-        self.project.bindings = self.input.bindings.clone();
-        self.save_project();
     }
 
     /// Build + reload the component plugins (blocking cargo build), then
@@ -6689,6 +6796,7 @@ impl EngineApp {
             TaskPayload::Scene(data) => self.apply_loaded_scene(*data),
             TaskPayload::AudioBake { scene_path, bytes } => self.apply_audio_bake(scene_path, bytes),
             TaskPayload::Occlusion { scene_path, data, secs } => self.apply_occlusion_bake(scene_path, *data, secs),
+            TaskPayload::BakeSaved(saved) => self.apply_bake_saved(*saved),
             TaskPayload::GameBuilt(result) => {
                 self.building_game = false;
                 match result {
@@ -7087,6 +7195,9 @@ impl EngineApp {
             if absolute {
                 typed.apply(&mut self.scene.objects[j]);
             }
+            if after.cast_shadows != before.cast_shadows {
+                self.scene.objects[j].cast_shadows = after.cast_shadows;
+            }
             if !changed.is_empty() {
                 let mut comps = self.scene.objects[j].save_components();
                 let mut touched = false;
@@ -7429,6 +7540,7 @@ impl EngineApp {
                     o.translation = state.translation;
                     o.rotation = state.rotation;
                     o.scale = state.scale;
+                    o.cast_shadows = state.cast_shadows;
                     o.load_components(&state.components, &self.components);
                 }
             }
@@ -7665,6 +7777,25 @@ impl EngineApp {
                 count_row(ui, "Materials drawn", s.materials_drawn);
                 count_row(ui, "Pipeline binds", s.pipeline_binds);
                 count_row(ui, "Shader variants", s.pipeline_variants);
+                if s.gpu_culling {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "GPU culling   {:.2} ms cull, {:.2} ms Hi-Z",
+                            s.gpu_cull_ms, s.gpu_hiz_ms
+                        ))
+                        .strong(),
+                    );
+                    count_row(ui, "Indirect draws", s.indirect_draws);
+                    count_row(ui, "Instances tested", s.gpu_cull_tested);
+                    count_row(ui, "  visible", s.gpu_cull_visible);
+                    count_row(ui, "  frustum / size culled", s.gpu_cull_frustum);
+                    count_row(ui, "  occluded (Hi-Z)", s.gpu_cull_occluded);
+                    count_row(ui, "Shadow instances", s.gpu_cull_shadow_visible);
+                    if s.gpu_cull_eye_visible > 0 {
+                        count_row(ui, "VR eye instances", s.gpu_cull_eye_visible);
+                    }
+                }
             });
         });
         if let Some(i) = toggle
@@ -7815,6 +7946,7 @@ impl EngineApp {
         shader_list.push("standard".into());
         shader_list.extend(self.shader_files.iter().cloned());
 
+        self.poll_rebind_capture();
         let egui_ctx = self.egui_ctx.clone();
         let output = egui_ctx.run(raw_input, |ctx| {
             self.menu_bar(ctx);
@@ -7878,6 +8010,10 @@ impl EngineApp {
             // scene borrow below.
             let generated_uv_models =
                 self.scene.models_with_generated_lightmap_uv(&self.project_root);
+            if self.bake_sizes.is_none() {
+                self.bake_sizes =
+                    Some(crate::bake_store::measure(&self.bake_base_path(), self.scene.baked.as_ref(), self.refl_slots.baked()));
+            }
             let ui_overlay_edit = !self.playing && self.widget_filter.game_ui;
             let active_prev = std::mem::take(&mut self.active_tabs);
             let fit_labels = fit_tab_labels(ctx, &dock_state, self.vp_strip_width);
@@ -7945,6 +8081,7 @@ impl EngineApp {
                 can_bake,
                 lightmap_preview: &mut self.lightmap_preview,
                 generated_uv_models: &generated_uv_models,
+                bake_sizes: self.bake_sizes.unwrap_or_default(),
                 selected_material_slot: &mut self.selected_material_slot,
             };
             DockArea::new(&mut dock_state)
@@ -8112,6 +8249,8 @@ impl EngineApp {
         // after process_actions so a "Save & Quit" SaveScene lands first.
         if self.quit_after_frame {
             self.save_project();
+            // Let a bake's background encode finish writing its sidecars.
+            crate::bake_store::wait_for_saves(std::time::Duration::from_secs(30));
             event_loop.exit();
             return;
         }
@@ -8131,6 +8270,7 @@ impl EngineApp {
                 net.pump();
             }
             let net_view = self.net.as_mut().map(|n| n.view()).unwrap_or_default();
+            self.input.feed_vr(&crate::runtime::vr_frame(self.xr_session.as_ref(), &self.vr_targets));
             self.input.resolve_frame();
             let mut commands = Vec::new();
             // Gameplay can spawn/destroy objects (indices shift); keep the
@@ -8204,8 +8344,12 @@ impl EngineApp {
                     }
                 }
             }
-            // Replicate networked objects (2G): owner sends, others apply.
+            // Replicate networked objects (2G): owner sends, others apply,
+            // after predicting / simulating predicted pawns.
             if let Some(net) = self.net.as_mut() {
+                if let Some(session) = self.play_session.as_mut() {
+                    session.net_predict(&mut self.scene, net, self.input.state(), dt);
+                }
                 self.scene.network_sync(net, dt);
             }
             // Voice chat + lip sync (needs a Voice Chat component in the scene).
@@ -8383,7 +8527,7 @@ impl EngineApp {
         let water_t = self.water.time();
         let preview_postfx = camera_preview.as_ref().map(|c| citrus_render::PostFx {
             underwater: crate::underwater::view_fx(&self.scene, c.position, water_t),
-            ..self.scene.effective_postfx(c.position, &self.project_root)
+            ..self.scene.effective_postfx(c.position, &self.project_root, water_t)
         });
         // The two reflection probes around the camera (blended per pixel);
         // realtime ones keep re-capturing so reflections track dynamic lighting,
@@ -8398,7 +8542,7 @@ impl EngineApp {
         }
         let postfx = citrus_render::PostFx {
             underwater: crate::underwater::view_fx(&self.scene, cam_pos, water_t),
-            ..self.scene.effective_postfx(cam_pos, &self.project_root)
+            ..self.scene.effective_postfx(cam_pos, &self.project_root, water_t)
         };
         let preview_postfx = preview_postfx.unwrap_or(postfx);
         let planar = self.scene.planar_surfaces();
@@ -8473,20 +8617,21 @@ impl EngineApp {
         // The eye view = the XR stage-space view composed with the play-space rig
         // (fly/scale/drag), so locomotion moves the player through the world.
         if self.xr_session.is_some() {
-            if !self.xr_stereo_ready {
+            if self.xr_stereo.is_none() {
+                // The window's format when the runtime offers it (as before).
                 let fmt = renderer.color_format_raw();
                 if let Some(session) = self.xr_session.as_mut() {
-                    match session.setup_stereo(fmt) {
-                        Ok((w, h)) => {
-                            self.xr_stereo_ready = true;
-                            tracing::info!("XR stereo swapchains ready ({w}x{h})");
+                    match session.setup_stereo(&[fmt], false) {
+                        Ok(setup) => {
+                            self.xr_stereo = Some(setup);
+                            tracing::info!("XR stereo swapchains ready ({}x{}, VkFormat {})", setup.width, setup.height, setup.format);
                         }
                         Err(e) => tracing::warn!("XR setup_stereo failed: {e:#}"),
                     }
                 }
             }
-            if self.xr_stereo_ready {
-                let fmt = renderer.color_format_raw();
+            if let Some(stereo) = self.xr_stereo {
+                let fmt = stereo.format;
                 let stage_to_world = self.vr_rig.stage_to_world_mat();
                 let world_to_stage = stage_to_world.inverse();
                 // Controller markers always show (so you can see your tracked
@@ -8688,6 +8833,8 @@ struct EditorTabs<'a> {
     /// Baker tab: model paths whose lightmap UVs were auto-generated (a `.lmuv`
     /// marker exists), so they can be regenerated/reverted. Computed per frame.
     generated_uv_models: &'a [String],
+    /// Baker tab: on-disk / VRAM sizes of the scene's bake sidecars.
+    bake_sizes: crate::bake_store::BakeSizes,
     /// Inspector: selected material slot of the current object (multi-material).
     selected_material_slot: &'a mut usize,
 }
@@ -8898,6 +9045,10 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         }
                         SpawnKind::Whirlpool => {
                             self.actions.push(EditorAction::SpawnWhirlpool);
+                            return;
+                        }
+                        SpawnKind::WindZone => {
+                            self.actions.push(EditorAction::SpawnWindZone);
                             return;
                         }
                         SpawnKind::Cube => ObjectSource::Primitive {
@@ -9653,14 +9804,9 @@ impl EditorTabs<'_> {
         ui.add_space(8.0);
 
         // Scrollable settings; Bake/Clear pinned at the bottom.
+        let sizes = self.bake_sizes;
         let baked = self.scene.baked.as_ref();
-        let summary = baked.map(|b| {
-            (
-                b.lightmaps.len(),
-                b.probe_sh.len(),
-                b.lightmaps.iter().map(|l| l.size).max().unwrap_or(0),
-            )
-        });
+        let summary = baked.map(|b| (b.lightmap_count(), b.probe_sh.len(), b.lightmap_max_size()));
         let footer = 84.0;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -9710,6 +9856,30 @@ impl EditorTabs<'_> {
                         .on_hover_text("Paths traced per texel / probe — higher = less noise");
                     ui.add(DragValue::new(&mut bake.samples).speed(8.0).range(1..=65536));
                 });
+
+                citrus_editor::widgets::section_gap(ui);
+                citrus_editor::widgets::eyebrow(ui, "Storage");
+                ui.checkbox(&mut bake.compress_lightmaps, "Compress lightmaps (BC6H)").on_hover_text(
+                    "Store lightmaps as BC6H: ~16x smaller than raw RGBA32F on disk and in VRAM, \
+                     encoded in the background after a bake. GPUs without BC decode them at load.",
+                );
+                ui.checkbox(&mut bake.compress_reflections, "Compress reflection probes (BC6H)").on_hover_text(
+                    "Store baked probe cubes (every roughness mip) as BC6H instead of raw RGBA16F faces.",
+                );
+                for (stats, what) in [(sizes.lightmaps, "Lightmaps"), (sizes.reflections, "Reflection probes")] {
+                    if let Some(st) = stats {
+                        ui.label(RichText::new(st.describe(what)).small().weak());
+                    }
+                }
+                if sizes.has_uncompressed()
+                    && (bake.compress_lightmaps || bake.compress_reflections)
+                    && ui
+                        .button(format!("{} Compress existing bake", ph::ARROWS_CLOCKWISE))
+                        .on_hover_text("Re-encode this scene's uncompressed .lightmap / .reflprobe as BC6H in the background.")
+                        .clicked()
+                {
+                    self.actions.push(EditorAction::RecompressBake);
+                }
 
                 citrus_editor::widgets::section_gap(ui);
                 citrus_editor::widgets::eyebrow(ui, "Lightmap UVs");
@@ -10921,7 +11091,7 @@ impl EditorTabs<'_> {
                     .iter()
                     .find_map(|c| c.as_any().downcast_ref::<citrus_core::RigidBody>())
                     .is_some_and(|rb| rb.kind != citrus_core::BodyKind::Fixed);
-                if let Some(wire) = crate::physics::mesh_collider_wire_for(self.scene, sel, crate::physics::MeshShapeMode::of(mc, moving)) {
+                if let Some(wire) = crate::physics::mesh_collider_wire_for(self.scene, sel, crate::physics::mesh_shape_mode(self.scene, sel, mc, moving)) {
                     let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(120, 235, 140, 150));
                     for (a, b) in wire.iter() {
                         if let (Some(pa), Some(pb)) = (project(world.transform_point3(*a)), project(world.transform_point3(*b))) {
@@ -12025,6 +12195,7 @@ impl EditorTabs<'_> {
                             name: objs.iter().any(|o| o.name != object.name),
                             enabled: objs.iter().any(|o| o.enabled != object.enabled),
                             static_geometry: objs.iter().any(|o| o.static_geometry != object.static_geometry),
+                            cast_shadows: objs.iter().any(|o| o.cast_shadows != object.cast_shadows),
                             translation: axis(&|o| o.translation.to_array()),
                             rotation: axis(&euler),
                             scale: axis(&|o| o.scale.to_array()),
@@ -12057,6 +12228,9 @@ impl EditorTabs<'_> {
                     let root = self.project_root.to_string_lossy().into_owned();
                     ui.data_mut(|d| {
                         d.insert_temp(egui::Id::new(citrus_editor::PROJECT_ROOT_KEY), root);
+                        let authored = crate::authored_collision::authored_pieces(self.scene, index)
+                            .map(|p| (p.len(), crate::authored_collision::pieces_summary(&p)));
+                        d.insert_temp(egui::Id::new(citrus_editor::AUTHORED_COLLISION_KEY), authored);
                         d.insert_temp(egui::Id::new(citrus_editor::ASSET_TEMPLATES_KEY), asset_templates().to_vec());
                     });
                     let mut info = ObjectInfoModel {
@@ -12065,6 +12239,7 @@ impl EditorTabs<'_> {
                         enabled: object.enabled,
                         static_geometry: object.static_geometry,
                         lightmap_scale: object.lightmap_scale,
+                        cast_shadows: object.cast_shadows,
                         kind: object.kind_label(),
                         transform: TransformModel {
                             translation: object.translation.to_array(),
@@ -12200,6 +12375,7 @@ impl EditorTabs<'_> {
                         object.enabled = info.enabled;
                         object.static_geometry = info.static_geometry;
                         object.lightmap_scale = info.lightmap_scale;
+                        object.cast_shadows = info.cast_shadows;
                         object.translation = Vec3::from(info.transform.translation);
                         object.rotation = glam::Quat::from_euler(
                             glam::EulerRot::XYZ,
@@ -12263,7 +12439,8 @@ impl EditorTabs<'_> {
                         if rigid_body {
                             let bounds = object_bounds(self.scene, index);
                             let ball = crate::physics::mesh_is_ball(self.scene, index);
-                            ensure_collider(&mut self.scene.objects[index], ball);
+                            let authored = crate::authored_collision::authored_set(self.scene, index).is_some();
+                            ensure_collider(&mut self.scene.objects[index], ball, authored);
                             if let (Some((lo, hi)), Some(last)) = (bounds, self.scene.objects[index].components.last_mut()) {
                                 fit_collider(last.as_any_mut(), lo, hi);
                             }
@@ -12505,8 +12682,9 @@ fn model_import_ui(ui: &mut egui::Ui, m: &mut citrus_assets::ModelImport) -> boo
 type FieldEdit = (String, Option<Vec<(String, String)>>);
 
 /// A body needs a shape: give an object without a collider a Mesh Collider
-/// (its own mesh), or a Box Collider when it has no mesh.
-fn ensure_collider(object: &mut crate::scene::SceneObject, ball: bool) {
+/// (its own mesh, or its authored collision pieces when it has some), or a
+/// Box Collider when it has no mesh.
+fn ensure_collider(object: &mut crate::scene::SceneObject, ball: bool, authored: bool) {
     let has = object.components.iter().any(|c| {
         let a = c.as_any();
         a.is::<citrus_core::BoxCollider>()
@@ -12522,6 +12700,7 @@ fn ensure_collider(object: &mut crate::scene::SceneObject, ball: bool) {
     // other meshes use their mesh; empties a box.
     use citrus_assets::{ObjectSource, PrimitiveShape};
     let collider: Box<dyn citrus_core::Component> = match &object.source {
+        _ if authored => Box::new(citrus_core::MeshCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Sphere } => Box::new(citrus_core::SphereCollider::default()),
         _ if ball => Box::new(citrus_core::SphereCollider::default()),
         ObjectSource::Primitive { shape: PrimitiveShape::Capsule } => Box::new(citrus_core::CapsuleCollider::default()),
@@ -12891,6 +13070,7 @@ fn object_state(o: &scene::SceneObject) -> ObjectState {
         translation: o.translation,
         rotation: o.rotation,
         scale: o.scale,
+        cast_shadows: o.cast_shadows,
         components: o.save_components(),
     }
 }
@@ -13423,6 +13603,14 @@ fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
         .unwrap_or_else(|| make(0))
 }
 
+impl Drop for EngineApp {
+    fn drop(&mut self) {
+        // The XR swapchains live on the renderer's device (fields drop in
+        // declaration order, renderer first): end the session before the device.
+        self.xr_session = None;
+    }
+}
+
 impl ApplicationHandler for EngineApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() || self.pending_init {
@@ -13524,41 +13712,28 @@ impl ApplicationHandler for EngineApp {
                 false
             };
 
-        // Rebind capture (2C): while a binding slot is armed, the next key /
-        // mouse-button press is captured into it (Esc cancels). Highest priority
-        // so it pre-empts editor shortcuts and egui focus.
-        if self.rebinding.is_some() {
-            match &event {
-                WindowEvent::KeyboardInput {
-                    event:
-                        KeyEvent {
-                            physical_key: PhysicalKey::Code(code),
-                            state: ElementState::Pressed,
-                            ..
-                        },
-                    ..
-                } => {
-                    if *code == KeyCode::Escape {
-                        self.rebinding = None;
-                    } else {
-                        self.apply_rebind(citrus_core::InputSource::Key(
-                            crate::input_engine::map_key(*code),
-                        ));
-                    }
-                    return;
-                }
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button,
-                    ..
-                } => {
-                    if let Some(b) = crate::input_engine::map_mouse(*button) {
-                        self.apply_rebind(citrus_core::InputSource::Mouse(b));
-                    }
-                    return;
-                }
-                _ => {}
-            }
+        // Rebind capture (2C): while a binding slot is armed, the next key
+        // press is captured into it (Esc cancels). Highest priority so it
+        // pre-empts editor shortcuts. Mouse buttons are captured by the
+        // listening button itself, gamepad / VR in `poll_rebind_capture`.
+        if self.bindings_editor.rebinding().is_some()
+            && let WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } = &event
+        {
+            let result = if *code == KeyCode::Escape {
+                citrus_core::CaptureResult::Cancelled
+            } else {
+                citrus_core::CaptureResult::Captured(citrus_core::InputSource::Key(crate::input_engine::map_key(*code)))
+            };
+            self.apply_rebind(result);
+            return;
         }
 
         match event {
@@ -14130,40 +14305,42 @@ fn switch_hovered_menu(ctx: &egui::Context, bar: &[(egui::Id, egui::Rect)]) {
     }
 }
 
-/// One binding-slot row in the Input Bindings window: shows the slot's bound
-/// inputs as removable chips plus a capture (＋) button that arms a rebind.
-/// Returns true if a binding was removed. The actual key/mouse capture happens
-/// in the window-event handler when `rebinding` is set.
-fn binding_slot_row(
-    ui: &mut egui::Ui,
-    label: &str,
-    list: &mut Vec<citrus_core::InputSource>,
-    action_index: usize,
-    slot: &str,
-    rebinding: &mut Option<(usize, String)>,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.add_sized([42.0, 16.0], egui::Label::new(egui::RichText::new(label).small()));
-        let mut remove = None;
-        for (i, src) in list.iter().enumerate() {
-            if ui.small_button(format!("{} {}", src.label(), ph::X)).clicked() {
-                remove = Some(i);
+/// Fit each Water whose inspector asked for it to the basin around it
+/// (outline, size and depth).
+fn fit_water_requests(scene: &mut LoadedScene, dirty: &mut bool) {
+    let asked: Vec<usize> = (0..scene.objects.len())
+        .filter(|&i| scene.objects[i].components.iter().any(|c| c.as_any().downcast_ref::<citrus_core::Water>().is_some_and(|w| w.fit_request)))
+        .collect();
+    if asked.is_empty() {
+        return;
+    }
+    let world = scene.world_transforms();
+    for wi in asked {
+        let fit = crate::water_walls::fit_basin(scene, wi, &world);
+        let name = scene.objects[wi].name.clone();
+        let Some(water) = scene.objects[wi].components.iter_mut().find_map(|c| c.as_any_mut().downcast_mut::<citrus_core::Water>()) else {
+            continue;
+        };
+        water.fit_request = false;
+        match fit {
+            Some((outline, depth)) => {
+                // The Size box covers the outline around the origin.
+                let reach = outline.iter().fold(glam::Vec2::ZERO, |m, p| m.max(glam::Vec2::from(*p).abs()));
+                water.size = (reach * 2.0).to_array();
+                water.shape = outline;
+                water.smooth_shape = false;
+                if let Some(d) = depth {
+                    water.depth = d;
+                }
+                if !water.body.basin() {
+                    water.body = citrus_core::WaterBody::Lake;
+                }
+                tracing::info!("{name}: fitted to its basin ({} points)", water.shape.len());
             }
+            None => tracing::warn!("{name}: no walls or shore around it to fit to; place it inside the basin at the water level"),
         }
-        if let Some(i) = remove {
-            list.remove(i);
-            changed = true;
-        }
-        let waiting = rebinding
-            .as_ref()
-            .map(|(a, s)| *a == action_index && s == slot)
-            .unwrap_or(false);
-        if ui.small_button(if waiting { "…" } else { ph::PLUS }).clicked() {
-            *rebinding = Some((action_index, slot.to_string()));
-        }
-    });
-    changed
+        *dirty = true;
+    }
 }
 
 #[cfg(test)]
@@ -14183,3 +14360,4 @@ mod collider_fit_tests {
         assert!(c.direction == citrus_core::ColliderAxis::Y && c.height == 2.0 && (c.radius - 0.3).abs() < 1e-6);
     }
 }
+

@@ -55,11 +55,16 @@ vec3 uniform_sphere(inout uint rng) {
     return vec3(r * cos(a), r * sin(a), z);
 }
 
+// TLAS instance masks (bake.rs): bounce rays see visible geometry, shadow
+// rays only casters ("Cast Shadows" Off / Shadows Only clear one bit).
+const uint BAKE_MASK_VISIBLE = 0x01u;
+const uint BAKE_MASK_CASTER = 0x02u;
+
 bool occluded(vec3 o, vec3 d, float dist) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, tlas,
         gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-        0xFF, o, 1e-3, d, dist - 2e-3);
+        BAKE_MASK_CASTER, o, 1e-3, d, dist - 2e-3);
     while (rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true)
         != gl_RayQueryCommittedIntersectionNoneEXT;
@@ -119,7 +124,7 @@ vec3 incoming(vec3 origin, vec3 d, inout uint rng) {
     vec3 ro = origin, rd = d;
     for (uint b = 0u; b <= pc.bounces; ++b) {
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, ro, 1e-3, rd, 1e16);
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, BAKE_MASK_VISIBLE, ro, 1e-3, rd, 1e16);
         while (rayQueryProceedEXT(rq)) {}
         if (rayQueryGetIntersectionTypeEXT(rq, true)
             == gl_RayQueryCommittedIntersectionNoneEXT) {

@@ -54,10 +54,25 @@ const _: () = assert!(std::mem::size_of::<GpuInstance>() == 176);
 /// their mean colour.
 pub(crate) const MAX_RT_TEXTURES: u32 = 4096;
 
-/// TLAS instance masks: reflection rays see both, shadow rays and the GI
-/// gather only solid geometry (water neither shadows nor blocks bounce light).
+/// TLAS instance masks: reflection rays see solid + water, the GI gather only
+/// solid geometry, shadow rays only casters (water neither shadows nor blocks
+/// bounce light; Cast Shadows = Off drops the caster bit, Shadows Only keeps
+/// only it).
 const MASK_SOLID: u8 = 0x01;
 const MASK_WATER: u8 = 0x02;
+const MASK_CASTER: u8 = 0x04;
+
+/// TLAS mask for a non-water instance with this "Cast Shadows" setting.
+pub(crate) fn solid_mask(shadow_casting: crate::ShadowCasting) -> u8 {
+    let mut mask = 0;
+    if shadow_casting.visible() {
+        mask |= MASK_SOLID;
+    }
+    if shadow_casting.casts() {
+        mask |= MASK_CASTER;
+    }
+    mask
+}
 
 /// One scene instance to reflect: mesh + world transform + surface colour.
 struct TlasSlot {
@@ -129,6 +144,8 @@ pub(crate) struct RtInstance {
     /// displaced water BLAS is refit while the version holds). None = built
     /// once.
     pub dynamic: Option<u32>,
+    /// "Cast Shadows": picks the TLAS mask (see `solid_mask`).
+    pub shadow_casting: crate::ShadowCasting,
 }
 
 /// Light for hit shading, mirrors `Light` in the shader (matches `bake`'s layout).
@@ -511,10 +528,11 @@ impl RtReflect {
             // must be this record's position (instances without a BLAS are
             // skipped, so it is not the input index).
             let custom = gpu_instances.len() as u32;
+            let mask = if inst.water >= 0 { MASK_WATER } else { solid_mask(inst.shadow_casting) };
             gpu_instances.push(g);
             tlas_instances.push(vk::AccelerationStructureInstanceKHR {
                 transform: bake::transform_matrix(&inst.transform),
-                instance_custom_index_and_mask: vk::Packed24_8::new(custom, if inst.water >= 0 { MASK_WATER } else { MASK_SOLID }),
+                instance_custom_index_and_mask: vk::Packed24_8::new(custom, mask),
                 instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                     0,
                     vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
@@ -525,6 +543,8 @@ impl RtReflect {
             });
             fnv(inst.mesh as u64, &mut sig);
             fnv(blas_address, &mut sig);
+            fnv(mask as u64, &mut sig);
+            fnv(mask as u64, &mut layout);
             // A refit water BLAS needs the TLAS refit over its new bounds.
             fnv(water_key, &mut sig);
             fnv(blas_address, &mut layout);

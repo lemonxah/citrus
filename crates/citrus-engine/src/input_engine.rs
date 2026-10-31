@@ -1,10 +1,15 @@
 //! Engine-side input capture for the binding system (2C). Translates winit
-//! keyboard/mouse events and `gilrs` gamepad state into a [`RawInput`], resolves
-//! it against the active control scheme, and exposes the per-frame
-//! [`InputState`] that components read through `ComponentCtx`.
+//! keyboard/mouse events, `gilrs` gamepad state and the VR controllers into a
+//! [`RawInput`], runs the live bindings (player overrides, auto scheme
+//! switching, rebind capture; see [`ControlsRuntime`]), resolves the active
+//! scheme and exposes the per-frame [`InputState`] that components read
+//! through `ComponentCtx`.
+
+use std::path::{Path, PathBuf};
 
 use citrus_core::{
-    Bindings, ControlScheme, InputState, Key, MouseButton, PadAxis, PadButton, RawInput, resolve,
+    Bindings, CaptureResult, ControlScheme, ControlsInfo, ControlsRuntime, InputCapture, InputCommand, InputState, Key,
+    MouseButton, PadAxis, PadButton, RawInput, resolve,
 };
 use winit::event::MouseButton as WMouse;
 use winit::keyboard::KeyCode;
@@ -12,8 +17,9 @@ use winit::keyboard::KeyCode;
 /// Owns gamepad polling + accumulated raw input + the resolved snapshot.
 pub struct InputManager {
     gilrs: Option<gilrs::Gilrs>,
-    pub bindings: Bindings,
+    controls: ControlsRuntime,
     raw: RawInput,
+    vr_active: bool,
     state: InputState,
     /// Empty scheme used when bindings have none (keeps resolve total).
     fallback: ControlScheme,
@@ -39,8 +45,9 @@ impl InputManager {
         };
         Self {
             gilrs,
-            bindings,
+            controls: ControlsRuntime::new(bindings),
             raw: RawInput::default(),
+            vr_active: false,
             state: InputState::default(),
             fallback: ControlScheme {
                 name: "none".into(),
@@ -54,6 +61,34 @@ impl InputManager {
     /// The resolved action snapshot for the current frame.
     pub fn state(&self) -> &InputState {
         &self.state
+    }
+
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub fn controls(&self) -> &ControlsRuntime {
+        &self.controls
+    }
+
+    /// New project bindings (edited in the editor); player overrides stay on top.
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub fn set_project_bindings(&mut self, bindings: Bindings) {
+        self.controls.set_defaults(bindings);
+    }
+
+    /// Where player overrides are loaded from and saved to.
+    pub fn set_overrides_path(&mut self, path: Option<PathBuf>) {
+        self.controls.set_overrides_path(path);
+    }
+
+    /// Apply a gameplay rebind / reset / capture request.
+    pub fn apply(&mut self, cmd: InputCommand) {
+        if let Err(e) = self.controls.apply(cmd) {
+            tracing::warn!("input bindings: {e}");
+        }
+    }
+
+    /// What gameplay sees of the bindings this frame (`ScreenInfo::controls`).
+    pub fn controls_info(&self) -> ControlsInfo {
+        self.controls.info()
     }
 
     // --- winit event feed (accumulated through the frame) ---
@@ -85,19 +120,43 @@ impl InputManager {
         self.raw.wheel += dy;
     }
 
+    /// This frame's VR controllers (call before [`Self::resolve_frame`]).
+    pub fn feed_vr(&mut self, vr: &citrus_core::VrFrame) {
+        self.vr_active = vr.active;
+        self.raw.set_vr(vr);
+    }
+
     /// Clear keys/buttons (e.g. on focus loss) so nothing sticks "down".
     pub fn clear_held(&mut self) {
         self.raw.keys_down.clear();
         self.raw.mouse_down.clear();
     }
 
+    /// Poll the gamepads and feed one editor-side capture (rebinding in the
+    /// bindings editor, outside Play).
+    #[cfg_attr(not(feature = "editor"), allow(dead_code))]
+    pub fn poll_capture(&mut self, capture: &mut InputCapture) -> Option<CaptureResult> {
+        self.poll_gamepads();
+        let result = capture.poll(&self.raw);
+        self.raw.mouse_delta = glam::Vec2::ZERO;
+        self.raw.wheel = 0.0;
+        result
+    }
+
     /// Poll gamepads and resolve the accumulated raw input into the snapshot.
     /// Call once per frame before driving components. Returns the new snapshot.
+    /// While a rebind capture runs, every action reads released.
     pub fn resolve_frame(&mut self) -> &InputState {
         self.poll_gamepads();
-        let scheme = self.bindings.active_scheme().unwrap_or(&self.fallback);
-        self.state = resolve(scheme, &self.raw, &self.state);
-        self.update_nav();
+        self.controls.frame(&self.raw, self.vr_active);
+        let capturing = self.controls.capturing();
+        let scheme = self.controls.bindings().active_scheme().unwrap_or(&self.fallback);
+        self.state = if capturing {
+            resolve(&self.fallback, &RawInput::default(), &self.state)
+        } else {
+            resolve(scheme, &self.raw, &self.state)
+        };
+        self.update_nav(capturing);
         // Per-frame deltas reset after resolving; held sets persist.
         self.raw.mouse_delta = glam::Vec2::ZERO;
         self.raw.wheel = 0.0;
@@ -110,7 +169,9 @@ impl InputManager {
         self.nav
     }
 
-    fn update_nav(&mut self) {
+    /// `suppress`: a capture has the input, so nothing navigates (and what
+    /// is held now won't fire when it ends).
+    fn update_nav(&mut self, suppress: bool) {
         use citrus_core::{Key, PadAxis, PadButton};
         let r = &self.raw;
         let key = |k: Key| r.keys_down.contains(&k);
@@ -124,7 +185,7 @@ impl InputManager {
             submit: key(Key::Enter) || pad(PadButton::South),
             cancel: key(Key::Escape) || pad(PadButton::East),
         };
-        let p = self.nav_held;
+        let p = if suppress { held } else { self.nav_held };
         self.nav = crate::game_ui::UiNav {
             up: held.up && !p.up,
             down: held.down && !p.down,
@@ -243,4 +304,34 @@ pub fn map_key(code: KeyCode) -> Key {
         C::Backslash => Key::Backslash, C::Backquote => Key::Grave,
         _ => Key::Unknown,
     }
+}
+
+/// The player's binding overrides for a shipped game: `input.ron` in the
+/// user's config folder for `title` (`%APPDATA%\<title>`, `~/Library/Application
+/// Support/<title>`, `$XDG_CONFIG_HOME/<title>` or `~/.config/<title>`).
+/// `CITRUS_CONFIG_DIR` replaces the base folder (platforms without one).
+pub fn player_bindings_path(title: &str) -> PathBuf {
+    let base = std::env::var_os("CITRUS_CONFIG_DIR").map(PathBuf::from).or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else if cfg!(target_os = "macos") {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        }
+    });
+    let name: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    base.unwrap_or_else(|| PathBuf::from(".")).join(name).join("input.ron")
+}
+
+/// Player overrides made in the editor's Play mode, kept in the project's
+/// `.citrus` folder so testing a remap menu never touches the shipped game's.
+#[cfg_attr(not(feature = "editor"), allow(dead_code))]
+pub fn editor_bindings_path(project_root: &Path) -> PathBuf {
+    project_root.join(".citrus").join("input_overrides.ron")
 }

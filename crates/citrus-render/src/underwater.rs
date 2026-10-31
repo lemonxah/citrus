@@ -20,7 +20,7 @@ use gpu_allocator::vulkan::Allocator;
 
 use crate::alloc::Buffer;
 use crate::post::HDR_FORMAT;
-use crate::{CameraData, LightData, MAX_WATER_WAVES, UnderwaterFx, image_barrier};
+use crate::{CameraData, LightData, MAX_WATER_WAVES, UnderwaterFx, image_barrier_layers};
 
 const FULLSCREEN_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
 const UNDERWATER_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/underwater.frag.spv"));
@@ -31,6 +31,8 @@ pub(crate) const SLOT_MAIN: u32 = 0;
 pub(crate) const SLOT_VIEWPORT: u32 = 8;
 pub(crate) const SLOT_PREVIEW: u32 = 16;
 pub(crate) const SLOT_XR: u32 = 24;
+/// The right eye of a multiview XR pass (`SLOT_XR` is the left).
+pub(crate) const SLOT_XR_RIGHT: u32 = 32;
 const MAX_SETS: u32 = 40;
 
 /// Near-plane margin (m) inside which a pixel blends between above and below.
@@ -209,6 +211,7 @@ impl UnderwaterPass {
         fx: &UnderwaterFx,
         light: &LightData,
         time: f32,
+        layer: u32,
     ) {
         // Crests can reach the near plane even when the surface over the
         // camera is below it.
@@ -250,15 +253,15 @@ impl UnderwaterPass {
             shallow: shallow.extend(0.0).to_array(),
         };
 
-        image_barrier(
-            device, cb, depth.0, vk::ImageAspectFlags::DEPTH,
+        image_barrier_layers(
+            device, cb, depth.0, vk::ImageAspectFlags::DEPTH, layer, 1,
             vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
             vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
         );
-        image_barrier(
-            device, cb, hdr.0, vk::ImageAspectFlags::COLOR,
+        image_barrier_layers(
+            device, cb, hdr.0, vk::ImageAspectFlags::COLOR, layer, 1,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
@@ -291,8 +294,8 @@ impl UnderwaterPass {
             }
             device.cmd_end_rendering(cb);
         }
-        image_barrier(
-            device, cb, depth.0, vk::ImageAspectFlags::DEPTH,
+        image_barrier_layers(
+            device, cb, depth.0, vk::ImageAspectFlags::DEPTH, layer, 1,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
             vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_SAMPLED_READ,
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,

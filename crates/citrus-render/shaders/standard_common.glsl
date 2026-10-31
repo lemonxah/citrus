@@ -73,7 +73,25 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 refl_blend;    // x = slot 0 blend distance, y = slot 1 blend distance, z = slot on top where boxes overlap
     vec4 water;         // x = water clock, y = opaque copy valid (bindings 5/6), z = body count
     GpuWater water_bodies[MAX_WATER_BODIES];
+#ifdef MULTIVIEW
+    // Multiview pass (both XR eyes at once): per-eye cameras by gl_ViewIndex.
+    // The camera fields above hold a view enclosing both eyes.
+    mat4 eye_view[2];
+    mat4 eye_view_proj[2];
+    vec4 eye_camera_pos[2];
+#endif
 } frame;
+
+// The camera this invocation renders for (an eye under multiview).
+#ifdef MULTIVIEW
+#define CAMERA_POS frame.eye_camera_pos[gl_ViewIndex]
+#define VIEW_MATRIX frame.eye_view[gl_ViewIndex]
+#define VIEW_PROJ frame.eye_view_proj[gl_ViewIndex]
+#else
+#define CAMERA_POS frame.camera_pos
+#define VIEW_MATRIX frame.view
+#define VIEW_PROJ frame.view_proj
+#endif
 
 // Extended per-material params (beyond the 128-byte push block).
 layout(set = 1, binding = 4) uniform MaterialFx {

@@ -54,6 +54,8 @@ ufbx = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tga", "bmp", "exr", "hdr", "gif", "webp"] }
 half = "2"
 intel_tex_2 = "0.4"
+# CPU BC6H decode: fallback for GPUs without textureCompressionBC.
+bcdec_rs = "0.2"
 
 openxr = "0.21"
 libloading = "0.8"
@@ -65,6 +67,15 @@ rodio = "0.19"
 # the official SDK (libphonon) at build time.
 audionimbus = { version = "0.16", default-features = false, features = ["auto-install"] }
 libc = "0.2"
+# Network session encryption (ChaCha20-Poly1305 AEAD, HKDF-SHA256 key derivation).
+chacha20poly1305 = { version = "0.10", default-features = false }
+hkdf = "0.12"
+sha2 = { version = "0.10", default-features = false }
+# Passphrase stretching (Argon2id), relay / cookie MACs (HMAC-SHA256) and
+# player / room identities (Ed25519 signatures).
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+hmac = "0.12"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 
 # internal crates
 citrus-engine = { path = "crates/citrus-engine" }
@@ -72,6 +83,7 @@ citrus-render = { path = "crates/citrus-render" }
 citrus-assets = { path = "crates/citrus-assets" }
 citrus-editor = { path = "crates/citrus-editor" }
 citrus-xr = { path = "crates/citrus-xr" }
+citrus-relay = { path = "crates/citrus-relay" }
 
 [profile.dev]
 # Vulkan bootstrap is slow in pure debug; optimize deps but keep our code debuggable.

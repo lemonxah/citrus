@@ -47,6 +47,8 @@ pub enum SpawnKind {
     Bucket,
     Waterfall,
     Whirlpool,
+    /// Wind for water waves, cloth and steam.
+    WindZone,
     Cube,
     Sphere,
     Capsule,
@@ -119,6 +121,7 @@ impl SpawnKind {
             Self::Bucket => "Bucket",
             Self::Waterfall => "Waterfall",
             Self::Whirlpool => "Whirlpool",
+            Self::WindZone => "Wind Zone",
             Self::Cube => "Cube",
             Self::Sphere => "Sphere",
             Self::Capsule => "Capsule",
@@ -240,6 +243,12 @@ fn spawn_menu(ui: &mut Ui, response: &mut ScenePanelResponse) {
         response.spawn = Some(SpawnKind::AudioSource);
         ui.close();
     }
+    ui.menu_button("Physics", |ui| {
+        if ui.button(SpawnKind::WindZone.label()).clicked() {
+            response.spawn = Some(SpawnKind::WindZone);
+            ui.close();
+        }
+    });
     ui.menu_button("Collider", |ui| {
         if ui.button("Box Collider").clicked() {
             response.spawn = Some(SpawnKind::BoxCollider);

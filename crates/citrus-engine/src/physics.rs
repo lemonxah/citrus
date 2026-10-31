@@ -307,6 +307,9 @@ pub struct PhysicsWorld {
     root: Option<PathBuf>,
     default_material: String,
     materials: HashMap<String, Option<PhysicsMaterial>>,
+    /// Colliders whose static friction differs from their sliding friction:
+    /// (static coefficient, its combine rule), applied by `FrictionHooks`.
+    static_friction: HashMap<ColliderHandle, (f32, CoefficientCombineRule)>,
 }
 
 fn rv(v: Vec3) -> Vector {
@@ -374,6 +377,7 @@ impl PhysicsWorld {
             root: root.map(Path::to_owned),
             default_material: settings.default_material.clone(),
             materials: HashMap::new(),
+            static_friction: HashMap::new(),
         };
         world.sync_structure(scene);
         world
@@ -416,6 +420,8 @@ impl PhysicsWorld {
                 );
             }
         }
+        let colliders = &self.colliders;
+        self.static_friction.retain(|h, _| colliders.contains(*h));
         for (&id, &i) in &wanted {
             if !self.bodies.contains_key(&id) {
                 self.add_body(scene, i, world[i]);
@@ -610,6 +616,7 @@ impl PhysicsWorld {
                 .active_events(ActiveEvents::COLLISION_EVENTS)
                 .user_data(id.raw());
             let b = if auto_mass { b.density(mat.map_or(DEFAULT_DENSITY, |m| m.density).max(1e-3)) } else { b };
+            let b = if (m.static_mu() - m.friction.max(0.0)).abs() > 1e-4 { b.active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS) } else { b };
             if trigger {
                 b.sensor(true).active_collision_types(ActiveCollisionTypes::all())
             } else {
@@ -652,6 +659,10 @@ impl PhysicsWorld {
                     &mut self.rigid_bodies,
                 );
                 self.collider_owner.insert(h, id);
+                let m = mat.or(legacy).unwrap_or_default();
+                if (m.static_mu() - m.friction.max(0.0)).abs() > 1e-4 {
+                    self.static_friction.insert(h, (m.static_mu(), combine_rule(m.friction_combine)));
+                }
             }
         }
         self.bodies.insert(
@@ -720,7 +731,7 @@ impl PhysicsWorld {
             &mut self.impulse_joints,
             &mut self.multibody_joints,
             &mut self.ccd,
-            &(),
+            &FrictionHooks { statics: &self.static_friction },
             &self.collector,
         );
         for body in self.bodies.values_mut() {
@@ -1244,8 +1255,34 @@ impl PhysicsWorld {
         }
     }
 
+    /// Put a character controller's body where its object is now (a
+    /// prediction rewind) without sweeping it there, with its ground contact.
+    pub fn place_character(&mut self, scene: &LoadedScene, index: usize, grounded: bool) {
+        let object = &scene.objects[index];
+        let Some(body) = self.bodies.get_mut(&object.id) else {
+            return;
+        };
+        let (_, r, t) = scene.world_transform(index).to_scale_rotation_translation();
+        if let Some(rb) = self.rigid_bodies.get_mut(body.handle) {
+            rb.set_position(pose(t, r), true);
+            rb.set_next_kinematic_position(pose(t, r));
+        }
+        body.prev = (t, r);
+        body.curr = (t, r);
+        body.written = (object.translation, object.rotation);
+        body.grounded = grounded;
+    }
+
     /// Move a character controller by `delta` (world space), resolving
     /// collisions now, and write the result into the scene.
+    ///
+    /// The sweep starts from the body's current pose (the collider's own
+    /// world pose only catches up on a physics step), so several moves
+    /// between steps chain. The controller keeps a skin off what it touches
+    /// but never recovers once inside it, so a capsule that starts there
+    /// (spawned with its feet exactly on the floor, grown back from a
+    /// crouch, rewound) is lifted clear first, and one a sweep left inside
+    /// something is pushed out at once.
     pub fn move_character(&mut self, scene: &mut LoadedScene, index: usize, delta: Vec3) {
         let id = scene.objects[index].id;
         let Some(body) = self.bodies.get_mut(&id) else {
@@ -1272,7 +1309,8 @@ impl PhysicsWorld {
         let Some(col) = self.colliders.get(capsule) else {
             return;
         };
-        let shape_pos = *col.position();
+        let body_pose = *rb.position();
+        let rel = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
         let filter = QueryFilter::default()
             .exclude_rigid_body(body.handle)
             .exclude_sensors();
@@ -1282,10 +1320,25 @@ impl PhysicsWorld {
             &self.colliders,
             filter,
         );
-        let movement = controller.move_shape(FIXED_DT, &qp, col.shape(), &shape_pos, rv(delta), |_| {});
-        let new_t = gv(rb.translation()) + gv(movement.translation);
-        let rot = gq(rb.rotation());
-        body.grounded = movement.grounded;
+        let skin = match controller.offset {
+            CharacterLength::Absolute(d) => d,
+            CharacterLength::Relative(f) => f * col.shape().compute_local_aabb().extents().y,
+        };
+        let shape_pos = body_pose * rel;
+        // Sweep from a clear start: lifted off the ground it stands on (or is
+        // inside of after a spawn, crouch or rewind), aiming back down at the
+        // same target. A sweep that starts right at the skin gets unreliable
+        // contact normals (a sideways one off the floor stops the character,
+        // a missed one lets it sink).
+        let backoff = clearance(&qp, col.shape(), &shape_pos, skin * 1.5, skin * 2.0, true);
+        let start = Pose::from_translation(rv(backoff)) * shape_pos;
+        let movement = controller.move_shape(FIXED_DT, &qp, col.shape(), &start, rv(delta - backoff), |_| {});
+        // Still inside something (a sweep that missed): out now, not a frame later.
+        let moved = Pose::from_translation(movement.translation) * start;
+        let after = clearance(&qp, col.shape(), &moved, skin * 0.5, skin, false);
+        let new_t = gv(body_pose.translation) + backoff + gv(movement.translation) + after;
+        let rot = gq(&body_pose.rotation);
+        body.grounded = movement.grounded || after.y > after.length() * 0.7;
         if let Some(rb) = self.rigid_bodies.get_mut(body.handle) {
             rb.set_position(pose(new_t, rot), true);
             rb.set_next_kinematic_position(pose(new_t, rot));
@@ -1302,6 +1355,36 @@ impl PhysicsWorld {
         }
         f
     }
+}
+
+/// How far to move a character's shape at `pos` so nothing nearer than
+/// `within` stays nearer than `to`: out of the deepest contact, a few times
+/// over so corners settle. `ground_only` lifts it straight up off what is
+/// under it and ignores walls.
+fn clearance(qp: &QueryPipeline, shape: &dyn Shape, pos: &Pose, within: f32, to: f32, ground_only: bool) -> Vec3 {
+    let mut push = Vec3::ZERO;
+    for _ in 0..4 {
+        let at = Pose::from_translation(rv(push)) * *pos;
+        let aabb = shape.compute_aabb(&at).loosened(within);
+        let mut deepest: Option<(f32, Vec3)> = None;
+        for (_, other) in qp.intersect_aabb_conservative(aabb) {
+            let Ok(Some(c)) = rapier3d::parry::query::contact(&at, shape, other.position(), other.shape(), within) else {
+                continue;
+            };
+            let out = -gv(c.normal1);
+            if ground_only && out.y < 0.7 {
+                continue;
+            }
+            if c.dist < within && deepest.is_none_or(|(d, _)| c.dist < d) {
+                deepest = Some((c.dist, if ground_only { Vec3::Y / out.y.max(0.7) } else { out }));
+            }
+        }
+        let Some((dist, out)) = deepest else {
+            break;
+        };
+        push += out * (to - dist);
+    }
+    push
 }
 
 /// A character controller's capsule (scaled by the object's world scale)
@@ -1398,6 +1481,54 @@ fn is_physics_object(scene: &LoadedScene, i: usize) -> bool {
 /// Rapier collider shapes (with object-space offsets baked in) for every
 /// collider component on object `i`, scaled by its world scale. Returns
 /// `(builder, is_trigger)`.
+/// Relative sliding speed (m/s) at a contact below which it holds by static
+/// friction.
+const STATIC_SPEED: f32 = 0.05;
+
+/// Static friction: contacts barely sliding take the colliders' static
+/// coefficient (combined like the sliding one), so it takes more to start
+/// something moving than to keep it going.
+struct FrictionHooks<'a> {
+    statics: &'a HashMap<ColliderHandle, (f32, CoefficientCombineRule)>,
+}
+
+impl PhysicsHooks for FrictionHooks<'_> {
+    fn modify_solver_contacts(&self, context: &mut ContactModificationContext) {
+        let side = |h: ColliderHandle| {
+            self.statics.get(&h).copied().or_else(|| context.colliders.get(h).map(|c| (c.friction(), c.friction_combine_rule())))
+        };
+        let (Some((a, ra)), Some((b, rb))) = (side(context.collider1), side(context.collider2)) else { return };
+        let mu = combine_coefficients(a, ra, b, rb);
+        let body = |h: Option<RigidBodyHandle>| h.and_then(|h| context.bodies.get(h));
+        let (b1, b2) = (body(context.rigid_body1), body(context.rigid_body2));
+        let n = gv(*context.normal);
+        for c in context.solver_contacts.iter_mut() {
+            let v = |b: Option<&RigidBody>| b.map_or(Vec3::ZERO, |b| gv(b.velocity_at_point(c.point)));
+            let rel = v(b1) - v(b2);
+            if (rel - n * rel.dot(n)).length() < STATIC_SPEED {
+                c.friction = mu;
+            }
+        }
+    }
+}
+
+/// Two coefficients combined the way rapier does: the higher-priority rule
+/// of the two (Average < Min < Multiply < Max).
+fn combine_coefficients(a: f32, ra: CoefficientCombineRule, b: f32, rb: CoefficientCombineRule) -> f32 {
+    let rank = |r: CoefficientCombineRule| match r {
+        CoefficientCombineRule::Average => 0,
+        CoefficientCombineRule::Min => 1,
+        CoefficientCombineRule::Multiply => 2,
+        _ => 3,
+    };
+    match if rank(ra) >= rank(rb) { ra } else { rb } {
+        CoefficientCombineRule::Average => (a + b) * 0.5,
+        CoefficientCombineRule::Min => a.min(b),
+        CoefficientCombineRule::Multiply => a * b,
+        _ => a.max(b),
+    }
+}
+
 fn combine_rule(mode: CombineMode) -> CoefficientCombineRule {
     match mode {
         CombineMode::Average => CoefficientCombineRule::Average,
@@ -1470,6 +1601,17 @@ pub(crate) fn solid_contains(c: &Collider, p: Vec3) -> bool {
     c.shape().contains_point(c.position(), rv(p))
 }
 
+/// How far down from world point `from` the top of `c` is, within `max`.
+pub(crate) fn solid_below(c: &Collider, from: Vec3, max: f32) -> Option<f32> {
+    solid_along(c, from, -Vec3::Y, max)
+}
+
+/// How far along unit `dir` from world point `from` `c` is, within `max`.
+pub(crate) fn solid_along(c: &Collider, from: Vec3, dir: Vec3, max: f32) -> Option<f32> {
+    let ray = Ray::new(rv(from), rv(dir));
+    c.shape().cast_ray(c.position(), &ray, max, true)
+}
+
 /// Each collider component's shape, trigger flag and material path.
 fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -> Vec<(ColliderBuilder, bool, &str)> {
     let obj = &scene.objects[i];
@@ -1501,7 +1643,7 @@ fn collider_shapes(scene: &LoadedScene, i: usize, scale: Vec3, kind: BodyKind) -
             };
             out.push((shape.translation(rv(off)), c.is_trigger, c.material.as_str()));
         } else if let Some(m) = any.downcast_ref::<MeshCollider>()
-            && let Some(shape) = mesh_shape(scene, i, scale, MeshShapeMode::of(m, kind != BodyKind::Fixed))
+            && let Some(shape) = mesh_shape(scene, i, scale, mesh_shape_mode(scene, i, m, kind != BodyKind::Fixed))
         {
             out.push((shape, m.is_trigger, m.material.as_str()));
         }
@@ -1520,6 +1662,8 @@ pub enum MeshColliderShape {
     Hulls(Vec<(Vec<Vec3>, Vec<[u32; 3]>)>),
     /// A mesh that is a ball: an exact sphere (centre, radius).
     Ball(Vec3, f32),
+    /// Collision pieces modelled with the mesh (`UCX_` etc.).
+    Authored(Vec<crate::authored_collision::ColliderPiece>),
 }
 
 /// Whether object `i`'s meshes form a ball (see [`ball_of`]).
@@ -1556,6 +1700,8 @@ pub enum MeshShapeMode {
     Hull(citrus_core::ColliderDetail),
     /// Simplified convex pieces that follow a concave shape.
     Pieces(citrus_core::ColliderDetail),
+    /// The object's authored collision pieces (static or moving).
+    Authored,
 }
 
 impl MeshShapeMode {
@@ -1570,6 +1716,16 @@ impl MeshShapeMode {
     }
 }
 
+/// How object `i`'s Mesh Collider `m` builds its shape: from its authored
+/// collision pieces when it has some and uses them, else by [`MeshShapeMode::of`].
+pub fn mesh_shape_mode(scene: &LoadedScene, i: usize, m: &MeshCollider, moving: bool) -> MeshShapeMode {
+    if m.use_authored && crate::authored_collision::authored_set(scene, i).is_some() {
+        MeshShapeMode::Authored
+    } else {
+        MeshShapeMode::of(m, moving)
+    }
+}
+
 /// Corner budget of a whole-mesh hull, and the pieces' count, corners and
 /// voxel resolution, per detail level.
 fn budgets(detail: citrus_core::ColliderDetail) -> (usize, u32, usize, u32) {
@@ -1581,19 +1737,38 @@ fn budgets(detail: citrus_core::ColliderDetail) -> (usize, u32, usize, u32) {
 }
 
 /// Key for [`LoadedScene::collider_shapes`]: the object's meshes and how
-/// they're turned into a collider.
+/// they're turned into a collider (for `Authored`, its piece set instead).
 pub type ColliderShapeKey = (Vec<usize>, MeshShapeMode);
+
+fn shape_key(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> ColliderShapeKey {
+    let ids = match mode {
+        MeshShapeMode::Authored => crate::authored_collision::authored_set(scene, i).into_iter().collect(),
+        _ => scene.objects[i].render_slots().map(|r| r.mesh).collect(),
+    };
+    (ids, mode)
+}
+
+/// Object `i`'s authored pieces fitted to their primitives.
+fn authored_shape(scene: &LoadedScene, i: usize) -> Option<MeshColliderShape> {
+    let pieces = crate::authored_collision::authored_pieces(scene, i)?;
+    let fitted: Vec<_> = pieces.iter().filter_map(crate::authored_collision::fit_piece).collect();
+    (!fitted.is_empty()).then_some(MeshColliderShape::Authored(fitted))
+}
 
 /// The collision shape object `i`'s Mesh Collider builds from its render
 /// meshes in `mode`. Cached on the scene (decomposing a big mesh is slow).
 /// None when there's no CPU geometry.
 pub fn mesh_collider_shape(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> Option<std::sync::Arc<MeshColliderShape>> {
-    let obj = &scene.objects[i];
-    let meshes: Vec<usize> = obj.render_slots().map(|r| r.mesh).collect();
-    let key: ColliderShapeKey = (meshes.clone(), mode);
+    let key = shape_key(scene, i, mode);
     if let Some(s) = scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Some(s.clone());
     }
+    if mode == MeshShapeMode::Authored {
+        let shape = std::sync::Arc::new(authored_shape(scene, i)?);
+        scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).insert(key, shape.clone());
+        return Some(shape);
+    }
+    let meshes = key.0.clone();
     let mut verts: Vec<Vec3> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     for m in meshes {
@@ -1622,6 +1797,7 @@ pub fn mesh_collider_shape(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -
             MeshColliderShape::Hulls(if parts.is_empty() { vec![hull] } else { parts })
         }
         MeshShapeMode::Exact => MeshColliderShape::Triangles(verts, tris),
+        MeshShapeMode::Authored => return None,
     };
     let shape = std::sync::Arc::new(shape);
     scene.collider_shapes.lock().unwrap_or_else(|e| e.into_inner()).insert(key, shape.clone());
@@ -1632,7 +1808,7 @@ pub fn mesh_collider_shape(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -
 /// Convex hull of `points` kept to at most `max_points` corners (spread
 /// evenly over the full hull); None for degenerate input (flat or too few
 /// points), which the hull builder can't take.
-fn hull_of(points: &[Vec3], max_points: usize) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+pub(crate) fn hull_of(points: &[Vec3], max_points: usize) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
     let build = |pts: &[Vec3]| -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
         let pts: Vec<Vector> = pts.iter().map(|p| rv(*p)).collect();
         let (p, t) = std::panic::catch_unwind(|| rapier3d::parry::transformation::convex_hull(&pts)).ok()?;
@@ -1658,7 +1834,7 @@ fn hull_of(points: &[Vec3], max_points: usize) -> Option<(Vec<Vec3>, Vec<[u32; 3
 }
 
 /// Enclosed volume of a closed triangle mesh (0-ish for open ones).
-fn mesh_volume(p: &[Vec3], t: &[[u32; 3]]) -> f32 {
+pub(crate) fn mesh_volume(p: &[Vec3], t: &[[u32; 3]]) -> f32 {
     t.iter().map(|t| p[t[0] as usize].dot(p[t[1] as usize].cross(p[t[2] as usize]))).sum::<f32>().abs() / 6.0
 }
 
@@ -1682,8 +1858,7 @@ fn convex_pieces(points: &[Vec3], tris: &[[u32; 3]], detail: citrus_core::Collid
 
 /// Object `i`'s Mesh Collider as wire edges (local space), cached.
 pub fn mesh_collider_wire_for(scene: &LoadedScene, i: usize, mode: MeshShapeMode) -> Option<std::sync::Arc<Vec<(Vec3, Vec3)>>> {
-    let meshes: Vec<usize> = scene.objects[i].render_slots().map(|r| r.mesh).collect();
-    let key: ColliderShapeKey = (meshes, mode);
+    let key = shape_key(scene, i, mode);
     if let Some(w) = scene.collider_wires.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Some(w.clone());
     }
@@ -1700,7 +1875,7 @@ pub fn mesh_collider_wire(shape: &MeshColliderShape) -> Vec<(Vec3, Vec3)> {
     // cos of the smallest fold that counts as an edge (~15 degrees).
     const FOLD: f32 = 0.966;
     let mut out = Vec::new();
-    let mut add = |pts: &[Vec3], tris: &[[u32; 3]]| {
+    let add = |out: &mut Vec<(Vec3, Vec3)>, pts: &[Vec3], tris: &[[u32; 3]]| {
         let normal = |t: &[u32; 3]| (pts[t[1] as usize] - pts[t[0] as usize]).cross(pts[t[2] as usize] - pts[t[0] as usize]).normalize_or_zero();
         let mut faces: HashMap<(u32, u32), Vec<Vec3>> = HashMap::new();
         for t in tris {
@@ -1717,23 +1892,54 @@ pub fn mesh_collider_wire(shape: &MeshColliderShape) -> Vec<(Vec3, Vec3)> {
         }
     };
     match shape {
-        MeshColliderShape::Triangles(p, t) => add(p, t),
+        MeshColliderShape::Triangles(p, t) => add(&mut out, p, t),
         MeshColliderShape::Hulls(parts) => {
             for (p, t) in parts {
-                add(p, t);
+                add(&mut out, p, t);
             }
         }
-        MeshColliderShape::Ball(c, r) => {
-            // Three great circles.
-            for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X)] {
-                for k in 0..48 {
-                    let (t0, t1) = (k as f32 / 48.0 * std::f32::consts::TAU, (k + 1) as f32 / 48.0 * std::f32::consts::TAU);
-                    out.push((*c + (a * t0.cos() + b * t0.sin()) * *r, *c + (a * t1.cos() + b * t1.sin()) * *r));
+        MeshColliderShape::Authored(pieces) => {
+            for piece in pieces {
+                match piece {
+                    crate::authored_collision::ColliderPiece::Hull(p, t) => add(&mut out, p, t),
+                    _ => crate::authored_collision::primitive_wire(piece, &mut out),
                 }
             }
         }
+        // Three great circles.
+        MeshColliderShape::Ball(c, r) => crate::authored_collision::primitive_wire(&crate::authored_collision::ColliderPiece::Ball(*c, *r), &mut out),
     }
     out
+}
+
+/// One authored piece as a rapier shape placed in its object, scaled by the
+/// object's world `scale`. Boxes and capsules keep their exact primitive under
+/// uniform scale; a non-uniformly scaled box becomes the hull of its corners.
+fn authored_piece_shape(piece: &crate::authored_collision::ColliderPiece, scale: Vec3) -> Option<(Pose, SharedShape)> {
+    use crate::authored_collision::ColliderPiece;
+    let uniform = scale.max_element() - scale.min_element() <= 1e-4 * scale.max_element().abs();
+    let s = scale.max_element().max(1e-6);
+    match piece {
+        ColliderPiece::Hull(p, _) => {
+            let pts: Vec<Vector> = p.iter().map(|v| rv(*v * scale)).collect();
+            SharedShape::convex_hull(&pts).map(|shape| (Pose::IDENTITY, shape))
+        }
+        ColliderPiece::Cuboid { center, rotation, half } if uniform => {
+            let h = (*half * s).max(Vec3::splat(1e-3));
+            Some((pose(*center * s, *rotation), SharedShape::cuboid(h.x, h.y, h.z)))
+        }
+        ColliderPiece::Cuboid { center, rotation, half } => {
+            let pts: Vec<Vector> = (0..8)
+                .map(|k| {
+                    let c = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
+                    rv((*center + *rotation * (c * *half)) * scale)
+                })
+                .collect();
+            SharedShape::convex_hull(&pts).map(|shape| (Pose::IDENTITY, shape))
+        }
+        ColliderPiece::Ball(c, r) => Some((pose(*c * scale, Quat::IDENTITY), SharedShape::ball((*r * s).max(1e-3)))),
+        ColliderPiece::Capsule(a, b, r) => Some((Pose::IDENTITY, SharedShape::capsule(rv(*a * scale), rv(*b * scale), (*r * s).max(1e-3)))),
+    }
 }
 
 /// Collider from the object's render meshes (see [`mesh_collider_shape`]),
@@ -1754,6 +1960,17 @@ fn mesh_shape(scene: &LoadedScene, i: usize, scale: Vec3, mode: MeshShapeMode) -
                 match pieces.len() {
                     0 => None,
                     1 => Some(ColliderBuilder::new(pieces.into_iter().next().unwrap().1)),
+                    _ => Some(ColliderBuilder::compound(pieces)),
+                }
+            }
+            MeshColliderShape::Authored(parts) => {
+                let mut pieces: Vec<(Pose, SharedShape)> = parts.iter().filter_map(|p| authored_piece_shape(p, scale)).collect();
+                match pieces.len() {
+                    0 => None,
+                    1 => {
+                        let (at, shape) = pieces.remove(0);
+                        Some(ColliderBuilder::new(shape).position(at))
+                    }
                     _ => Some(ColliderBuilder::compound(pieces)),
                 }
             }
@@ -1788,6 +2005,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: pos,
@@ -1862,6 +2080,42 @@ mod tests {
             citrus_core::save_physmat(dir.join(file), m).unwrap();
         }
         dir
+    }
+
+    /// How far (m) a box set on a 26 degree slope slides in two seconds,
+    /// both slope and box of material `m`.
+    fn slide_on_slope(name: &str, m: PhysicsMaterial) -> f32 {
+        let dir = material_dir(name, &[("m.physmat", m)]);
+        let mut scene = LoadedScene::empty();
+        let tilt = glam::Quat::from_rotation_z(26f32.to_radians());
+        let slope = obj(&mut scene, Vec3::ZERO, vec![Box::new(BoxCollider { size: [20.0, 1.0, 4.0], material: "m.physmat".into(), ..Default::default() })]);
+        let si = scene.index_of(slope).unwrap();
+        scene.objects[si].rotation = tilt;
+        let at = tilt * Vec3::new(0.0, 0.5 + 0.25, 0.0);
+        let block = obj(
+            &mut scene,
+            at,
+            vec![
+                Box::new(BoxCollider { size: [0.5, 0.5, 0.5], ..Default::default() }),
+                Box::new(RbComponent { mass: 2.0, material: "m.physmat".into(), ..Default::default() }),
+            ],
+        );
+        let bi = scene.index_of(block).unwrap();
+        scene.objects[bi].rotation = tilt;
+        let mut pw = PhysicsWorld::build_with(&scene, Some(&dir), &PhysicsSettings::default());
+        run(&mut pw, &mut scene, 120);
+        (scene.world_transform(bi).w_axis.truncate() - at).length()
+    }
+
+    #[test]
+    fn static_friction_holds_what_sliding_friction_would_let_go() {
+        // tan 26 = 0.49: more than 0.4 sliding friction, less than 0.6 static.
+        let sliding = PhysicsMaterial { friction: 0.4, static_friction: None, ..Default::default() };
+        let holding = PhysicsMaterial { static_friction: Some(0.6), ..sliding };
+        let slid = slide_on_slope("slides", sliding);
+        let held = slide_on_slope("holds", holding);
+        assert!(slid > 0.5, "0.4 alone lets it slide: {slid}");
+        assert!(held < 0.05, "0.6 static holds it: {held}");
     }
 
     fn peak_after_bounce(material: &str, dir: &Path) -> f32 {
@@ -1993,6 +2247,73 @@ mod tests {
         assert!(c.distance(Vec3::X) < 0.02 && (r - 0.5).abs() < 0.01);
         let (v, _) = box_mesh(Vec3::ZERO, Vec3::ONE, 0);
         assert!(ball_of(&v).is_none());
+    }
+
+    /// A loaded "couch" model (one render mesh) with three authored pieces
+    /// on it and one unmatched piece on the model root; returns the couch's
+    /// and the root's object index.
+    fn authored_couch(scene: &mut LoadedScene, components: Vec<Box<dyn Component>>) -> (usize, usize) {
+        use citrus_assets::{CollisionKind, CollisionPiece, Instance};
+        let (seat, _) = box_mesh(Vec3::new(-1.0, 0.0, -0.5), Vec3::new(1.0, 0.5, 0.5), 0);
+        let (back, _) = box_mesh(Vec3::new(-1.0, 0.5, 0.3), Vec3::new(1.0, 1.2, 0.5), 0);
+        let ball: Vec<Vec3> = (0..64).map(|k| Vec3::new(1.2, 0.8, 0.0) + Vec3::new((k as f32).cos(), (k as f32 * 0.7).sin(), (k as f32 * 1.3).sin()).normalize() * 0.2).collect();
+        let piece = |name: &str, kind, target, points: Vec<Vec3>| CollisionPiece { name: name.into(), kind, target, points };
+        let model = citrus_assets::Scene {
+            meshes: Vec::new(),
+            morphs: Vec::new(),
+            springs: Default::default(),
+            textures: Vec::new(),
+            materials: Vec::new(),
+            instances: vec![Instance::single("Couch", 0, 0, Mat4::IDENTITY)],
+            skeletons: Vec::new(),
+            animations: Vec::new(),
+            collision: vec![
+                piece("UCX_Couch_00", CollisionKind::Convex, Some(0), seat),
+                piece("UBX_Couch_01", CollisionKind::Box, Some(0), back),
+                piece("USP_Couch_02", CollisionKind::Sphere, Some(0), ball),
+                piece("UBX_Floor", CollisionKind::Box, None, box_mesh(Vec3::splat(-2.0), Vec3::new(2.0, -1.9, 2.0), 0).0),
+            ],
+        };
+        scene.authored_collision.register(&model, 0, Some("models/couch.glb"));
+        obj(scene, Vec3::ZERO, Vec::new());
+        let root = scene.objects.len() - 1;
+        obj(scene, Vec3::new(0.0, 3.0, 0.0), components);
+        let couch = scene.objects.len() - 1;
+        let o = &mut scene.objects[couch];
+        o.parent = Some(root);
+        o.render = Some(crate::scene::RenderInfo { mesh: 0, material: 0 });
+        o.source = ObjectSource::Model { path: "models/couch.glb".into(), mesh: 0, extra_meshes: Vec::new() };
+        (couch, root)
+    }
+
+    #[test]
+    fn authored_pieces_become_the_mesh_collider_compound() {
+        let mut scene = LoadedScene::empty();
+        let (couch, root) = authored_couch(&mut scene, vec![Box::new(MeshCollider::default()), Box::new(RbComponent::default())]);
+        let mc = MeshCollider { convex: true, ..Default::default() };
+        assert_eq!(mesh_shape_mode(&scene, couch, &mc, true), MeshShapeMode::Authored);
+        assert_eq!(mesh_shape_mode(&scene, couch, &MeshCollider { use_authored: false, ..mc }, true), MeshShapeMode::Hull(mc.detail));
+        let shape = mesh_collider_shape(&scene, couch, MeshShapeMode::Authored).expect("authored shape");
+        let MeshColliderShape::Authored(pieces) = &*shape else { panic!("not authored: {shape:?}") };
+        use crate::authored_collision::ColliderPiece;
+        assert!(matches!(pieces[..], [ColliderPiece::Hull(..), ColliderPiece::Cuboid { .. }, ColliderPiece::Ball(..)]), "{pieces:?}");
+        assert!(!mesh_collider_wire_for(&scene, couch, MeshShapeMode::Authored).unwrap().is_empty());
+
+        let shapes = collider_shapes(&scene, couch, Vec3::splat(2.0), BodyKind::Dynamic);
+        assert_eq!(shapes.len(), 1);
+        let built = shapes.into_iter().next().unwrap().0.build();
+        assert_eq!(built.shape().as_compound().map(|c| c.shapes().len()), Some(3));
+
+        // The model root owns the piece that matched no mesh.
+        assert_eq!(crate::authored_collision::authored_pieces(&scene, root).map(|p| p.len()), Some(1));
+        assert!(matches!(&*mesh_collider_shape(&scene, root, MeshShapeMode::Authored).unwrap(), MeshColliderShape::Authored(p) if p.len() == 1));
+
+        // The body's volume (what buoyancy uses) is the pieces' total.
+        let mut pw = PhysicsWorld::build(&scene);
+        run(&mut pw, &mut scene, 1);
+        let (_, volume) = pw.mass_and_volume(scene.objects[couch].id).unwrap();
+        let expected = 1.0 + 2.0 * 0.7 * 0.2 + 4.0 / 3.0 * std::f32::consts::PI * 0.2f32.powi(3);
+        assert!((volume - expected).abs() < 0.02 * expected, "{volume} vs {expected}");
     }
 
     #[test]
@@ -2130,6 +2451,64 @@ mod tests {
         };
         assert!(cell_at(3.0) && !cell_at(-2.0) && !cell_at(0.0), "the post blocks, the floating crate does not");
         assert!(w.ripples.as_ref().unwrap().gpu, "still owned by the GPU simulation");
+    }
+
+    #[test]
+    fn a_water_fits_the_basin_around_it() {
+        let mut scene = LoadedScene::empty();
+        let water = obj(&mut scene, Vec3::ZERO, vec![Box::new(citrus_core::Water { body: citrus_core::WaterBody::Pool, waves: Vec::new(), ..Default::default() })]);
+        // A 4 x 4 m pool, 1 m deep: four walls through the surface, a floor.
+        for (at, size) in [
+            (Vec3::new(2.25, 0.0, 0.0), [0.5, 3.0, 5.0]),
+            (Vec3::new(-2.25, 0.0, 0.0), [0.5, 3.0, 5.0]),
+            (Vec3::new(0.0, 0.0, 2.25), [5.0, 3.0, 0.5]),
+            (Vec3::new(0.0, 0.0, -2.25), [5.0, 3.0, 0.5]),
+            (Vec3::new(0.0, -1.25, 0.0), [5.0, 0.5, 5.0]),
+        ] {
+            obj(&mut scene, at, vec![Box::new(BoxCollider { size, ..Default::default() })]);
+        }
+        let world = scene.world_transforms();
+        let wi = scene.index_of(water).unwrap();
+        let (outline, depth) = crate::water_walls::fit_basin(&scene, wi, &world).expect("walls around it");
+        assert!((depth.unwrap() - 1.0).abs() < 0.02, "the floor 1 m down: {depth:?}");
+        assert!(outline.len() >= 4 && outline.len() <= 16, "a square needs few points: {}", outline.len());
+        for p in &outline {
+            let m = p[0].abs().max(p[1].abs());
+            assert!((m - 2.0).abs() < 0.03, "on the walls' inner faces: {p:?}");
+        }
+    }
+
+    #[test]
+    fn the_floor_under_the_water_sets_its_depth_and_dry_ground_is_shore() {
+        let mut scene = LoadedScene::empty();
+        let water = gpu_water(&mut scene);
+        // A shelf whose top is 0.4 m under the surface, a beach 0.2 m above
+        // it and a bank 1 m above it.
+        obj(&mut scene, Vec3::new(-3.0, -1.4, 0.0), vec![Box::new(BoxCollider { size: [2.0, 2.0, 2.0], ..Default::default() })]);
+        obj(&mut scene, Vec3::new(3.0, -0.8, 0.0), vec![Box::new(BoxCollider { size: [2.0, 2.0, 2.0], ..Default::default() })]);
+        obj(&mut scene, Vec3::new(6.0, 0.0, 0.0), vec![Box::new(BoxCollider { size: [2.0, 2.0, 2.0], ..Default::default() })]);
+        let w = water_mut(&mut scene, water);
+        w.sim_feed.window = Some(citrus_core::choose_window(w, glam::Vec2::ZERO, None));
+        let world = scene.world_transforms();
+        crate::water_walls::WaterWalls::default().update(&mut scene, &world);
+        let w = water_mut(&mut scene, water);
+        let window = w.sim_feed.window.unwrap();
+        let (_, bed) = w.sim_feed.bed.clone().expect("floor depths");
+        let at = |x: f32| {
+            let c = ((glam::Vec2::new(x, 0.0) - window.lo()) / window.cell).floor();
+            bed[c.y as usize * window.n as usize + c.x as usize]
+        };
+        assert!((at(-3.0) - 0.4).abs() < 0.02, "the shelf: {}", at(-3.0));
+        assert!(at(3.0) < 0.0, "the beach stands out of the water: {}", at(3.0));
+        assert!(at(0.0).is_nan(), "open water keeps its own depth");
+        let field = citrus_core::SimField::build_with_bed(w, window, None, Some(&bed));
+        let cell = |x: f32| {
+            let c = ((glam::Vec2::new(x, 0.0) - window.lo()) / window.cell).floor();
+            field.cells[c.y as usize * window.n as usize + c.x as usize]
+        };
+        assert!((cell(-3.0)[0] - 0.4).abs() < 0.02 && cell(-3.0)[3] == citrus_core::CELL_WATER);
+        assert!(cell(3.0)[0] < 0.0 && cell(3.0)[3] == citrus_core::CELL_WATER, "low ground is a beach the water can run up");
+        assert_eq!(cell(6.0)[3], citrus_core::CELL_SHORE, "a high bank is shore");
     }
 
     #[test]
@@ -2308,6 +2687,70 @@ mod tests {
         assert!(p.x < 2.5 - 0.3, "stopped at the wall (face at x=2.5), got {}", p.x);
         assert!((p.y - 0.5).abs() < 0.1, "standing on the floor (top y=0.5), got {}", p.y);
         assert!(pw.grounded(player));
+    }
+
+    /// A character with its feet on the floor (`y`), stepped like a play
+    /// session: one physics step, then `moves` moves of `delta`.
+    fn walk_character(scene: &mut LoadedScene, pw: &mut PhysicsWorld, i: usize, frames: usize, moves: usize, delta: Vec3) -> (f32, f32) {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for _ in 0..frames {
+            run(pw, scene, 1);
+            for _ in 0..moves {
+                pw.move_character(scene, i, delta);
+                let y = scene.objects[i].translation.y;
+                (lo, hi) = (lo.min(y), hi.max(y));
+            }
+        }
+        (lo, hi)
+    }
+
+    #[test]
+    fn moves_between_physics_steps_chain() {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        // A wall whose near face is at z = -1.5.
+        obj(&mut scene, Vec3::new(0.0, 1.5, -2.0), vec![Box::new(BoxCollider { size: [6.0, 2.0, 1.0], ..Default::default() })]);
+        let player = obj(&mut scene, Vec3::new(0.0, 0.5, 0.0), vec![Box::new(CharacterController::default())]);
+        let i = scene.index_of(player).unwrap();
+        let mut pw = PhysicsWorld::build(&scene);
+        run(&mut pw, &mut scene, 1);
+        // Several moves before the next step (a fast frame rate, or a
+        // prediction replay): each starts where the last one ended.
+        for _ in 0..4 {
+            pw.move_character(&mut scene, i, Vec3::new(0.3, 0.0, 0.0));
+        }
+        let p = scene.objects[i].translation;
+        assert!((p.x - 1.2).abs() < 0.01, "four 0.3 m moves add up: {p}");
+        // ... so they collide where the previous one left off too.
+        for _ in 0..20 {
+            pw.move_character(&mut scene, i, Vec3::new(0.0, 0.0, -0.2));
+        }
+        let p = scene.objects[i].translation;
+        assert!(p.z > -1.5 + 0.35 - 0.01 && p.z < -1.5 + 0.35 + 0.05, "stopped at the wall, not through it: {p}");
+    }
+
+    #[test]
+    fn a_character_spawned_on_the_floor_does_not_sink() {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        // Feet exactly on the floor top (y = 0.5), the default capsule.
+        let player = obj(&mut scene, Vec3::new(0.0, 0.5, 0.0), vec![Box::new(CharacterController::default())]);
+        let i = scene.index_of(player).unwrap();
+        let mut pw = PhysicsWorld::build(&scene);
+        // Standing (gravity only), two moves a step now and then.
+        let (lo, hi) = walk_character(&mut scene, &mut pw, i, 120, 1, Vec3::new(0.0, -0.005, 0.0));
+        assert!(lo > 0.5 - 1e-3 && hi < 0.5 + 0.03, "stays on the floor while standing: {lo}..{hi}");
+        assert!(pw.grounded(player));
+        // Walking, held down hard (a controller's grounded fall speed).
+        let (lo, hi) = walk_character(&mut scene, &mut pw, i, 120, 2, Vec3::new(0.0, -0.0222, -0.0136));
+        let p = scene.objects[i].translation;
+        assert!(lo > 0.5 - 1e-3 && hi < 0.5 + 0.03, "stays on the floor while walking: {lo}..{hi}");
+        assert!(p.z < -3.0, "the floor never stops it: {p}");
+        // Spawned a little inside the floor: pushed out on its first move.
+        scene.objects[i].translation = Vec3::new(0.0, 0.4, 0.0);
+        pw.place_character(&scene, i, true);
+        pw.move_character(&mut scene, i, Vec3::new(0.0, -0.005, 0.0));
+        assert!(scene.objects[i].translation.y > 0.5 - 1e-3, "out of the floor: {}", scene.objects[i].translation);
     }
 
     #[test]

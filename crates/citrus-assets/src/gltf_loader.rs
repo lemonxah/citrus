@@ -24,6 +24,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
         morphs: Vec::new(),
         springs: Default::default(),
         animations: Vec::new(),
+        collision: Vec::new(),
     };
     // (image index, srgb) -> scene texture index. The same image can be
     // legally referenced as both color and data; cache per usage.

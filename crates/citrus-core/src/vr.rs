@@ -127,6 +127,16 @@ pub struct VrFrame {
     pub left_trigger: bool,
     pub right_trigger: bool,
     pub menu: bool,
+    /// Analog trigger pull (0..1).
+    pub left_trigger_value: f32,
+    pub right_trigger_value: f32,
+    /// Face buttons: `X` / `Y` on the left controller, `A` / `B` on the right.
+    pub a: bool,
+    pub b: bool,
+    pub x: bool,
+    pub y: bool,
+    pub left_stick_click: bool,
+    pub right_stick_click: bool,
 }
 
 /// A world-space ray (origin + unit direction), e.g. a controller's pointer.

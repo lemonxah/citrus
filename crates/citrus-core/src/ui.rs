@@ -409,6 +409,12 @@ pub struct UiToggle {
     pub interactable: bool,
     pub box_color: [f32; 4],
     pub check_color: [f32; 4],
+    /// Input action whose vertical axis `on` inverts in every control scheme
+    /// that has it (a settings menu's Invert Look, e.g. "Look"). It starts
+    /// out showing the player's saved setting.
+    pub invert_y_action: String,
+    #[serde(skip)]
+    pub applied: Option<bool>,
 }
 
 impl Default for UiToggle {
@@ -418,12 +424,35 @@ impl Default for UiToggle {
             interactable: true,
             box_color: [0.2, 0.2, 0.25, 1.0],
             check_color: [0.95, 0.75, 0.2, 1.0],
+            invert_y_action: String::new(),
+            applied: None,
         }
     }
 }
 
 impl TypedComponent for UiToggle {
     const NAME: &'static str = "UI Toggle";
+
+    fn update(&mut self, ctx: &mut ComponentCtx) {
+        let action = self.invert_y_action.as_str();
+        if action.is_empty() || self.applied == Some(self.on) {
+            return;
+        }
+        if self.applied.is_none() {
+            if let Some(a) = ctx.control_scheme().and_then(|s| s.action(action)) {
+                self.on = a.invert_y;
+            }
+            self.applied = Some(self.on);
+            return;
+        }
+        let schemes: Vec<String> =
+            ctx.input_bindings().schemes.iter().filter(|s| s.action(action).is_some()).map(|s| s.name.clone()).collect();
+        let tuning = crate::ActionTuning { invert_y: Some(self.on), ..Default::default() };
+        for scheme in schemes {
+            ctx.tune_action(&scheme, action, tuning);
+        }
+        self.applied = Some(self.on);
+    }
 }
 
 /// Horizontal slider; drag to change `value` within `min..=max`.

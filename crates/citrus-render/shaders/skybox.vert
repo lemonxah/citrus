@@ -3,6 +3,11 @@
 // view ray per vertex from the inverse view-projection so the fragment stage
 // can sample an equirectangular map (or a procedural gradient).
 
+#ifdef MULTIVIEW
+// Multiview: the full frame block for the per-eye cameras at its end.
+#extension GL_EXT_multiview : require
+#include "standard_common.glsl"
+#else
 layout(set = 0, binding = 0) uniform FrameData {
     mat4 view;
     mat4 proj;
@@ -13,6 +18,8 @@ layout(set = 0, binding = 0) uniform FrameData {
     vec4 ambient;
     vec4 misc;
 } frame;
+#define VIEW_PROJ frame.view_proj
+#endif
 
 layout(location = 0) out vec3 v_dir;
 
@@ -21,7 +28,7 @@ void main() {
     vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
     vec2 ndc = p * 2.0 - 1.0;
 
-    mat4 inv = inverse(frame.view_proj);
+    mat4 inv = inverse(VIEW_PROJ);
     vec4 near = inv * vec4(ndc, 0.0, 1.0);
     vec4 far = inv * vec4(ndc, 1.0, 1.0);
     v_dir = far.xyz / far.w - near.xyz / near.w;

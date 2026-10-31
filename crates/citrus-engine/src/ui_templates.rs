@@ -5,7 +5,7 @@
 #![cfg_attr(not(feature = "editor"), allow(dead_code))]
 
 use citrus_core::{
-    Component, UiAction, UiAlign, UiButton, UiCanvas, UiFillDirection, UiPanel, UiPauseMenu, UiProgressBar,
+    Component, ControlsMenu, UiAction, UiAlign, UiButton, UiCanvas, UiFillDirection, UiPanel, UiPauseMenu, UiProgressBar,
     UiRect, UiSlider, UiText, UiToggle,
 };
 
@@ -14,6 +14,7 @@ pub enum UiTemplate {
     MainMenu,
     PauseMenu,
     Settings,
+    Controls,
     Hud,
     Overlay,
     Dialog,
@@ -21,10 +22,11 @@ pub enum UiTemplate {
 }
 
 impl UiTemplate {
-    pub const ALL: [UiTemplate; 7] = [
+    pub const ALL: [UiTemplate; 8] = [
         UiTemplate::MainMenu,
         UiTemplate::PauseMenu,
         UiTemplate::Settings,
+        UiTemplate::Controls,
         UiTemplate::Hud,
         UiTemplate::Overlay,
         UiTemplate::Dialog,
@@ -36,6 +38,7 @@ impl UiTemplate {
             UiTemplate::MainMenu => "Main Menu",
             UiTemplate::PauseMenu => "Pause Menu",
             UiTemplate::Settings => "Settings",
+            UiTemplate::Controls => "Controls",
             UiTemplate::Hud => "HUD",
             UiTemplate::Overlay => "Overlay",
             UiTemplate::Dialog => "Dialog",
@@ -47,7 +50,8 @@ impl UiTemplate {
         match self {
             UiTemplate::MainMenu => "Title, Play / Settings / Quit, settings page with volume sliders",
             UiTemplate::PauseMenu => "Escape toggles it and pauses time; Resume / Settings / Main Menu / Quit",
-            UiTemplate::Settings => "Volume sliders bound to the audio mixer, toggles, Back",
+            UiTemplate::Settings => "Volume sliders bound to the audio mixer, Subtitles and Invert Look toggles, Controls, Back",
+            UiTemplate::Controls => "Rebind menu: click a binding, press the new input; scheme switch, paging, reset",
             UiTemplate::Hud => "Health and stamina bars, score, objective, ammo, crosshair",
             UiTemplate::Overlay => "Screen fade, notification toast, subtitles",
             UiTemplate::Dialog => "Modal confirm box with Yes / No",
@@ -63,6 +67,11 @@ impl UiTemplate {
             UiTemplate::Settings => {
                 let root = b.canvas("Settings Menu", 20);
                 let page = settings_page(&mut b, root, "Settings Page", vec![UiAction::Hide("Settings Page".into())]);
+                b.nodes[page].active = true;
+            }
+            UiTemplate::Controls => {
+                let root = b.canvas("Controls Menu", 25);
+                let page = controls_page(&mut b, root, "Controls Page", "Controls", vec![UiAction::Hide("Controls Page".into())]);
                 b.nodes[page].active = true;
             }
             UiTemplate::Hud => hud(&mut b),
@@ -167,14 +176,25 @@ impl Builder {
         );
     }
 
-    fn toggle_row(&mut self, parent: usize, caption: &str, y: f32) {
+    /// A button whose caption is its own `UiText` (so code can rewrite it).
+    fn text_button(&mut self, parent: usize, name: &str, caption: &str, rect: UiRect, size: f32) -> usize {
+        self.add(
+            Some(parent),
+            name,
+            vec![
+                Box::new(rect),
+                Box::new(panel([0.18, 0.18, 0.22, 0.95], 8.0)),
+                Box::new(UiButton::default()),
+                Box::new(text(caption, size, UiAlign::Center)),
+            ],
+        )
+    }
+
+    fn toggle_row(&mut self, parent: usize, caption: &str, y: f32, toggle: UiToggle) {
         let row = self.add(
             Some(parent),
             caption,
-            vec![
-                Box::new(at([0.5, 0.0], [0.5, 0.0], [0.0, y], [600.0, 40.0])),
-                Box::new(UiToggle { on: true, ..Default::default() }),
-            ],
+            vec![Box::new(at([0.5, 0.0], [0.5, 0.0], [0.0, y], [600.0, 40.0])), Box::new(toggle)],
         );
         self.label(row, "Label", fill(0.0).with_left_inset(56.0), text(caption, 26.0, UiAlign::Start));
     }
@@ -204,9 +224,60 @@ fn settings_page(b: &mut Builder, parent: usize, name: &str, back: Vec<UiAction>
     b.slider_row(page, "Master Volume", 130.0, "master");
     b.slider_row(page, "Music Volume", 200.0, "music");
     b.slider_row(page, "Effects Volume", 270.0, "sfx");
-    b.toggle_row(page, "Subtitles", 350.0);
-    b.toggle_row(page, "Invert Look", 410.0);
-    b.button(page, "Back Button", "Back", at([0.5, 1.0], [0.5, 1.0], [0.0, -36.0], [280.0, 64.0]), back);
+    b.toggle_row(page, "Subtitles", 350.0, UiToggle { on: true, ..Default::default() });
+    // Inverts the Look action's vertical axis in the player's bindings.
+    b.toggle_row(page, "Invert Look", 410.0, UiToggle { invert_y_action: "Look".into(), ..Default::default() });
+    let controls = format!("{name} Controls");
+    b.button(
+        page,
+        "Controls Button",
+        "Controls",
+        at([0.5, 1.0], [1.0, 1.0], [-12.0, -36.0], [260.0, 64.0]),
+        vec![UiAction::Hide(name.into()), UiAction::Show(controls.clone())],
+    );
+    b.button(page, "Back Button", "Back", at([0.5, 1.0], [0.0, 1.0], [12.0, -36.0], [260.0, 64.0]), back);
+    controls_page(
+        b,
+        parent,
+        &controls,
+        &controls,
+        vec![UiAction::Hide(controls.clone()), UiAction::Show(name.into())],
+    );
+    page
+}
+
+/// A centered rebind page run by a [`ControlsMenu`] whose object names start
+/// with `prefix`. Starts hidden.
+fn controls_page(b: &mut Builder, parent: usize, name: &str, prefix: &str, back: Vec<UiAction>) -> usize {
+    let menu = ControlsMenu { prefix: prefix.into(), ..Default::default() };
+    let rows = menu.rows as usize;
+    let page = b.add(
+        Some(parent),
+        name,
+        vec![Box::new(at([0.5, 0.5], [0.5, 0.5], [0.0, 0.0], [960.0, 820.0])), Box::new(boxed()), Box::new(menu)],
+    );
+    b.hidden(page);
+    let n = |s: &str| format!("{prefix} {s}");
+    b.label(page, "Title", at([0.5, 0.0], [0.5, 0.0], [0.0, 24.0], [800.0, 64.0]), text("Controls", 48.0, UiAlign::Center));
+    b.text_button(page, &n("Scheme"), "Scheme", at([0.5, 0.0], [0.5, 0.0], [0.0, 100.0], [520.0, 52.0]), 26.0);
+    for i in 0..rows {
+        let y = 172.0 + i as f32 * 54.0;
+        let row = b.add(Some(page), &n(&format!("Row {}", i + 1)), vec![Box::new(at([0.5, 0.0], [0.5, 0.0], [0.0, y], [880.0, 48.0]))]);
+        b.label(row, &n(&format!("Row {} Label", i + 1)), at([0.0, 0.5], [0.0, 0.5], [0.0, 0.0], [400.0, 48.0]), text("Action", 26.0, UiAlign::Start));
+        for (col, x) in [(1, -244.0), (2, 0.0)] {
+            let name = n(&format!("Row {} Bind {col}", i + 1));
+            b.text_button(row, &name, "-", at([1.0, 0.5], [1.0, 0.5], [x, 0.0], [232.0, 44.0]), 24.0);
+        }
+    }
+    let mut status = text("", 22.0, UiAlign::Center);
+    status.color = DIM_TEXT;
+    b.label(page, &n("Status"), at([0.5, 0.0], [0.5, 0.0], [0.0, 614.0], [880.0, 40.0]), status);
+    let bottom = |x: f32, w: f32| at([0.0, 1.0], [0.0, 1.0], [x, -30.0], [w, 60.0]);
+    b.button(page, &n("Prev"), "<", bottom(40.0, 100.0), Vec::new());
+    b.label(page, &n("Page"), bottom(150.0, 120.0), text("1 / 1", 26.0, UiAlign::Center));
+    b.button(page, &n("Next"), ">", bottom(280.0, 100.0), Vec::new());
+    b.button(page, &n("Reset"), "Reset", at([1.0, 1.0], [1.0, 1.0], [-340.0, -30.0], [260.0, 60.0]), Vec::new());
+    b.button(page, "Back Button", "Back", at([1.0, 1.0], [1.0, 1.0], [-40.0, -30.0], [280.0, 60.0]), back);
     page
 }
 

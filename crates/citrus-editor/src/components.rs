@@ -287,6 +287,10 @@ pub const PROJECT_ROOT_KEY: &str = "citrus-project-root";
 /// egui temp data (`Vec<AssetTemplate>`): asset kinds an asset field's [+]
 /// can create.
 pub const ASSET_TEMPLATES_KEY: &str = "citrus-asset-templates";
+/// egui temp data (`Option<(usize, String)>`): the inspected object's authored
+/// collision pieces (count, prefixes in use), published by the editor each
+/// frame for the Mesh Collider inspector.
+pub const AUTHORED_COLLISION_KEY: &str = "citrus-authored-collision";
 
 /// A new-asset recipe: written to `folder/New <name>.<ext>` (numbered when
 /// taken).
@@ -2145,6 +2149,10 @@ impl Inspect for UiToggle {
         property_row(ui, "Interactable", &mut changed, |ui| ui.checkbox(&mut self.interactable, ""));
         rgba_row(ui, "Box", &mut self.box_color, &mut changed);
         rgba_row(ui, "Check", &mut self.check_color, &mut changed);
+        property_row(ui, "Inverts Y of", &mut changed, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.invert_y_action).hint_text("none (e.g. Look)"))
+                .on_hover_text("An Invert Look setting: inverts this action's vertical axis in the player's bindings (every control scheme that has it)")
+        });
         changed
     }
 }
@@ -2726,26 +2734,43 @@ impl Gizmo for CapsuleCollider {
 impl Inspect for MeshCollider {
     fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
         let mut changed = false;
-        property_row(ui, "Convex", &mut changed, |ui| {
-            ui.checkbox(&mut self.convex, "")
-                .on_hover_text("One convex hull even when static. Off: exact triangles when static; moving bodies always use a hull, or pieces with Follow shape")
-        });
-        property_row(ui, "Detail", &mut changed, |ui| {
-            let opts: Vec<(citrus_core::ColliderDetail, &str)> = citrus_core::ColliderDetail::ALL.iter().map(|d| (*d, d.label())).collect();
-            crate::widgets::segmented(ui, &mut self.detail, &opts)
-                .on_hover_text("How closely moving-body hulls and pieces hug the mesh (hull corners: 64 / 128 / 256; Follow-shape pieces: 8 / 16 / 32). Ball-shaped meshes always become an exact sphere.")
-        });
-        property_row(ui, "Follow shape", &mut changed, |ui| {
-            ui.add_enabled(!self.convex, egui::Checkbox::without_text(&mut self.follow_shape)).on_hover_text(
-                "Moving bodies: split into a few convex pieces that follow a concave shape (a couch's seat and arms) instead of one hull around it all. Slower to build.",
-            )
+        let authored: Option<(usize, String)> =
+            ui.data(|d| d.get_temp::<Option<(usize, String)>>(egui::Id::new(AUTHORED_COLLISION_KEY))).flatten().filter(|(n, _)| *n > 0);
+        if let Some((count, kinds)) = &authored {
+            property_row(ui, "Use authored", &mut changed, |ui| {
+                ui.checkbox(&mut self.use_authored, "").on_hover_text(
+                    "Collide with the collision pieces modelled with this mesh (UCX_ convex, UBX_ box, USP_ sphere, UCP_ capsule objects) instead of building a shape from the mesh. Applies to static and moving bodies.",
+                )
+            });
+            if self.use_authored {
+                let s = if *count == 1 { "" } else { "s" };
+                ui.label(RichText::new(format!("Using {count} authored collision piece{s} ({kinds})")).small().weak());
+            }
+        }
+        let from_mesh = !(authored.is_some() && self.use_authored);
+        ui.add_enabled_ui(from_mesh, |ui| {
+            property_row(ui, "Convex", &mut changed, |ui| {
+                ui.checkbox(&mut self.convex, "")
+                    .on_hover_text("One convex hull even when static. Off: exact triangles when static; moving bodies always use a hull, or pieces with Follow shape")
+            });
+            property_row(ui, "Detail", &mut changed, |ui| {
+                let opts: Vec<(citrus_core::ColliderDetail, &str)> = citrus_core::ColliderDetail::ALL.iter().map(|d| (*d, d.label())).collect();
+                crate::widgets::segmented(ui, &mut self.detail, &opts)
+                    .on_hover_text("How closely moving-body hulls and pieces hug the mesh (hull corners: 64 / 128 / 256; Follow-shape pieces: 8 / 16 / 32). Ball-shaped meshes always become an exact sphere.")
+            });
+            property_row(ui, "Follow shape", &mut changed, |ui| {
+                ui.add_enabled(!self.convex, egui::Checkbox::without_text(&mut self.follow_shape)).on_hover_text(
+                    "Moving bodies: split into a few convex pieces that follow a concave shape (a couch's seat and arms) instead of one hull around it all. Slower to build.",
+                )
+            });
         });
         collider_common_ui(ui, ctx, &mut self.material, &mut self.is_trigger, &mut self.layer, &mut changed);
-        ui.label(
-            RichText::new("Uses this object's mesh: exact triangles when static, one simplified hull on a moving Rigid Body (or pieces with Follow shape). Shown in green.")
-                .small()
-                .weak(),
-        );
+        let note = if from_mesh {
+            "Uses this object's mesh: exact triangles when static, one simplified hull on a moving Rigid Body (or pieces with Follow shape). Shown in green."
+        } else {
+            "Uses the authored pieces as a compound shape, static or moving. Shown in green."
+        };
+        ui.label(RichText::new(note).small().weak());
         changed
     }
 }

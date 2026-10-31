@@ -278,7 +278,12 @@ if ctx.is_grounded() { /* can jump */ }
 ```
 
 Gravity is yours to apply. The built-in `Pawn` uses the controller
-automatically when one is on the same object.
+automatically when one is on the same object. Moves chain: several in one
+frame (or between physics steps) each start where the last ended. The
+capsule keeps a 2 cm skin off what it touches, and one that starts inside
+something (spawned with its feet exactly on the floor, standing up from a
+crouch, a networked rewind) is pushed out on its next move instead of
+sinking.
 
 ### Audio
 
@@ -436,7 +441,7 @@ inside the game view:
 | `UI Image` | Texture with tint, optional aspect fit |
 | `UI Text` | Text: size, color, alignment, wrap, optional .ttf/.otf font |
 | `UI Button` | Clickable, tints the panel by state |
-| `UI Toggle` | Checkbox (`on`) |
+| `UI Toggle` | Checkbox (`on`); `Inverts Y of` an action (e.g. `Look`) makes it an Invert Look setting saved to the player's bindings |
 | `UI Slider` | Draggable `value` in `min..=max`; optional Audio bus it drives (e.g. `music`) |
 | `UI Progress Bar` | Health / loading bar: `value` 0..1, fill direction, colors |
 | `UI Pause Menu` | On the canvas: Escape / gamepad back toggles the named panel, pausing time and freeing the cursor |

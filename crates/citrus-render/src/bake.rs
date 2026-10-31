@@ -100,6 +100,25 @@ pub(crate) struct Accel {
     pub address: u64,
 }
 
+/// TLAS instance masks, matching `BAKE_MASK_*` in the bake shaders: bounce
+/// rays test `MASK_VISIBLE`, shadow rays `MASK_CASTER`.
+const MASK_VISIBLE: u8 = 0x01;
+const MASK_CASTER: u8 = 0x02;
+
+/// Bake TLAS mask for an instance's "Cast Shadows": `Off` stays visible to
+/// bounce light but no longer blocks direct light; `ShadowsOnly` blocks direct
+/// light but is invisible to bounces.
+pub(crate) fn instance_mask(shadow_casting: crate::ShadowCasting) -> u8 {
+    let mut mask = 0;
+    if shadow_casting.visible() {
+        mask |= MASK_VISIBLE;
+    }
+    if shadow_casting.casts() {
+        mask |= MASK_CASTER;
+    }
+    mask
+}
+
 /// Run the full bake synchronously. Thin wrapper over the resumable `BakeJob`
 /// (single code path); used by callers that don't need progress/chunking.
 pub fn bake(
@@ -216,7 +235,7 @@ impl BakeJob {
             let blas = &accels[blas_for_mesh[&inst.mesh.0]];
             tlas_instances.push(vk::AccelerationStructureInstanceKHR {
                 transform: transform_matrix(&inst.transform),
-                instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, 0xFF),
+                instance_custom_index_and_mask: vk::Packed24_8::new(i as u32, instance_mask(inst.shadow_casting)),
                 instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
                     0,
                     vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,

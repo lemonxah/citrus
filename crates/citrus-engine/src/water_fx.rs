@@ -479,6 +479,7 @@ impl WaterFx {
                 static_geometry: false,
                 planar_index: -1,
                 occluded: false,
+                shadow_casting: citrus_render::ShadowCasting::On,
             });
         }
     }
@@ -545,6 +546,7 @@ impl WaterFx {
             static_geometry: false,
             planar_index: -1,
             occluded: false,
+            shadow_casting: citrus_render::ShadowCasting::On,
         });
     }
 }

@@ -62,6 +62,16 @@ const MAX_SPEED: f32 = 8.0;
 pub const CELL_WATER: f32 = 0.0;
 pub const CELL_SHORE: f32 = 1.0;
 pub const CELL_OBSTACLE: f32 = 2.0;
+/// Shallower ground than this (m) starts dry.
+const MIN_WET_DEPTH: f32 = 0.03;
+/// Ground up to this high above the rest surface (m) is a beach waves can
+/// run up onto and drain back from; higher is a bank (a wall).
+pub const RUNUP_HEIGHT: f32 = 0.6;
+/// Water thinner than this (m) over a beach cell is drawn as dry (sunk
+/// under the ground) and holds no dispersive ripples.
+pub const DRY_FILM: f32 = 0.01;
+/// How far under the ground (m) a dry beach cell's surface is put.
+const DRY_SINK: f32 = 0.15;
 
 /// The square of cells a simulation covers (water-local XZ).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -284,6 +294,14 @@ impl SimField {
     /// The field of `water` over `window`; `blocked` (row-major, same window)
     /// marks cells obstacles fill.
     pub fn build(water: &Water, window: SimWindow, blocked: Option<&[bool]>) -> Self {
+        Self::build_with_bed(water, window, blocked, None)
+    }
+
+    /// The same over the ground: `bed` (row-major, same window) is the depth
+    /// of the floor under each cell's rest surface (m; NaN = none found, the
+    /// water's own depth). Ground just above the surface is a dry beach the
+    /// water can run up (`RUNUP_HEIGHT`); higher ground is a bank.
+    pub fn build_with_bed(water: &Water, window: SimWindow, blocked: Option<&[bool]>, bed: Option<&[f32]>) -> Self {
         let n = window.n as usize;
         let cols = water.columns_in(window.lo(), n, window.cell);
         let mut flowing = false;
@@ -294,9 +312,18 @@ impl SimField {
             .map(|(i, c)| match c {
                 Some(c) if blocked.is_some_and(|b| b.get(i).copied().unwrap_or(false)) => [c.depth.max(0.05), 0.0, 0.0, CELL_OBSTACLE],
                 Some(c) => {
+                    let depth = bed.and_then(|b| b.get(i).copied()).filter(|d| d.is_finite()).unwrap_or(c.depth);
+                    if depth < -RUNUP_HEIGHT {
+                        return [0.05, 0.0, 0.0, CELL_SHORE];
+                    }
+                    if depth < MIN_WET_DEPTH {
+                        // A beach: dry ground (negative rest depth) the
+                        // water can run up onto.
+                        return [depth.min(0.0), 0.0, 0.0, CELL_WATER];
+                    }
                     flowing |= c.flow.x.abs() + c.flow.z.abs() > 1e-4;
-                    max_depth = max_depth.max(c.depth);
-                    [c.depth.max(0.05), c.flow.x, c.flow.z, CELL_WATER]
+                    max_depth = max_depth.max(depth);
+                    [depth.max(0.05), c.flow.x, c.flow.z, CELL_WATER]
                 }
                 None => [0.05, 0.0, 0.0, CELL_SHORE],
             })
@@ -318,6 +345,9 @@ pub struct WaterSimFeed {
     pub pushes: Vec<WaterPush>,
     /// Cells obstacles fill (from physics), and the window it was made for.
     pub blocked: Option<(SimWindow, Arc<Vec<bool>>)>,
+    /// Depth of the ground under each cell (`SimField::build_with_bed`),
+    /// and the window it was made for.
+    pub bed: Option<(SimWindow, Arc<Vec<f32>>)>,
     /// Last readback applied to `Water::ripples`.
     pub readback_serial: u64,
     /// Frames with nothing moving (the simulation idles past a while).
@@ -327,6 +357,7 @@ pub struct WaterSimFeed {
     field_key: u64,
     field: Option<Arc<SimField>>,
     field_blocked: Option<Arc<Vec<bool>>>,
+    field_bed: Option<Arc<Vec<f32>>>,
 }
 
 impl WaterSimFeed {
@@ -342,21 +373,29 @@ impl WaterSimFeed {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         };
+        let bed = self.bed.as_ref().filter(|(w, _)| *w == window).map(|(_, b)| b.clone());
+        let bed_same = match (&bed, &self.field_bed) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
         if let Some(f) = &self.field
             && same_window
             && key == self.field_key
             && blocked_same
+            && bed_same
         {
             return (f.clone(), false);
         }
         let reset = same_window && key != self.field_key;
         let version = self.field.as_ref().map_or(1, |f| f.version + 1);
-        let mut field = SimField::build(water, window, blocked.as_deref().map(|b| b.as_slice()));
+        let mut field = SimField::build_with_bed(water, window, blocked.as_deref().map(|b| b.as_slice()), bed.as_deref().map(|b| b.as_slice()));
         field.version = version;
         let field = Arc::new(field);
         self.field = Some(field.clone());
         self.field_key = key;
         self.field_blocked = blocked;
+        self.field_bed = bed;
         (field, reset)
     }
 
@@ -543,6 +582,16 @@ impl PipeSim {
     fn field_at(&self, w: IVec2) -> [f32; 4] {
         let f = w + self.window.origin - self.field_origin;
         if self.inside(f) { self.field[self.win(f)] } else { [self.default_depth, 0.0, 0.0, CELL_WATER] }
+    }
+
+    /// How dry cell `w` is (0 wet .. 1 dry): only beach cells (ground above
+    /// the rest surface) with less than a film of water on them.
+    fn dryness(&self, w: IVec2) -> f32 {
+        if !self.inside(w) || self.field_at(w)[0] > 0.0 {
+            return 0.0;
+        }
+        let h = self.h[self.store(w)];
+        1.0 - (h / DRY_FILM).clamp(0.0, 1.0)
     }
 
     fn solid(&self, w: IVec2) -> bool {
@@ -815,7 +864,7 @@ impl PipeSim {
         for w in self.cells() {
             // By the smoothed footprint the source follows, so what a body
             // pushes in ahead and lets go behind are blocked alike.
-            let block = layer.smoothed(self.store(w)) / crate::water_ewave::BLOCK_DRAFT;
+            let block = (layer.smoothed(self.store(w)) / crate::water_ewave::BLOCK_DRAFT).max(self.dryness(w));
             layer.mask_cell(self.store(w), self.solid(w), sponge_depth(w, self.n(), sponge), block, dt);
         }
         self.ewave = Some((p, layer));
@@ -883,6 +932,9 @@ impl PipeSim {
             // Inside a body's footprint there is no free surface (see
             // water_sim.comp): drawn flattened, the readback keeps it.
             let inside_body = (self.ew_in[self.win(w)][0] / crate::water_ewave::BLOCK_DRAFT).clamp(0.0, 1.0);
+            // A dry beach: the surface sinks under the ground there, for
+            // drawing and for what floats on it.
+            let e = e - DRY_SINK * self.dryness(w);
             let shown = if e > 0.0 { e * (1.0 - inside_body) } else { e };
             tex.push([shown, g.x * (1.0 - inside_body), g.y * (1.0 - inside_body), u.length()]);
             back.push([e, u.x, u.y, self.couple[self.win(w)][1]]);
@@ -910,8 +962,22 @@ impl PipeSim {
 mod tests {
     use super::*;
 
+    /// A fixed reference setup for tests of one mechanism, so they don't
+    /// shift with the defaults (which are tuned for looks).
+    fn reference(w: Water) -> Water {
+        Water {
+            ripple_damping: 0.35,
+            sim_wave_depth: 3.0,
+            sim_displacement: 1.0,
+            sim_momentum: 1.0,
+            sim_ripple_mix: 1.0,
+            sim_chop_smoothing: 0.3,
+            ..w
+        }
+    }
+
     fn tank(n: u32, size: f32, depth: f32) -> (Water, SimField) {
-        let water = Water { size: [size, size], depth, waves: Vec::new(), ripple_resolution: n, ripple_area: size * 2.0, ..Default::default() };
+        let water = reference(Water { size: [size, size], depth, waves: Vec::new(), ripple_resolution: n, ripple_area: size * 2.0, ..Default::default() });
         let window = choose_window(&water, Vec2::ZERO, None);
         assert!(window.closed);
         let field = SimField::build(&water, window, None);
@@ -1151,8 +1217,15 @@ mod tests {
         assert!(tuned < raw * 0.25, "smoothing and fine damping: {tuned} vs {raw}");
     }
 
-    /// Surface energy (heights squared, summed over the simulation and the
-    /// dispersive layer) left `secs` after a push into a fluid of `preset`.
+    /// The water's motion: surface velocity squared, summed (the readback,
+    /// simulation plus dispersive layer). Thick fluid barely moves; a dent
+    /// in it just slowly flattens.
+    fn motion(back: &[[f32; 4]]) -> f32 {
+        back.iter().map(|b| b[1] * b[1] + b[2] * b[2]).sum()
+    }
+
+    /// The motion (`motion`) left `secs` after a push into a fluid of
+    /// `preset`.
     fn ringing(preset: &str, secs: f32) -> f32 {
         let (mut water, field) = tank(128, 16.0, 1.5);
         crate::FLUID_PRESETS.iter().find(|f| f.name == preset).unwrap().apply(&mut water);
@@ -1165,8 +1238,8 @@ mod tests {
             let list = if k < 3 { vec![push] } else { Vec::new() };
             sim.step(1.0 / 90.0, &p, &list);
         }
-        let (tex, _) = sim.output();
-        tex.iter().map(|t| t[0] * t[0]).sum()
+        let (_, back) = sim.output();
+        motion(&back)
     }
 
     #[test]
@@ -1236,7 +1309,8 @@ mod tests {
         assert!(smooth_rough / smooth_all < raw_rough / raw_all, "the short share falls");
     }
 
-    /// `ringing` on the user's pool: 25 cm cells, 1.1 m deep.
+    /// `ringing` on a pool like the user's (25 cm cells, 1.1 m deep) with the
+    /// default settings.
     fn pool_ringing(preset: &str, scale: f32, secs: f32) -> f32 {
         let mut water = Water { size: [10.8, 10.4], depth: 1.1, waves: Vec::new(), ripple_resolution: 128, ripple_area: 32.0, ..Default::default() };
         crate::FLUID_PRESETS.iter().find(|f| f.name == preset).unwrap().apply(&mut water);
@@ -1251,8 +1325,8 @@ mod tests {
             let list = if k < 3 { vec![push] } else { Vec::new() };
             sim.step(1.0 / 90.0, &p, &list);
         }
-        let (tex, _) = sim.output();
-        tex.iter().map(|t| t[0] * t[0]).sum()
+        let (_, back) = sim.output();
+        motion(&back)
     }
 
     #[test]
@@ -1291,6 +1365,48 @@ mod tests {
         let (water, honey, mud) = (ringing("Water", 3.0), ringing("Honey", 3.0), ringing("Mud", 3.0));
         assert!(honey < water * 0.5, "honey settles: {honey} vs water {water}");
         assert!(mud < honey * 0.7, "mud settles faster still: {mud} vs honey {honey}");
+    }
+
+    #[test]
+    fn waves_run_up_a_beach_and_drain_back() {
+        // A beach rising from 1 m deep at x = -4 to 0.5 m above the water at
+        // x = 4 (16 m tank), and a surge sent up it.
+        let water = reference(Water { size: [16.0, 16.0], depth: 1.0, waves: Vec::new(), ripple_resolution: 64, ripple_area: 32.0, sim_dispersion: 0.0, ..Default::default() });
+        let window = choose_window(&water, Vec2::ZERO, None);
+        let n = window.n as usize;
+        let bed: Vec<f32> = (0..n * n)
+            .map(|i| {
+                let x = window.lo().x + ((i % n) as f32 + 0.5) * window.cell;
+                if (-4.0..=4.0).contains(&x) { 1.0 - (x + 4.0) / 8.0 * 1.5 } else if x < -4.0 { 1.0 } else { -0.5 }
+            })
+            .collect();
+        let field = SimField::build_with_bed(&water, window, None, Some(&bed));
+        let column = |x: f32| {
+            let c = ((Vec2::new(x, 0.0) - window.lo()) / window.cell).floor().as_ivec2();
+            (c.y as usize * n + c.x as usize, c)
+        };
+        let (land, _) = column(2.0);
+        assert!(field.cells[land][0] < 0.0 && field.cells[land][3] == CELL_WATER, "dry beach, not a wall: {:?}", field.cells[land]);
+        let p = PipeParams::for_water(&water);
+        let mut sim = PipeSim::new(&field);
+        // A dam break: the deep end raised 30 cm, let go.
+        for z in 0..n {
+            for x in 0..n {
+                if window.lo().x + (x as f32 + 0.5) * window.cell < -5.0 {
+                    let st = sim.store(IVec2::new(x as i32, z as i32));
+                    sim.h[st] += 0.3;
+                }
+            }
+        }
+        let (_, at) = column(2.0);
+        let wet = |sim: &PipeSim| sim.h[sim.store(at)];
+        let mut most = 0.0f32;
+        for _ in 0..900 {
+            sim.step(1.0 / 90.0, &p, &[]);
+            most = most.max(wet(&sim));
+        }
+        assert!(most > 0.01, "the swell ran up onto ground 0.125 m above the water: {most}");
+        assert!(wet(&sim) < most * 0.5, "and drained back: {} of {most}", wet(&sim));
     }
 
     #[test]
@@ -1339,7 +1455,7 @@ mod tests {
     #[test]
     fn ripples_bounce_off_a_body_in_the_water() {
         let behind = |blocked: bool| {
-            let water = Water { size: [16.0, 16.0], depth: 2.0, waves: Vec::new(), ripple_resolution: 128, ripple_area: 32.0, sim_dispersion: 1.0, ..Default::default() };
+            let water = reference(Water { size: [16.0, 16.0], depth: 2.0, waves: Vec::new(), ripple_resolution: 128, ripple_area: 32.0, sim_dispersion: 1.0, ..Default::default() });
             let window = choose_window(&water, Vec2::ZERO, None);
             let field = SimField::build(&water, window, None);
             let p = PipeParams::for_water(&water);

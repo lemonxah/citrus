@@ -6,16 +6,20 @@
 //! Model: one peer hosts (peer id 1, the server), others join it. Every
 //! networked object has an owner peer; owner 0 means "unowned", and the host
 //! is then its authority. The authority simulates the object and replicates
-//! it; everyone else interpolates what it sends.
+//! it; everyone else interpolates what it sends. When the host leaves, the
+//! next member in its succession list takes over (host migration): peer ids
+//! stay, `NetView::host_peer` names the new host and `HostChanged` fires.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::{ComponentCommand, ComponentCtx, ObjectId, ObjectRef, TrackerTargets, TypedComponent};
 
-/// Peer id of the host / server.
+/// Peer id of the session's first host (after a host migration the host is
+/// whichever peer `NetView::host_peer` names).
 pub const HOST_PEER: u64 = 1;
 
 // ------------------------------------------------------------------ values
@@ -191,6 +195,29 @@ pub struct PeerInfo {
     /// Round-trip time to this peer as seen from the local machine (ms; 0 for self).
     pub rtt_ms: f32,
     pub is_host: bool,
+    /// Round-trip jitter (ms) and packet loss (0..1, both directions) to this peer.
+    pub jitter_ms: f32,
+    pub loss: f32,
+    /// Seconds behind the newest state this peer renders remote objects
+    /// (reported by clients; lag compensation rewinds by it).
+    pub view_delay: f32,
+    /// The player's verified id (its Ed25519 public key, checked by the host
+    /// during the handshake), and its fingerprint (8 groups of 4 hex digits).
+    pub identity: Option<[u8; 32]>,
+    pub fingerprint: String,
+}
+
+/// Connection quality to the host (zero on the host itself and offline).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NetQuality {
+    pub rtt_ms: f32,
+    /// Smoothed round-trip variation (ms).
+    pub jitter_ms: f32,
+    /// Fraction of packets lost on the way in / out (0..1).
+    pub loss_in: f32,
+    pub loss_out: f32,
+    /// Traffic goes through a relay server rather than a direct path.
+    pub relayed: bool,
 }
 
 /// Session and replication events, delivered once via [`NetView::events`].
@@ -210,6 +237,11 @@ pub enum NetEvent {
     Spawned { object: ObjectId, owner: u64 },
     Despawned { object: ObjectId },
     VarChanged { object: ObjectId, key: String, value: NetValue, from: u64 },
+    /// The host is gone and a successor is being looked for (unowned objects
+    /// pause until `HostChanged`).
+    HostMigrating { previous: u64 },
+    /// A new host took over (`host` may be the local peer: `ctx.i_am_host()`).
+    HostChanged { host: u64, previous: u64 },
 }
 
 /// What a networked spawn instantiates.
@@ -246,6 +278,10 @@ pub struct NetView {
     pub is_server: bool,
     /// This machine's peer id (0 when offline).
     pub local_peer: u64,
+    /// The current host's peer id (changes on host migration).
+    pub host_peer: u64,
+    /// The host was lost and a successor is taking over.
+    pub migrating: bool,
     /// Per-object current authority (only objects that are owned appear).
     pub owners: HashMap<ObjectId, u64>,
     /// Text messages received this frame: `(from_peer, is_private, text)`.
@@ -265,6 +301,14 @@ pub struct NetView {
     pub reclaimed_bodies: HashMap<ObjectId, Vec3>,
     /// Round-trip time to the host (ms; 0 on the host).
     pub rtt_ms: f32,
+    /// Jitter, loss and route to the host.
+    pub quality: NetQuality,
+    /// The session clock: the host's time as this peer estimates it.
+    pub clock: f64,
+    /// How far behind the newest snapshots remote objects render (s).
+    pub view_delay: f32,
+    /// Host: recent hitbox poses for lag-compensated hit tests.
+    pub rewind: Option<Arc<Mutex<crate::HitHistory>>>,
 }
 
 impl NetView {
@@ -348,6 +392,9 @@ pub struct NetObjectState {
     pub connected: bool,
     pub owner: u64,
     pub authority: bool,
+    /// Predicted owner: the smoothing offset currently added to the
+    /// rendered position (removed again before the next simulation step).
+    pub visual_offset: Vec3,
 }
 
 /// Marks an object as networked: a stable network identity (the object id,
@@ -378,6 +425,17 @@ pub struct NetworkObject {
     pub despawn_on_owner_leave: bool,
     /// Pack positions into 24 bits per axis (1 mm, +-8 km) and rotations into 32 bits.
     pub quantize: bool,
+    /// Grow the interpolation delay above `interp_delay` when the measured
+    /// jitter and loss need it (and shrink back when the link calms down).
+    pub adaptive_delay: bool,
+    /// Server-authoritative movement with client-side prediction, for a
+    /// [`crate::Pawn`], First / Third Person Controller or VR Player (any
+    /// [`crate::Predictable`]): the owner moves at once from its own input
+    /// and sends the inputs; the host simulates the controller from them and
+    /// replies with the authoritative state, which the owner reconciles with
+    /// (rewind + replay, smoothed). Everyone else interpolates the host's
+    /// state.
+    pub predicted: bool,
     #[serde(skip)]
     pub state: NetObjectState,
 }
@@ -399,6 +457,8 @@ impl Default for NetworkObject {
             relevancy: 0.0,
             despawn_on_owner_leave: false,
             quantize: true,
+            adaptive_delay: true,
+            predicted: false,
             state: NetObjectState::default(),
         }
     }
@@ -698,8 +758,27 @@ pub struct NetworkManager {
     pub dedicated: bool,
     pub clients_can_spawn: bool,
     pub auto_start: NetAutoStart,
-    /// Address `Join` auto-start connects to.
+    /// Address `Join` auto-start connects to: `host:port`, or a room code
+    /// (`ABC123`, via `relay`, or `ABC123@relay.example.com:47800`).
     pub address: String,
+    /// Relay server (`host:port`) for internet play without port forwarding.
+    /// Hosting registers a room there too; empty = LAN / direct only.
+    pub relay: String,
+    /// Room code a host asks the relay for (empty = the relay picks one).
+    pub room_code: String,
+    /// Join secret: peers must know it to join, and it keys the session's
+    /// encryption. Empty = anyone who reaches the session can join.
+    pub secret: String,
+    /// When the host leaves, the next player in line takes over and the
+    /// session goes on (off = the session ends with its host).
+    pub host_migration: bool,
+    /// Clients remember the host's identity for this address / room code
+    /// and refuse a different one later (trust on first use).
+    pub pin_host: bool,
+    /// Only these player fingerprints may join (empty = anyone with the secret).
+    pub allow_list: Vec<String>,
+    /// Player fingerprints refused at the door.
+    pub ban_list: Vec<String>,
 }
 
 impl Default for NetworkManager {
@@ -716,6 +795,13 @@ impl Default for NetworkManager {
             clients_can_spawn: true,
             auto_start: NetAutoStart::Off,
             address: "127.0.0.1:9000".to_string(),
+            relay: String::new(),
+            room_code: String::new(),
+            secret: String::new(),
+            host_migration: true,
+            pin_host: false,
+            allow_list: Vec::new(),
+            ban_list: Vec::new(),
         }
     }
 }
@@ -741,6 +827,37 @@ impl ComponentCtx<'_> {
     pub fn local_peer(&self) -> u64 {
         self.net.local_peer
     }
+    /// The current host's peer id (0 offline; changes on host migration).
+    pub fn net_host_peer(&self) -> u64 {
+        if self.net.connected { self.net.host_peer } else { 0 }
+    }
+    /// This peer hosts the session (also right after taking over as host).
+    pub fn i_am_host(&self) -> bool {
+        self.is_server()
+    }
+    /// The new host's peer id when the host changed since last frame.
+    pub fn host_changed(&self) -> Option<u64> {
+        self.net.events.iter().rev().find_map(|e| match e {
+            NetEvent::HostChanged { host, .. } => Some(*host),
+            _ => None,
+        })
+    }
+    /// The host was lost and a successor is taking over.
+    pub fn net_migrating(&self) -> bool {
+        self.net.connected && self.net.migrating
+    }
+    /// A peer's verified player id (Ed25519 public key).
+    pub fn peer_identity(&self, id: u64) -> Option<[u8; 32]> {
+        self.net.peer(id).and_then(|p| p.identity)
+    }
+    /// A peer's player-id fingerprint (what allow / ban lists hold).
+    pub fn peer_fingerprint(&self, id: u64) -> Option<&str> {
+        self.net.peer(id).map(|p| p.fingerprint.as_str()).filter(|f| !f.is_empty())
+    }
+    /// Host: remove a player (`ban` also refuses its player id from now on).
+    pub fn net_kick(&mut self, peer: u64, reason: impl Into<String>, ban: bool) {
+        self.commands.push(ComponentCommand::NetKick { peer, reason: reason.into(), ban });
+    }
     /// Everyone in the session, the local peer included.
     pub fn peers(&self) -> &[PeerInfo] {
         &self.net.peers
@@ -751,6 +868,18 @@ impl ComponentCtx<'_> {
     /// Session / replication events since last frame.
     pub fn net_events(&self) -> &[NetEvent] {
         &self.net.events
+    }
+    /// Round-trip time to the host in milliseconds (0 on the host and offline).
+    pub fn net_rtt_ms(&self) -> f32 {
+        self.net.rtt_ms
+    }
+    /// Round-trip time to the host in seconds.
+    pub fn net_rtt(&self) -> f32 {
+        self.net.rtt_ms / 1000.0
+    }
+    /// Jitter, packet loss and route to the host.
+    pub fn net_quality(&self) -> NetQuality {
+        self.net.quality
     }
 
     /// Whether the local peer simulates the owning object (its owner, the

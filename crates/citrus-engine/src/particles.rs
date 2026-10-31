@@ -253,6 +253,7 @@ impl ParticleRenderer {
                 static_geometry: false,
                 planar_index: -1,
                 occluded: false,
+                shadow_casting: citrus_render::ShadowCasting::On,
             });
         }
         self.sims.retain(|id, _| alive.contains(id));

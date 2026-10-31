@@ -1,15 +1,23 @@
-//! The editor's Network window: host / join (direct or from the LAN list),
-//! then the session status, player list, traffic and owned objects.
+//! The editor's Network window: host / join (direct, from the LAN list, or
+//! online by room code through a relay), then the session status, room
+//! code, host migration (who takes over, a migration in progress), the
+//! player list with link quality and verified player ids (kick / ban on the
+//! host), bans, traffic and owned objects.
 
 use citrus_editor::{icons::Icon, theme, widgets};
 use egui::RichText;
 
-use crate::net::{ConnState, LanBrowser, NetSession};
+use crate::net::{ConnState, LanBrowser, NetSession, RelayPhase, short_fingerprint};
 use crate::scene::LoadedScene;
 
 /// Window state kept between frames.
 pub struct NetWindowState {
     pub player_name: String,
+    /// Relay server for online play (empty = the scene's Network Manager setting).
+    pub relay: String,
+    /// Join secret (empty = the scene's Network Manager setting).
+    pub secret: String,
+    show_secret: bool,
     browser: Option<LanBrowser>,
     last_refresh: f64,
 }
@@ -18,6 +26,9 @@ impl Default for NetWindowState {
     fn default() -> Self {
         Self {
             player_name: std::env::var("CITRUS_NAME").unwrap_or_else(|_| "Editor".to_string()),
+            relay: std::env::var("CITRUS_RELAY").unwrap_or_default(),
+            secret: std::env::var("CITRUS_SECRET").unwrap_or_default(),
+            show_secret: false,
             browser: None,
             last_refresh: -10.0,
         }
@@ -28,6 +39,10 @@ enum Act {
     Host(u16),
     Join(String),
     Disconnect,
+    EndSession,
+    Kick(u64),
+    Ban(u64),
+    Unban(String),
 }
 
 /// Draw the window. Returns an error to show in the status bar, if any.
@@ -51,7 +66,39 @@ pub fn network_window(
                 let (cfg, port) = crate::net_sync::config_for(scene);
                 widgets::eyebrow(ui, "Session");
                 widgets::property_row(ui, "Name", |ui| ui.text_edit_singleline(&mut st.player_name));
-                widgets::property_row(ui, "Address", |ui| ui.text_edit_singleline(addr));
+                widgets::property_row(ui, "Address", |ui| {
+                    ui.add(egui::TextEdit::singleline(addr).hint_text("host:port or room code"))
+                        .on_hover_text("Host: the port to listen on. Join: host:port on the LAN / a forwarded port, or a room code (ABC123, or ABC123@relay:port) to join online")
+                });
+                widgets::property_row(ui, "Relay", |ui| {
+                    let hint = if cfg.relay.is_empty() { "none (LAN / direct only)".to_string() } else { cfg.relay.clone() };
+                    ui.add(egui::TextEdit::singleline(&mut st.relay).hint_text(hint))
+                        .on_hover_text("Relay server (host:port, default port 47800) for online play without port forwarding. Run one with `citrus-relay`.")
+                });
+                widgets::property_row(ui, "Secret", |ui| {
+                    ui.horizontal(|ui| {
+                        let hint = if cfg.secret.is_empty() { "none (open session)" } else { "from the Network Manager" };
+                        ui.add(egui::TextEdit::singleline(&mut st.secret).password(!st.show_secret).hint_text(hint).desired_width(150.0))
+                            .on_hover_text("Players must enter the same secret to join; it also keys the session encryption");
+                        let eye = if st.show_secret { Icon::EyeOff } else { Icon::Eye };
+                        if widgets::icon_button(ui, eye, "Show / hide", st.show_secret).clicked() {
+                            st.show_secret = !st.show_secret;
+                        }
+                        if widgets::icon_button(ui, Icon::Reset, "Generate a random secret (80 bits: no key stretching needed)", false).clicked() {
+                            st.secret = crate::net::generate_secret();
+                            st.show_secret = true;
+                        }
+                    })
+                });
+                let me = crate::net::Identity::install().fingerprint();
+                widgets::property_row(ui, "Player ID", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(short_fingerprint(&me)).font(theme::mono(11.0))).on_hover_text(&me);
+                        if widgets::icon_button(ui, Icon::Duplicate, "Copy your full player id (hosts put it on allow / ban lists)", false).clicked() {
+                            ui.ctx().copy_text(me.clone());
+                        }
+                    })
+                });
                 ui.horizontal(|ui| {
                     if widgets::primary_button(ui, Some(Icon::Play), "Host").clicked() {
                         let p = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(port);
@@ -61,11 +108,15 @@ pub fn network_window(
                         act = Some(Act::Join(addr.clone()));
                     }
                 });
+                let online = !st.relay.trim().is_empty() || !cfg.relay.is_empty();
                 widgets::info_note(
                     ui,
                     &format!(
-                        "{} · up to {} players. Host binds the port in Address; Join connects to it. Networked objects replicate while playing.",
-                        cfg.session_name, cfg.max_players
+                        "{} · up to {} players. Host binds the port in Address{}. Join takes host:port, or a room code{}. Networked objects replicate while playing.",
+                        cfg.session_name,
+                        cfg.max_players,
+                        if online { " and opens a room on the relay" } else { "" },
+                        if online { " (through the relay)" } else { " (set a relay first)" },
                     ),
                 );
                 widgets::section_gap(ui);
@@ -108,10 +159,40 @@ pub fn network_window(
         });
     let (mut cfg, _) = crate::net_sync::config_for(scene);
     cfg.player_name = st.player_name.clone();
+    if !st.relay.trim().is_empty() {
+        cfg.relay = st.relay.trim().to_string();
+    }
+    if !st.secret.is_empty() {
+        cfg.secret = st.secret.clone();
+    }
     match act? {
         Act::Disconnect => {
             if let Some(mut s) = net.take() {
                 s.disconnect();
+            }
+            None
+        }
+        Act::EndSession => {
+            if let Some(mut s) = net.take() {
+                s.close_session();
+            }
+            None
+        }
+        Act::Kick(peer) => {
+            if let Some(s) = net.as_mut() {
+                s.kick(peer, "removed by the host");
+            }
+            None
+        }
+        Act::Ban(peer) => {
+            if let Some(s) = net.as_mut() {
+                s.ban(peer);
+            }
+            None
+        }
+        Act::Unban(fp) => {
+            if let Some(s) = net.as_mut() {
+                s.unban(&fp);
             }
             None
         }
@@ -137,7 +218,8 @@ fn connected_ui(ui: &mut egui::Ui, s: &NetSession, scene: &LoadedScene, act: &mu
     ui.horizontal(|ui| {
         match s.state() {
             ConnState::Connected => {
-                widgets::chip(ui, &format!("{role} · peer {}", s.local_peer()));
+                let epoch = if s.epoch() > 0 { format!(" · host #{}", s.epoch() + 1) } else { String::new() };
+                widgets::chip(ui, &format!("{role} · peer {}{epoch}", s.local_peer()));
             }
             ConnState::Connecting => {
                 widgets::badge(ui, "Connecting...");
@@ -153,8 +235,53 @@ fn connected_ui(ui: &mut egui::Ui, s: &NetSession, scene: &LoadedScene, act: &mu
     if let ConnState::Disconnected(reason) = s.state() {
         widgets::info_note(ui, reason);
     }
+    if let Some(m) = s.migration_status() {
+        ui.horizontal(|ui| {
+            widgets::warn_badge(ui, "Host lost");
+            let path = if m.relayed { "via the relay" } else { "directly" };
+            let who = if m.target == s.local_peer() { "taking over".to_string() } else { format!("joining peer {} {path}", m.target) };
+            ui.label(RichText::new(format!("{who} · {:.1} s", m.seconds)).font(theme::mono(11.0)));
+        });
+        widgets::info_note(ui, "The host left; the next player in line takes over and everyone reconnects to it. Objects the host simulated pause until then.");
+    }
+    let back = s.reconnecting();
+    if s.is_host() && !back.is_empty() {
+        let list = back.iter().map(|p| format!("#{p}")).collect::<Vec<_>>().join(", ");
+        widgets::info_note(ui, &format!("Took over as host: waiting for {list} to reconnect."));
+    }
+    if let Some(r) = s.relay_status() {
+        widgets::section_gap(ui);
+        widgets::eyebrow(ui, "Online");
+        widgets::property_row(ui, "Relay", |ui| ui.label(RichText::new(r.relay.to_string()).font(theme::mono(11.0))));
+        match &r.phase {
+            RelayPhase::Registering => {
+                widgets::property_row(ui, "Room", |ui| widgets::badge(ui, "Registering..."));
+            }
+            RelayPhase::Failed(why) => {
+                widgets::property_row(ui, "Room", |ui| widgets::warn_badge(ui, "Relay error"));
+                widgets::info_note(ui, why);
+            }
+            RelayPhase::Registered => {
+                widgets::property_row(ui, "Room", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&r.code).font(theme::mono(15.0)).color(theme::accent()));
+                        if widgets::icon_button(ui, Icon::Duplicate, "Copy the room code", false).clicked() {
+                            ui.ctx().copy_text(r.code.clone());
+                        }
+                    })
+                });
+                if let Some(p) = r.public {
+                    widgets::property_row(ui, "Public", |ui| ui.label(RichText::new(p.to_string()).font(theme::mono(11.0)).weak()));
+                }
+                if s.is_host() {
+                    widgets::info_note(ui, "Players join with this room code (Join > Address), no port forwarding needed.");
+                }
+            }
+        }
+    }
     widgets::section_gap(ui);
     widgets::eyebrow(ui, &format!("Players ({}/{})", s.peer_count(), s.cfg.max_players));
+    let next = s.next_host();
     for p in s.peer_infos() {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("#{}", p.id)).font(theme::mono(11.0)).weak());
@@ -165,11 +292,51 @@ fn connected_ui(ui: &mut egui::Ui, s: &NetSession, scene: &LoadedScene, act: &mu
             if p.id == s.local_peer() {
                 widgets::badge(ui, "you");
             }
+            if Some(p.id) == next {
+                widgets::badge(ui, "next host").on_hover_text("Takes over if the host leaves (host migration)");
+            }
+            if !p.fingerprint.is_empty() {
+                let fp = ui
+                    .add(egui::Label::new(RichText::new(short_fingerprint(&p.fingerprint)).font(theme::mono(10.0)).weak()).sense(egui::Sense::click()))
+                    .on_hover_text(format!("Verified player id {}\nClick to copy", p.fingerprint));
+                if fp.clicked() {
+                    ui.ctx().copy_text(p.fingerprint.clone());
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if s.is_host() && p.id != s.local_peer() && !s.reconnecting().contains(&p.id) {
+                    if widgets::icon_button(ui, Icon::Lock, "Ban: kick and refuse this player id from now on", false).clicked() {
+                        *act = Some(Act::Ban(p.id));
+                    }
+                    if widgets::icon_button(ui, Icon::Close, "Kick from the session", false).clicked() {
+                        *act = Some(Act::Kick(p.id));
+                    }
+                }
                 if p.id != s.local_peer() && p.rtt_ms > 0.0 {
+                    if let Some(route) = s.peer_route(p.id) {
+                        widgets::badge(ui, route);
+                    }
+                    if p.loss > 0.005 {
+                        ui.label(RichText::new(format!("{:.1}% loss", p.loss * 100.0)).font(theme::mono(11.0)).weak());
+                    }
                     ui.label(RichText::new(format!("{:.0} ms", p.rtt_ms)).font(theme::mono(11.0)));
                 }
             });
+        });
+    }
+    if s.is_host() && !s.cfg.ban.is_empty() {
+        egui::CollapsingHeader::new(format!("Banned ({})", s.cfg.ban.len())).show(ui, |ui| {
+            for fp in &s.cfg.ban {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(short_fingerprint(fp)).font(theme::mono(11.0))).on_hover_text(fp);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::icon_button(ui, Icon::LockOpen, "Unban", false).clicked() {
+                            *act = Some(Act::Unban(fp.clone()));
+                        }
+                    });
+                });
+            }
+            widgets::info_note(ui, "For this session only; add ids to the Network Manager's Ban List to keep them out of every session.");
         });
     }
     widgets::section_gap(ui);
@@ -180,8 +347,20 @@ fn connected_ui(ui: &mut egui::Ui, s: &NetSession, scene: &LoadedScene, act: &mu
     };
     mono(ui, "In / Out", format!("{:.1} / {:.1} kB/s", stats.rate_in / 1024.0, stats.rate_out / 1024.0));
     mono(ui, "Packets", format!("{} in · {} out · {} resent", stats.packets_in, stats.packets_out, stats.resends));
+    if stats.rejected > 0 {
+        mono(ui, "Rejected", format!("{} (failed authentication)", stats.rejected));
+    }
+    if stats.half_open_refused > 0 {
+        mono(ui, "Refused joins", format!("{} (too many handshakes at once)", stats.half_open_refused));
+    }
+    if s.migrations() > 0 {
+        mono(ui, "Migrations", format!("{} · host is peer {}", s.migrations(), s.host_peer()));
+    }
     if !s.is_host() {
-        mono(ui, "Ping", format!("{:.0} ms", s.rtt_ms()));
+        let q = s.quality();
+        mono(ui, "Ping", format!("{:.0} ms · jitter {:.0} ms", q.rtt_ms, q.jitter_ms));
+        mono(ui, "Loss", format!("{:.1}% in · {:.1}% out", q.loss_in * 100.0, q.loss_out * 100.0));
+        mono(ui, "Interp delay", format!("{:.0} ms", s.view_delay * 1000.0));
     }
     let owned = s.world.owners.values().filter(|(o, _)| *o == s.local_peer() && *o != 0).count();
     mono(ui, "Objects", format!("{} owned · {} spawned", owned, s.world.spawns.len()));
@@ -211,7 +390,18 @@ fn connected_ui(ui: &mut egui::Ui, s: &NetSession, scene: &LoadedScene, act: &mu
         });
     }
     widgets::section_gap(ui);
-    if widgets::secondary_button(ui, Some(Icon::Stop), "Disconnect").clicked() {
-        *act = Some(Act::Disconnect);
-    }
+    ui.horizontal(|ui| {
+        let hand_off = s.is_host() && s.cfg.migration && s.next_host().is_some();
+        let (label, tip) = if hand_off {
+            ("Leave", "Leave and hand the session to the next host (everyone else stays)")
+        } else {
+            ("Disconnect", "Leave the session")
+        };
+        if widgets::secondary_button(ui, Some(Icon::Stop), label).on_hover_text(tip).clicked() {
+            *act = Some(Act::Disconnect);
+        }
+        if s.is_host() && s.peer_count() > 1 && widgets::secondary_button(ui, Some(Icon::Close), "End session").on_hover_text("Close the session for everyone (no host migration)").clicked() {
+            *act = Some(Act::EndSession);
+        }
+    });
 }

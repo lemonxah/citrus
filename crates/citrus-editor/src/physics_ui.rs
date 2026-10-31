@@ -42,7 +42,21 @@ pub fn physmat_editor_ui(ui: &mut Ui, m: &mut PhysicsMaterial) -> bool {
         });
     });
     widgets::eyebrow(ui, "Contact");
-    c |= drag(ui, "Friction", &mut m.friction, 0.01, 0.0..=4.0, "0 = ice, ~0.5 wood, 1+ rubber");
+    c |= drag(ui, "Friction", &mut m.friction, 0.01, 0.0..=4.0, "While sliding: 0 = ice, ~0.5 wood, 1+ rubber");
+    let mut separate = m.static_friction.is_some();
+    crate::widgets::property_row(ui, "Static friction", |ui| {
+        if ui
+            .checkbox(&mut separate, "")
+            .on_hover_text("Its own coefficient while at rest: it takes more to start something sliding than to keep it going. Off = the same as Friction")
+            .changed()
+        {
+            m.static_friction = separate.then_some(m.friction * 1.2);
+            c = true;
+        }
+        if let Some(s) = m.static_friction.as_mut() {
+            c |= ui.add(egui::DragValue::new(s).speed(0.01).range(0.0..=4.0)).changed();
+        }
+    });
     c |= combine(ui, "Friction combine", &mut m.friction_combine, "citrus-physmat-fric");
     c |= drag(ui, "Bounciness", &mut m.bounciness, 0.01, 0.0..=1.0, "Share of speed kept on a bounce");
     c |= combine(ui, "Bounce combine", &mut m.bounce_combine, "citrus-physmat-bounce");

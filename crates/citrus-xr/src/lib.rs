@@ -10,7 +10,9 @@
 //!
 //! Runtime targets: Monado and SteamVR's OpenXR runtime (SteamVR exposes Vive
 //! trackers through OpenXR tracker extensions, which the full-body path will use
-//! to feed `citrus_core::TrackerTargets` into the IK solver).
+//! to feed `citrus_core::TrackerTargets` into the IK solver), and on Android the
+//! headset's system runtime (Meta Quest) through the Khronos loader shipped in
+//! the APK (`lib/arm64-v8a/libopenxr_loader.so`, see tools/android/build_apk.sh).
 
 use anyhow::{Context as _, Result};
 
@@ -32,6 +34,8 @@ pub struct XrContext {
     face_supported: bool,
     /// `XR_EXT_eye_gaze_interaction`.
     eye_gaze_supported: bool,
+    /// `XR_FB_display_refresh_rate` (Quest: 72 / 80 / 90 / 120 Hz).
+    refresh_rate_supported: bool,
 }
 
 impl XrContext {
@@ -49,6 +53,13 @@ impl XrContext {
                 return Ok(None);
             }
         };
+        // Android: the Khronos loader (libopenxr_loader.so in the APK) needs the
+        // JavaVM + activity before any other call, to find the system runtime.
+        #[cfg(target_os = "android")]
+        if let Err(e) = entry.initialize_android_loader() {
+            tracing::warn!("xrInitializeLoaderKHR failed, VR disabled: {e}");
+            return Ok(None);
+        }
 
         let available = entry
             .enumerate_extensions()
@@ -60,6 +71,16 @@ impl XrContext {
 
         let mut extensions = openxr::ExtensionSet::default();
         extensions.khr_vulkan_enable2 = true;
+        // Android runtimes (Quest) take the JavaVM + activity at instance
+        // creation; the openxr crate chains them in when this is set.
+        #[cfg(target_os = "android")]
+        {
+            if !available.khr_android_create_instance {
+                tracing::warn!("OpenXR runtime lacks XR_KHR_android_create_instance; VR disabled");
+                return Ok(None);
+            }
+            extensions.khr_android_create_instance = true;
+        }
         // Instance::now() (used to timestamp head/tracker pose lookups) needs the
         // timespec-conversion extension on Linux runtimes; enabling it avoids the
         // `KHR_convert_timespec_time not loaded` panic. Tracked so the pose readers
@@ -79,6 +100,8 @@ impl XrContext {
         extensions.fb_face_tracking2 = face_supported;
         let eye_gaze_supported = available.ext_eye_gaze_interaction;
         extensions.ext_eye_gaze_interaction = eye_gaze_supported;
+        let refresh_rate_supported = available.fb_display_refresh_rate;
+        extensions.fb_display_refresh_rate = refresh_rate_supported;
 
         let app_info = openxr::ApplicationInfo {
             application_name: app_name,
@@ -124,6 +147,7 @@ impl XrContext {
             tracker_supported,
             face_supported,
             eye_gaze_supported,
+            refresh_rate_supported,
         }))
     }
 
@@ -197,7 +221,14 @@ impl XrContext {
                 z: 0.0,
             },
         };
-        let stage = session.create_reference_space(openxr::ReferenceSpaceType::STAGE, identity)?;
+        // STAGE needs a configured play area; standalone headsets with a
+        // stationary boundary may only offer LOCAL, which still tracks.
+        let stage = session
+            .create_reference_space(openxr::ReferenceSpaceType::STAGE, identity)
+            .or_else(|e| {
+                tracing::warn!("OpenXR STAGE space unavailable ({e}); using LOCAL");
+                session.create_reference_space(openxr::ReferenceSpaceType::LOCAL, identity)
+            })?;
         let view = session.create_reference_space(openxr::ReferenceSpaceType::VIEW, identity)?;
 
         // Full-body tracker action set: pose actions for hands (controllers) +
@@ -244,6 +275,15 @@ impl XrContext {
         let a_lgrip = mkf("left_grip", "Left Grip")?;
         let a_rgrip = mkf("right_grip", "Right Grip")?;
         let a_rtrigger = mkb("right_trigger", "Right Trigger")?;
+        let a_ltrigger = mkb("left_trigger", "Left Trigger")?;
+        let a_ltrigger_value = mkf("left_trigger_value", "Left Trigger Pull")?;
+        let a_rtrigger_value = mkf("right_trigger_value", "Right Trigger Pull")?;
+        let a_a = mkb("button_a", "A")?;
+        let a_b = mkb("button_b", "B")?;
+        let a_x = mkb("button_x", "X")?;
+        let a_y = mkb("button_y", "Y")?;
+        let a_lstick_click = mkb("left_stick_click", "Left Stick Click")?;
+        let a_rstick_click = mkb("right_stick_click", "Right Stick Click")?;
         let a_menu = mkb("menu", "Menu")?;
 
         // Suggested bindings. Hands map to the cross-vendor simple controller;
@@ -293,33 +333,56 @@ impl XrContext {
         }
         // Locomotion/interaction bindings on the Oculus Touch profile (Quest, Rift;
         // the most common runtime). Pose hands also bind here so controllers track.
-        if let (Ok(lsx), Ok(lsy), Ok(rsx), Ok(rsy), Ok(lg), Ok(rg), Ok(rt), Ok(mn), Ok(lhp), Ok(rhp)) = (
-            path("/user/hand/left/input/thumbstick/x"),
-            path("/user/hand/left/input/thumbstick/y"),
-            path("/user/hand/right/input/thumbstick/x"),
-            path("/user/hand/right/input/thumbstick/y"),
-            path("/user/hand/left/input/squeeze/value"),
-            path("/user/hand/right/input/squeeze/value"),
-            path("/user/hand/right/input/trigger/value"),
-            path("/user/hand/left/input/y/click"),
-            path("/user/hand/left/input/aim/pose"),
-            path("/user/hand/right/input/aim/pose"),
-        ) {
-            let _ = self.instance.suggest_interaction_profile_bindings(
-                path("/interaction_profiles/oculus/touch_controller").unwrap_or(openxr::Path::NULL),
-                &[
-                    openxr::Binding::new(&a_left_hand, lhp),
-                    openxr::Binding::new(&a_right_hand, rhp),
-                    openxr::Binding::new(&a_lstick_x, lsx),
-                    openxr::Binding::new(&a_lstick_y, lsy),
-                    openxr::Binding::new(&a_rstick_x, rsx),
-                    openxr::Binding::new(&a_rstick_y, rsy),
-                    openxr::Binding::new(&a_lgrip, lg),
-                    openxr::Binding::new(&a_rgrip, rg),
-                    openxr::Binding::new(&a_rtrigger, rt),
-                    openxr::Binding::new(&a_menu, mn),
-                ],
-            );
+        // Touch Plus (Quest 3 / 3S) and Touch Pro also drive this profile, so
+        // the face buttons, analog trigger pull and stick clicks bind here too.
+        let touch_extra = [
+            ("/user/hand/left/input/trigger/value", &a_ltrigger_value),
+            ("/user/hand/right/input/trigger/value", &a_rtrigger_value),
+        ];
+        let touch_buttons = [
+            ("/user/hand/right/input/a/click", &a_a),
+            ("/user/hand/right/input/b/click", &a_b),
+            ("/user/hand/left/input/x/click", &a_x),
+            ("/user/hand/left/input/y/click", &a_y),
+            ("/user/hand/left/input/thumbstick/click", &a_lstick_click),
+            ("/user/hand/right/input/thumbstick/click", &a_rstick_click),
+        ];
+        if let Ok(profile) = path("/interaction_profiles/oculus/touch_controller") {
+            let base: [(&str, BindingAction); 11] = [
+                ("/user/hand/left/input/aim/pose", BindingAction::Pose(&a_left_hand)),
+                ("/user/hand/right/input/aim/pose", BindingAction::Pose(&a_right_hand)),
+                ("/user/hand/left/input/thumbstick/x", BindingAction::Float(&a_lstick_x)),
+                ("/user/hand/left/input/thumbstick/y", BindingAction::Float(&a_lstick_y)),
+                ("/user/hand/right/input/thumbstick/x", BindingAction::Float(&a_rstick_x)),
+                ("/user/hand/right/input/thumbstick/y", BindingAction::Float(&a_rstick_y)),
+                ("/user/hand/left/input/squeeze/value", BindingAction::Float(&a_lgrip)),
+                ("/user/hand/right/input/squeeze/value", BindingAction::Float(&a_rgrip)),
+                ("/user/hand/right/input/trigger/value", BindingAction::Bool(&a_rtrigger)),
+                ("/user/hand/left/input/trigger/value", BindingAction::Bool(&a_ltrigger)),
+                ("/user/hand/left/input/y/click", BindingAction::Bool(&a_menu)),
+            ];
+            let mut bindings = Vec::new();
+            for (p, action) in base {
+                let Ok(p) = path(p) else { continue };
+                bindings.push(match action {
+                    BindingAction::Pose(a) => openxr::Binding::new(a, p),
+                    BindingAction::Float(a) => openxr::Binding::new(a, p),
+                    BindingAction::Bool(a) => openxr::Binding::new(a, p),
+                });
+            }
+            for (p, a) in touch_extra {
+                if let Ok(p) = path(p) {
+                    bindings.push(openxr::Binding::new(a, p));
+                }
+            }
+            for (p, a) in touch_buttons {
+                if let Ok(p) = path(p) {
+                    bindings.push(openxr::Binding::new(a, p));
+                }
+            }
+            if let Err(e) = self.instance.suggest_interaction_profile_bindings(profile, &bindings) {
+                tracing::warn!("OpenXR Touch controller bindings rejected: {e}");
+            }
         }
         session
             .attach_action_sets(&[&action_set])
@@ -368,13 +431,26 @@ impl XrContext {
             a_lgrip,
             a_rgrip,
             a_rtrigger,
+            a_ltrigger,
+            a_ltrigger_value,
+            a_rtrigger_value,
+            a_a,
+            a_b,
+            a_x,
+            a_y,
+            a_lstick_click,
+            a_rstick_click,
             a_menu,
             running: false,
+            lifecycle: SessionLifecycle::default(),
+            last_display_time: None,
             swapchains: Vec::new(),
             swap_images: Vec::new(),
             view_extent: (0, 0),
+            multiview: false,
             blend_mode: openxr::EnvironmentBlendMode::OPAQUE,
             time_supported: self.time_supported,
+            refresh_rate_supported: self.refresh_rate_supported,
         })
     }
 }
@@ -387,8 +463,101 @@ pub struct VrInput {
     pub right_stick: (f32, f32),
     pub left_grip: f32,
     pub right_grip: f32,
+    pub left_trigger: bool,
     pub right_trigger: bool,
     pub menu: bool,
+    /// Analog trigger pull (0..1).
+    pub left_trigger_value: f32,
+    pub right_trigger_value: f32,
+    /// Face buttons: X / Y on the left controller, A / B on the right.
+    pub a: bool,
+    pub b: bool,
+    pub x: bool,
+    pub y: bool,
+    pub left_stick_click: bool,
+    pub right_stick_click: bool,
+}
+
+/// A typed action for building one interaction profile's binding list.
+enum BindingAction<'a> {
+    Pose(&'a openxr::Action<openxr::Posef>),
+    Float(&'a openxr::Action<f32>),
+    Bool(&'a openxr::Action<bool>),
+}
+
+/// What the app must do in response to an OpenXR session state change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleAction {
+    None,
+    /// READY: call `xrBeginSession`.
+    Begin,
+    /// STOPPING: call `xrEndSession` and stop submitting frames.
+    End,
+    /// EXITING / LOSS_PENDING: the runtime wants the app (or session) gone.
+    Exit,
+}
+
+/// The OpenXR session state machine, kept apart from the runtime so the
+/// transitions are testable. On a standalone headset the runtime walks it as
+/// the app is paused and resumed (system menu, headset off, app switch):
+/// FOCUSED -> VISIBLE -> SYNCHRONIZED -> STOPPING -> IDLE, then back up
+/// through READY when the app returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionLifecycle {
+    /// Between a successful `xrBeginSession` and STOPPING.
+    pub running: bool,
+    /// The compositor shows this app's frames (VISIBLE or FOCUSED).
+    pub visible: bool,
+    /// The app has input focus (FOCUSED). Without it controller input reads
+    /// inactive, e.g. while the system menu is open.
+    pub focused: bool,
+    /// EXITING or LOSS_PENDING was seen.
+    pub exit_requested: bool,
+}
+
+impl SessionLifecycle {
+    /// Apply a session state change and return what the caller must do.
+    /// After [`LifecycleAction::Begin`] the caller reports the outcome with
+    /// [`SessionLifecycle::began`].
+    pub fn on_state(&mut self, state: openxr::SessionState) -> LifecycleAction {
+        match state {
+            openxr::SessionState::READY => LifecycleAction::Begin,
+            openxr::SessionState::SYNCHRONIZED => {
+                self.visible = false;
+                self.focused = false;
+                LifecycleAction::None
+            }
+            openxr::SessionState::VISIBLE => {
+                self.visible = true;
+                self.focused = false;
+                LifecycleAction::None
+            }
+            openxr::SessionState::FOCUSED => {
+                self.visible = true;
+                self.focused = true;
+                LifecycleAction::None
+            }
+            openxr::SessionState::STOPPING => {
+                self.visible = false;
+                self.focused = false;
+                self.running = false;
+                LifecycleAction::End
+            }
+            openxr::SessionState::EXITING | openxr::SessionState::LOSS_PENDING => {
+                self.visible = false;
+                self.focused = false;
+                self.running = false;
+                self.exit_requested = true;
+                LifecycleAction::Exit
+            }
+            _ => LifecycleAction::None,
+        }
+    }
+
+    /// Record whether `xrBeginSession` succeeded after a READY.
+    pub fn began(&mut self, ok: bool) {
+        self.running = ok;
+    }
 }
 
 /// Tracked full-body poses (stage space) read from the VR session this frame.
@@ -441,15 +610,58 @@ pub struct XrSession {
     a_lgrip: openxr::Action<f32>,
     a_rgrip: openxr::Action<f32>,
     a_rtrigger: openxr::Action<bool>,
+    a_ltrigger: openxr::Action<bool>,
+    a_ltrigger_value: openxr::Action<f32>,
+    a_rtrigger_value: openxr::Action<f32>,
+    a_a: openxr::Action<bool>,
+    a_b: openxr::Action<bool>,
+    a_x: openxr::Action<bool>,
+    a_y: openxr::Action<bool>,
+    a_lstick_click: openxr::Action<bool>,
+    a_rstick_click: openxr::Action<bool>,
     a_menu: openxr::Action<bool>,
     pub running: bool,
-    // Stereo render: per-eye swapchains + their VkImage handles, render extent.
+    lifecycle: SessionLifecycle,
+    /// Predicted display time of the last `xrWaitFrame`: the pose time when
+    /// the runtime lacks `XR_KHR_convert_timespec_time`.
+    last_display_time: Option<openxr::Time>,
+    // Stereo render: per-eye swapchains (or one 2-layer swapchain under
+    // multiview) + their VkImage handles, render extent.
     swapchains: Vec<openxr::Swapchain<openxr::Vulkan>>,
     swap_images: Vec<Vec<u64>>,
     view_extent: (u32, u32),
+    multiview: bool,
     blend_mode: openxr::EnvironmentBlendMode,
     /// `Instance::now()` is only safe when `XR_KHR_convert_timespec_time` loaded.
     time_supported: bool,
+    refresh_rate_supported: bool,
+}
+
+/// Raw `VkFormat`s the eye images can use, best first after the caller's own
+/// preference: 8-bit sRGB (the post pass writes linear, the hardware encodes),
+/// then half float (linear for the compositor).
+const XR_FALLBACK_FORMATS: [u32; 3] = [
+    43, // VK_FORMAT_R8G8B8A8_SRGB
+    50, // VK_FORMAT_B8G8R8A8_SRGB
+    97, // VK_FORMAT_R16G16B16A16_SFLOAT
+];
+
+/// The eye swapchains [`XrSession::setup_stereo`] made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StereoSetup {
+    /// Per-eye render extent (both eyes share it).
+    pub width: u32,
+    pub height: u32,
+    /// Raw `VkFormat` of the eye images.
+    pub format: u32,
+    /// One swapchain with an array layer per eye (`XrEye::layer`); render both
+    /// eyes in one multiview pass.
+    pub multiview: bool,
+}
+
+/// First of `preferred`, then [`XR_FALLBACK_FORMATS`], that the runtime offers.
+fn pick_swapchain_format(preferred: &[u32], offered: &[u32]) -> Option<u32> {
+    preferred.iter().chain(XR_FALLBACK_FORMATS.iter()).copied().find(|f| offered.contains(f))
 }
 
 /// One XR frame's per-eye render targets + view/projection (from [`begin_frame`]).
@@ -462,6 +674,9 @@ pub struct XrFrame {
 pub struct XrEye {
     /// Raw `VkImage` (u64) of the acquired swapchain image to render into.
     pub image: u64,
+    /// Array layer of `image` for this eye (non-zero only under multiview,
+    /// where both eyes share one 2-layer image).
+    pub layer: u32,
     pub image_index: u32,
     /// View matrix (world → eye) and projection (asymmetric, from the eye FOV).
     pub view: glam::Mat4,
@@ -470,6 +685,55 @@ pub struct XrEye {
     pub fov: openxr::Fovf,
     pub width: u32,
     pub height: u32,
+}
+
+impl XrFrame {
+    /// One view (stage space) whose frustum encloses every eye's: the eyes'
+    /// shared orientation from a point behind them, with the union of their
+    /// fields of view. Fits shadow cascades and culls a multiview pass. None
+    /// for canted displays (eye orientations differ) or unusual FOVs.
+    pub fn combined_view(&self, near: f32, far: f32) -> Option<(glam::Mat4, glam::Mat4)> {
+        let poses: Vec<(glam::Vec3, glam::Quat, openxr::Fovf)> = self
+            .eyes
+            .iter()
+            .map(|e| {
+                let p = e.pose.position;
+                let o = e.pose.orientation;
+                (glam::Vec3::new(p.x, p.y, p.z), glam::Quat::from_xyzw(o.x, o.y, o.z, o.w).normalize(), e.fov)
+            })
+            .collect();
+        combined_view(&poses, near, far)
+    }
+}
+
+/// See [`XrFrame::combined_view`]: eye world poses + FOVs in, (view, proj) out.
+fn combined_view(eyes: &[(glam::Vec3, glam::Quat, openxr::Fovf)], near: f32, far: f32) -> Option<(glam::Mat4, glam::Mat4)> {
+    let &(_, q, _) = eyes.first()?;
+    if eyes.iter().any(|(_, qi, _)| qi.dot(q).abs() < 0.9999) {
+        return None;
+    }
+    let (mut l, mut r, mut u, mut d) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for (_, _, f) in eyes {
+        l = l.min(f.angle_left.tan());
+        r = r.max(f.angle_right.tan());
+        u = u.max(f.angle_up.tan());
+        d = d.min(f.angle_down.tan());
+    }
+    if l >= 0.0 || r <= 0.0 || u <= 0.0 || d >= 0.0 {
+        return None;
+    }
+    let center = eyes.iter().map(|(p, _, _)| *p).sum::<glam::Vec3>() / eyes.len() as f32;
+    // Pull the apex back until each eye's side planes sit inside the union.
+    let inv = q.inverse();
+    let mut back = 0.0f32;
+    for (p, _, _) in eyes {
+        let local = inv * (*p - center);
+        back = back.max(local.x / r).max(local.x / l).max(local.y / u).max(local.y / d).max(local.z);
+    }
+    let apex = center + q * glam::Vec3::new(0.0, 0.0, back);
+    let fov = openxr::Fovf { angle_left: l.atan(), angle_right: r.atan(), angle_up: u.atan(), angle_down: d.atan() };
+    let view = glam::Mat4::from_rotation_translation(q, apex).inverse();
+    Some((view, fov_to_proj(fov, near, far + back)))
 }
 
 /// Asymmetric perspective projection from an OpenXR field of view (Vulkan depth
@@ -507,24 +771,33 @@ impl XrSession {
     pub fn poll(&mut self) {
         let mut buf = openxr::EventDataBuffer::new();
         while let Ok(Some(event)) = self.instance.poll_event(&mut buf) {
-            if let openxr::Event::SessionStateChanged(e) = event {
-                match e.state() {
-                    openxr::SessionState::READY => {
-                        if self
-                            .session
-                            .begin(openxr::ViewConfigurationType::PRIMARY_STEREO)
-                            .is_ok()
-                        {
-                            self.running = true;
-                            tracing::info!("OpenXR session running");
+            match event {
+                openxr::Event::SessionStateChanged(e) => {
+                    tracing::debug!(state = ?e.state(), "OpenXR session state");
+                    match self.lifecycle.on_state(e.state()) {
+                        LifecycleAction::Begin => {
+                            let ok = self
+                                .session
+                                .begin(openxr::ViewConfigurationType::PRIMARY_STEREO)
+                                .is_ok();
+                            self.lifecycle.began(ok);
+                            if ok {
+                                tracing::info!("OpenXR session running");
+                            }
                         }
+                        LifecycleAction::End => {
+                            let _ = self.session.end();
+                        }
+                        LifecycleAction::Exit => tracing::info!("OpenXR session exiting ({:?})", e.state()),
+                        LifecycleAction::None => {}
                     }
-                    openxr::SessionState::STOPPING => {
-                        let _ = self.session.end();
-                        self.running = false;
-                    }
-                    _ => {}
+                    self.running = self.lifecycle.running;
                 }
+                openxr::Event::InstanceLossPending(_) => {
+                    self.lifecycle.on_state(openxr::SessionState::LOSS_PENDING);
+                    self.running = false;
+                }
+                _ => {}
             }
         }
         // Sync the tracker action set so the action spaces have fresh poses.
@@ -532,6 +805,28 @@ impl XrSession {
             let _ = self
                 .session
                 .sync_actions(&[openxr::ActiveActionSet::new(&self.action_set)]);
+        }
+    }
+
+    /// The app has input focus (FOCUSED). Controller input is meaningless
+    /// without it (system menu open, guardian, another app in front).
+    pub fn focused(&self) -> bool {
+        self.lifecycle.focused
+    }
+
+    /// The runtime asked the app to quit (EXITING) or lost the session
+    /// (LOSS_PENDING). A standalone app should exit its loop.
+    pub fn exit_requested(&self) -> bool {
+        self.lifecycle.exit_requested
+    }
+
+    /// Time to locate poses at: now when the runtime converts system time,
+    /// otherwise the last predicted display time.
+    fn pose_time(&self) -> Option<openxr::Time> {
+        if self.time_supported {
+            self.instance.now().ok()
+        } else {
+            self.last_display_time
         }
     }
 
@@ -557,10 +852,10 @@ impl XrSession {
     pub fn face_weights(&self) -> Option<Vec<f32>> {
         let tracker = self.face_tracker?;
         let ext = self.instance.exts().fb_face_tracking2.as_ref()?;
-        if !self.running || !self.time_supported {
+        if !self.running {
             return None;
         }
-        let time = self.instance.now().ok()?;
+        let time = self.pose_time()?;
         let mut weights = vec![0.0f32; 70];
         let mut confidences = vec![0.0f32; 2];
         let info = openxr::sys::FaceExpressionInfo2FB { ty: openxr::sys::FaceExpressionInfo2FB::TYPE, next: std::ptr::null(), time };
@@ -584,10 +879,10 @@ impl XrSession {
     /// reports it.
     pub fn eye_gaze(&self) -> Option<glam::Quat> {
         let space = self.eye_gaze.as_ref()?;
-        if !self.running || !self.time_supported {
+        if !self.running {
             return None;
         }
-        let time = self.instance.now().ok()?;
+        let time = self.pose_time()?;
         let loc = space.locate(&self.view, time).ok()?;
         if !loc.location_flags.contains(openxr::SpaceLocationFlags::ORIENTATION_VALID) {
             return None;
@@ -599,10 +894,10 @@ impl XrSession {
     /// All tracked full-body poses this frame (head + hands + waist + feet) in
     /// the stage space. Feed straight into `citrus_core::TrackerTargets`.
     pub fn body_poses(&self) -> BodyPoses {
-        if !self.running || !self.time_supported {
+        if !self.running {
             return BodyPoses::default();
         }
-        let Ok(time) = self.instance.now() else {
+        let Some(time) = self.pose_time() else {
             return BodyPoses::default();
         };
         BodyPoses {
@@ -641,16 +936,28 @@ impl XrSession {
             right_stick: (f(&self.a_rstick_x), f(&self.a_rstick_y)),
             left_grip: f(&self.a_lgrip),
             right_grip: f(&self.a_rgrip),
+            left_trigger: b(&self.a_ltrigger),
             right_trigger: b(&self.a_rtrigger),
             menu: b(&self.a_menu),
+            left_trigger_value: f(&self.a_ltrigger_value),
+            right_trigger_value: f(&self.a_rtrigger_value),
+            a: b(&self.a_a),
+            b: b(&self.a_b),
+            x: b(&self.a_x),
+            y: b(&self.a_y),
+            left_stick_click: b(&self.a_lstick_click),
+            right_stick_click: b(&self.a_rstick_click),
         }
     }
 
-    /// Create the per-eye stereo swapchains (color) for `color_format` (a raw
-    /// `VkFormat` as u64 the renderer will render into). Call once after the
-    /// session is created, before [`begin_frame`]. Returns the per-eye render
-    /// extent (both eyes share it).
-    pub fn setup_stereo(&mut self, color_format: u32) -> Result<(u32, u32)> {
+    /// Create the eye swapchains. The format is the first of `preferred` (raw
+    /// `VkFormat`s) the runtime offers, else an sRGB / half-float one it does.
+    /// `multiview` asks for one swapchain with a layer per eye. Call once after
+    /// the session is created, before [`begin_frame`].
+    pub fn setup_stereo(&mut self, preferred: &[u32], multiview: bool) -> Result<StereoSetup> {
+        let offered: Vec<u32> = self.session.enumerate_swapchain_formats().context("enumerating XR swapchain formats")?;
+        let format = pick_swapchain_format(preferred, &offered)
+            .with_context(|| format!("the OpenXR runtime offers no usable eye format (offered VkFormats {offered:?})"))?;
         let views = self
             .instance
             .enumerate_view_configuration_views(
@@ -664,21 +971,23 @@ impl XrSession {
             v0.recommended_image_rect_width,
             v0.recommended_image_rect_height,
         );
+        let eyes = views.len().max(2) as u32;
+        let (count, array_size) = if multiview { (1, eyes) } else { (eyes, 1) };
         let mut swapchains = Vec::new();
         let mut images = Vec::new();
-        for _ in 0..views.len().max(2) {
+        for _ in 0..count {
             let sc = self
                 .session
                 .create_swapchain(&openxr::SwapchainCreateInfo {
                     create_flags: openxr::SwapchainCreateFlags::EMPTY,
                     usage_flags: openxr::SwapchainUsageFlags::COLOR_ATTACHMENT
                         | openxr::SwapchainUsageFlags::SAMPLED,
-                    format: color_format,
+                    format,
                     sample_count: 1,
                     width: w,
                     height: h,
                     face_count: 1,
-                    array_size: 1,
+                    array_size,
                     mip_count: 1,
                 })
                 .context("creating XR swapchain")?;
@@ -689,7 +998,26 @@ impl XrSession {
         self.swapchains = swapchains;
         self.swap_images = images;
         self.view_extent = (w, h);
-        Ok((w, h))
+        self.multiview = multiview;
+        Ok(StereoSetup { width: w, height: h, format, multiview })
+    }
+
+    /// Ask for the display refresh rate closest to `hz` the headset offers
+    /// (`XR_FB_display_refresh_rate`). Returns the rate requested, or None when
+    /// the runtime has no such control.
+    pub fn request_refresh_rate(&self, hz: f32) -> Option<f32> {
+        if !self.refresh_rate_supported {
+            return None;
+        }
+        let rates = self.session.enumerate_display_refresh_rates().ok()?;
+        let best = rates.iter().copied().min_by(|a, b| (a - hz).abs().total_cmp(&(b - hz).abs()))?;
+        match self.session.request_display_refresh_rate(best) {
+            Ok(()) => Some(best),
+            Err(e) => {
+                tracing::warn!("OpenXR refresh rate {best} Hz refused: {e}");
+                None
+            }
+        }
     }
 
     /// Begin an XR frame: wait for the predicted display time, start the frame,
@@ -701,6 +1029,7 @@ impl XrSession {
             return Ok(None);
         }
         let state = self.frame_waiter.wait().context("xrWaitFrame")?;
+        self.last_display_time = Some(state.predicted_display_time);
         self.frame_stream.begin().context("xrBeginFrame")?;
         if !state.should_render {
             // Still must end the frame with no layers.
@@ -718,14 +1047,20 @@ impl XrSession {
             )
             .context("xrLocateViews")?;
         let (w, h) = self.view_extent;
-        let mut eyes = Vec::with_capacity(self.swapchains.len());
-        for (i, view) in views.iter().enumerate().take(self.swapchains.len()) {
-            let idx = self.swapchains[i].acquire_image().context("acquire XR image")?;
-            self.swapchains[i]
-                .wait_image(openxr::Duration::INFINITE)
-                .context("wait XR image")?;
+        let mut acquired = Vec::with_capacity(self.swapchains.len());
+        for sc in &mut self.swapchains {
+            let idx = sc.acquire_image().context("acquire XR image")?;
+            sc.wait_image(openxr::Duration::INFINITE).context("wait XR image")?;
+            acquired.push(idx);
+        }
+        let eye_count = if self.multiview { views.len() } else { views.len().min(self.swapchains.len()) };
+        let mut eyes = Vec::with_capacity(eye_count);
+        for (i, view) in views.iter().enumerate().take(eye_count) {
+            let (sc, layer) = if self.multiview { (0, i as u32) } else { (i, 0) };
+            let idx = acquired[sc];
             eyes.push(XrEye {
-                image: self.swap_images[i][idx as usize],
+                image: self.swap_images[sc][idx as usize],
+                layer,
                 image_index: idx,
                 view: view_to_view_matrix(view.pose),
                 proj: fov_to_proj(view.fov, 0.05, 2000.0),
@@ -760,13 +1095,14 @@ impl XrSession {
             .iter()
             .enumerate()
             .map(|(i, eye)| {
+                let sc = if self.multiview { 0 } else { i };
                 openxr::CompositionLayerProjectionView::new()
                     .pose(eye.pose)
                     .fov(eye.fov)
                     .sub_image(
                         openxr::SwapchainSubImage::new()
-                            .swapchain(&self.swapchains[i])
-                            .image_array_index(0)
+                            .swapchain(&self.swapchains[sc])
+                            .image_array_index(eye.layer)
                             .image_rect(rect),
                     )
             })
@@ -783,10 +1119,10 @@ impl XrSession {
     /// The headset pose (position + orientation) in the stage reference space, or
     /// `None` if not yet tracking. Feed into `citrus_core::TrackerTargets::head`.
     pub fn head_pose(&self) -> Option<(glam::Vec3, glam::Quat)> {
-        if !self.running || !self.time_supported {
+        if !self.running {
             return None;
         }
-        let time = self.instance.now().ok()?;
+        let time = self.pose_time()?;
         let loc = self.view.locate(&self.stage, time).ok()?;
         if !loc
             .location_flags
@@ -827,3 +1163,90 @@ fn create_face_tracker(
     Some(tracker)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openxr::SessionState as S;
+
+    #[test]
+    fn lifecycle_runs_a_pause_resume_cycle() {
+        let mut life = SessionLifecycle::default();
+        assert_eq!(life.on_state(S::IDLE), LifecycleAction::None);
+        assert_eq!(life.on_state(S::READY), LifecycleAction::Begin);
+        assert!(!life.running);
+        life.began(true);
+        assert!(life.running);
+        life.on_state(S::SYNCHRONIZED);
+        life.on_state(S::VISIBLE);
+        assert!(life.visible && !life.focused);
+        life.on_state(S::FOCUSED);
+        assert!(life.visible && life.focused);
+        // System menu: focus goes, frames still show.
+        life.on_state(S::VISIBLE);
+        assert!(life.visible && !life.focused && life.running);
+        // App paused: the runtime stops the session.
+        life.on_state(S::SYNCHRONIZED);
+        assert_eq!(life.on_state(S::STOPPING), LifecycleAction::End);
+        assert!(!life.running && !life.visible && !life.focused);
+        assert_eq!(life.on_state(S::IDLE), LifecycleAction::None);
+        // Resumed: READY again.
+        assert_eq!(life.on_state(S::READY), LifecycleAction::Begin);
+        life.began(true);
+        life.on_state(S::FOCUSED);
+        assert!(life.running && life.focused && !life.exit_requested);
+    }
+
+    #[test]
+    fn swapchain_format_prefers_caller_then_srgb() {
+        assert_eq!(pick_swapchain_format(&[50], &[43, 50, 97]), Some(50));
+        assert_eq!(pick_swapchain_format(&[44], &[97, 43]), Some(43));
+        assert_eq!(pick_swapchain_format(&[], &[97]), Some(97));
+        assert_eq!(pick_swapchain_format(&[44], &[44]), Some(44));
+        assert_eq!(pick_swapchain_format(&[], &[37]), None);
+    }
+
+    #[test]
+    fn combined_view_encloses_both_eyes() {
+        let fov = openxr::Fovf { angle_left: -0.9, angle_right: 0.8, angle_up: 0.85, angle_down: -0.95 };
+        let mirror = openxr::Fovf { angle_left: -0.8, angle_right: 0.9, ..fov };
+        let q = glam::Quat::from_rotation_y(0.4);
+        let head = glam::Vec3::new(0.3, 1.6, -0.2);
+        let eyes = [
+            (head + q * glam::Vec3::new(-0.032, 0.0, 0.0), q, fov),
+            (head + q * glam::Vec3::new(0.032, 0.0, 0.0), q, mirror),
+        ];
+        let (view, proj) = combined_view(&eyes, 0.05, 100.0).unwrap();
+        let vp = proj * view;
+        // Points along each eye's frustum edges stay inside the combined one.
+        for (p, eq, f) in &eyes {
+            for (tx, ty) in [
+                (f.angle_left.tan(), f.angle_up.tan()),
+                (f.angle_right.tan(), f.angle_down.tan()),
+                (f.angle_left.tan(), f.angle_down.tan()),
+                (f.angle_right.tan(), f.angle_up.tan()),
+            ] {
+                for depth in [0.5f32, 5.0, 50.0] {
+                    let world = *p + *eq * glam::Vec3::new(tx * depth, ty * depth, -depth) * 0.999;
+                    let c = vp * world.extend(1.0);
+                    let n = c.truncate() / c.w;
+                    assert!(c.w > 0.0 && n.x.abs() <= 1.0 && n.y.abs() <= 1.0, "{n:?} at depth {depth}");
+                }
+            }
+        }
+        let canted = [eyes[0], (eyes[1].0, glam::Quat::from_rotation_y(0.5), mirror)];
+        assert!(combined_view(&canted, 0.05, 100.0).is_none());
+    }
+
+    #[test]
+    fn lifecycle_exit_and_failed_begin() {
+        let mut life = SessionLifecycle::default();
+        life.on_state(S::READY);
+        life.began(false);
+        assert!(!life.running);
+        assert_eq!(life.on_state(S::EXITING), LifecycleAction::Exit);
+        assert!(life.exit_requested);
+        let mut lost = SessionLifecycle { running: true, visible: true, focused: true, exit_requested: false };
+        assert_eq!(lost.on_state(S::LOSS_PENDING), LifecycleAction::Exit);
+        assert!(lost.exit_requested && !lost.running && !lost.focused);
+    }
+}

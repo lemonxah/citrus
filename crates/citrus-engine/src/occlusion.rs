@@ -194,12 +194,13 @@ pub struct BakeInput {
     pub settings: OcclusionSettings,
 }
 
-/// Static, active, rendered objects and their world triangles.
+/// Static, active, rendered objects and their world triangles. Shadows Only
+/// objects are never seen, so they neither occlude nor get culled.
 pub fn bake_input(scene: &LoadedScene, settings: OcclusionSettings) -> BakeInput {
     let world = scene.world_transforms();
     let mut input = BakeInput { tris: Vec::new(), tri_obj: Vec::new(), objects: Vec::new(), obj_bounds: Vec::new(), settings };
     for (i, o) in scene.objects.iter().enumerate() {
-        if !o.static_geometry || o.render.is_none() || !scene.is_active(i) {
+        if !o.static_geometry || o.render.is_none() || !scene.is_active(i) || !o.cast_shadows.visible() {
             continue;
         }
         let slot = input.objects.len() as u32;

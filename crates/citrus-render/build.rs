@@ -5,6 +5,13 @@ use std::process::Command;
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     println!("cargo:rerun-if-changed=shaders");
+    // Android (Quest) devices may only offer Vulkan 1.1, which loads SPIR-V
+    // up to 1.3; desktop keeps the 1.3 environment.
+    let target_env = if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        "--target-env=vulkan1.1"
+    } else {
+        "--target-env=vulkan1.3"
+    };
 
     for name in [
         "standard.vert",
@@ -54,11 +61,14 @@ fn main() {
         "skin.comp",
         // Built-in unlit material (world-space UI, particles).
         "unlit.frag",
+        // GPU-driven culling + its Hi-Z depth pyramid.
+        "gpu_cull.comp",
+        "hiz_build.comp",
     ] {
         let src = format!("shaders/{name}");
         let dst = Path::new(&out_dir).join(format!("{name}.spv"));
         let output = Command::new("glslc")
-            .arg("--target-env=vulkan1.3")
+            .arg(target_env)
             .arg("-O")
             .arg(&src)
             .arg("-o")
@@ -70,6 +80,25 @@ fn main() {
                 "glslc failed for {src}:\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+
+    // Multiview variants (`<name>.mv.spv`): both XR eyes in one pass, the
+    // eye picked by gl_ViewIndex.
+    for name in ["standard.vert", "standard.frag", "skybox.vert"] {
+        let src = format!("shaders/{name}");
+        let dst = Path::new(&out_dir).join(format!("{name}.mv.spv"));
+        let output = Command::new("glslc")
+            .arg(target_env)
+            .arg("-DMULTIVIEW")
+            .arg("-O")
+            .arg(&src)
+            .arg("-o")
+            .arg(&dst)
+            .output()
+            .expect("failed to run glslc — is shaderc/glslc installed?");
+        if !output.status.success() {
+            panic!("glslc failed for {src} (multiview):\n{}", String::from_utf8_lossy(&output.stderr));
         }
     }
 }

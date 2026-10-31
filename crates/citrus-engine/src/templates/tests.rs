@@ -126,6 +126,7 @@ fn obj(scene: &mut LoadedScene, pos: Vec3, components: Vec<Box<dyn Component>>) 
         enabled: true,
         static_geometry: false,
         lightmap_scale: 1.0,
+        cast_shadows: citrus_core::ShadowCasting::On,
         layer: 0,
         parent: None,
         translation: pos,
@@ -260,6 +261,30 @@ fn crouch_shrinks_the_capsule_and_waits_for_headroom() {
     }
 }
 
+#[test]
+fn character_controllers_rest_on_the_floor_and_walk() {
+    use citrus_core::{BoxCollider, CharacterController, Pawn};
+    let w = input_with(&[Key::W], &[], &InputState::default());
+    for fps in [false, true] {
+        let mut scene = LoadedScene::empty();
+        obj(&mut scene, Vec3::new(0.0, -0.5, 0.0), vec![Box::new(BoxCollider { size: [40.0, 1.0, 40.0], ..Default::default() })]);
+        let mover: Box<dyn Component> =
+            if fps { Box::new(FirstPersonController { lock_cursor: false, ..Default::default() }) } else { Box::new(Pawn::default()) };
+        // Spawned with its feet exactly on the floor.
+        let player = obj(&mut scene, Vec3::ZERO, vec![mover, Box::new(CharacterController::default())]);
+        let mut session = PlaySession::new(&scene, Path::new("."), None);
+        let y = |scene: &LoadedScene| scene.objects[scene.index_of(player).unwrap()].translation.y;
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for f in 0..180 {
+            run(&mut session, &mut scene, 1, |_| if f < 60 { InputState::default() } else { w.clone() });
+            (lo, hi) = (lo.min(y(&scene)), hi.max(y(&scene)));
+        }
+        let p = scene.objects[scene.index_of(player).unwrap()].translation;
+        assert!(lo > -1e-3 && hi < 0.03, "fps {fps}: never sinks into the floor: {lo}..{hi}");
+        assert!(p.z < -6.0, "fps {fps}: walks freely along it: {p}");
+    }
+}
+
 // ------------------------------------------------------- template playthroughs
 
 /// A template's boot scene as a headless `LoadedScene` (no meshes), plus its bindings.
@@ -286,6 +311,7 @@ fn push_entries(scene: &mut LoadedScene, registry: &ComponentRegistry, entries: 
             enabled: e.enabled,
             static_geometry: e.static_geometry,
             lightmap_scale: e.lightmap_scale,
+            cast_shadows: e.cast_shadows,
             layer: e.layer,
             parent: e.parent.map(|p| p + base),
             translation: Vec3::from(e.translation),
@@ -474,4 +500,112 @@ fn vr_social_avatar_prefab_mirrors_the_local_player_for_others() {
     for name in ["Head Model", "Avatar Body"] {
         assert!(!scene.objects[find(name, base)].enabled, "{name} hidden for the owner");
     }
+}
+
+#[test]
+fn vr_player_reads_remapped_controller_actions() {
+    use citrus_core::{BindingSlot, Bindings, ConflictPolicy, ControlsInfo, Grabbable, VrButton, VrFrame, VrPlayer};
+    let mut scene = LoadedScene::empty();
+    let rig = obj(&mut scene, Vec3::ZERO, vec![]);
+    let head = obj(&mut scene, Vec3::ZERO, vec![]);
+    let left = obj(&mut scene, Vec3::ZERO, vec![]);
+    let right = obj(&mut scene, Vec3::ZERO, vec![]);
+    for child in [1, 2, 3] {
+        scene.objects[child].parent = Some(0);
+    }
+    let i = scene.index_of(rig).unwrap();
+    scene.objects[i].components.push(Box::new(VrPlayer {
+        head: ObjectRef::new(head),
+        left_hand: ObjectRef::new(left),
+        right_hand: ObjectRef::new(right),
+        ..Default::default()
+    }));
+    let ball = obj(&mut scene, Vec3::new(0.25, 1.2, -0.3), vec![Box::new(Grabbable::default())]);
+    // The player moved Grab Right from the grip to A.
+    let mut bindings = Bindings::from_schemes(vec![ControlScheme::default_vr()]);
+    bindings.rebind("", "Grab Right", BindingSlot::Buttons, 0, InputSource::VrButton(VrButton::A), ConflictPolicy::Steal).unwrap();
+    let scheme = bindings.schemes[0].clone();
+    let base = citrus_core::ScreenInfo {
+        controls: ControlsInfo { bindings: std::sync::Arc::new(bindings), ..Default::default() },
+        ..Default::default()
+    };
+
+    let registry = ComponentRegistry::with_builtins();
+    let mut shaders = ShaderLibrary::default();
+    let net = NetView::default();
+    let mut session = PlaySession::new(&scene, Path::new("."), None);
+    let mut state = InputState::default();
+    for frame in 0..40 {
+        let vr = VrFrame {
+            active: true,
+            head: Some((Vec3::new(0.0, 1.65, 0.0), Quat::IDENTITY)),
+            left_hand: Some((Vec3::new(-0.25, 1.2, -0.3), Quat::IDENTITY)),
+            right_hand: Some((Vec3::new(0.25, 1.2, -0.3), Quat::IDENTITY)),
+            right_grip: if frame < 20 { 1.0 } else { 0.0 },
+            a: frame >= 25,
+            ..Default::default()
+        };
+        let mut raw = RawInput::default();
+        raw.set_vr(&vr);
+        state = citrus_core::resolve(&scheme, &raw, &state);
+        let screen = citrus_core::ScreenInfo { vr, ..base.clone() };
+        session.tick(
+            &mut World { scene: &mut scene, renderer: None, registry: &registry, shaders: &mut shaders },
+            &TickInput { dt: 1.0 / 60.0, input: &state, net: &net, listener_fallback: Mat4::IDENTITY, screen: &screen },
+        );
+        if frame == 19 {
+            assert!(!get::<Grabbable>(&scene, ball).held, "the grip no longer grabs");
+        }
+    }
+    assert!(get::<Grabbable>(&scene, ball).held, "A grabs after the remap");
+}
+
+#[test]
+fn invert_look_toggle_tunes_the_look_action_in_every_scheme() {
+    use citrus_core::{ComponentCommand, ControlsInfo, InputCommand, UiToggle};
+    let ui = crate::ui_templates::UiTemplate::Settings.build();
+    let toggle = ui
+        .iter()
+        .find(|n| n.name == "Invert Look")
+        .and_then(|n| n.components.iter().find_map(|c| c.as_any().downcast_ref::<UiToggle>()))
+        .expect("the Settings template has an Invert Look toggle");
+    assert_eq!(toggle.invert_y_action, "Look");
+
+    let mut scene = LoadedScene::empty();
+    let id = obj(&mut scene, Vec3::ZERO, vec![Box::new(UiToggle { invert_y_action: "Look".into(), ..Default::default() })]);
+    // The player inverted the mouse earlier (saved override); the pad isn't.
+    let mut bindings = super::builder::shooter_bindings();
+    bindings.schemes[0].actions.iter_mut().find(|a| a.name == "Look").unwrap().invert_y = true;
+    let screen = citrus_core::ScreenInfo {
+        controls: ControlsInfo { bindings: std::sync::Arc::new(bindings), ..Default::default() },
+        ..Default::default()
+    };
+    let registry = ComponentRegistry::with_builtins();
+    let mut shaders = ShaderLibrary::default();
+    let net = NetView::default();
+    let mut session = PlaySession::new(&scene, Path::new("."), None);
+    let mut tick = |scene: &mut LoadedScene| {
+        session.tick(
+            &mut World { scene, renderer: None, registry: &registry, shaders: &mut shaders },
+            &TickInput { dt: 1.0 / 60.0, input: &InputState::default(), net: &net, listener_fallback: Mat4::IDENTITY, screen: &screen },
+        )
+    };
+    let tunes = |cmds: Vec<ComponentCommand>| -> Vec<(String, String, Option<bool>)> {
+        cmds.into_iter()
+            .filter_map(|c| match c {
+                ComponentCommand::Input(InputCommand::Tune { scheme, action, tuning }) => Some((scheme, action, tuning.invert_y)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(tunes(tick(&mut scene)).is_empty(), "showing the saved setting changes nothing");
+    assert!(get::<UiToggle>(&scene, id).on, "the toggle shows the saved inversion");
+    // The player unticks it: every scheme with a Look action follows.
+    let i = scene.index_of(id).unwrap();
+    scene.objects[i].components[0].as_any_mut().downcast_mut::<UiToggle>().unwrap().on = false;
+    let got = tunes(tick(&mut scene));
+    let schemes: Vec<&str> = got.iter().map(|(s, _, _)| s.as_str()).collect();
+    assert_eq!(schemes.len(), 2, "keyboard + mouse and gamepad: {got:?}");
+    assert!(got.iter().all(|(_, a, inv)| a == "Look" && *inv == Some(false)), "{got:?}");
+    assert!(tunes(tick(&mut scene)).is_empty(), "applied once");
 }

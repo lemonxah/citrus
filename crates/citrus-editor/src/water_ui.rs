@@ -234,6 +234,19 @@ impl Inspect for Water {
                         }
                     }
                 });
+                widgets::property_row(ui, "", |ui| {
+                    if ui
+                        .button("Fit to mesh")
+                        .on_hover_text(
+                            "Trace the outline and depth from the pool, spring or shore around this object: place it inside the basin at the water level first. \
+                             Uses static objects and colliders on layers the water meets",
+                        )
+                        .clicked()
+                    {
+                        self.fit_request = true;
+                        c = true;
+                    }
+                });
                 widgets::property_row(ui, "Smooth outline", |ui| {
                     c |= ui.checkbox(&mut self.smooth_shape, "").on_hover_text("A smooth curve through the points instead of straight edges").changed();
                 });
@@ -356,16 +369,22 @@ impl Inspect for Water {
         c |= _ctx.file_field(ui, "Sound", &mut u.sound, "audio/underwater.ogg", &["wav", "ogg", "mp3", "flac"]);
         drag(ui, "Volume", &mut u.volume, 0.01, 0.0..=4.0, &mut c);
         drag(ui, "Muffle", &mut u.muffle, 0.005, 0.0..=1.0, &mut c);
-        drag(ui, "Fog density", &mut u.fog_density, 0.01, 0.0..=20.0, &mut c);
+        widgets::property_row(ui, "Visibility (m)", |ui| {
+            c |= ui
+                .add(egui::Slider::new(&mut u.visibility, 0.5..=200.0).logarithmic(true).max_decimals(1))
+                .on_hover_text("How far you can see under water: the view is nearly all fog at this distance. Murky: 2-5 m, a lake: ~10 m, a clear pool or tropical sea: 20-40 m")
+                .changed();
+        });
         drag(ui, "Distortion", &mut u.distortion, 0.01, 0.0..=5.0, &mut c);
         drag(ui, "Blur", &mut u.blur, 0.05, 0.0..=12.0, &mut c);
+        c |= _ctx.file_field(ui, "Post FX", &mut u.postfx, "none", &["postfx"]);
         drag(ui, "Caustics", &mut u.caustics, 0.01, 0.0..=4.0, &mut c);
         widgets::property_row(ui, "Project caustics", |ui| c |= ui.checkbox(&mut self.project_caustics, "").changed());
         if self.project_caustics {
             drag(ui, "Projection strength", &mut self.projection_strength, 0.01, 0.0..=8.0, &mut c);
         }
         note(ui, "Caustics: the moving light pattern on whatever lies under the surface. Projected: lights under the surface throw it out onto the walls and ceiling (1 = physical brightness).");
-        note(ui, "Below the surface the view fogs toward the water's colours (Look) and the mix is muffled under the looping sound.");
+        note(ui, "Below the surface the view fogs toward the water's colours (Look), blurs, takes the Post FX profile over the camera's and the mix is muffled under the looping sound.");
         c
     }
 }

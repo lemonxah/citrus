@@ -13,10 +13,13 @@
 //! object's components from serialized state.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "editor")]
 use std::process::Command;
+#[cfg(feature = "editor")]
 use std::sync::mpsc;
 
 use anyhow::{Context as _, Result, bail};
+#[cfg(feature = "editor")]
 use citrus_core::ComponentRegistry;
 #[cfg(feature = "editor")]
 use citrus_editor::{CodeDiagnostic, EditorComponents};

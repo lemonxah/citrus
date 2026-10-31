@@ -4,7 +4,9 @@
 //! the root (`src/main.rs`) plus a `plugins/components` crate the editor
 //! hot-loads and the game links statically. `scaffold_project` writes that
 //! layout; `build_game` compiles it `--release` and copies the executable plus
-//! the referenced assets into `build/`, ready to ship.
+//! the referenced assets into `build/`, ready to ship. Android and Meta Quest
+//! builds generate a small `android_main` cdylib crate under
+//! `target/citrus-android/` and package it with `tools/android/build_apk.sh`.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +17,7 @@ use citrus_assets::ProjectFile;
 const ASSET_DIRS: &[&str] = &["scenes", "materials", "shaders", "textures", "models", "audio", "prefabs"];
 
 /// Top-level project folders that are code or build output, never game content.
-const NON_ASSET_DIRS: &[&str] = &["build", "build-windows", "target", "src", "plugins"];
+const NON_ASSET_DIRS: &[&str] = &["build", "build-windows", "build-android", "build-quest", "target", "src", "plugins"];
 
 /// Which platform `build_game` produces an executable for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,10 +27,16 @@ pub enum BuildTarget {
     /// 64-bit Windows (MSVC ABI). From Linux/macOS this cross-compiles with
     /// `cargo xwin`; output in `build-windows/`.
     Windows,
+    /// Android phone/tablet (arm64-v8a APK, flat). Output in `build-android/`.
+    Android,
+    /// Meta Quest 3 / 3S / Pro standalone (arm64-v8a APK with the OpenXR
+    /// loader and the VR manifest). Output in `build-quest/`.
+    Quest,
 }
 
 impl BuildTarget {
-    pub const ALL: [BuildTarget; 2] = [BuildTarget::Host, BuildTarget::Windows];
+    pub const ALL: [BuildTarget; 4] =
+        [BuildTarget::Host, BuildTarget::Windows, BuildTarget::Android, BuildTarget::Quest];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -36,16 +44,29 @@ impl BuildTarget {
             BuildTarget::Host if cfg!(target_os = "macos") => "macOS (this machine)",
             BuildTarget::Host => "Linux (this machine)",
             BuildTarget::Windows => "Windows x64",
+            BuildTarget::Android => "Android (arm64)",
+            BuildTarget::Quest => "Meta Quest 3 / 3S / Pro",
         }
     }
 
-    /// Parse a CLI name (`host`, `windows`).
+    /// Parse a CLI name (`host`, `windows`, `android`, `quest`).
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "host" | "native" => Some(BuildTarget::Host),
             "windows" | "win" | "win64" | "x86_64-pc-windows-msvc" => Some(BuildTarget::Windows),
+            "android" | "aarch64-linux-android" => Some(BuildTarget::Android),
+            "quest" | "meta-quest" | "quest3" | "questpro" => Some(BuildTarget::Quest),
             _ => None,
         }
+    }
+
+    /// The targets offered on this machine: no Windows cross-build from
+    /// Windows itself, and the APK packager is a bash script (no Windows host).
+    pub fn available() -> impl Iterator<Item = BuildTarget> {
+        Self::ALL.into_iter().filter(|t| match t {
+            BuildTarget::Host => true,
+            BuildTarget::Windows | BuildTarget::Android | BuildTarget::Quest => !cfg!(windows),
+        })
     }
 
     /// True when this target needs a cross toolchain from the current host.
@@ -57,11 +78,27 @@ impl BuildTarget {
         match self {
             BuildTarget::Host => cfg!(windows),
             BuildTarget::Windows => true,
+            BuildTarget::Android | BuildTarget::Quest => false,
         }
     }
 
+    /// Builds an APK (Android or Meta Quest).
+    pub fn is_android(self) -> bool {
+        matches!(self, BuildTarget::Android | BuildTarget::Quest)
+    }
+
     fn output_dir(self) -> &'static str {
-        if self.is_cross() { "build-windows" } else { "build" }
+        match self {
+            BuildTarget::Android => "build-android",
+            BuildTarget::Quest => "build-quest",
+            _ if self.is_cross() => "build-windows",
+            _ => "build",
+        }
+    }
+
+    /// Where the build lands, relative to the project root.
+    pub fn output_hint(self) -> &'static str {
+        self.output_dir()
     }
 }
 
@@ -264,6 +301,9 @@ pub fn build_game(
             project_root.display()
         );
     }
+    if target.is_android() {
+        return build_android(project_root, project, target, log);
+    }
     let pkg = crate_name(&project.name);
 
     // `cargo rustc` passes the rpath to the game binary only (no dependency
@@ -339,6 +379,19 @@ pub fn build_game(
         }
     }
 
+    stage_assets(project_root, &assets_dir, target, &mut log)?;
+    log(format!("done: {}", out_exe.display()));
+    Ok(out_exe)
+}
+
+/// Cook the project's content into `assets_dir`: the referenced files,
+/// precompiled shaders and keyword variants, and `project.citrus`. Android /
+/// Quest cooks compile shaders for Vulkan 1.1 and pre-encode ASTC texture
+/// caches ([`cook_astc_textures`]).
+fn stage_assets(project_root: &Path, assets_dir: &Path, target: BuildTarget, log: &mut impl FnMut(String)) -> Result<()> {
+    let _shader_env = target
+        .is_android()
+        .then(|| citrus_assets::scoped_shader_target_env(citrus_assets::ShaderTargetEnv::Vulkan1_1));
     log("cooking assets…".into());
     let cooked = cook_assets(project_root)?;
     for rel in &cooked.files {
@@ -358,9 +411,12 @@ pub fn build_game(
         cooked.skipped,
         cooked.skipped_bytes as f64 / 1e6
     ));
+    if target.is_android() {
+        cook_astc_textures(project_root, &cooked.files, assets_dir, log);
+    }
     log("precompiling shaders…".into());
-    precompile_shaders(&assets_dir, &mut log);
-    let baked = crate::shaders::bake_project_variants(&assets_dir, &mut log);
+    precompile_shaders(assets_dir, log);
+    let baked = crate::shaders::bake_project_variants(assets_dir, log);
     log(format!("baked {baked} shader keyword variant(s)"));
     // The game reads boot_scene/title from project.citrus at startup.
     std::fs::copy(
@@ -368,9 +424,326 @@ pub fn build_game(
         assets_dir.join("project.citrus"),
     )
     .context("copying project.citrus")?;
+    Ok(())
+}
 
-    log(format!("done: {}", out_exe.display()));
-    Ok(out_exe)
+/// Android / Quest: pre-encode the ASTC import cache of every (texture,
+/// sRGB) pair the cooked scenes, prefabs and materials use, so the device
+/// never encodes on first load. The blobs go under
+/// [`citrus_assets::package::COOKED_TEXCACHE_DIR`] (the APK packager drops
+/// the hidden per-file `.citrus_texcache/`) and `android_assets_root`
+/// installs them after extraction. Failures are logged, not fatal (that
+/// texture is then encoded on the device). Returns the caches written.
+fn cook_astc_textures(project_root: &Path, files: &[String], assets_dir: &Path, log: &mut impl FnMut(String)) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let files: std::collections::BTreeSet<String> = files.iter().cloned().collect();
+    let mut warnings = Vec::new();
+    let refs: Vec<(String, bool)> =
+        citrus_assets::package::material_texture_refs(project_root, &files, &[], &mut warnings).into_iter().collect();
+    for w in warnings {
+        log(format!("warning: {w}"));
+    }
+    if refs.is_empty() {
+        return 0;
+    }
+    let blocks = citrus_assets::astc_blocks();
+    log(format!(
+        "encoding {} ASTC texture(s) (colour {b}x{b}, data {d}x{d})…",
+        refs.len(),
+        b = blocks.color,
+        d = blocks.data
+    ));
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(refs.len());
+    let encode = |(rel, srgb): &(String, bool)| -> Result<u64> {
+        let blob = citrus_assets::astc_cache_blob(project_root.join(rel), *srgb, blocks).with_context(|| rel.clone())?;
+        let out = assets_dir.join(citrus_assets::package::cooked_texcache_rel(rel, *srgb));
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&out, &blob).with_context(|| format!("writing {}", out.display()))?;
+        Ok(blob.len() as u64)
+    };
+    let results: Vec<Result<u64>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    while let Some(r) = refs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        done.push(encode(r));
+                    }
+                    done
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
+    });
+    let (mut written, mut bytes) = (0, 0u64);
+    for r in results {
+        match r {
+            Ok(n) => {
+                written += 1;
+                bytes += n;
+            }
+            Err(e) => log(format!("warning: ASTC texture not cooked: {e:#}")),
+        }
+    }
+    if written < refs.len() {
+        log(format!("warning: {} texture(s) will be encoded on the device", refs.len() - written));
+    }
+    log(format!("cooked {written} ASTC texture cache(s), {:.1} MB", bytes as f64 / 1e6));
+    written
+}
+
+const ANDROID_TRIPLE: &str = "aarch64-linux-android";
+
+/// The Android SDK pieces the APK packager needs, found up front so a
+/// missing one is a clear error instead of a script failure halfway in.
+#[derive(Debug)]
+struct AndroidSdk {
+    sdk: PathBuf,
+    ndk: PathBuf,
+}
+
+/// Newest entry (by version-aware name order) of `dir` passing `ok`.
+fn newest_child(dir: &Path, ok: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| ok(p)).collect();
+    let key = |p: &PathBuf| -> Vec<u64> {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        name.split(|c: char| !c.is_ascii_digit()).filter_map(|n| n.parse().ok()).collect()
+    };
+    found.sort_by_key(key);
+    found.pop()
+}
+
+/// Locate the SDK, NDK, build-tools and a platform from `env` (ANDROID_HOME,
+/// ANDROID_SDK_ROOT, ANDROID_NDK_HOME, HOME), falling back to /opt/android-sdk
+/// and ~/Android/Sdk.
+fn find_android_sdk(env: &dyn Fn(&str) -> Option<String>) -> Result<AndroidSdk> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.extend(env("ANDROID_HOME").map(PathBuf::from));
+    candidates.extend(env("ANDROID_SDK_ROOT").map(PathBuf::from));
+    candidates.push(PathBuf::from("/opt/android-sdk"));
+    candidates.extend(env("HOME").map(|h| PathBuf::from(h).join("Android/Sdk")));
+    let Some(sdk) = candidates.into_iter().find(|p| p.is_dir()) else {
+        bail!("Android SDK not found: install it (build-tools, platforms;android-34, ndk) and set ANDROID_HOME");
+    };
+    let ndk = match env("ANDROID_NDK_HOME").map(PathBuf::from) {
+        Some(ndk) if ndk.is_dir() => ndk,
+        Some(ndk) => bail!("ANDROID_NDK_HOME={} does not exist", ndk.display()),
+        None => newest_child(&sdk.join("ndk"), |p| p.join("toolchains/llvm").is_dir()).with_context(|| {
+            format!("Android NDK not found under {}/ndk: install it with `sdkmanager --install \"ndk;29.0.14206865\"` or set ANDROID_NDK_HOME", sdk.display())
+        })?,
+    };
+    newest_child(&sdk.join("build-tools"), |p| p.join("aapt2").is_file() && p.join("apksigner").is_file()).with_context(|| {
+        format!("Android build-tools (aapt2, zipalign, apksigner) not found under {}/build-tools: `sdkmanager --install \"build-tools;35.0.0\"`", sdk.display())
+    })?;
+    newest_child(&sdk.join("platforms"), |p| p.join("android.jar").is_file()).with_context(|| {
+        format!("no Android platform under {}/platforms: `sdkmanager --install \"platforms;android-34\"`", sdk.display())
+    })?;
+    Ok(AndroidSdk { sdk, ndk })
+}
+
+/// The Rust target and the JDK `keytool` (debug signing) must be installed.
+fn check_android_host() -> Result<()> {
+    let targets = std::process::Command::new("rustup").args(["target", "list", "--installed"]).output();
+    if let Ok(out) = targets
+        && out.status.success()
+        && !String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == ANDROID_TRIPLE)
+    {
+        bail!("the Rust {ANDROID_TRIPLE} target is missing: run `rustup target add {ANDROID_TRIPLE}`");
+    }
+    if std::env::var_os("CITRUS_KEYSTORE").is_none()
+        && std::process::Command::new("keytool").arg("-help").output().is_err()
+    {
+        bail!("`keytool` (from a JDK) is needed to make the debug signing key; install a JDK or set CITRUS_KEYSTORE");
+    }
+    Ok(())
+}
+
+/// A Quest build ships the OpenXR loader: `OPENXR_LOADER_SO`, or the pinned
+/// Khronos release the packager fetches with curl.
+fn check_openxr_loader(env: &dyn Fn(&str) -> Option<String>, curl_available: bool) -> Result<()> {
+    if let Some(so) = env("OPENXR_LOADER_SO") {
+        if !Path::new(&so).is_file() {
+            bail!("OPENXR_LOADER_SO={so} does not exist");
+        }
+        return Ok(());
+    }
+    if env("CITRUS_OPENXR_FETCH").as_deref() == Some("0") {
+        bail!(
+            "a Meta Quest build needs the OpenXR loader: set OPENXR_LOADER_SO to an arm64-v8a libopenxr_loader.so \
+             (from the Khronos openxr_loader_for_android AAR), or unset CITRUS_OPENXR_FETCH to download the pinned release"
+        );
+    }
+    if !curl_available {
+        bail!("a Meta Quest build needs the OpenXR loader: install curl (to fetch the pinned Khronos release) or set OPENXR_LOADER_SO");
+    }
+    Ok(())
+}
+
+/// A Java-legal application id from the project name, unless
+/// `CITRUS_ANDROID_PACKAGE` overrides it: `com.citrus.<name>`.
+fn android_package_id(project_name: &str) -> String {
+    let mut seg: String = project_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if seg.is_empty() {
+        seg = "game".into();
+    }
+    if seg.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        seg.insert(0, 'g');
+    }
+    format!("com.citrus.{seg}")
+}
+
+/// The generated `android_main` crate: links the engine runtime and the
+/// project's components, and boots from the APK's extracted assets.
+fn android_crate_sources(citrus: &Path, project_root: &Path, pkg: &str, target: BuildTarget) -> (String, String) {
+    let lib = pkg.replace('-', "_");
+    let manifest = format!(
+        r#"# Generated by citrus Build Game ({label}); rewritten on every build.
+[package]
+name = "{pkg}-android"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+name = "{lib}"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+citrus-engine = {{ path = "{citrus}/crates/citrus-engine", default-features = false }}
+citrus-project-components = {{ path = "{components}" }}
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+"#,
+        label = target.label(),
+        citrus = citrus.display(),
+        components = project_root.join("plugins/components").display(),
+    );
+    let xr = if target == BuildTarget::Quest { "Required" } else { "Auto" };
+    let source = format!(
+        r#"//! Generated by citrus Build Game ({label}); rewritten on every build.
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+fn android_main(app: citrus_engine::AndroidApp) {{
+    citrus_engine::init_logging();
+    let root = match citrus_engine::android_assets_root(&app) {{
+        Ok(root) => root,
+        Err(e) => {{
+            tracing::error!("extracting game assets: {{e:#}}");
+            return;
+        }}
+    }};
+    let mut config = match citrus_engine::GameConfig::from_project_dir(root) {{
+        Ok(config) => config,
+        Err(e) => {{
+            tracing::error!("reading project.citrus: {{e:#}}");
+            return;
+        }}
+    }};
+    config.xr = citrus_engine::XrMode::{xr};
+    if let Err(e) = citrus_engine::run_game_android(app, config, citrus_project_components::citrus_register) {{
+        tracing::error!("game exited: {{e:#}}");
+    }}
+}}
+"#,
+        label = target.label(),
+    );
+    (manifest, source)
+}
+
+/// Android / Meta Quest: cook the assets, generate the `android_main` crate
+/// and run `tools/android/build_apk.sh`. Returns the signed APK.
+fn build_android(
+    project_root: &Path,
+    project: &ProjectFile,
+    target: BuildTarget,
+    mut log: impl FnMut(String),
+) -> Result<PathBuf> {
+    if cfg!(windows) {
+        bail!("Android builds need a Linux or macOS host (the APK packager is a bash script)");
+    }
+    let env = |k: &str| std::env::var(k).ok();
+    let sdk = find_android_sdk(&env)?;
+    check_android_host()?;
+    if target == BuildTarget::Quest {
+        let curl = std::process::Command::new("curl").arg("--version").output().is_ok_and(|o| o.status.success());
+        check_openxr_loader(&env, curl)?;
+    }
+    let components = project_root.join("plugins/components/Cargo.toml");
+    if !components.is_file() {
+        bail!("{} is missing; the game's components crate is linked into the APK", components.display());
+    }
+    let citrus = citrus_root()?;
+    let script = citrus.join("tools/android/build_apk.sh");
+    if !script.is_file() {
+        bail!("APK packager not found at {}", script.display());
+    }
+    let pkg = crate_name(&project.name);
+
+    let build_dir = project_root.join(target.output_dir());
+    let assets_dir = build_dir.join("assets");
+    let _ = std::fs::remove_dir_all(&assets_dir);
+    std::fs::create_dir_all(&assets_dir).with_context(|| format!("creating {}", assets_dir.display()))?;
+    stage_assets(project_root, &assets_dir, target, &mut log)?;
+
+    let crate_dir = project_root.join("target/citrus-android");
+    std::fs::create_dir_all(crate_dir.join("src")).context("creating the Android crate")?;
+    let (manifest, source) = android_crate_sources(&citrus, project_root, &pkg, target);
+    std::fs::write(crate_dir.join("Cargo.toml"), manifest).context("writing the Android Cargo.toml")?;
+    std::fs::write(crate_dir.join("src/lib.rs"), source).context("writing the Android lib.rs")?;
+    // Seed the lockfile from the engine's so the APK builds against the same
+    // dependency versions as the editor.
+    let lock = crate_dir.join("Cargo.lock");
+    if !lock.is_file() && citrus.join("Cargo.lock").is_file() {
+        std::fs::copy(citrus.join("Cargo.lock"), &lock).context("seeding the Android Cargo.lock")?;
+    }
+
+    let apk = build_dir.join(format!("{pkg}.apk"));
+    let package_id = env("CITRUS_ANDROID_PACKAGE").unwrap_or_else(|| android_package_id(&project.name));
+    log(format!("building {} ({package_id}) for {}… (the first build compiles the engine for {ANDROID_TRIPLE})", apk.display(), target.label()));
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&script);
+    if target == BuildTarget::Quest {
+        cmd.arg("--quest");
+    }
+    cmd.arg(&crate_dir)
+        .arg(&assets_dir)
+        .arg(&apk)
+        .arg(&package_id)
+        .env("ANDROID_HOME", &sdk.sdk)
+        .env("ANDROID_NDK_HOME", &sdk.ndk)
+        .env("CARGO_TARGET_DIR", project_root.join("target"))
+        .env("CITRUS_APP_LABEL", &project.name);
+    let output = cmd.output().context("running tools/android/build_apk.sh")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: Vec<&str> = stderr.trim().lines().rev().take(60).collect();
+        bail!("APK build failed:\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"));
+    }
+    if !apk.is_file() {
+        bail!("the packager succeeded but {} is missing", apk.display());
+    }
+    log(format!("done: {} (install: adb install -r {})", apk.display(), apk.display()));
+    Ok(apk)
 }
 
 /// Steam Audio's licence text, shipped next to `libphonon` in game builds.
@@ -567,5 +940,237 @@ mod cook_tests {
         assert_eq!(cooked.skipped, 2);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Every file path under `dir`, relative.
+    fn tree(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p.strip_prefix(dir).unwrap().to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn spirv_version(path: &Path) -> u32 {
+        let b = std::fs::read(path).unwrap();
+        u32::from_le_bytes(b[4..8].try_into().unwrap())
+    }
+
+    #[test]
+    fn android_cook_ships_astc_caches_and_vulkan_1_1_shaders() {
+        let root = std::env::temp_dir().join(format!("citrus-cook-astc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("project.citrus", "()");
+        write("scenes/level.scene", r#"(entries: [(name: "Box", material: File("materials/wood.material"))])"#);
+        let material = format!(
+            r#"(name: "Wood", params: {}, features: {}, textures: (albedo: Some("textures/wood.png"), normal: Some("textures/wood_n.png")))"#,
+            ron::to_string(&citrus_render::MaterialParams::default()).unwrap(),
+            ron::to_string(&citrus_render::MaterialFeatures::default()).unwrap()
+        );
+        write("materials/wood.material", &material);
+        write("resources/glow.frag", citrus_assets::SHADER_TEMPLATE);
+        let png = Path::new(env!("CARGO_MANIFEST_DIR")).join("../citrus-editor/assets/ferris.png");
+        std::fs::create_dir_all(root.join("textures")).unwrap();
+        for name in ["wood.png", "wood_n.png"] {
+            std::fs::copy(&png, root.join("textures").join(name)).unwrap();
+        }
+
+        let mut log = |_: String| {};
+        let quest = root.join("build-quest/assets");
+        std::fs::create_dir_all(&quest).unwrap();
+        stage_assets(&root, &quest, BuildTarget::Quest, &mut log).unwrap();
+        let files = tree(&quest);
+        for f in ["citrus_texcache/textures/wood.png.1.castc", "citrus_texcache/textures/wood_n.png.0.castc", "textures/wood.png"] {
+            assert!(files.iter().any(|x| x == f), "missing {f}: {files:?}");
+        }
+        // aapt2 drops dot / underscore prefixed paths and the APK's extraction
+        // list names every file, so none may exist.
+        assert!(
+            !files.iter().any(|f| f.split('/').any(|c| c.starts_with('.') || c.starts_with('_'))),
+            "{files:?}"
+        );
+        assert!(!files.iter().any(|f| f.ends_with(".cbc")), "no BC data in an Android cook");
+        assert_eq!(spirv_version(&quest.join("resources/glow.frag.spv")), 0x0001_0300);
+
+        // Desktop cook output is unchanged: no ASTC caches, Vulkan 1.3 SPIR-V.
+        let host = root.join("build/assets");
+        std::fs::create_dir_all(&host).unwrap();
+        stage_assets(&root, &host, BuildTarget::Host, &mut log).unwrap();
+        assert!(!host.join(citrus_assets::package::COOKED_TEXCACHE_DIR).exists());
+        assert_eq!(spirv_version(&host.join("resources/glow.frag.spv")), 0x0001_0600);
+
+        // On device, extraction installs the caches next to the textures.
+        let (seeded, warnings) = citrus_assets::package::seed_cooked_texture_caches(&quest);
+        assert_eq!((seeded, warnings.len()), (2, 0), "{warnings:?}");
+        assert!(quest.join("textures/.citrus_texcache/wood.png.1.castc").is_file());
+        assert!(!quest.join(citrus_assets::package::COOKED_TEXCACHE_DIR).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
+
+#[cfg(test)]
+mod android_tests {
+    use super::*;
+
+    #[test]
+    fn build_targets_parse_and_place_output() {
+        assert_eq!(BuildTarget::parse("android"), Some(BuildTarget::Android));
+        assert_eq!(BuildTarget::parse("aarch64-linux-android"), Some(BuildTarget::Android));
+        assert_eq!(BuildTarget::parse("Quest"), Some(BuildTarget::Quest));
+        assert_eq!(BuildTarget::parse("meta-quest"), Some(BuildTarget::Quest));
+        assert_eq!(BuildTarget::parse("win64"), Some(BuildTarget::Windows));
+        assert_eq!(BuildTarget::parse("ps5"), None);
+        assert!(BuildTarget::Android.is_android() && BuildTarget::Quest.is_android());
+        assert!(!BuildTarget::Host.is_android() && !BuildTarget::Windows.is_android());
+        assert!(!BuildTarget::Quest.is_windows() && !BuildTarget::Quest.is_cross());
+        assert_eq!(BuildTarget::Android.output_dir(), "build-android");
+        assert_eq!(BuildTarget::Quest.output_dir(), "build-quest");
+        for t in BuildTarget::ALL {
+            assert!(NON_ASSET_DIRS.contains(&t.output_dir()), "{t:?} output would be cooked as content");
+        }
+        let labels: std::collections::BTreeSet<_> = BuildTarget::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(labels.len(), BuildTarget::ALL.len());
+        let available: Vec<_> = BuildTarget::available().collect();
+        assert!(available.contains(&BuildTarget::Host));
+        assert_eq!(available.contains(&BuildTarget::Quest), !cfg!(windows));
+    }
+
+    #[test]
+    fn package_ids_are_java_legal() {
+        assert_eq!(android_package_id("My Game"), "com.citrus.my_game");
+        assert_eq!(android_package_id("  VR--Shooter 2! "), "com.citrus.vr_shooter_2");
+        assert_eq!(android_package_id("3D Maze"), "com.citrus.g3d_maze");
+        assert_eq!(android_package_id("***"), "com.citrus.game");
+    }
+
+    #[test]
+    fn android_sdk_detection_reports_what_is_missing() {
+        let root = std::env::temp_dir().join(format!("citrus-android-sdk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sdk = root.join("sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        let home = root.join("home");
+        let sdk_s = sdk.to_string_lossy().into_owned();
+        let home_s = home.to_string_lossy().into_owned();
+        let env = |k: &str| match k {
+            "ANDROID_HOME" => Some(sdk_s.clone()),
+            "HOME" => Some(home_s.clone()),
+            _ => None,
+        };
+        let err = format!("{:#}", find_android_sdk(&env).unwrap_err());
+        assert!(err.contains("NDK"), "{err}");
+        for ndk in ["27.1.12297006", "29.0.14206865"] {
+            std::fs::create_dir_all(sdk.join("ndk").join(ndk).join("toolchains/llvm")).unwrap();
+        }
+        let err = format!("{:#}", find_android_sdk(&env).unwrap_err());
+        assert!(err.contains("build-tools"), "{err}");
+        let bt = sdk.join("build-tools/35.0.0");
+        std::fs::create_dir_all(&bt).unwrap();
+        std::fs::write(bt.join("aapt2"), "").unwrap();
+        std::fs::write(bt.join("apksigner"), "").unwrap();
+        let err = format!("{:#}", find_android_sdk(&env).unwrap_err());
+        assert!(err.contains("platform"), "{err}");
+        std::fs::create_dir_all(sdk.join("platforms/android-34")).unwrap();
+        std::fs::write(sdk.join("platforms/android-34/android.jar"), "").unwrap();
+        let found = find_android_sdk(&env).unwrap();
+        assert_eq!(found.sdk, sdk);
+        assert!(found.ndk.ends_with("29.0.14206865"), "{:?}", found.ndk);
+        let bad_ndk = |k: &str| match k {
+            "ANDROID_HOME" => Some(sdk_s.clone()),
+            "ANDROID_NDK_HOME" => Some("/nonexistent/ndk".into()),
+            _ => None,
+        };
+        assert!(format!("{:#}", find_android_sdk(&bad_ndk).unwrap_err()).contains("ANDROID_NDK_HOME"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn openxr_loader_sources() {
+        let none = |_: &str| None;
+        assert!(check_openxr_loader(&none, true).is_ok());
+        assert!(format!("{:#}", check_openxr_loader(&none, false).unwrap_err()).contains("curl"));
+        let no_fetch = |k: &str| (k == "CITRUS_OPENXR_FETCH").then(|| "0".to_string());
+        assert!(format!("{:#}", check_openxr_loader(&no_fetch, true).unwrap_err()).contains("OPENXR_LOADER_SO"));
+        let missing = |k: &str| (k == "OPENXR_LOADER_SO").then(|| "/nonexistent/libopenxr_loader.so".to_string());
+        assert!(check_openxr_loader(&missing, true).is_err());
+    }
+
+    #[test]
+    fn generated_android_crate_links_components_and_picks_xr() {
+        let (manifest, quest) = android_crate_sources(Path::new("/src/citrus"), Path::new("/p/game"), "my-game", BuildTarget::Quest);
+        assert!(manifest.contains(r#"name = "my_game""#), "{manifest}");
+        assert!(manifest.contains(r#"crate-type = ["cdylib"]"#));
+        assert!(manifest.contains("/src/citrus/crates/citrus-engine"));
+        assert!(manifest.contains("default-features = false"));
+        assert!(manifest.contains("/p/game/plugins/components"));
+        assert!(manifest.contains("[workspace]"));
+        assert!(quest.contains("fn android_main"));
+        assert!(quest.contains("XrMode::Required"));
+        assert!(quest.contains("citrus_project_components::citrus_register"));
+        let (_, phone) = android_crate_sources(Path::new("/src/citrus"), Path::new("/p/game"), "my-game", BuildTarget::Android);
+        assert!(phone.contains("XrMode::Auto"));
+    }
+
+    /// The packager's manifests (`--manifest-only`), checked against what
+    /// Meta Quest and the Khronos loader require.
+    #[cfg(unix)]
+    #[test]
+    fn apk_manifests() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let script = repo.join("tools/android/build_apk.sh");
+        let example = repo.join("examples/android-game");
+        let manifest = |quest: bool| -> Option<String> {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg(&script).arg("--manifest-only");
+            if quest {
+                cmd.arg("--quest");
+            }
+            let out = cmd.arg(&example).arg("unused").arg("unused.apk").arg("com.citrus.test").output().ok()?;
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            Some(String::from_utf8(out.stdout).unwrap())
+        };
+        let Some(quest) = manifest(true) else {
+            return; // no bash
+        };
+        for needle in [
+            r#"package="com.citrus.test""#,
+            r#"android:minSdkVersion="29""#,
+            r#"android:targetSdkVersion="32""#,
+            r#"<category android:name="com.oculus.intent.category.VR" />"#,
+            r#"<category android:name="android.intent.category.LAUNCHER" />"#,
+            r#"android:name="android.hardware.vr.headtracking" android:version="1" android:required="true""#,
+            r#"android:name="com.oculus.supportedDevices" android:value="quest3|quest3s|questpro""#,
+            r#"android:name="oculus.software.handtracking" android:required="false""#,
+            r#"android:name="oculus.software.eye_tracking" android:required="false""#,
+            r#"android:name="oculus.software.face_tracking" android:required="false""#,
+            "com.oculus.permission.HAND_TRACKING",
+            "com.oculus.permission.EYE_TRACKING",
+            "com.oculus.permission.FACE_TRACKING",
+            "org.khronos.openxr.permission.OPENXR",
+            "org.khronos.openxr.runtime_broker",
+            r#"android:name="com.oculus.vr.focusaware" android:value="true""#,
+            r#"android:screenOrientation="landscape""#,
+            r#"android:name="android.app.lib_name" android:value="android_game""#,
+        ] {
+            assert!(quest.contains(needle), "Quest manifest lacks {needle}:\n{quest}");
+        }
+        let phone = manifest(false).unwrap();
+        assert!(!phone.contains("oculus"), "{phone}");
+        assert!(phone.contains("android.intent.category.LAUNCHER"));
+        assert!(phone.contains(r#"android:minSdkVersion="30""#));
+    }
+}

@@ -6,7 +6,7 @@
 //! ```text
 //! manifest.ron                  PackageManifest (kind, metadata, file table, hash)
 //! files/<project-relative path> the entry .scene plus every asset it references
-//! texcache/<path>.<srgb>.cbc    BC import-cache blobs for material textures
+//! texcache/<path>.<srgb>.cbc    import-cache blobs for material textures (BC on desktop)
 //! thumbnail.png                 optional preview image
 //! ```
 //!
@@ -603,6 +603,134 @@ pub fn material_texture_slots(t: &MaterialTextures) -> Vec<(PathBuf, bool)> {
     slots.into_iter().filter_map(|(p, s)| p.clone().map(|p| (p, s))).collect()
 }
 
+/// (texture, srgb) pairs loaded through material slots by `scenes` (already
+/// parsed, with their project-relative paths) and by every `.scene`,
+/// `.prefab` and `.material` among `files`, limited to textures that are
+/// themselves in `files`. Used by package builds (BC cache blobs) and the
+/// Android cook (ASTC caches). Unparseable files add a warning.
+pub fn material_texture_refs(
+    root: &Path,
+    files: &BTreeSet<String>,
+    scenes: &[(&str, &SceneFile)],
+    warnings: &mut Vec<String>,
+) -> BTreeSet<(String, bool)> {
+    #[derive(Deserialize)]
+    struct PrefabEntries {
+        entries: Vec<crate::SceneEntry>,
+    }
+    let mut refs = BTreeSet::new();
+    let mut add_slots = |t: &MaterialTextures| {
+        for (p, srgb) in material_texture_slots(t) {
+            if let Some(rel) = normalize_rel(&p.to_string_lossy())
+                && files.contains(&rel)
+            {
+                refs.insert((rel, srgb));
+            }
+        }
+    };
+    let mut entry_lists: Vec<Vec<crate::SceneEntry>> = Vec::new();
+    for rel in files.iter().filter(|r| !scenes.iter().any(|(s, _)| s == r)) {
+        match ext_of(rel).as_str() {
+            "scene" => match crate::load_scene_file(root.join(rel)) {
+                Ok(s) => entry_lists.push(s.entries),
+                Err(e) => warnings.push(format!("{rel}: {e:#}")),
+            },
+            "prefab" => match std::fs::read_to_string(root.join(rel)).map_err(anyhow::Error::from).and_then(|t| {
+                ron::from_str::<PrefabEntries>(&t).map_err(anyhow::Error::from)
+            }) {
+                Ok(p) => entry_lists.push(p.entries),
+                Err(e) => warnings.push(format!("{rel}: {e:#}")),
+            },
+            "material" => match crate::load_material_file(root.join(rel)) {
+                Ok(m) => add_slots(&m.textures),
+                Err(e) => warnings.push(format!("{rel}: {e:#}")),
+            },
+            _ => {}
+        }
+    }
+    let entries = scenes.iter().flat_map(|(_, s)| &s.entries).chain(entry_lists.iter().flatten());
+    for e in entries {
+        for m in std::iter::once(&e.material).chain(e.extra_materials.iter()) {
+            if let MaterialRef::Inline { textures, .. } = m {
+                add_slots(textures);
+            }
+        }
+    }
+    refs
+}
+
+/// Asset-root folder an Android / Quest build ships its pre-encoded ASTC
+/// caches in, as `<folder>/<texture path>.<srgb>.castc`. Not the hidden
+/// per-file `.citrus_texcache/` because the APK packager drops dot-prefixed
+/// paths; [`seed_cooked_texture_caches`] moves them into place on device.
+pub const COOKED_TEXCACHE_DIR: &str = "citrus_texcache";
+
+/// Shipped path of a texture's cooked ASTC cache (see [`COOKED_TEXCACHE_DIR`]).
+pub fn cooked_texcache_rel(texture_rel: &str, srgb: bool) -> String {
+    format!("{COOKED_TEXCACHE_DIR}/{texture_rel}.{}.{}", srgb as u8, crate::ASTC_CACHE_EXTENSION)
+}
+
+/// Inverse of [`cooked_texcache_rel`]: (texture path, srgb).
+pub fn parse_cooked_texcache_rel(rel: &str) -> Option<(&str, bool)> {
+    let rest = rel.strip_prefix(COOKED_TEXCACHE_DIR)?.strip_prefix('/')?;
+    let rest = rest.strip_suffix(crate::ASTC_CACHE_EXTENSION)?.strip_suffix('.')?;
+    let (tex, srgb) = rest.rsplit_once('.')?;
+    let srgb = match srgb {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    normalize_rel(tex).filter(|t| t == tex)?;
+    Some((tex, srgb))
+}
+
+/// Install the cooked ASTC caches under `assets_root/`[`COOKED_TEXCACHE_DIR`]
+/// into each texture's import cache (re-bound to the extracted file's mtime
+/// and size, independent of the device), then delete the shipped copies.
+/// Returns (caches installed, warnings).
+pub fn seed_cooked_texture_caches(assets_root: &Path) -> (usize, Vec<String>) {
+    let dir = assets_root.join(COOKED_TEXCACHE_DIR);
+    let mut found = Vec::new();
+    collect_files_rel(&dir, &dir, &mut found);
+    let (mut seeded, mut warnings) = (0, Vec::new());
+    for shipped in found {
+        let rel = format!("{COOKED_TEXCACHE_DIR}/{shipped}");
+        let Some((tex, srgb)) = parse_cooked_texcache_rel(&rel) else {
+            warnings.push(format!("ignoring unknown cooked cache {rel}"));
+            continue;
+        };
+        let result = std::fs::read(dir.join(&shipped))
+            .map_err(anyhow::Error::from)
+            .and_then(|blob| crate::seed_astc_cache(assets_root.join(tex), srgb, &blob, COOKED_MAX_TEXTURE_DIM));
+        match result {
+            Ok(_) => seeded += 1,
+            Err(e) => warnings.push(format!("cooked texture cache for {tex}: {e:#}")),
+        }
+    }
+    if dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+    {
+        warnings.push(format!("removing {}: {e}", dir.display()));
+    }
+    (seeded, warnings)
+}
+
+/// Largest texture a cooked cache may describe (Vulkan's common 2D limit).
+const COOKED_MAX_TEXTURE_DIM: u32 = 16384;
+
+/// `/`-separated paths of every file under `dir`, relative to `base`.
+fn collect_files_rel(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_rel(base, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(base) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
 /// Rendered triangles of a scene: each model placement counts its slots.
 pub fn count_triangles(file: &SceneFile, models: &HashMap<String, crate::Scene>) -> u64 {
     let mut total = 0u64;
@@ -624,8 +752,11 @@ pub fn count_triangles(file: &SceneFile, models: &HashMap<String, crate::Scene>)
 pub fn estimate_texture_bytes(path: &Path) -> Option<(u32, u32, u64)> {
     let (w, h) = image::image_dimensions(path).ok()?;
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    let hdr = matches!(ext.as_str(), "exr" | "hdr");
     let bc = citrus_render::bc_supported() && w % 4 == 0 && h % 4 == 0 && w >= 4 && h >= 4;
-    let per_texel = if bc { 1 } else if matches!(ext.as_str(), "exr" | "hdr") { 8 } else { 4 };
+    // ASTC at the finest footprint (4x4) is also 1 B/texel; HDR stays raw there.
+    let astc = !citrus_render::bc_supported() && citrus_render::astc_supported() && !hdr;
+    let per_texel = if bc || astc { 1 } else if hdr { 8 } else { 4 };
     Some((w, h, w as u64 * h as u64 * per_texel * 4 / 3))
 }
 
@@ -771,39 +902,7 @@ pub fn plan_package(opts: &BuildOptions) -> Result<PackagePlan> {
 
     // Material textures (with the sRGB flag their slot loads them with) for
     // the BC cache and the texture-memory estimate.
-    let mut tex_refs: BTreeSet<(String, bool)> = BTreeSet::new();
-    let mut add_slots = |t: &MaterialTextures| {
-        for (p, srgb) in material_texture_slots(t) {
-            if let Some(rel) = normalize_rel(&p.to_string_lossy())
-                && deps.contains(&rel)
-            {
-                tex_refs.insert((rel, srgb));
-            }
-        }
-    };
-    let mut scenes: Vec<(String, SceneFile)> = vec![(entry.clone(), scene.clone())];
-    for rel in deps.iter().filter(|r| **r != entry) {
-        match ext_of(rel).as_str() {
-            "scene" => match crate::load_scene_file(root.join(rel)) {
-                Ok(s) => scenes.push((rel.clone(), s)),
-                Err(e) => warnings.push(format!("{rel}: {e:#}")),
-            },
-            "material" => match crate::load_material_file(root.join(rel)) {
-                Ok(m) => add_slots(&m.textures),
-                Err(e) => warnings.push(format!("{rel}: {e:#}")),
-            },
-            _ => {}
-        }
-    }
-    for (_, s) in &scenes {
-        for e in &s.entries {
-            for m in std::iter::once(&e.material).chain(e.extra_materials.iter()) {
-                if let MaterialRef::Inline { textures, .. } = m {
-                    add_slots(textures);
-                }
-            }
-        }
-    }
+    let tex_refs = material_texture_refs(root, &deps, &[(entry.as_str(), &scene)], &mut warnings);
     let mut texture_bytes = 0u64;
     for (rel, srgb) in &tex_refs {
         let abs = root.join(rel);
@@ -1573,6 +1672,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             material,
             extra_materials: vec![],
@@ -1686,6 +1786,86 @@ mod tests {
         }
         assert!(escapes_package("/home/me/secret.png") && escapes_package("..\\up") && escapes_package("D:/x"));
         assert!(!escapes_package("Hello world /") && !escapes_package("textures/a.png"));
+    }
+
+    #[test]
+    fn texture_refs_and_cooked_astc_caches() {
+        let (root, scene) = sample_project();
+        crate::save_scene_file(root.join("scenes/world.scene"), &scene).unwrap();
+        for name in ["n.png", "e.png"] {
+            image::RgbaImage::from_pixel(12, 6, image::Rgba([1, 2, 3, 255])).save(root.join("textures").join(name)).unwrap();
+        }
+        let inline = MaterialRef::Inline {
+            params: Default::default(),
+            features: Default::default(),
+            shader: "standard".into(),
+            custom: Default::default(),
+            render_queue: None,
+            textures: MaterialTextures {
+                normal: Some("textures/n.png".into()),
+                emission: Some("textures/e.png".into()),
+                ao: Some("textures/not_cooked.png".into()),
+                ..Default::default()
+            },
+        };
+        #[derive(Serialize)]
+        struct Prefab {
+            entries: Vec<SceneEntry>,
+        }
+        let prefab = Prefab { entries: vec![entry("Enemy", ObjectSource::Light, inline, vec![])] };
+        std::fs::create_dir_all(root.join("prefabs")).unwrap();
+        std::fs::write(root.join("prefabs/enemy.prefab"), ron::to_string(&prefab).unwrap()).unwrap();
+        let files: BTreeSet<String> = [
+            "scenes/world.scene",
+            "prefabs/enemy.prefab",
+            "materials/ferris.material",
+            "textures/ferris.png",
+            "textures/orm.png",
+            "textures/n.png",
+            "textures/e.png",
+        ]
+        .map(String::from)
+        .into();
+        let mut warnings = Vec::new();
+        let refs = material_texture_refs(&root, &files, &[], &mut warnings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let want: BTreeSet<(String, bool)> = [
+            ("textures/ferris.png", true),
+            ("textures/orm.png", false),
+            ("textures/n.png", false),
+            ("textures/e.png", true),
+        ]
+        .map(|(r, s)| (r.to_owned(), s))
+        .into();
+        assert_eq!(refs, want);
+
+        assert_eq!(cooked_texcache_rel("textures/n.png", false), "citrus_texcache/textures/n.png.0.castc");
+        assert_eq!(parse_cooked_texcache_rel("citrus_texcache/a/b.png.1.castc"), Some(("a/b.png", true)));
+        for bad in ["citrus_texcache/b.png.2.castc", "texcache/b.png.1.castc", "citrus_texcache/../x.png.1.castc", "citrus_texcache/b.png.1.cbc"] {
+            assert_eq!(parse_cooked_texcache_rel(bad), None, "{bad}");
+        }
+
+        // A cooked asset root (as the APK extracts it) gets its caches installed.
+        let assets = temp_dir("cooked");
+        for (rel, srgb) in &refs {
+            let dst = assets.join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(root.join(rel), &dst).unwrap();
+            let blob = crate::astc_cache_blob(root.join(rel), *srgb, crate::AstcBlocks::default()).unwrap();
+            let shipped = assets.join(cooked_texcache_rel(rel, *srgb));
+            std::fs::create_dir_all(shipped.parent().unwrap()).unwrap();
+            std::fs::write(shipped, blob).unwrap();
+        }
+        std::fs::write(assets.join("citrus_texcache/stray.bin"), b"?").unwrap();
+        let (seeded, warnings) = seed_cooked_texture_caches(&assets);
+        assert_eq!(seeded, 4);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(!assets.join(COOKED_TEXCACHE_DIR).exists(), "shipped copies removed");
+        assert!(assets.join("textures/.citrus_texcache/ferris.png.1.castc").is_file());
+        assert!(assets.join("textures/.citrus_texcache/n.png.0.castc").is_file());
+        assert_eq!(seed_cooked_texture_caches(&assets), (0, vec![]), "nothing left to seed");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&assets);
     }
 
     #[test]

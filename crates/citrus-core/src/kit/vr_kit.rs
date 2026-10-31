@@ -7,7 +7,15 @@
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{ComponentCommand, ComponentCtx, ObjectId, ObjectRef, RayFilter, TypedComponent};
+use super::swim::{breathe, float_accel, stroke, swims};
+use crate::{
+    ComponentCommand, ComponentCtx, InputState, MotionState, MoveHost, ObjectId, ObjectRef, Predictable, RayFilter, TypedComponent,
+    driven_remotely,
+};
+
+/// Share of a hand's speed through the water a stroke turns into the
+/// swimmer's speed (the other way).
+const ARM_STROKE: f32 = 0.6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum VrLocomotion {
@@ -68,6 +76,89 @@ pub fn teleport_arc(
     None
 }
 
+/// The active scheme is a VR controller scheme that binds `action`. When it
+/// isn't (a desktop scheme left active, an older project) the VR Player
+/// reads the raw controller input that action defaults to.
+fn vr_bound(ctx: &ComponentCtx, action: &str) -> bool {
+    ctx.control_scheme().is_some_and(|s| s.device() == Some(crate::InputDevice::Vr) && s.action(action).is_some())
+}
+
+fn vr_button(ctx: &ComponentCtx, action: &str, raw: bool) -> bool {
+    if vr_bound(ctx, action) { ctx.input.down(action) } else { raw }
+}
+
+/// One frame of a VR Player's locomotion input as the rig read it (stick,
+/// turn, headset pose), so networked prediction can replay it without the
+/// headset.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[doc(hidden)]
+pub struct VrStride {
+    /// The play space's rotation before the frame's turn.
+    pub rig: Quat,
+    pub stick: glam::Vec2,
+    /// Degrees the play space turns about the head.
+    pub turn: f32,
+    /// Head pose in stage space.
+    pub head: (Vec3, Quat),
+    /// Hands in stage space and their world velocity, while there is water
+    /// at the head (arm strokes).
+    pub hands: Option<[(Vec3, Vec3); 2]>,
+    /// Feet target of a teleport this frame.
+    pub teleport: Option<Vec3>,
+}
+
+const STRIDE_HANDS: u32 = 1;
+const STRIDE_TELEPORT: u32 = 2;
+
+impl VrStride {
+    /// Flat form carried by an input command.
+    pub fn pack(&self) -> Vec<f32> {
+        let flags = if self.hands.is_some() { STRIDE_HANDS } else { 0 } | if self.teleport.is_some() { STRIDE_TELEPORT } else { 0 };
+        let ((p, q), r) = (self.head, self.rig);
+        let mut v = vec![flags as f32, self.stick.x, self.stick.y, self.turn, p.x, p.y, p.z, q.x, q.y, q.z, q.w, r.x, r.y, r.z, r.w];
+        if let Some(hands) = self.hands {
+            for (pos, vel) in hands {
+                v.extend_from_slice(&[pos.x, pos.y, pos.z, vel.x, vel.y, vel.z]);
+            }
+        }
+        if let Some(t) = self.teleport {
+            v.extend_from_slice(&[t.x, t.y, t.z]);
+        }
+        v
+    }
+
+    pub fn unpack(v: &[f32]) -> Option<Self> {
+        fn vec3(s: &[f32]) -> Vec3 {
+            Vec3::new(s[0], s[1], s[2])
+        }
+        let (&flags, rest) = v.split_first()?;
+        let flags = flags as u32;
+        let (fixed, mut tail) = rest.split_at_checked(14)?;
+        let mut take = |n: usize| {
+            let (a, b) = tail.split_at_checked(n)?;
+            tail = b;
+            Some(a)
+        };
+        let hands = if flags & STRIDE_HANDS != 0 {
+            let h = take(12)?;
+            Some([(vec3(&h[0..]), vec3(&h[3..])), (vec3(&h[6..]), vec3(&h[9..]))])
+        } else {
+            None
+        };
+        let teleport = if flags & STRIDE_TELEPORT != 0 { Some(vec3(take(3)?)) } else { None };
+        let rot = Quat::from_xyzw(fixed[6], fixed[7], fixed[8], fixed[9]);
+        let rig = Quat::from_xyzw(fixed[10], fixed[11], fixed[12], fixed[13]);
+        (rot.length_squared() > 0.5 && rig.length_squared() > 0.5).then(|| Self {
+            rig: rig.normalize(),
+            stick: glam::Vec2::new(fixed[0], fixed[1]),
+            turn: fixed[2],
+            head: (vec3(&fixed[3..]), rot.normalize()),
+            hands,
+            teleport,
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct Held {
@@ -80,6 +171,8 @@ pub struct Held {
 /// locomotion and snap turns, writes the tracked head / hand poses into the
 /// children, and grabs [`Grabbable`] objects with the grips (trigger is passed
 /// to the held object, e.g. a gun). Desktop fallback without a headset.
+/// Controller input goes through the bound actions (Move, Turn, Teleport,
+/// Grab / Use Left / Right), so players can remap it.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct VrPlayer {
@@ -107,6 +200,13 @@ pub struct VrPlayer {
     pub grab_action: String,
     pub fire_action: String,
     pub teleport_action: String,
+    /// VR actions (the "VR Controllers" scheme). An action the active scheme
+    /// lacks falls back to the raw controller input it defaults to.
+    pub turn_action: String,
+    pub grab_left_action: String,
+    pub grab_right_action: String,
+    pub use_left_action: String,
+    pub use_right_action: String,
     #[serde(skip)]
     pub vr_active: bool,
     #[serde(skip)]
@@ -127,6 +227,17 @@ pub struct VrPlayer {
     pub teleport_target: Option<Vec3>,
     #[serde(skip)]
     pub started: bool,
+    /// Swimming (water past the chest): velocity, and seconds of breath
+    /// left while the head has been under.
+    #[serde(skip)]
+    pub swimming: bool,
+    #[serde(skip)]
+    pub swim_vel: Vec3,
+    #[serde(skip)]
+    pub breath: Option<f32>,
+    /// The locomotion input of the last frame (for networked prediction).
+    #[serde(skip)]
+    pub last_stride: Option<VrStride>,
 }
 
 impl Default for VrPlayer {
@@ -151,6 +262,11 @@ impl Default for VrPlayer {
             grab_action: "Grab".into(),
             fire_action: "Fire".into(),
             teleport_action: "Teleport".into(),
+            turn_action: "Turn".into(),
+            grab_left_action: "Grab Left".into(),
+            grab_right_action: "Grab Right".into(),
+            use_left_action: "Use Left".into(),
+            use_right_action: "Use Right".into(),
             vr_active: false,
             pitch: 0.0,
             held: [None; 2],
@@ -161,6 +277,10 @@ impl Default for VrPlayer {
             aiming: false,
             teleport_target: None,
             started: false,
+            swimming: false,
+            swim_vel: Vec3::ZERO,
+            breath: None,
+            last_stride: None,
         }
     }
 }
@@ -172,19 +292,15 @@ impl VrPlayer {
     }
 
     fn rig_world(ctx: &ComponentCtx) -> Mat4 {
-        let local = Mat4::from_rotation_translation(*ctx.rotation, *ctx.translation);
-        match ctx.parent_world {
-            Some(p) => p * local,
-            None => local,
-        }
+        MoveHost::world(ctx)
     }
 
     /// Turn the play space by `delta` degrees about a world pivot (the head).
-    fn turn(ctx: &mut ComponentCtx, pivot: Vec3, delta: f32) {
+    fn turn(host: &mut dyn MoveHost, pivot: Vec3, delta: f32) {
         let r = Quat::from_rotation_y(delta.to_radians());
-        let origin = Self::rig_world(ctx).w_axis.truncate();
-        ctx.set_world_position(pivot + r * (origin - pivot));
-        *ctx.rotation = (r * *ctx.rotation).normalize();
+        let origin = host.world().w_axis.truncate();
+        host.set_world_position(pivot + r * (origin - pivot));
+        host.set_rotation((r * host.rotation()).normalize());
     }
 
     /// Head / hand poses in the rig's local (stage) space.
@@ -207,52 +323,127 @@ impl VrPlayer {
         }
     }
 
-    fn locomotion(&mut self, ctx: &mut ComponentCtx, dt: f32) {
-        let vr = ctx.screen.vr;
-        let rig = Self::rig_world(ctx);
-        let head_stage = self.stage_poses(ctx)[0];
-        let head_world = rig.transform_point3(head_stage.0);
+    /// Swim when the water is past the chest (see [`super::Swimmer`], tuned
+    /// by one on this object): the stick strokes where the head looks,
+    /// pulling a hand back through the water pushes the other way, the rig
+    /// floats with the head just out, and breath runs out with it under.
+    /// True while swimming (the walk and teleport are skipped).
+    fn swim(&mut self, host: &mut dyn MoveHost, stride: &VrStride, dt: f32) -> bool {
+        let s = host.swimmer();
+        let rig = host.world();
+        let (head_local, head_rot) = stride.head;
+        let head = rig.transform_point3(head_local);
+        let feet = rig.w_axis.truncate();
+        let height = (head.y - feet.y).max(1.0) / 0.92;
+        let surface = host.water_surface(head);
+        self.swimming = surface.is_some_and(|h| swims(&s, self.swimming, h - feet.y, height));
+        let Some(h) = surface.filter(|_| self.swimming) else {
+            self.swim_vel = Vec3::ZERO;
+            self.breath = self.breath.map(|b| breathe(&s, b, false, dt)).filter(|b| *b < s.breath);
+            return false;
+        };
+        self.breath = Some(breathe(&s, self.breath.unwrap_or(s.breath), head.y < h, dt));
+        let look = Quat::from_mat4(&rig) * head_rot;
+        let mut target = stroke(look, stride.stick, 0.0, s.swim_speed);
+        // Arm strokes: hands under the surface push against the water.
+        for (p, vel) in stride.hands.into_iter().flatten() {
+            if rig.transform_point3(p).y < h {
+                target -= (vel - self.swim_vel) * ARM_STROKE;
+            }
+        }
+        let target = target.clamp_length_max(s.sprint_speed);
+        let rate = if target.length_squared() > 1e-4 { s.stroke_accel } else { s.water_drag };
+        self.swim_vel = self.swim_vel.lerp(target, 1.0 - (-rate * dt).exp());
+        if stride.stick.length_squared() < 0.02 {
+            self.swim_vel.y += float_accel(&s, head.y, h, self.swim_vel.y) * dt;
+        }
+        let mut origin = feet + self.swim_vel * dt;
+        // Not through the floor.
+        let filter = RayFilter { exclude: Some(host.self_id()), ..Default::default() };
+        if let Some(floor) = host.raycast(origin + Vec3::Y * 1.0, Vec3::NEG_Y, 1.2, &filter)
+            && origin.y < floor.point.y
+        {
+            origin.y = floor.point.y;
+            self.swim_vel.y = self.swim_vel.y.max(0.0);
+        }
+        host.set_world_position(origin);
+        true
+    }
+
+    /// The movement part of a frame: turn, then swim or walk with the stick.
+    /// Live frames and networked prediction's replays both run this. True
+    /// while swimming.
+    fn stride(&mut self, host: &mut dyn MoveHost, stride: &VrStride, dt: f32) -> bool {
+        // The owner's facing, like a first-person view: a replay adopts it.
+        host.set_rotation(stride.rig);
+        let rig = host.world();
+        let head_world = rig.transform_point3(stride.head.0);
         let head_yaw = {
-            let f = (Quat::from_mat4(&rig) * head_stage.1) * Vec3::NEG_Z;
+            let f = (Quat::from_mat4(&rig) * stride.head.1) * Vec3::NEG_Z;
             Quat::from_rotation_y((-f.x).atan2(-f.z))
         };
-        let (mv, teleport_down) = if vr.active {
-            let rx = vr.right_stick.x;
+        if stride.turn != 0.0 {
+            Self::turn(host, head_world, stride.turn);
+        }
+        if self.swim(host, stride, dt) {
+            return true;
+        }
+        let mv = stride.stick;
+        if self.locomotion.smooth() && mv.length_squared() > 0.02 {
+            let dir = head_yaw * Vec3::new(mv.x, 0.0, -mv.y);
+            let mut origin = host.world().w_axis.truncate() + dir.clamp_length_max(1.0) * self.move_speed * dt;
+            let filter = RayFilter { exclude: Some(host.self_id()), ..Default::default() };
+            let probe = origin + Vec3::Y * (stride.head.0.y.max(0.5));
+            if let Some(hit) = host.raycast(probe, Vec3::NEG_Y, stride.head.0.y.max(0.5) + 1.0, &filter) {
+                origin.y = hit.point.y;
+            }
+            host.set_world_position(origin);
+        }
+        false
+    }
+
+    /// Snap the play space so the head stands over `target`.
+    fn teleport_to(host: &mut dyn MoveHost, head_local: Vec3, target: Vec3) {
+        let rig = host.world();
+        let head_offset = (rig.transform_point3(head_local) - rig.w_axis.truncate()).with_y(0.0);
+        host.set_world_position(target - head_offset);
+    }
+
+    fn locomotion(&mut self, ctx: &mut ComponentCtx, dt: f32) {
+        let vr = ctx.screen.vr;
+        let (mv, turn, teleport_down) = if vr.active {
+            let rx = if vr_bound(ctx, &self.turn_action) { ctx.input.axis(&self.turn_action) } else { vr.right_stick.x };
+            let mut turn = 0.0;
             if self.snap_turn > 0.0 {
                 if rx.abs() > 0.7 && !self.turn_latched {
                     self.turn_latched = true;
-                    Self::turn(ctx, head_world, -rx.signum() * self.snap_turn);
+                    turn = -rx.signum() * self.snap_turn;
                 } else if rx.abs() < 0.3 {
                     self.turn_latched = false;
                 }
             } else if rx.abs() > 0.15 {
-                Self::turn(ctx, head_world, -rx * self.smooth_turn_speed * dt);
+                turn = -rx * self.smooth_turn_speed * dt;
             }
-            (vr.left_stick, vr.right_stick.y > 0.6)
+            let mv = if vr_bound(ctx, &self.move_action) { ctx.input.axis2(&self.move_action) } else { vr.left_stick };
+            (mv, turn, vr_button(ctx, &self.teleport_action, vr.right_stick.y > 0.6))
         } else {
             let look = ctx.input.axis2(&self.look_action);
-            if look.x != 0.0 {
-                Self::turn(ctx, head_world, -look.x * self.look_sensitivity);
-            }
             self.pitch = (self.pitch - look.y * self.look_sensitivity).clamp(-85.0, 85.0);
-            (ctx.input.axis2(&self.move_action), ctx.input.down(&self.teleport_action))
+            (ctx.input.axis2(&self.move_action), -look.x * self.look_sensitivity, ctx.input.down(&self.teleport_action))
         };
-
-        if self.locomotion.smooth() && mv.length_squared() > 0.02 {
-            let dir = head_yaw * Vec3::new(mv.x, 0.0, -mv.y);
-            let mut origin = Self::rig_world(ctx).w_axis.truncate() + dir.clamp_length_max(1.0) * self.move_speed * dt;
-            let filter = RayFilter { exclude: Some(ctx.self_id()), ..Default::default() };
-            let probe = origin + Vec3::Y * (head_stage.0.y.max(0.5));
-            if let Some(hit) = ctx.raycast_filtered(probe, Vec3::NEG_Y, head_stage.0.y.max(0.5) + 1.0, &filter) {
-                origin.y = hit.point.y;
-            }
-            ctx.set_world_position(origin);
+        let poses = self.stage_poses(ctx);
+        let rig = Self::rig_world(ctx);
+        let wet = ctx.water_surface(rig.transform_point3(poses[0].0)).is_some();
+        let hands = wet.then(|| [(poses[1].0, self.hand_vel[0]), (poses[2].0, self.hand_vel[1])]);
+        let mut stride = VrStride { rig: *ctx.rotation, stick: mv, turn, head: poses[0], hands, teleport: None };
+        if self.stride(ctx, &stride, dt) {
+            self.last_stride = Some(stride);
+            return;
         }
 
         if self.locomotion.teleport() {
             if teleport_down {
                 self.aiming = true;
-                let poses = self.stage_poses(ctx);
                 let rig = Self::rig_world(ctx);
                 let (from, rot) = if vr.active { poses[2] } else { poses[0] };
                 let origin = rig.transform_point3(from);
@@ -273,15 +464,15 @@ impl VrPlayer {
             } else if self.aiming {
                 self.aiming = false;
                 if let Some(target) = self.teleport_target.take() {
-                    let rig = Self::rig_world(ctx);
-                    let head_offset = (rig.transform_point3(head_stage.0) - rig.w_axis.truncate()).with_y(0.0);
-                    ctx.set_world_position(target - head_offset);
+                    Self::teleport_to(ctx, poses[0].0, target);
+                    stride.teleport = Some(target);
                 }
                 if self.teleport_marker.is_set() {
                     ctx.set_active(self.teleport_marker, false);
                 }
             }
         }
+        self.last_stride = Some(stride);
     }
 
     /// Pick up the nearest free [`Grabbable`] within reach of the hand, or
@@ -359,6 +550,46 @@ impl VrPlayer {
     }
 }
 
+impl Predictable for VrPlayer {
+    fn motion(&self) -> MotionState {
+        MotionState {
+            vel: self.swim_vel,
+            pitch: self.pitch,
+            swimming: self.swimming,
+            breath: self.breath,
+            ..Default::default()
+        }
+    }
+
+    fn set_motion(&mut self, m: &MotionState, _host: &mut dyn MoveHost) {
+        self.swim_vel = m.vel;
+        self.pitch = m.pitch;
+        self.swimming = m.swimming;
+        self.breath = m.breath;
+    }
+
+    fn frame_extra(&self) -> Vec<f32> {
+        self.last_stride.map(|s| s.pack()).unwrap_or_default()
+    }
+
+    fn replay(&mut self, host: &mut dyn MoveHost, _input: &InputState, extra: &[f32], dt: f32) {
+        let dt = dt.min(0.1);
+        let Some(stride) = VrStride::unpack(extra).filter(|_| dt > 0.0) else {
+            return;
+        };
+        if self.stride(host, &stride, dt) {
+            return;
+        }
+        // The owner's teleport, if the arc could have reached it.
+        if let Some(target) = stride.teleport
+            && self.locomotion.teleport()
+            && (target - host.world_position()).with_y(0.0).length() <= self.teleport_speed * 3.0 + 1.0
+        {
+            Self::teleport_to(host, stride.head.0, target);
+        }
+    }
+}
+
 impl TypedComponent for VrPlayer {
     const NAME: &'static str = "VR Player";
 
@@ -391,6 +622,10 @@ impl TypedComponent for VrPlayer {
         if !self.started {
             TypedComponent::start(self, ctx);
         }
+        self.last_stride = None;
+        if driven_remotely(ctx) {
+            return;
+        }
         let vr = ctx.screen.vr;
         self.vr_active = vr.active;
         if !vr.active && !self.desktop_fallback {
@@ -408,12 +643,18 @@ impl TypedComponent for VrPlayer {
 
         let rig = Self::rig_world(ctx);
         let grips = if vr.active {
-            [vr.left_grip > 0.6, vr.right_grip > 0.6]
+            [
+                vr_button(ctx, &self.grab_left_action, vr.left_grip > 0.6),
+                vr_button(ctx, &self.grab_right_action, vr.right_grip > 0.6),
+            ]
         } else {
             [false, ctx.input.down(&self.grab_action)]
         };
         let triggers = if vr.active {
-            [vr.left_trigger, vr.right_trigger]
+            [
+                vr_button(ctx, &self.use_left_action, vr.left_trigger),
+                vr_button(ctx, &self.use_right_action, vr.right_trigger),
+            ]
         } else {
             [false, ctx.input.down(&self.fire_action)]
         };
@@ -594,6 +835,25 @@ mod tests {
         assert!(hit.y.abs() < 1e-3);
         assert!(hit.z < -2.0, "travels forward: {hit:?}");
         assert!(hit.x.abs() < 1e-3);
+    }
+
+    #[test]
+    fn locomotion_input_packs_for_input_commands() {
+        let full = VrStride {
+            rig: Quat::from_rotation_y(0.4),
+            stick: glam::Vec2::new(0.2, -1.0),
+            turn: -30.0,
+            head: (Vec3::new(0.1, 1.6, -0.05), Quat::from_rotation_x(-0.3)),
+            hands: Some([(Vec3::new(-0.2, 1.1, -0.3), Vec3::X), (Vec3::new(0.2, 1.0, -0.3), Vec3::NEG_Y)]),
+            teleport: Some(Vec3::new(4.0, 0.0, -6.0)),
+        };
+        for s in [full, VrStride { hands: None, teleport: None, ..full }] {
+            let back = VrStride::unpack(&s.pack()).expect("round trip");
+            assert!(back.rig.angle_between(s.rig) < 1e-5 && back.head.1.angle_between(s.head.1) < 1e-5);
+            assert_eq!((back.stick, back.turn, back.head.0, back.hands, back.teleport), (s.stick, s.turn, s.head.0, s.hands, s.teleport));
+        }
+        assert!(VrStride::unpack(&full.pack()[..20]).is_none(), "cut short");
+        assert!(VrStride::unpack(&[]).is_none());
     }
 
     #[test]

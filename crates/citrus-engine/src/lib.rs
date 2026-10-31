@@ -11,6 +11,7 @@ mod cloth;
 mod face_drive;
 mod face_input;
 mod slimevr;
+#[cfg(feature = "editor")]
 mod ron_fields;
 mod viseme;
 mod voice_codec;
@@ -22,12 +23,14 @@ pub mod particles;
 pub mod water_render;
 pub mod water_fx;
 pub mod water_carry;
+#[cfg(feature = "editor")]
 mod editor_water;
 mod water_walls;
 mod underwater;
 pub mod prefab;
 mod log_capture;
 pub mod physics;
+pub mod authored_collision;
 mod plugins;
 mod game_ui;
 mod play;
@@ -44,6 +47,10 @@ pub mod sw_gi;
 mod input_engine;
 // Public so tools (dedicated servers, bots, test harnesses) can drive sessions directly.
 pub mod net;
+mod net_identity;
+pub mod net_predict;
+mod net_relay;
+mod net_secure;
 mod net_sync;
 mod voice;
 mod shaders;
@@ -64,9 +71,11 @@ mod splash;
 #[cfg(feature = "editor")]
 mod tasks;
 #[cfg(feature = "editor")]
+mod bake_store;
+#[cfg(feature = "editor")]
 mod undo;
 
-pub use runtime::{GameConfig, run_game};
+pub use runtime::{GameConfig, XrMode, run_game};
 #[cfg(target_os = "android")]
 pub use runtime::{android_assets_root, run_game_android};
 #[cfg(target_os = "android")]
@@ -76,7 +85,7 @@ pub mod templates;
 pub use templates::{ProjectTemplate, TemplateCategory};
 
 
-/// Install the tracing subscriber (stdout + the in-app Log tab capture).
+/// Install the tracing subscriber (stdout, plus the editor's Log tab capture).
 pub fn init_logging() {
     log_capture::init();
 }

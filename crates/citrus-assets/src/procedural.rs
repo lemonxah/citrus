@@ -264,6 +264,7 @@ pub fn test_scene() -> Scene {
         morphs: Vec::new(),
         springs: Default::default(),
         animations: Vec::new(),
+        collision: Vec::new(),
     }
 }
 

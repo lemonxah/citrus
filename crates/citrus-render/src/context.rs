@@ -48,6 +48,10 @@ pub struct GpuContext {
     /// The driver's own fault report after a loss (cross-vendor).
     fault: Option<ext::device_fault::Device>,
     lost_reported: std::sync::atomic::AtomicBool,
+    /// Negotiated device API version (1.1 ..= 1.3).
+    pub api_version: u32,
+    /// `VK_KHR_multiview` (core 1.1) enabled: one pass renders both eyes.
+    pub multiview: bool,
 }
 
 /// `VK_AMD_buffer_marker` target: word 0 = last marker the GPU started,
@@ -126,11 +130,21 @@ impl GpuContext {
         let get_proc: openxr::sys::platform::VkGetInstanceProcAddr =
             unsafe { std::mem::transmute(entry.static_fn().get_instance_proc_addr) };
 
+        // Ask for 1.3 when the loader offers it; a Vulkan 1.1 loader (older
+        // Android) caps the instance at what it implements.
+        let loader_version = unsafe { entry.try_enumerate_instance_version() }
+            .ok()
+            .flatten()
+            .unwrap_or(vk::API_VERSION_1_0);
+        if loader_version < vk::API_VERSION_1_1 {
+            bail!("the Vulkan loader only implements {}; citrus needs Vulkan 1.1 or newer", version_label(loader_version));
+        }
+        let instance_version = loader_version.min(vk::API_VERSION_1_3);
         let app_info = vk::ApplicationInfo::default()
             .application_name(app_name)
             .application_version(vk::make_api_version(0, 0, 1, 0))
             .engine_name(c"citrus")
-            .api_version(vk::API_VERSION_1_3);
+            .api_version(instance_version);
 
         let mut extensions: Vec<*const c_char> =
             ash_window::enumerate_required_extensions(display)?.to_vec();
@@ -208,7 +222,11 @@ impl GpuContext {
         };
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
         let gpu_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) };
-        tracing::info!(gpu = ?gpu_name, "selected physical device");
+        let api_version = props.api_version.min(instance_version);
+        if api_version < vk::API_VERSION_1_1 {
+            bail!("{gpu_name:?} only offers {}; citrus needs Vulkan 1.1 or newer", version_label(props.api_version));
+        }
+        tracing::info!(gpu = ?gpu_name, api = %version_label(api_version), "selected physical device");
 
         // Request a SECOND queue from the same family (when the family exposes
         // ≥2) to use as a background asset-upload queue: a loader thread can
@@ -238,7 +256,8 @@ impl GpuContext {
             khr::ray_query::NAME,
             khr::deferred_host_operations::NAME,
         ];
-        let mut has_rt = device_supports(&instance, physical_device, &rt_exts)?;
+        // The RT feature chain uses Vulkan12Features, which needs a 1.2 device.
+        let mut has_rt = api_version >= vk::API_VERSION_1_2 && device_supports(&instance, physical_device, &rt_exts)?;
         // Ray-traced hit shading samples every material texture through one
         // runtime-sized array (descriptor indexing). VK_KHR_acceleration_structure
         // requires the extension, so RT devices have it; check the features anyway.
@@ -281,9 +300,64 @@ impl GpuContext {
         }
         let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
 
+        // Dynamic rendering + synchronization2: core on 1.3, otherwise the KHR
+        // extensions (the device table aliases their entry points onto the core
+        // names below, so call sites are the same on both paths).
+        let core13 = api_version >= vk::API_VERSION_1_3;
+        let astc_hdr_ext = !core13 && device_supports(&instance, physical_device, &[ext::texture_compression_astc_hdr::NAME])?;
+        let (multiview, astc_hdr) = {
+            let mut mv = vk::PhysicalDeviceMultiviewFeatures::default();
+            let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut hdr = vk::PhysicalDeviceTextureCompressionASTCHDRFeatures::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut mv);
+            if core13 {
+                f2 = f2.push_next(&mut f13);
+            } else if astc_hdr_ext {
+                f2 = f2.push_next(&mut hdr);
+            }
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            let astc_hdr = if core13 { f13.texture_compression_astc_hdr } else { hdr.texture_compression_astc_hdr };
+            (mv.multiview == vk::TRUE, astc_hdr == vk::TRUE)
+        };
+        if !core13 {
+            let mut required = vec![khr::dynamic_rendering::NAME, khr::synchronization2::NAME];
+            if api_version < vk::API_VERSION_1_2 {
+                // VK_KHR_dynamic_rendering depends on these (core in 1.2).
+                required.extend([khr::depth_stencil_resolve::NAME, khr::create_renderpass2::NAME]);
+            }
+            for name in required {
+                if !device_supports(&instance, physical_device, &[name])? {
+                    bail!(
+                        "{gpu_name:?} offers {} without {}: citrus needs Vulkan 1.3 or that extension",
+                        version_label(api_version),
+                        name.to_string_lossy()
+                    );
+                }
+                device_extensions.push(name.as_ptr());
+            }
+            let mut dr = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+            let mut s2 = vk::PhysicalDeviceSynchronization2Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut dr).push_next(&mut s2);
+            unsafe { instance.get_physical_device_features2(physical_device, &mut f2) };
+            if dr.dynamic_rendering != vk::TRUE {
+                bail!("{gpu_name:?} lists VK_KHR_dynamic_rendering but not its dynamicRendering feature");
+            }
+            if s2.synchronization2 != vk::TRUE {
+                bail!("{gpu_name:?} lists VK_KHR_synchronization2 but not its synchronization2 feature");
+            }
+            if astc_hdr {
+                device_extensions.push(ext::texture_compression_astc_hdr::NAME.as_ptr());
+            }
+            tracing::info!("Vulkan {} device: dynamic rendering + synchronization2 via KHR extensions", version_label(api_version));
+        }
         let mut vk13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
-            .synchronization2(true);
+            .synchronization2(true)
+            .texture_compression_astc_hdr(astc_hdr);
+        let mut dr_khr = vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut s2_khr = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut astc_hdr_khr = vk::PhysicalDeviceTextureCompressionASTCHDRFeatures::default().texture_compression_astc_hdr(true);
+        let mut multiview_features = vk::PhysicalDeviceMultiviewFeatures::default().multiview(true);
         let mut vk12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .runtime_descriptor_array(true)
@@ -302,13 +376,41 @@ impl GpuContext {
             tracing::warn!("GPU lacks textureCompressionBC; textures upload uncompressed");
         }
         crate::set_bc_supported(bc);
-        let features = vk::PhysicalDeviceFeatures::default().texture_compression_bc(bc);
+        // E5B9G9R9: the compact fallback for baked HDR data on GPUs without BC.
+        let e5 = unsafe {
+            instance.get_physical_device_format_properties(physical_device, vk::Format::E5B9G9R9_UFLOAT_PACK32)
+        }
+        .optimal_tiling_features;
+        crate::set_rgb9e5_supported(e5.contains(
+            vk::FormatFeatureFlags::SAMPLED_IMAGE
+                | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+                | vk::FormatFeatureFlags::TRANSFER_DST,
+        ));
+        // ASTC: the mobile path for colour / data textures (no BC on Adreno).
+        let astc = supported.texture_compression_astc_ldr == vk::TRUE;
+        crate::set_astc_supported(astc, astc_hdr);
+        if !bc {
+            tracing::info!("ASTC textures: LDR={astc} HDR={astc_hdr}");
+        }
+        let features = vk::PhysicalDeviceFeatures::default()
+            .texture_compression_bc(bc)
+            .texture_compression_astc_ldr(astc);
 
         let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&device_extensions)
-            .enabled_features(&features)
-            .push_next(&mut vk13);
+            .enabled_features(&features);
+        if core13 {
+            device_info = device_info.push_next(&mut vk13);
+        } else {
+            device_info = device_info.push_next(&mut dr_khr).push_next(&mut s2_khr);
+            if astc_hdr {
+                device_info = device_info.push_next(&mut astc_hdr_khr);
+            }
+        }
+        if multiview {
+            device_info = device_info.push_next(&mut multiview_features);
+        }
         if has_rt {
             device_info = device_info
                 .push_next(&mut vk12)
@@ -339,6 +441,7 @@ impl GpuContext {
             None => unsafe { instance.create_device(physical_device, &device_info, None) }
                 .context("creating logical device")?,
         };
+        let device = if core13 { device } else { unsafe { load_with_khr_aliases(&instance, device.handle()) } };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let transfer_queue = if want_transfer {
             tracing::info!("background asset-upload queue enabled");
@@ -383,6 +486,8 @@ impl GpuContext {
             markers,
             fault,
             lost_reported: std::sync::atomic::AtomicBool::new(false),
+            api_version,
+            multiview,
         })
     }
 
@@ -485,6 +590,33 @@ impl Drop for GpuContext {
             }
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+/// "Vulkan 1.x" for a packed API version.
+fn version_label(v: u32) -> String {
+    format!("Vulkan {}.{}", vk::api_version_major(v), vk::api_version_minor(v))
+}
+
+/// Load the device table so the core 1.3 names (`cmd_begin_rendering`,
+/// `cmd_pipeline_barrier2`, `queue_submit2`, ...) dispatch to the KHR
+/// extension entry points on a 1.1 / 1.2 device. The KHR commands have the
+/// same signatures and structs as their core promotions; they are preferred
+/// because a pre-1.3 driver may resolve the core names to stubs.
+unsafe fn load_with_khr_aliases(instance: &ash::Instance, device: vk::Device) -> ash::Device {
+    let get = instance.fp_v1_0().get_device_proc_addr;
+    unsafe {
+        ash::Device::load_with(
+            |name| {
+                let mut khr = name.to_bytes().to_vec();
+                khr.extend_from_slice(b"KHR\0");
+                let alias = CStr::from_bytes_with_nul(&khr).ok().and_then(|n| get(device, n.as_ptr()));
+                alias
+                    .or_else(|| get(device, name.as_ptr()))
+                    .map_or(std::ptr::null(), |f| f as *const c_void)
+            },
+            device,
+        )
     }
 }
 

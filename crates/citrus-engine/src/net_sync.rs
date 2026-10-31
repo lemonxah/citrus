@@ -5,10 +5,16 @@
 //!   quantized transforms at their send rate, parent / active changes,
 //!   Animator parameters and avatar poses;
 //! - everything else is written from the snapshot buffers (interpolated
-//!   `interp_delay` behind, optionally extrapolated);
+//!   behind by a delay that adapts to the sender's jitter and loss, briefly
+//!   extrapolated when packets are late);
+//! - a stopped object sends rest snapshots, so starved receivers don't drift;
+//! - predicted controllers (`NetworkObject::predicted`) are sent by the
+//!   host, which simulates them from their owner's inputs, and left alone on
+//!   the owner, which predicts them (`PlaySession::net_predict`);
 //! - received synced variables and parent changes land on their objects;
 //! - networked dynamic bodies another peer simulates are reported back so the
 //!   play session makes them kinematic;
+//! - the host records networked hitboxes for lag-compensated hit tests;
 //! - the host spawns the Network Manager's player prefab for every peer.
 //!
 //! Host-loop helpers (`route_command`, `config_for`, `auto_start`) and the
@@ -18,18 +24,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use citrus_core::{
-    Animator, BodyKind, ComponentCommand, InterpolationMode, NetAutoStart, NetSpawnSource, NetworkAnimator,
-    NetworkAvatar, NetworkManager, NetworkObject, NetworkVariables, ObjectId, Pawn, RigidBody, SpawnPoint,
-    Sync as SyncComp,
+    Animator, BodyKind, BoxCollider, CapsuleCollider, CharacterController, ColliderAxis, ComponentCommand, HitShape,
+    InterpolationMode, NetAutoStart, NetSpawnSource, NetworkAnimator, NetworkAvatar, NetworkManager, NetworkObject,
+    NetworkVariables, ObjectId, Pawn, RigidBody, SpawnPoint, SphereCollider, Sync as SyncComp,
 };
 use glam::{Mat4, Quat, Vec3};
 
 use crate::net::{NetConfig, NetSession, SnapEntry, XformState, sample_avatar, sample_snapshots};
+use crate::net_predict::target_delay;
 use crate::prefab::Prefab;
 use crate::scene::LoadedScene;
 
 /// Seconds between full (non-delta) transform keyframes.
 const KEYFRAME: f64 = 1.0;
+/// Rest snapshots sent after an object stops (redundant against loss).
+const REST_SENDS: u8 = 2;
 
 fn component<T: 'static>(o: &crate::scene::SceneObject) -> Option<&T> {
     o.components.iter().find_map(|c| c.as_any().downcast_ref::<T>())
@@ -59,8 +68,56 @@ fn is_dynamic_body(o: &crate::scene::SceneObject) -> bool {
     component::<RigidBody>(o).is_some_and(|r| r.kind == BodyKind::Dynamic)
 }
 
+/// Whether an object carries a controller prediction can replay (Pawn,
+/// First / Third Person Controller, VR Player).
+fn has_predictable(o: &crate::scene::SceneObject) -> bool {
+    o.components.iter().any(|c| citrus_core::is_predictable(c.as_ref()))
+}
+
+/// Whether an object is predicted (server-authoritative, owner-predicted).
+pub fn is_predicted(o: &crate::scene::SceneObject) -> bool {
+    component::<NetworkObject>(o).is_some_and(|n| n.predicted) && has_predictable(o)
+}
+
+/// An object's hit volumes for lag compensation (local space; triggers excluded).
+fn hit_shapes(o: &crate::scene::SceneObject) -> Vec<HitShape> {
+    let mut out = Vec::new();
+    for c in &o.components {
+        let any = c.as_any();
+        if let Some(cc) = any.downcast_ref::<CharacterController>() {
+            let half = (cc.height * 0.5 - cc.radius).max(0.0);
+            let center = Vec3::from(cc.center);
+            out.push(HitShape::Capsule { a: center - Vec3::Y * half, b: center + Vec3::Y * half, radius: cc.radius });
+        } else if let Some(c) = any.downcast_ref::<CapsuleCollider>().filter(|c| !c.is_trigger) {
+            let axis = match c.direction {
+                ColliderAxis::X => Vec3::X,
+                ColliderAxis::Y => Vec3::Y,
+                ColliderAxis::Z => Vec3::Z,
+            };
+            let half = (c.height * 0.5 - c.radius).max(0.0);
+            let center = Vec3::from(c.center);
+            out.push(HitShape::Capsule { a: center - axis * half, b: center + axis * half, radius: c.radius });
+        } else if let Some(c) = any.downcast_ref::<SphereCollider>().filter(|c| !c.is_trigger) {
+            out.push(HitShape::Sphere { center: Vec3::from(c.center), radius: c.radius });
+        } else if let Some(c) = any.downcast_ref::<BoxCollider>().filter(|c| !c.is_trigger) {
+            out.push(HitShape::Box { center: Vec3::from(c.center), half: Vec3::from(c.size) * 0.5 });
+        }
+    }
+    out
+}
+
+/// The interpolation delay for an object whose snapshots come from `origin`.
+fn interp_delay(s: &mut NetSession, raw: u128, origin: u64, cfg: &NetworkObject, dt: f32) -> f32 {
+    let floor = cfg.interp_delay.max(0.0);
+    if !cfg.adaptive_delay {
+        return floor;
+    }
+    let target = target_delay(1.0 / cfg.send_rate.max(0.5), s.jitter_of(origin), s.link_loss(origin), floor);
+    s.delays.entry(raw).or_default().update(target, dt)
+}
+
 /// Replicate the scene for one frame.
-pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
+pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, dt: f32) {
     if !s.is_connected() {
         return;
     }
@@ -73,12 +130,15 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
         s.world.modes.clear();
         s.world.var_anyone.clear();
         s.world.relevancy.clear();
+        s.world.predicted.clear();
     }
     let mut entries: Vec<SnapEntry> = Vec::new();
     let mut remote_bodies: HashMap<ObjectId, Vec3> = HashMap::new();
     let mut part_writes: Vec<(usize, Vec3, Quat)> = Vec::new();
     let mut transform_writes: Vec<(usize, Vec3, Quat, Option<Vec3>)> = Vec::new();
     let mut present: HashSet<u128> = HashSet::new();
+    let mut delays: Vec<f32> = Vec::new();
+    let mut hits: Vec<(ObjectId, Vec3, Quat, Vec3, Vec<HitShape>)> = Vec::new();
 
     for i in 0..scene.objects.len() {
         let Some(cfg) = settings(&scene.objects[i]) else {
@@ -89,8 +149,15 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
         present.insert(raw);
         let owner = s.owner_of_raw(raw);
         let authority = s.has_authority_raw(raw);
+        let predicted = cfg.predicted && has_predictable(&scene.objects[i]);
+        // Who sends the transform: its authority, except for a predicted
+        // controller, which the host simulates from its owner's input.
+        let sender = if predicted { is_host } else { authority };
+        let predicting = predicted && authority && !is_host;
         if let Some(n) = component_mut::<NetworkObject>(&mut scene.objects[i]) {
-            n.state = citrus_core::NetObjectState { connected: true, owner, authority };
+            n.state.connected = true;
+            n.state.owner = owner;
+            n.state.authority = authority;
         }
         if is_host {
             s.world.modes.insert(raw, cfg.ownership);
@@ -100,17 +167,28 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
             if cfg.despawn_on_owner_leave {
                 s.world.despawn_on_leave.insert(raw);
             }
+            if predicted {
+                s.world.predicted.insert(raw);
+            }
             if component::<NetworkVariables>(&scene.objects[i]).is_some_and(|v| v.anyone_can_write) {
                 s.world.var_anyone.insert(raw);
             }
             if owner != 0
-                && (component::<Pawn>(&scene.objects[i]).is_some()
-                    || component::<NetworkAvatar>(&scene.objects[i]).is_some())
+                && (has_predictable(&scene.objects[i]) || component::<NetworkAvatar>(&scene.objects[i]).is_some())
             {
                 s.world.player_obj.entry(owner).or_insert(raw);
             }
         }
         let (wscale, wrot, wpos) = world[i].to_scale_rotation_translation();
+        if is_host && cfg.sync_transform {
+            let shapes = hit_shapes(&scene.objects[i]);
+            if !shapes.is_empty() {
+                // Remote-simulated objects: where their owner last said they
+                // were (what the other peers are shown), not our interpolation.
+                let pose = if sender { (wpos, wrot) } else { s.world.xforms.get(&raw).map_or((wpos, wrot), |x| (x.pos, x.rot)) };
+                hits.push((id, pose.0, pose.1, wscale, shapes));
+            }
+        }
         let parent_raw = scene.objects[i].parent.map(|p| scene.objects[p].id.raw()).unwrap_or(0);
         let enabled = scene.objects[i].enabled;
         let dynamic = is_dynamic_body(&scene.objects[i]);
@@ -118,36 +196,45 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
         st.seen = true;
         st.missing_since = None;
 
-        if authority {
-            if cfg.sync_transform && now - st.last_send >= 1.0 / cfg.send_rate.max(0.5) as f64 {
-                let vel = match st.prev_pos {
-                    Some((p, t)) if now > t => (wpos - p) / (now - t) as f32,
-                    _ => Vec3::ZERO,
-                };
-                st.prev_pos = Some((wpos, now));
-                let key = now - st.last_key >= KEYFRAME || st.sent.is_none();
-                let sent = st.sent.unwrap_or_default();
-                let pos_changed = key || sent.pos.distance(wpos) > cfg.position_threshold;
-                let rot_changed = key || sent.rot.angle_between(wrot).to_degrees() > cfg.rotation_threshold;
-                let scale_changed = cfg.sync_scale && (key || sent.scale.distance(wscale) > 1e-4);
-                let want_vel = cfg.interpolation == InterpolationMode::Extrapolate || (cfg.sync_rigidbody && dynamic);
-                if pos_changed || rot_changed || scale_changed {
-                    entries.push(SnapEntry {
-                        id: raw,
-                        pos: pos_changed.then_some(wpos),
-                        rot: rot_changed.then_some(wrot),
-                        scale: scale_changed.then_some(wscale),
-                        vel: (want_vel && (pos_changed || key)).then_some(vel),
-                        quantized: cfg.quantize,
-                    });
-                    st.sent = Some(XformState { pos: wpos, rot: wrot, scale: wscale, vel });
-                    st.last_send = now;
-                    if key {
-                        st.last_key = now;
-                    }
-                    s.world.xforms.insert(raw, XformState { pos: wpos, rot: wrot, scale: wscale, vel });
+        if sender && cfg.sync_transform && now - st.last_send >= 1.0 / cfg.send_rate.max(0.5) as f64 {
+            let vel = match st.prev_pos {
+                Some((p, t)) if now > t => (wpos - p) / (now - t) as f32,
+                _ => Vec3::ZERO,
+            };
+            st.prev_pos = Some((wpos, now));
+            let key = now - st.last_key >= KEYFRAME || st.sent.is_none();
+            let sent = st.sent.unwrap_or_default();
+            let pos_changed = key || sent.pos.distance(wpos) > cfg.position_threshold;
+            let rot_changed = key || sent.rot.angle_between(wrot).to_degrees() > cfg.rotation_threshold;
+            let scale_changed = cfg.sync_scale && (key || sent.scale.distance(wscale) > 1e-4);
+            let want_vel = cfg.interpolation == InterpolationMode::Extrapolate || (cfg.sync_rigidbody && dynamic);
+            if pos_changed || rot_changed || scale_changed {
+                entries.push(SnapEntry {
+                    id: raw,
+                    pos: pos_changed.then_some(wpos),
+                    rot: rot_changed.then_some(wrot),
+                    scale: scale_changed.then_some(wscale),
+                    vel: (want_vel && (pos_changed || key)).then_some(vel),
+                    quantized: cfg.quantize,
+                });
+                if pos_changed && sent.pos.distance(wpos) > cfg.position_threshold {
+                    st.rest = REST_SENDS;
                 }
+                st.sent = Some(XformState { pos: wpos, rot: wrot, scale: wscale, vel });
+                st.last_send = now;
+                if key {
+                    st.last_key = now;
+                }
+                s.world.xforms.insert(raw, XformState { pos: wpos, rot: wrot, scale: wscale, vel });
+            } else if st.rest > 0 {
+                // Stopped: say so explicitly (zero velocity at the same
+                // pose), so receivers extrapolating over a gap stop too.
+                st.rest -= 1;
+                entries.push(SnapEntry { id: raw, pos: Some(wpos), rot: Some(wrot), scale: None, vel: Some(Vec3::ZERO), quantized: cfg.quantize });
+                st.last_send = now;
             }
+        }
+        if authority {
             if cfg.sync_parent {
                 if st.parent.is_some_and(|p| p != parent_raw) {
                     st.parent = Some(parent_raw);
@@ -167,12 +254,22 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
         } else {
             st.parent = None;
             st.active = None;
+        }
+        let origin = s.buffers.get(&raw).map(|b| b.origin).or_else(|| s.avatar_in.get(&raw).map(|b| b.origin));
+        let delay = match origin {
+            Some(o) if !sender => interp_delay(s, raw, o, &cfg, dt),
+            _ => cfg.interp_delay.max(0.0),
+        };
+        if !sender {
             st.sent = None;
             st.prev_pos = None;
-            if cfg.sync_transform
+            if predicting {
+                // The play session predicts and reconciles this one.
+            } else if cfg.sync_transform
                 && let Some(buf) = s.buffers.get(&raw)
             {
-                let rt = s.render_time(buf.origin, cfg.interp_delay.max(0.0));
+                delays.push(delay);
+                let rt = s.render_time(buf.origin, delay);
                 if let Some(snap) = sample_snapshots(buf, rt, cfg.interpolation) {
                     transform_writes.push((i, snap.pos, snap.rot, cfg.sync_scale.then_some(snap.scale)));
                     if dynamic && cfg.sync_rigidbody {
@@ -186,9 +283,19 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, _dt: f32) {
         s.send_state.insert(raw, st);
 
         sync_animator(scene, s, i, raw, authority, now);
-        sync_avatar(scene, s, &ids, &world, i, raw, authority, now, cfg.interp_delay, &mut part_writes);
+        sync_avatar(scene, s, &ids, &world, i, raw, authority, now, delay, &mut part_writes);
     }
 
+    if !delays.is_empty() {
+        s.view_delay = delays.iter().sum::<f32>() / delays.len() as f32;
+    }
+    if is_host {
+        let mut h = s.history.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, pos, rot, scale, shapes) in &hits {
+            h.record(*id, now, *pos, *rot, *scale, shapes);
+        }
+        h.prune(now);
+    }
     for (i, pos, rot, scale) in transform_writes {
         set_world_pose(scene, i, pos, rot, scale);
     }
@@ -379,7 +486,7 @@ fn sync_avatar(
         let Some(buf) = s.avatar_in.get(&raw) else {
             return;
         };
-        let rt = s.render_time(buf.origin, delay.max(0.0));
+        let rt = s.render_time(buf.origin, delay);
         let Some(poses) = sample_avatar(buf, rt) else {
             return;
         };
@@ -438,7 +545,7 @@ fn spawn_players(scene: &LoadedScene, s: &mut NetSession, world: &[Mat4]) {
     if !s.host_player_done {
         s.host_player_done = true;
         if !m.dedicated {
-            todo.insert(0, citrus_core::HOST_PEER);
+            todo.insert(0, s.local_peer());
         }
     }
     let mut points: Vec<(u32, usize)> = scene
@@ -562,6 +669,14 @@ pub fn route_command(net: &mut Option<NetSession>, scene: &LoadedScene, cmd: Com
                 n.disconnect();
             }
         }
+        C::NetKick { peer, reason, ban } => {
+            if let Some(n) = net.as_mut().filter(|n| n.is_host()) {
+                if ban && let Some(fp) = n.peer_fingerprint(peer) {
+                    n.ban_fingerprint(&fp);
+                }
+                n.kick(peer, &reason);
+            }
+        }
         C::NetLoadScene(path) => match net {
             Some(n) if n.is_connected() => {
                 if n.is_host() {
@@ -637,6 +752,28 @@ pub fn reid_subtree(scene: &mut LoadedScene, root: usize, root_id: ObjectId) {
     }
     for (slot, &i) in subtree.iter().enumerate() {
         scene.objects[i].id = child_id(root_id, slot);
+    }
+}
+
+/// Before a frame simulates: take the smoothing offset back off predicted
+/// pawns, so they simulate from their true position.
+pub fn restore_prediction_offsets(scene: &mut LoadedScene) {
+    for i in 0..scene.objects.len() {
+        let Some(off) = component_mut::<NetworkObject>(&mut scene.objects[i]).map(|n| std::mem::take(&mut n.state.visual_offset)) else {
+            continue;
+        };
+        if off != Vec3::ZERO {
+            let local = local_offset(scene, i, off);
+            scene.objects[i].translation -= local;
+        }
+    }
+}
+
+/// A world-space offset in object `i`'s parent space.
+pub fn local_offset(scene: &LoadedScene, i: usize, world: Vec3) -> Vec3 {
+    match scene.objects[i].parent {
+        Some(p) => scene.world_transform(p).inverse().transform_vector3(world),
+        None => world,
     }
 }
 
@@ -731,6 +868,7 @@ mod tests {
             enabled,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent,
             translation: Vec3::ZERO,
@@ -814,32 +952,37 @@ mod tests {
         net: Option<NetSession>,
         scene: LoadedScene,
         play: PlaySession,
+        input: InputState,
     }
 
     impl Peer {
         fn new(net: NetSession, ids: &Ids) -> Self {
-            let scene = build_scene(ids);
-            let play = PlaySession::new(&scene, Path::new("."), None);
-            Self { net: Some(net), scene, play }
+            Self::with_scene(net, build_scene(ids))
         }
 
-        /// One frame of the host loop: pump, tick, route commands, replicate.
+        fn with_scene(net: NetSession, scene: LoadedScene) -> Self {
+            let play = PlaySession::new(&scene, Path::new("."), None);
+            Self { net: Some(net), scene, play, input: InputState::default() }
+        }
+
+        /// One frame of the host loop: pump, tick, route commands, predict, replicate.
         fn frame(&mut self, registry: &ComponentRegistry) {
             let net = self.net.as_mut().unwrap();
             net.advance(DT as f64);
             net.pump();
             let view: NetView = net.view();
             let mut shaders = ShaderLibrary::default();
-            let input = InputState::default();
             let screen = ScreenInfo::default();
             let host = self.play.tick(
                 &mut World { scene: &mut self.scene, renderer: None, registry, shaders: &mut shaders },
-                &TickInput { dt: DT, input: &input, net: &view, listener_fallback: Mat4::IDENTITY, screen: &screen },
+                &TickInput { dt: DT, input: &self.input, net: &view, listener_fallback: Mat4::IDENTITY, screen: &screen },
             );
             for c in host {
                 route_command(&mut self.net, &self.scene, c);
             }
-            self.scene.network_sync(self.net.as_mut().unwrap(), DT);
+            let net = self.net.as_mut().unwrap();
+            self.play.net_predict(&mut self.scene, net, &self.input, DT);
+            self.scene.network_sync(net, DT);
         }
 
         fn net(&mut self) -> &mut NetSession {
@@ -864,7 +1007,7 @@ mod tests {
     }
 
     fn session(hub: &MemHub, host: Option<&NetSession>, name: &str) -> NetSession {
-        let cfg = NetConfig { player_name: name.into(), discovery: false, ..Default::default() };
+        let cfg = NetConfig { player_name: name.into(), discovery: false, secret: String::new(), relay: String::new(), ..Default::default() };
         let mut s = match host {
             None => NetSession::host_on(Box::new(hub.endpoint()), cfg),
             Some(h) => NetSession::join_on(Box::new(hub.endpoint()), h.local_addr().unwrap(), cfg),
@@ -1026,6 +1169,266 @@ mod tests {
         assert!(a.scene.index_of(spawned).is_none() && late.scene.index_of(spawned).is_none());
     }
 
+    fn walk(forward: f32, crouch: bool) -> InputState {
+        let v = citrus_core::ActionValue { axis2: glam::Vec2::new(0.0, forward), ..Default::default() };
+        let mut actions = vec![("Move".to_string(), v)];
+        if crouch {
+            actions.push(("Crouch".to_string(), citrus_core::ActionValue { down: true, value: 1.0, ..Default::default() }));
+        }
+        InputState::from_actions(actions, glam::Vec2::ZERO)
+    }
+
+    /// The controller a prediction round trip drives.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Mover {
+        Pawn,
+        FirstPerson,
+        ThirdPerson,
+        Vr,
+    }
+
+    impl Mover {
+        fn component(self) -> Box<dyn Component> {
+            match self {
+                Mover::Pawn => Box::new(Pawn::default()),
+                Mover::FirstPerson => Box::new(citrus_core::FirstPersonController { lock_cursor: false, ..Default::default() }),
+                Mover::ThirdPerson => Box::new(citrus_core::ThirdPersonController { lock_cursor: false, ..Default::default() }),
+                Mover::Vr => Box::new(citrus_core::VrPlayer::default()),
+            }
+        }
+
+        fn speed(self) -> f32 {
+            match self {
+                Mover::Pawn => Pawn::default().move_speed,
+                Mover::FirstPerson => citrus_core::FirstPersonController::default().walk_speed,
+                Mover::ThirdPerson => citrus_core::ThirdPersonController::default().walk_speed,
+                Mover::Vr => citrus_core::VrPlayer::default().move_speed,
+            }
+        }
+    }
+
+    /// A predicted pawn over a laggy, lossy link: the owner moves at once,
+    /// the host simulates it from the owner's inputs, a server-side shove is
+    /// reconciled without a visible snap, and both end up in the same place.
+    #[test]
+    fn predicted_pawn_moves_at_once_and_reconciles_smoothly() {
+        predicted_round_trip(Mover::Pawn, false);
+    }
+
+    /// The same with a Character Controller walking on a floor collider
+    /// (replays rewind the controller body and re-run its moves).
+    #[test]
+    fn predicted_character_controller_pawn_reconciles() {
+        predicted_round_trip(Mover::Pawn, true);
+    }
+
+    /// A First Person Controller on a Character Controller, crouching for a
+    /// while (the capsule resize is rewound and replayed too).
+    #[test]
+    fn predicted_first_person_controller_reconciles() {
+        predicted_round_trip(Mover::FirstPerson, true);
+    }
+
+    #[test]
+    fn predicted_third_person_controller_reconciles() {
+        predicted_round_trip(Mover::ThirdPerson, true);
+    }
+
+    /// A VR Player's smooth locomotion (desktop fallback), replayed from the
+    /// stick and head pose its input commands carry.
+    #[test]
+    fn predicted_vr_player_reconciles() {
+        predicted_round_trip(Mover::Vr, false);
+    }
+
+    fn predicted_round_trip(mover: Mover, physical: bool) {
+        let registry = registry();
+        let pawn_id = ObjectId::new();
+        let floor_id = ObjectId::new();
+        let scene = || {
+            let mut s = LoadedScene::empty();
+            let net = NetworkObject { predicted: true, ..Default::default() };
+            let mut comps: Vec<Box<dyn Component>> = vec![Box::new(net), mover.component()];
+            if physical {
+                comps.push(Box::new(CharacterController::default()));
+            }
+            if physical || mover == Mover::Vr {
+                let floor = obj(&mut s, floor_id, None, true, vec![Box::new(BoxCollider { size: [200.0, 1.0, 200.0], ..Default::default() })]);
+                s.objects[floor].translation = Vec3::new(0.0, -0.5, 0.0);
+            }
+            obj(&mut s, pawn_id, None, true, comps);
+            s
+        };
+        let hub = MemHub::new();
+        let hs = session(&hub, None, "Host");
+        let cs = session(&hub, Some(&hs), "Client");
+        let mut host = Peer::with_scene(hs, scene());
+        let mut client = Peer::with_scene(cs, scene());
+        let frame = |host: &mut Peer, client: &mut Peer| {
+            hub.advance(DT as f64);
+            host.frame(&registry);
+            client.frame(&registry);
+        };
+        for _ in 0..10 {
+            frame(&mut host, &mut client);
+        }
+        // 60 ms each way with jitter, 5% loss both ways.
+        hub.set_latency(0.06, 0.02);
+        hub.set_loss(0.05);
+        client.net().request_ownership(pawn_id);
+        for _ in 0..60 {
+            frame(&mut host, &mut client);
+        }
+        assert_eq!(host.net().owner_of(pawn_id), 2);
+        let ci = client.index(pawn_id);
+        if let Some(p) = component_mut::<Pawn>(&mut client.scene.objects[ci]) {
+            p.possessed = true;
+        }
+        let hi = host.index(pawn_id);
+        if mover == Mover::Pawn {
+            assert!(!component::<Pawn>(&host.scene.objects[hi]).unwrap().possessed, "the host never reads its own input for it");
+        }
+        if mover == Mover::FirstPerson {
+            let fpc = component::<citrus_core::FirstPersonController>(&host.scene.objects[hi]).unwrap();
+            assert!(!fpc.controlling, "the host never drives the owner's controller from its own input");
+        }
+
+        let start = client.pos(pawn_id);
+        let mut prev = start;
+        let mut max_extra = 0.0f32;
+        let speed_step = mover.speed() * DT;
+        let crouch = |k: usize| mover == Mover::FirstPerson && (40..80).contains(&k);
+        let mut crouched_on_host = false;
+        for k in 0..240 {
+            client.input = walk(if k < 150 { 1.0 } else { 0.0 }, crouch(k));
+            if k == 100 {
+                // Server-side knockback the client can't predict.
+                let hi = host.index(pawn_id);
+                host.scene.objects[hi].translation += Vec3::new(0.5, 0.0, 0.0);
+            }
+            frame(&mut host, &mut client);
+            let visual = client.pos(pawn_id);
+            if k == 0 {
+                assert!(visual.z < start.z - 1e-4, "moved on the first input frame, before any reply");
+            }
+            max_extra = max_extra.max((visual - prev).length() - speed_step);
+            prev = visual;
+            if mover == Mover::FirstPerson {
+                let hi = host.index(pawn_id);
+                crouched_on_host |= component::<CharacterController>(&host.scene.objects[hi]).is_some_and(|c| c.height < 1.5);
+            }
+        }
+        client.input = InputState::default();
+        for _ in 0..90 {
+            frame(&mut host, &mut client);
+        }
+        let ci = client.index(pawn_id);
+        let offset = component::<NetworkObject>(&client.scene.objects[ci]).unwrap().state.visual_offset;
+        let client_true = client.scene.objects[ci].translation - offset;
+        let host_pos = host.pos(pawn_id);
+        assert!(client_true.distance(host_pos) < 1e-3, "{mover:?}: converged: client {client_true} host {host_pos}");
+        assert!(offset.length() < 1e-3, "{mover:?}: smoothing finished");
+        assert!((host_pos.x - 0.5).abs() < 0.01, "{mover:?}: the shove stuck: {host_pos}");
+        assert!(host_pos.y > -0.01, "{mover:?}: stands on the floor, not in it: {host_pos}");
+        let walked = -host_pos.z;
+        assert!(walked > mover.speed() * 1.5, "{mover:?}: walked a fair way: {host_pos}");
+        assert!(max_extra < 0.15, "{mover:?}: no visible snap: largest extra per-frame move {max_extra} m (the shove is 0.5 m)");
+        let pred = &client.net().predictors[&pawn_id.raw()];
+        assert!(pred.corrections > 0 && pred.corrections < 20, "{mover:?}: {} corrections", pred.corrections);
+        if mover == Mover::FirstPerson {
+            assert!(crouched_on_host, "the host replayed the crouch");
+            let hi = host.index(pawn_id);
+            let cc = component::<CharacterController>(&host.scene.objects[hi]).unwrap();
+            assert!((cc.height - 1.8).abs() < 1e-4, "stood back up on the host");
+        }
+    }
+
+    /// A predicted pawn keeps moving through a host crash: its owner predicts
+    /// on, the successor takes over the simulation from the owner's state
+    /// (no rubber-banding back to where it was when the host died), and
+    /// owner and new host end up agreeing.
+    #[test]
+    fn predicted_pawn_keeps_moving_through_a_host_migration() {
+        let registry = registry();
+        let pawn_id = ObjectId::new();
+        let scene = || {
+            let mut s = LoadedScene::empty();
+            let net = NetworkObject { predicted: true, ..Default::default() };
+            obj(&mut s, pawn_id, None, true, vec![Box::new(net), Box::new(Pawn::default())]);
+            s
+        };
+        let hub = MemHub::new();
+        let quick = |name: &str| NetConfig {
+            player_name: name.into(),
+            discovery: false,
+            secret: String::new(),
+            relay: String::new(),
+            timeout: 2.0,
+            migrate_attempt: 1.0,
+            identity: crate::net::Identity::generate(),
+            ..Default::default()
+        };
+        let mut hs = NetSession::host_on(Box::new(hub.endpoint()), quick("Host"));
+        hs.use_manual_clock();
+        let ha = hs.local_addr().unwrap();
+        let join = |name: &str| {
+            let mut s = NetSession::join_on(Box::new(hub.endpoint()), ha, quick(name));
+            s.use_manual_clock();
+            s
+        };
+        let (sa, sb) = (join("A"), join("B"));
+        let mut host = Peer::with_scene(hs, scene());
+        let mut a = Peer::with_scene(sa, scene());
+        let mut b = Peer::with_scene(sb, scene());
+        let frame = |peers: &mut [&mut Peer]| {
+            hub.advance(DT as f64);
+            for p in peers.iter_mut() {
+                p.frame(&registry);
+            }
+        };
+        for _ in 0..10 {
+            frame(&mut [&mut host, &mut a, &mut b]);
+        }
+        b.net().request_ownership(pawn_id);
+        for _ in 0..30 {
+            frame(&mut [&mut host, &mut a, &mut b]);
+        }
+        let bi = b.index(pawn_id);
+        component_mut::<Pawn>(&mut b.scene.objects[bi]).unwrap().possessed = true;
+        b.input = walk(1.0, false);
+        for _ in 0..60 {
+            frame(&mut [&mut host, &mut a, &mut b]);
+        }
+        host.net().crash();
+        hub.cut(ha);
+        let at_crash = b.pos(pawn_id);
+        let mut prev = at_crash;
+        let mut max_step = 0.0f32;
+        let step = Pawn::default().move_speed * DT;
+        for _ in 0..(5.0 / DT) as usize {
+            frame(&mut [&mut a, &mut b]);
+            let p = b.pos(pawn_id);
+            max_step = max_step.max((p - prev).length());
+            prev = p;
+        }
+        assert!(a.net().is_host() && b.net().host_peer() == 2 && b.net().is_connected());
+        assert!(b.pos(pawn_id).z < at_crash.z - Pawn::default().move_speed * 4.0, "kept walking through the migration");
+        b.input = InputState::default();
+        for _ in 0..90 {
+            frame(&mut [&mut a, &mut b]);
+            let p = b.pos(pawn_id);
+            max_step = max_step.max((p - prev).length());
+            prev = p;
+        }
+        assert!(max_step < step + 0.15, "no snap back: largest step {max_step} m");
+        let bi = b.index(pawn_id);
+        let offset = component::<NetworkObject>(&b.scene.objects[bi]).unwrap().state.visual_offset;
+        let truth = b.scene.objects[bi].translation - offset;
+        let on_new_host = a.pos(pawn_id);
+        assert!(truth.distance(on_new_host) < 1e-3, "owner {truth} and new host {on_new_host} agree");
+        assert!(b.net().predictors[&pawn_id.raw()].corrections < 20);
+    }
+
     #[test]
     fn deterministic_spawn_ids_and_ref_remap() {
         use citrus_assets::{ComponentData, MaterialRef, SceneEntry};
@@ -1036,6 +1439,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             material: MaterialRef::File(String::new()),
             extra_materials: vec![],

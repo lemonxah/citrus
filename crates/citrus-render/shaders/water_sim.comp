@@ -151,6 +151,19 @@ float sponge_at(ivec2 w) {
     return 0.25 * t * t;
 }
 
+// Water thinner than this (m) over a beach cell is dry (water_pipe.rs).
+const float DRY_FILM = 0.01;
+const float DRY_SINK = 0.15;
+
+// How dry cell `w` is (0 wet .. 1 dry): beach cells (ground above the rest
+// surface) with less than a film of water.
+float dryness(ivec2 w) {
+    if (!inside(w) || field_at(w).x > 0.0) {
+        return 0.0;
+    }
+    return 1.0 - clamp(h[store(w)] / DRY_FILM, 0.0, 1.0);
+}
+
 float eta(ivec2 w) {
     if (solid(w)) {
         return 0.0;
@@ -460,7 +473,7 @@ void ew_mask(ivec2 w) {
     // off them instead of running underneath.
     // By the smoothed footprint the source follows (ew_prev), so what a
     // body pushes in ahead and lets go behind are blocked alike.
-    float block = clamp(max(ew_prev[s], 0.0) / EW_BLOCK_DRAFT, 0.0, 1.0);
+    float block = clamp(max(max(ew_prev[s], 0.0) / EW_BLOCK_DRAFT, dryness(w)), 0.0, 1.0);
     ew[s] = v * (exp(-EW_SPONGE_RATE * t * t * pc.dt) * (1.0 - block));
 }
 
@@ -488,6 +501,9 @@ void output_cell(ivec2 w) {
     // pressure under it: a rise there would draw water up through the body.
     // Drawn flattened (the readback keeps it: it is what lifts the body).
     float inside_body = clamp(ew_in[win(w)].x / EW_BLOCK_DRAFT, 0.0, 1.0);
+    // A dry beach: the surface sinks under the ground there, for drawing
+    // and for what floats on it (water_pipe.rs dryness).
+    e -= DRY_SINK * dryness(w);
     float shown = e > 0.0 ? e * (1.0 - inside_body) : e;
     imageStore(out_field, w, vec4(shown, g * (1.0 - inside_body), length(u)));
     readback[win(w)] = vec4(e, u, couple[win(w)].y);

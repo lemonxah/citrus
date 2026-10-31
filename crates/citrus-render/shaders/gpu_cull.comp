@@ -1,0 +1,144 @@
+#version 450
+// GPU-driven culling. One thread per (view, instance) candidate: frustum test
+// (all 6 planes, or 5 for shadow views), optional distance / small-object
+// cull, optional Hi-Z occlusion against the previous frame's depth pyramid.
+// Visible instances are appended to their batch's region of the instance
+// vertex stream and counted into that batch's VkDrawIndexedIndirectCommand.
+// The math is mirrored in gpu_cull.rs (tests compare it against the CPU cull).
+
+layout(local_size_x = 64) in;
+
+const uint MAX_VIEWS = 16;
+
+struct Draw {
+    mat4 model;
+    vec4 sphere; // object-space center xyz, radius w (<= 0: never culled)
+};
+
+struct View {
+    vec4 planes[6];  // left, right, bottom, top, near, far (normalized)
+    mat4 hiz_vp;     // view-projection the depth pyramid was rendered with
+    vec4 hiz;        // xy pyramid mip-0 size, z mip count, w 1 = Hi-Z test on
+    vec4 cam;        // xyz camera position, w max distance (0 = off)
+    vec4 lod;        // x min projected radius px (0 = off), y px per unit at distance 1, z near-plane test
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Draws { Draw draws[]; };
+// x = index into `draws`, y = batch.
+layout(std430, set = 0, binding = 1) readonly buffer Candidates { uvec2 candidates[]; };
+// x = view, y = first instance of the batch's region in `instances`.
+layout(std430, set = 0, binding = 2) readonly buffer Batches { uvec4 batches[]; };
+layout(std430, set = 0, binding = 3) readonly buffer Views { View views[]; };
+// VkDrawIndexedIndirectCommand per batch (5 uints); instanceCount is the counter.
+layout(std430, set = 0, binding = 4) buffer Commands { uint commands[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Instances { mat4 instances[]; };
+// Per view: tested, visible, frustum/distance/size culled, occluded.
+layout(std430, set = 0, binding = 6) buffer Counters { uint counters[]; };
+layout(set = 0, binding = 7) uniform sampler2D hiz;
+
+layout(push_constant) uniform Push {
+    uint count;
+} pc;
+
+shared uint s_counts[MAX_VIEWS * 4];
+
+// Nearest NDC depth of the sphere's bounding box vs the farthest depth the
+// pyramid holds over its screen rectangle. Anything touching the previous
+// camera's near plane or leaving its screen counts as visible.
+bool occluded(View v, vec3 c, float r) {
+    vec3 lo = c - vec3(r);
+    vec3 hi = c + vec3(r);
+    vec2 mn = vec2(1e30);
+    vec2 mx = vec2(-1e30);
+    float zmin = 1e30;
+    for (int k = 0; k < 8; ++k) {
+        vec3 p = vec3((k & 1) != 0 ? hi.x : lo.x, (k & 2) != 0 ? hi.y : lo.y, (k & 4) != 0 ? hi.z : lo.z);
+        vec4 clip = v.hiz_vp * vec4(p, 1.0);
+        if (clip.w <= 1e-5) {
+            return false;
+        }
+        vec3 ndc = clip.xyz / clip.w;
+        mn = min(mn, ndc.xy);
+        mx = max(mx, ndc.xy);
+        zmin = min(zmin, ndc.z);
+    }
+    if (zmin <= 0.0 || mn.x < -1.0 || mn.y < -1.0 || mx.x > 1.0 || mx.y > 1.0) {
+        return false;
+    }
+    // Negative-height viewport: NDC +y is the top image row.
+    vec2 uv0 = vec2(mn.x * 0.5 + 0.5, 0.5 - mx.y * 0.5);
+    vec2 uv1 = vec2(mx.x * 0.5 + 0.5, 0.5 - mn.y * 0.5);
+    vec2 px = (uv1 - uv0) * v.hiz.xy;
+    int max_lod = int(v.hiz.z) - 1;
+    int lod = clamp(int(ceil(log2(max(max(px.x, px.y), 1.0)))), 0, max_lod);
+    ivec2 a;
+    ivec2 b;
+    for (;;) {
+        ivec2 dim = textureSize(hiz, lod);
+        a = clamp(ivec2(floor(uv0 * vec2(dim))), ivec2(0), dim - 1);
+        b = clamp(ivec2(floor(uv1 * vec2(dim))), ivec2(0), dim - 1);
+        if (all(lessThanEqual(b - a, ivec2(1))) || lod >= max_lod) {
+            break;
+        }
+        lod += 1;
+    }
+    float zmax = max(
+        max(texelFetch(hiz, a, lod).r, texelFetch(hiz, ivec2(b.x, a.y), lod).r),
+        max(texelFetch(hiz, ivec2(a.x, b.y), lod).r, texelFetch(hiz, b, lod).r));
+    return zmin > zmax;
+}
+
+// 0 = visible, 1 = frustum / distance / size culled, 2 = occluded.
+uint classify(View v, Draw d) {
+    if (d.sphere.w <= 0.0) {
+        return 0u;
+    }
+    vec3 c = (d.model * vec4(d.sphere.xyz, 1.0)).xyz;
+    float s = max(max(length(d.model[0].xyz), length(d.model[1].xyz)), length(d.model[2].xyz));
+    float r = d.sphere.w * s;
+    for (int k = 0; k < 6; ++k) {
+        if (k == 4 && v.lod.z < 0.5) {
+            continue;
+        }
+        if (dot(v.planes[k].xyz, c) + v.planes[k].w < -r) {
+            return 1u;
+        }
+    }
+    float dist = distance(c, v.cam.xyz);
+    if (v.cam.w > 0.0 && dist - r > v.cam.w) {
+        return 1u;
+    }
+    if (v.lod.x > 0.0 && dist > r && r / dist * v.lod.y < v.lod.x) {
+        return 1u;
+    }
+    if (v.hiz.w > 0.5 && occluded(v, c, r)) {
+        return 2u;
+    }
+    return 0u;
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    s_counts[t] = 0u;
+    barrier();
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.count) {
+        uvec2 cand = candidates[i];
+        uvec4 batch = batches[cand.y];
+        uint vi = batch.x;
+        Draw d = draws[cand.x];
+        uint result = classify(views[vi], d);
+        atomicAdd(s_counts[vi * 4u], 1u);
+        if (result == 0u) {
+            uint slot = atomicAdd(commands[cand.y * 5u + 1u], 1u);
+            instances[batch.y + slot] = d.model;
+            atomicAdd(s_counts[vi * 4u + 1u], 1u);
+        } else {
+            atomicAdd(s_counts[vi * 4u + 1u + result], 1u);
+        }
+    }
+    barrier();
+    if (s_counts[t] != 0u) {
+        atomicAdd(counters[t], s_counts[t]);
+    }
+}

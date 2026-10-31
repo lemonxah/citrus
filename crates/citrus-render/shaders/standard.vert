@@ -1,4 +1,7 @@
 #version 450
+#ifdef MULTIVIEW
+#extension GL_EXT_multiview : require
+#endif
 // citrus standard shader, vertex stage (phase 1)
 
 layout(location = 0) in vec3 a_position;
@@ -94,5 +97,5 @@ void main() {
     v_uv = FEAT_WATER ? water_rest : a_uv;
     v_uv1 = uv1;
     v_color = color;
-    gl_Position = frame.view_proj * world;
+    gl_Position = VIEW_PROJ * world;
 }

@@ -88,7 +88,7 @@ pub(super) fn vr_bindings(extra: Vec<citrus_core::ActionBinding>) -> citrus_core
         button("Teleport", vec![citrus_core::InputSource::Key(Key::T), mouse(MouseButton::Middle)]),
     ];
     kb.extend(extra);
-    builder::bindings(
+    let mut bindings = builder::bindings(
         kb,
         vec![
             builder::stick("Move", citrus_core::PadAxis::LeftStickX, citrus_core::PadAxis::LeftStickY, 1.0),
@@ -97,7 +97,10 @@ pub(super) fn vr_bindings(extra: Vec<citrus_core::ActionBinding>) -> citrus_core
             button("Grab", vec![builder::pad(citrus_core::PadButton::RightBumper)]),
             button("Teleport", vec![builder::pad(citrus_core::PadButton::South)]),
         ],
-    )
+    );
+    // What the VR Player reads in a headset (includes Voice).
+    bindings.schemes.push(citrus_core::ControlScheme::default_vr());
+    bindings
 }
 
 /// A grabbable hitscan gun lying at `t`; the held trigger fires it.

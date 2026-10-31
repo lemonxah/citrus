@@ -96,6 +96,9 @@ pub struct PlaySession {
     carry: crate::water_carry::CarrySim,
     /// Static objects and still colliders as walls in the simulated water.
     water_walls: crate::water_walls::WaterWalls,
+    /// A UI text field had the keyboard last tick (prediction records no
+    /// gameplay input then).
+    typing: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -134,6 +137,7 @@ impl PlaySession {
             driver_prev: HashMap::new(),
             carry: crate::water_carry::CarrySim::default(),
             water_walls: crate::water_walls::WaterWalls::default(),
+            typing: false,
         }
     }
 
@@ -232,6 +236,7 @@ impl PlaySession {
         self.listener = crate::audio::listener_pose(w.scene).unwrap_or(inp.listener_fallback);
         let events = std::mem::take(&mut self.events_prev);
         let mut host = Vec::new();
+        self.typing = inp.screen.ui_text_editing;
 
         self.net_pre_tick(w, inp.net, &mut host);
         self.start_pending(w, inp, dt, unscaled, &events, &mut host);
@@ -913,6 +918,7 @@ mod tests {
             enabled,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             parent: None,
             translation: pos,
@@ -1015,6 +1021,80 @@ mod tests {
         tick_ui(&mut session, &mut scene, &registry, vec![], false);
         assert!(!enabled(&scene, panel));
         assert_eq!(session.time_scale, 1.0, "closing resumes");
+    }
+
+    /// One frame with live bindings: the runtime sees `raw`, the session
+    /// ticks with its view, and binding requests go back to the runtime.
+    fn tick_controls(
+        session: &mut PlaySession,
+        scene: &mut LoadedScene,
+        registry: &ComponentRegistry,
+        rt: &mut citrus_core::ControlsRuntime,
+        raw: &citrus_core::RawInput,
+        clicks: Vec<ObjectId>,
+    ) {
+        rt.frame(raw, false);
+        let mut shaders = ShaderLibrary::default();
+        let input = InputState::default();
+        let net = NetView::default();
+        let screen = citrus_core::ScreenInfo { ui_clicks: clicks, controls: rt.info(), ..Default::default() };
+        let host = session.tick(
+            &mut World { scene, renderer: None, registry, shaders: &mut shaders },
+            &TickInput { dt: 1.0 / 60.0, input: &input, net: &net, listener_fallback: Mat4::IDENTITY, screen: &screen },
+        );
+        for c in host {
+            if let ComponentCommand::Input(c) = c {
+                rt.apply(c).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn controls_menu_rebinds_through_capture() {
+        use citrus_core::{InputSource, Key, UiText};
+        let registry = registry();
+        let mut scene = LoadedScene::empty();
+        for node in crate::ui_templates::UiTemplate::Controls.build() {
+            obj(&mut scene, Vec3::ZERO, node.active, node.components);
+            let o = scene.objects.last_mut().unwrap();
+            o.name = node.name;
+            o.parent = node.parent;
+        }
+        let id = |scene: &LoadedScene, n: &str| scene.objects.iter().find(|o| o.name == n).unwrap().id;
+        let text = |scene: &LoadedScene, n: &str| {
+            let o = scene.objects.iter().find(|o| o.name == n).unwrap();
+            o.components.iter().find_map(|c| c.as_any().downcast_ref::<UiText>()).unwrap().text.clone()
+        };
+        let mut rt = citrus_core::ControlsRuntime::new(citrus_core::Bindings::default());
+        let mut session = PlaySession::new(&scene, Path::new("."), None);
+        let none = citrus_core::RawInput::default();
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![]);
+        assert_eq!(text(&scene, "Controls Scheme"), "KB+Mouse (in use)");
+        assert_eq!(text(&scene, "Controls Row 1 Label"), "Move Up");
+        assert_eq!(text(&scene, "Controls Row 6 Label"), "Jump");
+        assert_eq!(text(&scene, "Controls Row 6 Bind 1"), "Space");
+
+        let jump = id(&scene, "Controls Row 6 Bind 1");
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![jump]);
+        assert_eq!(text(&scene, "Controls Row 6 Bind 1"), "...");
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![]);
+        let mut raw = citrus_core::RawInput::default();
+        raw.keys_down.insert(Key::J);
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &raw, vec![]);
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![]);
+        let kb = &rt.bindings().schemes[0];
+        assert_eq!(kb.action("Jump").unwrap().buttons, vec![InputSource::Key(Key::J)], "rebound by pressing J");
+        assert_eq!(text(&scene, "Controls Row 6 Bind 1"), "J");
+        assert_eq!(rt.overrides().actions.len(), 1, "saved as a player override");
+
+        // Clicks wait out the capture's mouse release first.
+        for _ in 0..20 {
+            tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![]);
+        }
+        let reset = id(&scene, "Controls Reset");
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![reset]);
+        tick_controls(&mut session, &mut scene, &registry, &mut rt, &none, vec![]);
+        assert_eq!(text(&scene, "Controls Row 6 Bind 1"), "Space", "reset to the game's defaults");
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Input binding system (engine-agnostic). Defines abstract actions
 //! (`Move`, `Jump`, `Look`, ...) and control schemes that map physical
-//! inputs (keys, mouse, gamepad) to them, plus the per-frame [`InputState`]
+//! inputs (keys, mouse, gamepad, VR controllers) to them, plus the per-frame [`InputState`]
 //! snapshot a component reads through `ComponentCtx`.
 //!
 //! This crate is winit/gilrs-free, so physical inputs are mirrored as
-//! plain enums ([`Key`], [`MouseButton`], [`PadButton`], [`PadAxis`]). The engine
+//! plain enums ([`Key`], [`MouseButton`], [`PadButton`], [`PadAxis`], [`VrButton`],
+//! [`VrAxis`]). Rebinding, player overrides and capture live in `input_remap`. The engine
 //! translates real device events into [`RawInput`] and [`resolve`]s it against the
 //! active [`ControlScheme`] into an [`InputState`].
 
@@ -65,14 +66,57 @@ pub enum PadAxis {
     RightTrigger,
 }
 
+/// A VR controller button. Triggers, grips and stick directions are the
+/// thresholded versions of their analog values ([`VrAxis`]); `X` / `Y` sit on
+/// the left controller and `A` / `B` on the right. `Menu` is the left menu
+/// button (or `Y` on runtimes without one).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum VrButton {
+    LeftTrigger, RightTrigger,
+    LeftGrip, RightGrip,
+    A, B, X, Y,
+    LeftStickClick, RightStickClick,
+    Menu,
+    LeftStickUp, LeftStickDown, LeftStickLeft, LeftStickRight,
+    RightStickUp, RightStickDown, RightStickLeft, RightStickRight,
+}
+
+impl VrButton {
+    pub const ALL: [VrButton; 19] = [
+        VrButton::LeftTrigger, VrButton::RightTrigger, VrButton::LeftGrip, VrButton::RightGrip,
+        VrButton::A, VrButton::B, VrButton::X, VrButton::Y,
+        VrButton::LeftStickClick, VrButton::RightStickClick, VrButton::Menu,
+        VrButton::LeftStickUp, VrButton::LeftStickDown, VrButton::LeftStickLeft, VrButton::LeftStickRight,
+        VrButton::RightStickUp, VrButton::RightStickDown, VrButton::RightStickLeft, VrButton::RightStickRight,
+    ];
+}
+
+/// A VR controller analog value: thumbsticks in [-1, 1], triggers and grips in [0, 1].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub enum VrAxis {
+    LeftStickX, LeftStickY,
+    RightStickX, RightStickY,
+    LeftTrigger, RightTrigger,
+    LeftGrip, RightGrip,
+}
+
+impl VrAxis {
+    pub const ALL: [VrAxis; 8] = [
+        VrAxis::LeftStickX, VrAxis::LeftStickY, VrAxis::RightStickX, VrAxis::RightStickY,
+        VrAxis::LeftTrigger, VrAxis::RightTrigger, VrAxis::LeftGrip, VrAxis::RightGrip,
+    ];
+}
+
 /// One physical input that can drive an action.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum InputSource {
     Key(Key),
     Mouse(MouseButton),
     MouseAxis(MouseAxis),
     PadButton(PadButton),
     PadAxis(PadAxis),
+    VrButton(VrButton),
+    VrAxis(VrAxis),
 }
 
 impl InputSource {
@@ -84,6 +128,8 @@ impl InputSource {
             InputSource::MouseAxis(a) => format!("Mouse{a:?}"),
             InputSource::PadButton(b) => format!("Pad{b:?}"),
             InputSource::PadAxis(a) => format!("Pad{a:?}"),
+            InputSource::VrButton(b) => format!("Vr{b:?}"),
+            InputSource::VrAxis(a) => format!("Vr{a:?}"),
         }
     }
 }
@@ -101,7 +147,7 @@ pub enum ActionKind {
 
 /// Binding of one named action to physical inputs. Composite fields let a 2D axis
 /// be built from four buttons (WASD) and/or an analog stick.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ActionBinding {
     pub name: String,
     pub kind: ActionKind,
@@ -130,10 +176,19 @@ pub struct ActionBinding {
     /// Output multiplier (also use negative to invert).
     #[serde(default = "one")]
     pub scale: f32,
+    /// Flip the X (Axis1 value) / Y output, e.g. an "Invert look" setting.
+    #[serde(default)]
+    pub invert_x: bool,
+    #[serde(default)]
+    pub invert_y: bool,
 }
 
 fn one() -> f32 {
     1.0
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl ActionBinding {
@@ -146,7 +201,8 @@ impl ActionBinding {
         }
     }
 
-    fn empty(name: &str, kind: ActionKind) -> Self {
+    /// An action of `kind` with nothing bound (deadzone 0.15, scale 1).
+    pub fn empty(name: &str, kind: ActionKind) -> Self {
         Self {
             name: name.to_string(),
             kind,
@@ -159,12 +215,19 @@ impl ActionBinding {
             analog_y: None,
             deadzone: 0.15,
             scale: 1.0,
+            invert_x: false,
+            invert_y: false,
         }
+    }
+
+    /// An analog 2D action read from a stick-like pair of axes.
+    pub fn stick(name: &str, x: InputSource, y: InputSource, deadzone: f32) -> Self {
+        Self { analog_x: Some(x), analog_y: Some(y), deadzone, ..Self::empty(name, ActionKind::Axis2) }
     }
 }
 
 /// A named set of bindings (e.g. "KB+Mouse", "Gamepad").
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ControlScheme {
     pub name: String,
     pub actions: Vec<ActionBinding>,
@@ -178,23 +241,52 @@ impl ControlScheme {
 
 /// All control schemes for a project + the active one. Serialized to
 /// `project.citrus` (so it survives reloads) and editable at runtime.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Bindings {
     pub schemes: Vec<ControlScheme>,
     #[serde(default)]
     pub active: usize,
+    /// Follow the device in use: the VR scheme while a headset runs, else
+    /// whichever of keyboard + mouse / gamepad was touched last.
+    #[serde(default = "yes")]
+    pub auto_switch: bool,
+    /// Format revision; older files are upgraded by [`Bindings::upgrade`].
+    #[serde(default)]
+    pub version: u32,
 }
 
 impl Default for Bindings {
     fn default() -> Self {
-        Self {
-            schemes: vec![ControlScheme::default_kb_mouse(), ControlScheme::default_gamepad()],
-            active: 0,
-        }
+        Self::from_schemes(vec![
+            ControlScheme::default_kb_mouse(),
+            ControlScheme::default_gamepad(),
+            ControlScheme::default_vr(),
+        ])
     }
 }
 
 impl Bindings {
+    /// The current [`Bindings::version`].
+    pub const VERSION: u32 = 1;
+
+    /// These schemes, the first active, auto-switching on.
+    pub fn from_schemes(schemes: Vec<ControlScheme>) -> Self {
+        Self { schemes, active: 0, auto_switch: true, version: Self::VERSION }
+    }
+
+    /// Bring bindings saved by an older version up to date: projects from
+    /// before VR bindings get the default VR Controllers scheme. A scheme the
+    /// user deleted later stays deleted.
+    pub fn upgrade(&mut self) {
+        if self.version < 1 && !self.schemes.iter().any(|s| s.device() == Some(crate::InputDevice::Vr)) {
+            self.schemes.push(ControlScheme::default_vr());
+        }
+        self.version = Self::VERSION;
+        if self.active >= self.schemes.len() {
+            self.active = 0;
+        }
+    }
+
     pub fn active_scheme(&self) -> Option<&ControlScheme> {
         self.schemes.get(self.active)
     }
@@ -262,6 +354,34 @@ impl ControlScheme {
             ],
         }
     }
+
+    /// The default VR controller scheme (what the VR Player reads): left
+    /// stick move, right stick turn (push forward to aim a teleport), grips
+    /// grab and triggers use per hand, A jump, B crouch, left stick click
+    /// sprint, X interact, menu button opens the menu.
+    pub fn default_vr() -> Self {
+        use InputSource::VrButton as B;
+        let mut turn = ActionBinding::empty("Turn", ActionKind::Axis1);
+        turn.analog_x = Some(InputSource::VrAxis(VrAxis::RightStickX));
+        Self {
+            name: "VR Controllers".to_string(),
+            actions: vec![
+                ActionBinding::stick("Move", InputSource::VrAxis(VrAxis::LeftStickX), InputSource::VrAxis(VrAxis::LeftStickY), 0.1),
+                turn,
+                ActionBinding::button("Teleport", [B(VrButton::RightStickUp)]),
+                ActionBinding::button("Grab Left", [B(VrButton::LeftGrip)]),
+                ActionBinding::button("Grab Right", [B(VrButton::RightGrip)]),
+                ActionBinding::button("Use Left", [B(VrButton::LeftTrigger)]),
+                ActionBinding::button("Use Right", [B(VrButton::RightTrigger)]),
+                ActionBinding::button("Jump", [B(VrButton::A)]),
+                ActionBinding::button("Crouch", [B(VrButton::B)]),
+                ActionBinding::button("Sprint", [B(VrButton::LeftStickClick)]),
+                ActionBinding::button("Interact", [B(VrButton::X)]),
+                ActionBinding::button("Menu", [B(VrButton::Menu)]),
+                ActionBinding::button("Voice", [B(VrButton::RightStickClick)]),
+            ],
+        }
+    }
 }
 
 impl PadAxis {
@@ -279,10 +399,64 @@ pub struct RawInput {
     pub mouse_delta: Vec2,
     /// Mouse wheel this frame (lines/notches).
     pub wheel: f32,
+    /// VR controller buttons held (see [`RawInput::set_vr`]).
+    pub vr_down: std::collections::HashSet<VrButton>,
+    pub vr_axes: HashMap<VrAxis, f32>,
 }
 
+/// Grip / stick deflection past which the thresholded VR buttons read as held.
+const VR_PRESS: f32 = 0.6;
+
 impl RawInput {
-    fn source_value(&self, src: &InputSource) -> f32 {
+    /// Mirror this frame's VR controller state (cleared when inactive).
+    pub fn set_vr(&mut self, vr: &crate::VrFrame) {
+        self.vr_down.clear();
+        self.vr_axes.clear();
+        if !vr.active {
+            return;
+        }
+        let axes = [
+            (VrAxis::LeftStickX, vr.left_stick.x),
+            (VrAxis::LeftStickY, vr.left_stick.y),
+            (VrAxis::RightStickX, vr.right_stick.x),
+            (VrAxis::RightStickY, vr.right_stick.y),
+            (VrAxis::LeftTrigger, vr.left_trigger_value.max(vr.left_trigger as i32 as f32)),
+            (VrAxis::RightTrigger, vr.right_trigger_value.max(vr.right_trigger as i32 as f32)),
+            (VrAxis::LeftGrip, vr.left_grip),
+            (VrAxis::RightGrip, vr.right_grip),
+        ];
+        for (a, v) in axes {
+            if v != 0.0 {
+                self.vr_axes.insert(a, v);
+            }
+        }
+        let (l, r) = (vr.left_stick, vr.right_stick);
+        let held = [
+            (VrButton::LeftTrigger, vr.left_trigger),
+            (VrButton::RightTrigger, vr.right_trigger),
+            (VrButton::LeftGrip, vr.left_grip > VR_PRESS),
+            (VrButton::RightGrip, vr.right_grip > VR_PRESS),
+            (VrButton::A, vr.a),
+            (VrButton::B, vr.b),
+            (VrButton::X, vr.x),
+            (VrButton::Y, vr.y),
+            (VrButton::LeftStickClick, vr.left_stick_click),
+            (VrButton::RightStickClick, vr.right_stick_click),
+            (VrButton::Menu, vr.menu),
+            (VrButton::LeftStickUp, l.y > VR_PRESS),
+            (VrButton::LeftStickDown, l.y < -VR_PRESS),
+            (VrButton::LeftStickLeft, l.x < -VR_PRESS),
+            (VrButton::LeftStickRight, l.x > VR_PRESS),
+            (VrButton::RightStickUp, r.y > VR_PRESS),
+            (VrButton::RightStickDown, r.y < -VR_PRESS),
+            (VrButton::RightStickLeft, r.x < -VR_PRESS),
+            (VrButton::RightStickRight, r.x > VR_PRESS),
+        ];
+        self.vr_down.extend(held.into_iter().filter(|(_, on)| *on).map(|(b, _)| b));
+    }
+
+    /// Current value of one source: 0/1 for buttons, the raw analog value otherwise.
+    pub fn source_value(&self, src: &InputSource) -> f32 {
         match src {
             InputSource::Key(k) => self.keys_down.contains(k) as i32 as f32,
             InputSource::Mouse(b) => self.mouse_down.contains(b) as i32 as f32,
@@ -293,6 +467,8 @@ impl RawInput {
                 MouseAxis::Wheel => self.wheel,
             },
             InputSource::PadAxis(a) => self.pad_axes.get(a).copied().unwrap_or(0.0),
+            InputSource::VrButton(b) => self.vr_down.contains(b) as i32 as f32,
+            InputSource::VrAxis(a) => self.vr_axes.get(a).copied().unwrap_or(0.0),
         }
     }
 
@@ -343,6 +519,23 @@ impl InputState {
     pub fn axis2(&self, name: &str) -> Vec2 {
         self.get(name).axis2
     }
+    /// Every action that is not at rest this frame (what a networked input
+    /// frame carries).
+    pub fn active_actions(&self) -> impl Iterator<Item = (&str, ActionValue)> {
+        self.actions.iter().filter(|(_, v)| v.is_active()).map(|(k, v)| (k.as_str(), *v))
+    }
+    /// An input frame rebuilt from action values (a remote player's input
+    /// replayed on the host, or a scripted frame in tests).
+    pub fn from_actions(actions: impl IntoIterator<Item = (String, ActionValue)>, mouse_delta: Vec2) -> Self {
+        Self { actions: actions.into_iter().collect(), mouse_delta }
+    }
+}
+
+impl ActionValue {
+    /// Pressed, released, held or deflected.
+    pub fn is_active(&self) -> bool {
+        self.down || self.just_pressed || self.just_released || self.value != 0.0 || self.axis2 != Vec2::ZERO
+    }
 }
 
 fn apply_deadzone(v: f32, dz: f32) -> f32 {
@@ -375,7 +568,8 @@ pub fn resolve(scheme: &ControlScheme, raw: &RawInput, prev: &InputState) -> Inp
                         x = av;
                     }
                 }
-                v.value = apply_deadzone(x, a.deadzone) * a.scale;
+                let flip = if a.invert_x { -1.0 } else { 1.0 };
+                v.value = apply_deadzone(x, a.deadzone) * a.scale * flip;
                 v.down = v.value.abs() > 0.5;
             }
             ActionKind::Axis2 => {
@@ -399,6 +593,12 @@ pub fn resolve(scheme: &ControlScheme, raw: &RawInput, prev: &InputState) -> Inp
                 }
                 if axis.length() < a.deadzone {
                     axis = Vec2::ZERO;
+                }
+                if a.invert_x {
+                    axis.x = -axis.x;
+                }
+                if a.invert_y {
+                    axis.y = -axis.y;
                 }
                 v.axis2 = axis * a.scale;
                 v.value = v.axis2.length();

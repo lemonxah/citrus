@@ -897,12 +897,59 @@ pub fn compile_shader(source: &ShaderSource, label: &str) -> Result<Vec<u8>> {
     compile_shader_variant(source, label, None)
 }
 
+/// Vulkan environment custom shaders compile for. The editor and desktop
+/// builds use 1.3; the Android / Quest cook uses 1.1 (SPIR-V 1.3), since
+/// standalone headsets may expose only Vulkan 1.1, which can't load newer
+/// SPIR-V.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShaderTargetEnv {
+    #[default]
+    Vulkan1_3,
+    Vulkan1_1,
+}
+
+impl ShaderTargetEnv {
+    fn glslc_flag(self) -> &'static str {
+        match self {
+            Self::Vulkan1_3 => "--target-env=vulkan1.3",
+            Self::Vulkan1_1 => "--target-env=vulkan1.1",
+        }
+    }
+}
+
+thread_local! {
+    static SHADER_TARGET_ENV: std::cell::Cell<ShaderTargetEnv> = const { std::cell::Cell::new(ShaderTargetEnv::Vulkan1_3) };
+}
+
+/// The target environment shader compiles on this thread use.
+pub fn shader_target_env() -> ShaderTargetEnv {
+    SHADER_TARGET_ENV.with(|e| e.get())
+}
+
+/// Restores the previous [`ShaderTargetEnv`] when dropped.
+#[must_use = "the target environment reverts when the guard drops"]
+pub struct ShaderTargetEnvGuard {
+    prev: ShaderTargetEnv,
+}
+
+impl Drop for ShaderTargetEnvGuard {
+    fn drop(&mut self) {
+        SHADER_TARGET_ENV.with(|e| e.set(self.prev));
+    }
+}
+
+/// Compile shaders on the current thread for `env` until the guard drops
+/// (a cook scope: other threads, e.g. the editor's, are unaffected).
+pub fn scoped_shader_target_env(env: ShaderTargetEnv) -> ShaderTargetEnvGuard {
+    ShaderTargetEnvGuard { prev: SHADER_TARGET_ENV.with(|e| e.replace(env)) }
+}
+
 /// Compile with keywords frozen to plain constants, so glslc's optimizer
 /// strips every disabled feature from the SPIR-V itself (baked variants).
 pub fn compile_shader_variant(source: &ShaderSource, label: &str, frozen: Option<&KeywordSet>) -> Result<Vec<u8>> {
     let text = assemble_shader(source, frozen);
     let mut cmd = Command::new("glslc");
-    cmd.arg("--target-env=vulkan1.3").arg("-fshader-stage=fragment");
+    cmd.arg(shader_target_env().glslc_flag()).arg("-fshader-stage=fragment");
     if source.lang == ShaderLang::Hlsl {
         cmd.args(["-x", "hlsl", "-fauto-combined-image-sampler"]);
     }
@@ -1093,6 +1140,27 @@ mod tests {
         std::fs::write(&frag, SHADER_TEMPLATE).unwrap();
         assert!(load_shader_file(&frag).unwrap().1.len() > 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cook_scope_targets_vulkan_1_1() {
+        // SPIR-V header word 1 is the version: 0x00010600 for Vulkan 1.3
+        // (SPIR-V 1.6), 0x00010300 for Vulkan 1.1 (SPIR-V 1.3).
+        let version = |b: &[u8]| u32::from_le_bytes(b[4..8].try_into().unwrap());
+        let source = parse_shader_source(SHADER_TEMPLATE, "template").unwrap();
+        assert_eq!(shader_target_env(), ShaderTargetEnv::Vulkan1_3);
+        assert_eq!(version(&compile_shader(&source, "template").unwrap()), 0x0001_0600);
+        {
+            let _cook = scoped_shader_target_env(ShaderTargetEnv::Vulkan1_1);
+            let spirv = compile_shader(&source, "template").unwrap();
+            assert!(is_spirv(&spirv));
+            assert_eq!(version(&spirv), 0x0001_0300);
+            // Other threads keep the editor's target.
+            std::thread::spawn(|| assert_eq!(shader_target_env(), ShaderTargetEnv::Vulkan1_3)).join().unwrap();
+            let hlsl = parse_shader_source_lang(HLSL_SHADER_TEMPLATE, "hlsl", ShaderLang::Hlsl).unwrap();
+            assert_eq!(version(&compile_shader(&hlsl, "hlsl").unwrap()), 0x0001_0300);
+        }
+        assert_eq!(shader_target_env(), ShaderTargetEnv::Vulkan1_3, "guard restores");
     }
 
     #[test]

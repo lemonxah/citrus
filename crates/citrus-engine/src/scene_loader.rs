@@ -528,6 +528,7 @@ mod tests {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             material: citrus_assets::MaterialRef::File(String::new()),
             extra_materials: vec![],

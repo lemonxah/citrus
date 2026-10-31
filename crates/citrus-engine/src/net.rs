@@ -10,15 +10,43 @@
 //!
 //! Transport: UDP (or an in-memory hub for tests) with two channels per
 //! connection. Unreliable packets carry snapshots, avatar poses, animator
-//! parameters, voice and unreliable RPCs. A reliable ordered channel
-//! (sequence numbers, batched acks, RTT-based resend, fragmentation of large
-//! messages) carries everything that must arrive: joins/leaves, ownership,
-//! spawns, variables, RPCs, chat, scene changes and late-join catch-up.
-//! Connections handshake (HELLO / WELCOME / REJECT), ping for RTT and time out
-//! after `NetConfig::timeout` of silence.
+//! parameters, voice, predicted-pawn inputs / states and unreliable RPCs. A
+//! reliable ordered channel (sequence numbers, batched acks, RTT-based
+//! resend, fragmentation of large messages) carries everything that must
+//! arrive: joins/leaves, ownership, spawns, variables, RPCs, chat, scene
+//! changes and late-join catch-up.
+//!
+//! Handshake (protocol 6): HELLO (padded, client nonce) -> CHALLENGE (no
+//! larger than the HELLO: key-stretching parameters, the host's identity,
+//! epoch and peer id, a stateless cookie; the host keeps nothing) -> JOIN
+//! (the cookie back, plus name, player id and a signature over the
+//! transcript, sealed under the connection key: HKDF of the stretched secret
+//! and the transcript) -> WELCOME (sealed, signed by the host). A wrong
+//! secret gets a REJECT signed with the host's identity; other refusals are
+//! sealed; unauthenticated rejects are only believed when no CHALLENGE turns
+//! up. After that every packet is sealed with ChaCha20-Poly1305 and
+//! replay-checked (`net_secure`), so stray or forged datagrams are dropped.
+//! Connections ping for RTT, jitter and loss (both directions) and time out
+//! after `NetConfig::timeout` of silence. Half-open joins are capped.
+//!
+//! Host migration: the host replicates a succession plan (members in join
+//! order, their endpoints, the relay room and its owner key, bans). When the
+//! host times out or hands off, every member walks the same list: the first
+//! one takes over with the world it has (peer ids, ownership and spawns
+//! stay), the others reconnect to it (directly, then through the relay),
+//! resend what the old host never acknowledged, and resync. A promoted host
+//! that gave up on a better-ranked one keeps probing it and steps down if it
+//! turns out to be hosting too.
+//!
+//! Internet play: with a relay server configured (`NetConfig::relay`) the
+//! host also opens a room there and clients join by room code; peers punch
+//! a direct UDP path when they can and stay relayed when they can't
+//! (`net_relay`, `citrus-relay`). LAN clients keep connecting directly to the
+//! same socket.
 //!
 //! Scene-level replication (which objects to send, interpolation, physics
-//! hand-over) lives in `net_sync`; this module only moves state around.
+//! hand-over) lives in `net_sync`, prediction in `net_predict`; this module
+//! only moves state around.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
@@ -26,21 +54,46 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use citrus_core::{
-    HOST_PEER, InterpolationMode, NetEvent, NetRpc, NetSpawnSource, NetValue, NetView, NetWorldOp, NetworkManager,
-    ObjectId, OwnershipMode, PeerInfo, RpcTarget, TRACKER_SLOTS,
+    HOST_PEER, HitHistory, InterpolationMode, NetEvent, NetQuality, NetRpc, NetSpawnSource, NetValue, NetView,
+    NetWorldOp, NetworkManager, ObjectId, OwnershipMode, PeerInfo, RpcTarget, TRACKER_SLOTS,
 };
+use citrus_relay::proto::{self as relay_proto, HOST_SLOT};
 use glam::{Quat, Vec3};
 
-/// Bumped whenever the wire format changes; mismatched peers are rejected.
-pub const PROTOCOL: u16 = 4;
+pub use crate::net_identity::{Identity, fingerprint, set_identity_dir, short_fingerprint};
+pub use crate::net_relay::{HostAuth, RelayPhase, RelayRole, RelayStatus, virtual_addr};
+pub use crate::net_secure::{KdfMode, KdfParams, generate_secret};
+use crate::net_predict::{AdaptiveDelay, AuthState, InputCmd, InputQueue, JitterMeter, MAX_CMDS_PER_PACKET, Predictor};
+use crate::net_relay::{RelayClient, Route};
+use crate::net_secure::{Bucket, KdfJob, SEAL_OVERHEAD, SecureChannel, conn_key, hash, mac16, random_bytes, relay_join_key};
+
+/// Bumped whenever the wire format changes; mismatched peers are rejected
+/// with a message naming both versions.
+pub const PROTOCOL: u16 = 6;
 /// UDP port LAN discovery queries go to.
 pub const DISCOVERY_PORT: u16 = 47777;
-/// Largest datagram we build (stays under common path MTUs).
+/// Largest game packet we build. Sealing adds [`SEAL_OVERHEAD`] + 1 and a
+/// relay hop 5 more, so datagrams on the wire stay under [`MAX_DATAGRAM`]
+/// (below the 1280-byte IPv6 minimum MTU; no IP fragmentation).
 pub const MTU: usize = 1200;
+pub const MAX_DATAGRAM: usize = MTU + 1 + SEAL_OVERHEAD + relay_proto::DATA_HEADER;
 const FRAG: usize = MTU - 16;
 const RECV_BUF: usize = 2048;
 const PING_INTERVAL: f64 = 0.5;
 const HELLO_INTERVAL: f64 = 0.25;
+/// HELLOs are padded to this, so the CHALLENGE (and any pre-auth reply) is
+/// never larger than what an unauthenticated sender sent.
+pub const HELLO_SIZE: usize = 128;
+/// How long an unauthenticated REJECT may stand before the client believes it.
+const REJECT_GRACE: f64 = 2.0;
+/// Handshake cookies rotate this often (the previous one is accepted too).
+const COOKIE_PERIOD: f64 = 30.0;
+/// Accepted joins that haven't confirmed their key yet.
+pub const MAX_HALF_OPEN: usize = 32;
+/// Seconds a half-open join may stay unconfirmed.
+const HALF_OPEN_TTL: f64 = 5.0;
+/// Seconds between tie-break probes of better-ranked successors.
+const PROBE_INTERVAL: f64 = 1.0;
 const MAX_QUEUE: usize = 4096;
 /// Pending world writes (variables, parents) wait this long for their object.
 const PENDING_TTL: f64 = 10.0;
@@ -64,6 +117,25 @@ const P_URPC: u8 = 13;
 const P_DISCOVER: u8 = 14;
 const P_INFO: u8 = 15;
 const P_FACE: u8 = 16;
+const P_CHALLENGE: u8 = 17;
+const P_JOIN: u8 = 18;
+const P_INPUT: u8 = 19;
+const P_PSTATE: u8 = 20;
+const P_PROBE_ACK: u8 = 21;
+/// Every packet after the handshake: `[P_SECURE][counter][sealed packet][tag]`.
+const P_SECURE: u8 = 0x20;
+/// JOIN header: tag + client nonce + cookie + mode (authenticated, clear).
+const JOIN_HEADER: usize = 34;
+const JOIN_MODE_JOIN: u8 = 0;
+const JOIN_MODE_PROBE: u8 = 1;
+// REJECT kinds (clear packets).
+const REJECT_HINT: u8 = 0;
+const REJECT_SIGNED: u8 = 1;
+// BYE reasons (sealed).
+const BYE_LEAVE: u8 = 0;
+const BYE_HANDOFF: u8 = 1;
+const BYE_CLOSED: u8 = 2;
+const BYE_KICKED: u8 = 3;
 
 // Reliable message tags.
 const M_PEERS: u8 = 1;
@@ -85,6 +157,11 @@ const M_TEXT: u8 = 16;
 const M_SCENE: u8 = 17;
 const M_XFORM: u8 = 18;
 const M_ANIM: u8 = 19;
+const M_SUCCESSION: u8 = 20;
+const M_RESYNC: u8 = 21;
+const M_RESYNC_END: u8 = 22;
+const M_VAR_SYNC: u8 = 23;
+const M_ANCHOR: u8 = 24;
 
 // ------------------------------------------------------------------ transport
 
@@ -93,28 +170,89 @@ pub trait Transport {
     fn send(&self, data: &[u8], to: SocketAddr);
     fn recv(&mut self, buf: &mut [u8]) -> Option<(usize, SocketAddr)>;
     fn local_addr(&self) -> Option<SocketAddr>;
+    /// Periodic work (relay registration, hole punching, keepalives).
+    fn poll(&mut self, _now: f64) {}
+    /// Relay registration and routes, when going through a relay.
+    fn relay_status(&self) -> Option<RelayStatus> {
+        None
+    }
+    /// How datagrams reach `addr`: "direct", "relayed" or "LAN".
+    fn route_label(&self, _addr: SocketAddr) -> &'static str {
+        "LAN"
+    }
+    /// The session is closing (leave the relay room).
+    fn close(&mut self) {}
+    /// The punched direct endpoint of a relay peer (None for anything else).
+    fn direct_route(&self, _addr: SocketAddr) -> Option<SocketAddr> {
+        None
+    }
+    /// Host: the room credentials, once the session key is stretched.
+    fn set_relay_host_auth(&mut self, _auth: HostAuth) {}
+    /// Client: the relay handed over the room's stretching parameters and
+    /// waits for the join proof.
+    fn relay_needs_join_key(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn set_relay_join_key(&mut self, _key: [u8; 32]) {}
+    /// Host migration: take over the room's host slot.
+    fn relay_claim_host(&mut self, _owner_seed: [u8; 32]) {}
+    /// Start using a relay mid-session (migration fallback). False when
+    /// this transport can't.
+    fn attach_relay(&mut self, _relay: SocketAddr, _role: RelayRole, _punch: bool) -> bool {
+        false
+    }
 }
 
+/// UDP socket, optionally registered with a relay server: relay control and
+/// relayed data, punched direct paths and plain LAN traffic share it.
 pub struct UdpTransport {
     socket: UdpSocket,
+    relay: Option<RelayClient>,
+    out: Vec<(Vec<u8>, SocketAddr)>,
 }
 
 impl UdpTransport {
     pub fn bind(port: u16) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", port))?;
         socket.set_nonblocking(true)?;
-        Ok(Self { socket })
+        Ok(Self { socket, relay: None, out: Vec::new() })
+    }
+
+    /// Register with a relay too (a room host, or a client joining a room).
+    /// `punch` off keeps every relay peer on the relayed path.
+    pub fn with_relay(mut self, relay: SocketAddr, role: RelayRole, punch: bool) -> Self {
+        let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        self.relay = Some(RelayClient::new(relay, role, port, punch));
+        self
+    }
+
+    fn flush(&mut self) {
+        for (b, a) in self.out.drain(..) {
+            let _ = self.socket.send_to(&b, a);
+        }
     }
 }
 
 impl Transport for UdpTransport {
     fn send(&self, data: &[u8], to: SocketAddr) {
-        let _ = self.socket.send_to(data, to);
+        match &self.relay {
+            Some(r) => match r.route(to) {
+                Route::Direct(a) => {
+                    let _ = self.socket.send_to(data, a);
+                }
+                Route::Relay(slot) => {
+                    let _ = self.socket.send_to(&relay_proto::data_packet(slot, data), r.relay);
+                }
+            },
+            None => {
+                let _ = self.socket.send_to(data, to);
+            }
+        }
     }
     fn recv(&mut self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
         loop {
-            match self.socket.recv_from(buf) {
-                Ok(v) => return Some(v),
+            let (n, src) = match self.socket.recv_from(buf) {
+                Ok(v) => v,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return None,
                 // ICMP port-unreachable surfaces as a reset on some platforms.
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
@@ -122,11 +260,73 @@ impl Transport for UdpTransport {
                     tracing::debug!("net recv error: {e}");
                     return None;
                 }
+            };
+            let Some(relay) = self.relay.as_mut() else {
+                return Some((n, src));
+            };
+            if relay_proto::is_relay_packet(&buf[..n]) {
+                let data = relay.on_packet(&buf[..n], src, &mut self.out).map(|(p, v)| (p.len(), v));
+                self.flush();
+                if let Some((len, virt)) = data {
+                    buf.copy_within(relay_proto::DATA_HEADER..relay_proto::DATA_HEADER + len, 0);
+                    return Some((len, virt));
+                }
+                continue;
             }
+            return Some((n, relay.virtual_of(src).unwrap_or(src)));
         }
     }
     fn local_addr(&self) -> Option<SocketAddr> {
         self.socket.local_addr().ok()
+    }
+    fn poll(&mut self, now: f64) {
+        if let Some(r) = self.relay.as_mut() {
+            r.poll(now, &mut self.out);
+        }
+        self.flush();
+    }
+    fn relay_status(&self) -> Option<RelayStatus> {
+        self.relay.as_ref().map(|r| r.status())
+    }
+    fn route_label(&self, addr: SocketAddr) -> &'static str {
+        self.relay.as_ref().map_or("LAN", |r| r.route_label(addr))
+    }
+    fn close(&mut self) {
+        if let Some(r) = self.relay.take() {
+            let (b, a) = r.leave_packet();
+            for _ in 0..2 {
+                let _ = self.socket.send_to(&b, a);
+            }
+        }
+    }
+    fn direct_route(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        match self.relay.as_ref()?.route(addr) {
+            Route::Direct(d) if crate::net_relay::slot_of(addr).is_some() => Some(d),
+            _ => None,
+        }
+    }
+    fn set_relay_host_auth(&mut self, auth: HostAuth) {
+        if let Some(r) = self.relay.as_mut() {
+            r.set_host_auth(auth);
+        }
+    }
+    fn relay_needs_join_key(&self) -> Option<Vec<u8>> {
+        self.relay.as_ref()?.needs_join_key()
+    }
+    fn set_relay_join_key(&mut self, key: [u8; 32]) {
+        if let Some(r) = self.relay.as_mut() {
+            r.set_join_key(key);
+        }
+    }
+    fn relay_claim_host(&mut self, owner_seed: [u8; 32]) {
+        if let Some(r) = self.relay.as_mut() {
+            r.claim_host(owner_seed);
+        }
+    }
+    fn attach_relay(&mut self, relay: SocketAddr, role: RelayRole, punch: bool) -> bool {
+        let port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        self.relay = Some(RelayClient::new(relay, role, port, punch));
+        true
     }
 }
 
@@ -140,11 +340,28 @@ pub struct MemHub {
 
 #[derive(Default)]
 struct HubInner {
-    queues: HashMap<SocketAddr, VecDeque<(Vec<u8>, SocketAddr)>>,
+    /// (datagram, sender, delivery time)
+    queues: HashMap<SocketAddr, VecDeque<(Vec<u8>, SocketAddr, f64)>>,
     next: u16,
     loss: f32,
     rng: u64,
     cut: HashSet<SocketAddr>,
+    cut_links: HashSet<(SocketAddr, SocketAddr)>,
+    time: f64,
+    latency: f64,
+    jitter: f64,
+}
+
+impl HubInner {
+    fn rand(&mut self) -> f64 {
+        if self.rng == 0 {
+            self.rng = 0x9E37_79B9_7F4A_7C15;
+        }
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        (self.rng % 10_000) as f64 / 10_000.0
+    }
 }
 
 impl MemHub {
@@ -169,6 +386,36 @@ impl MemHub {
     pub fn cut(&self, addr: SocketAddr) {
         self.inner.lock().unwrap().cut.insert(addr);
     }
+    /// Drop everything between `a` and `b` (both ways): a partition.
+    pub fn cut_link(&self, a: SocketAddr, b: SocketAddr) {
+        let mut h = self.inner.lock().unwrap();
+        h.cut_links.insert((a, b));
+        h.cut_links.insert((b, a));
+    }
+    /// Undo every cut.
+    pub fn heal(&self) {
+        let mut h = self.inner.lock().unwrap();
+        h.cut.clear();
+        h.cut_links.clear();
+    }
+    /// Deliver a datagram claiming to come from `from` (a spoofing attacker).
+    pub fn inject(&self, from: SocketAddr, to: SocketAddr, data: &[u8]) {
+        let mut h = self.inner.lock().unwrap();
+        let at = h.time;
+        if let Some(q) = h.queues.get_mut(&to) {
+            q.push_back((data.to_vec(), from, at));
+        }
+    }
+    /// Delay every datagram by `one_way` seconds plus up to `jitter` more
+    /// (which reorders them). Time only moves with [`Self::advance`].
+    pub fn set_latency(&self, one_way: f64, jitter: f64) {
+        let mut h = self.inner.lock().unwrap();
+        h.latency = one_way;
+        h.jitter = jitter;
+    }
+    pub fn advance(&self, dt: f64) {
+        self.inner.lock().unwrap().time += dt;
+    }
 }
 
 pub struct MemTransport {
@@ -179,24 +426,23 @@ pub struct MemTransport {
 impl Transport for MemTransport {
     fn send(&self, data: &[u8], to: SocketAddr) {
         let mut h = self.hub.inner.lock().unwrap();
-        if h.cut.contains(&self.addr) || h.cut.contains(&to) {
+        if h.cut.contains(&self.addr) || h.cut.contains(&to) || h.cut_links.contains(&(self.addr, to)) {
             return;
         }
-        if h.loss > 0.0 {
-            h.rng ^= h.rng << 13;
-            h.rng ^= h.rng >> 7;
-            h.rng ^= h.rng << 17;
-            if (h.rng % 10_000) as f32 / 10_000.0 < h.loss {
-                return;
-            }
+        if h.loss > 0.0 && (h.rand() as f32) < h.loss {
+            return;
         }
+        let at = h.time + h.latency + if h.jitter > 0.0 { h.rand() * h.jitter } else { 0.0 };
         if let Some(q) = h.queues.get_mut(&to) {
-            q.push_back((data.to_vec(), self.addr));
+            q.push_back((data.to_vec(), self.addr, at));
         }
     }
     fn recv(&mut self, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
         let mut h = self.hub.inner.lock().unwrap();
-        let (data, from) = h.queues.get_mut(&self.addr)?.pop_front()?;
+        let now = h.time;
+        let q = h.queues.get_mut(&self.addr)?;
+        let i = q.iter().position(|(_, _, at)| *at <= now)?;
+        let (data, from, _) = q.remove(i)?;
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
         Some((n, from))
@@ -218,6 +464,36 @@ pub struct NetConfig {
     pub discovery: bool,
     pub discovery_port: u16,
     pub clients_can_spawn: bool,
+    /// Join secret: keys the session encryption, and joiners must know it.
+    /// Empty = an open session (still encrypted, but anyone may join).
+    pub secret: String,
+    /// Relay server (`host:port`, default port 47800) for internet play:
+    /// hosting also opens a room there; room-code joins go through it.
+    pub relay: String,
+    /// Room code a host asks the relay for (empty = the relay picks one).
+    pub room: String,
+    /// Try UDP hole punching to relay peers (off = always relayed).
+    pub punch: bool,
+    /// Operator token for relays that require one to open rooms.
+    pub relay_token: String,
+    /// This install's player identity (signs the handshake).
+    pub identity: Identity,
+    /// Host: key-stretching parameters (None = the defaults for the secret).
+    pub kdf: Option<KdfParams>,
+    /// Keep the session going when the host leaves: the next in line takes over.
+    pub migration: bool,
+    /// This peer may be elected host after a migration.
+    pub can_host: bool,
+    /// Seconds a migrating client tries one successor over one path
+    /// (direct, then through the relay).
+    pub migrate_attempt: f32,
+    /// Host: only these player fingerprints may join (empty = anyone with the secret).
+    pub allow: Vec<String>,
+    /// Host: player fingerprints refused at the door.
+    pub ban: Vec<String>,
+    /// Client: remember the host's identity per address / room code (trust
+    /// on first use) and refuse a different one later.
+    pub pin_host: bool,
 }
 
 impl Default for NetConfig {
@@ -230,6 +506,19 @@ impl Default for NetConfig {
             discovery: true,
             discovery_port: DISCOVERY_PORT,
             clients_can_spawn: true,
+            secret: std::env::var("CITRUS_SECRET").unwrap_or_default(),
+            relay: std::env::var("CITRUS_RELAY").unwrap_or_default(),
+            room: String::new(),
+            punch: std::env::var("CITRUS_NO_PUNCH").is_err(),
+            relay_token: std::env::var("CITRUS_RELAY_TOKEN").unwrap_or_default(),
+            identity: Identity::install(),
+            kdf: None,
+            migration: true,
+            can_host: true,
+            migrate_attempt: 3.0,
+            allow: Vec::new(),
+            ban: Vec::new(),
+            pin_host: false,
         }
     }
 }
@@ -242,8 +531,59 @@ impl NetConfig {
             timeout: m.timeout.max(1.0),
             discovery: m.discovery,
             clients_can_spawn: m.clients_can_spawn,
-            ..Default::default()
+            ..Self::default().with_manager_net(m)
         }
+    }
+
+    fn with_manager_net(mut self, m: &NetworkManager) -> Self {
+        if !m.secret.is_empty() {
+            self.secret = m.secret.clone();
+        }
+        if !m.relay.is_empty() {
+            self.relay = m.relay.clone();
+        }
+        self.room = m.room_code.clone();
+        self.migration = m.host_migration;
+        self.pin_host = m.pin_host;
+        self.allow = m.allow_list.clone();
+        self.ban = m.ban_list.clone();
+        self
+    }
+}
+
+/// Where a join goes: a direct address, or a room on a relay.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JoinTarget {
+    Direct(SocketAddr),
+    Room { code: String, relay: SocketAddr },
+}
+
+impl JoinTarget {
+    /// `host:port` joins directly; `CODE` joins a room on `default_relay`;
+    /// `CODE@relay:port` names the relay.
+    pub fn parse(input: &str, default_relay: &str) -> std::io::Result<Self> {
+        let input = input.trim();
+        if let Some((code, relay)) = input.split_once('@') {
+            return Ok(Self::Room { code: relay_proto::normalize_code(code), relay: parse_relay(relay)? });
+        }
+        if relay_proto::looks_like_code(input) {
+            if default_relay.trim().is_empty() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "joining by room code needs a relay server"));
+            }
+            return Ok(Self::Room { code: relay_proto::normalize_code(input), relay: parse_relay(default_relay)? });
+        }
+        Ok(Self::Direct(parse_addr(input)?))
+    }
+}
+
+/// A relay address; the port defaults to 47800.
+pub fn parse_relay(addr: &str) -> std::io::Result<SocketAddr> {
+    let addr = addr.trim();
+    let has_port = addr.rsplit_once(':').is_some_and(|(h, p)| p.parse::<u16>().is_ok() && (!h.contains(':') || h.ends_with(']')));
+    if has_port {
+        parse_addr(addr)
+    } else {
+        parse_addr(&format!("{addr}:{}", relay_proto::DEFAULT_PORT))
     }
 }
 
@@ -262,6 +602,10 @@ pub struct NetStats {
     pub packets_in: u64,
     pub packets_out: u64,
     pub resends: u64,
+    /// Datagrams dropped for failing authentication / replay / cookie checks.
+    pub rejected: u64,
+    /// Joins turned away because too many handshakes were half-open.
+    pub half_open_refused: u64,
     /// Bytes per second over the last full second.
     pub rate_in: f32,
     pub rate_out: f32,
@@ -278,6 +622,8 @@ pub struct SpawnRecord {
     pub translation: Vec3,
     pub rotation: Quat,
     pub owner: u64,
+    /// Its owner's player object (despawned when they leave).
+    pub player: bool,
 }
 
 /// Latest known world transform of an object.
@@ -315,6 +661,8 @@ pub struct NetWorld {
     pub despawn_on_leave: HashSet<u128>,
     /// Each peer's player object (relevancy origin, despawned on leave).
     pub player_obj: HashMap<u64, u128>,
+    /// Host: predicted objects (the host simulates them from their owner's input).
+    pub predicted: HashSet<u128>,
 }
 
 impl NetWorld {
@@ -335,6 +683,9 @@ impl NetWorld {
             Some((_, v)) => *v = value,
             None => vars.push((key.to_owned(), value)),
         }
+    }
+    fn var(&self, id: u128, key: &str) -> Option<&NetValue> {
+        self.vars.get(&id)?.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 }
 
@@ -407,6 +758,48 @@ pub struct PendingVar {
     pub expires: f64,
 }
 
+/// One peer in line to take over as host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Successor {
+    pub peer: u64,
+    /// Endpoints other members can try directly (empty for relay-only peers).
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// The host's succession plan, replicated to every member ahead of time:
+/// who takes over (in order), and what the new host needs to carry on.
+#[derive(Clone, Debug, Default)]
+pub struct Succession {
+    pub version: u32,
+    pub epoch: u32,
+    pub next_peer: u64,
+    pub spawn_counter: u32,
+    pub max_players: u32,
+    pub clients_can_spawn: bool,
+    pub session_name: String,
+    /// Relay the session's room lives on, and its code ("" = none).
+    pub relay: String,
+    pub room: String,
+    /// The room owner key members claim the room with.
+    pub room_key: Option<[u8; 32]>,
+    /// Candidates in election order (join order; peers that can't host left out).
+    pub order: Vec<Successor>,
+    pub ban: Vec<String>,
+    pub allow: Vec<String>,
+}
+
+/// Where a migrating client is (for the UI).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationStatus {
+    /// The host that was lost.
+    pub previous: u64,
+    /// The successor being tried now.
+    pub target: u64,
+    /// Through the relay rather than directly.
+    pub relayed: bool,
+    pub seconds: f32,
+}
+
 struct Conn {
     addr: SocketAddr,
     peer: u64,
@@ -415,16 +808,40 @@ struct Conn {
     last_ping: f64,
     rtt: f32,
     send_seq: u32,
-    unacked: BTreeMap<u32, (Vec<u8>, f64)>,
+    /// seq -> (packet, last sent, first fragment of its message).
+    unacked: BTreeMap<u32, (Vec<u8>, f64, bool)>,
     recv_next: u32,
     recv_buf: BTreeMap<u32, (bool, Vec<u8>)>,
     frag: Vec<u8>,
     acks: Vec<u32>,
+    sec: Option<SecureChannel>,
+    client_nonce: [u8; 16],
+    /// Smoothed round-trip variation (s).
+    rtt_var: f32,
+    /// Loss the other side measures on what we send.
+    remote_loss: f32,
+    /// The client's reported interpolation delay (s).
+    view_delay: f32,
+    /// Host: the client's verified player id and handshake transcript.
+    identity: [u8; 32],
+    transcript: [u8; 32],
+    /// Host: the client has sent a sealed packet since its JOIN (until then
+    /// it is a half-open join, not yet a member).
+    confirmed: bool,
+    created: f64,
+    /// Host: a member coming back after a host migration (keeps its peer id).
+    rejoined: bool,
+    can_host: bool,
 }
 
 impl Conn {
     fn new(addr: SocketAddr, peer: u64, now: f64) -> Self {
         Self {
+            sec: None,
+            client_nonce: [0; 16],
+            rtt_var: 0.0,
+            remote_loss: 0.0,
+            view_delay: 0.0,
             addr,
             peer,
             name: String::new(),
@@ -437,10 +854,40 @@ impl Conn {
             recv_buf: BTreeMap::new(),
             frag: Vec::new(),
             acks: Vec::new(),
+            identity: [0; 32],
+            transcript: [0; 32],
+            confirmed: true,
+            created: now,
+            rejoined: false,
+            can_host: true,
         }
     }
     fn rto(&self) -> f64 {
         (self.rtt as f64 * 2.0 + 0.05).clamp(0.08, 1.0)
+    }
+    /// Reliable messages sent but not acknowledged, reassembled in order
+    /// (resent to a new host after a migration).
+    fn unacked_messages(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut cur: Option<Vec<u8>> = None;
+        let mut seqs: Vec<&u32> = self.unacked.keys().collect();
+        seqs.sort_by_key(|s| s.wrapping_sub(self.send_seq));
+        for seq in seqs {
+            let (p, _, first) = &self.unacked[seq];
+            if p.len() < 6 {
+                continue;
+            }
+            if *first {
+                cur = Some(Vec::new());
+            }
+            if let Some(m) = cur.as_mut() {
+                m.extend_from_slice(&p[6..]);
+                if p[5] != 0 {
+                    out.push(cur.take().unwrap_or_default());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -464,6 +911,72 @@ pub struct SendState {
     pub last_avatar: f64,
     pub seen: bool,
     pub missing_since: Option<f64>,
+    /// Rest snapshots still to send after the object stopped moving.
+    pub rest: u8,
+}
+
+/// A host's CHALLENGE as a client parsed it.
+#[derive(Clone)]
+struct Challenge {
+    kdf: KdfParams,
+    host_pk: [u8; 32],
+    epoch: u32,
+    host_peer: u64,
+    cookie: [u8; 16],
+    transcript: [u8; 32],
+}
+
+/// A client's handshake in progress (joining, or rejoining a new host).
+struct Handshake {
+    /// Where HELLOs go until a CHALLENGE picks one.
+    addrs: Vec<SocketAddr>,
+    addr: Option<SocketAddr>,
+    nonce: [u8; 16],
+    started: f64,
+    last_hello: f64,
+    /// Migration: the peer that must answer, and the player id the session
+    /// knows it by.
+    expect: Option<(u64, Option<[u8; 32]>)>,
+    challenge: Option<Challenge>,
+    join: Option<Vec<u8>>,
+    sec: Option<SecureChannel>,
+    /// An unauthenticated rejection (believed only if nothing better arrives).
+    hint: Option<(String, f64)>,
+}
+
+/// A client looking for the new host after losing the old one.
+struct Migration {
+    previous: u64,
+    candidates: Vec<Successor>,
+    index: usize,
+    relayed: bool,
+    attempt_started: Option<f64>,
+    started: f64,
+}
+
+/// A promoted host checking whether a better-ranked successor is hosting too.
+struct Probe {
+    peer: u64,
+    addr: SocketAddr,
+    nonce: [u8; 16],
+    sec: Option<SecureChannel>,
+    join: Option<Vec<u8>>,
+    last: f64,
+}
+
+/// A client re-learning the world from a new host.
+#[derive(Default)]
+struct Resync {
+    spawns: HashSet<u128>,
+    owners: HashSet<u128>,
+    mine_before: Vec<SpawnRecord>,
+}
+
+/// A reliable RPC or chat line the new host replays to members that are
+/// still reconnecting after a migration (they drop ones they already saw).
+struct Backlog {
+    sender: u64,
+    msg: Vec<u8>,
 }
 
 // ------------------------------------------------------------------ session
@@ -476,14 +989,17 @@ pub struct NetSession {
     clock: Clock,
     is_host: bool,
     local_peer: u64,
+    /// The current host's peer id (1 until a migration).
+    host_peer: u64,
+    /// Bumped by every host migration.
+    epoch: u32,
     state: ConnState,
-    host_addr: Option<SocketAddr>,
-    started: f64,
-    last_hello: f64,
     conns: HashMap<u64, Conn>,
     addr_peer: HashMap<SocketAddr, u64>,
     /// Everyone known (id -> name), the local peer included.
     peers: BTreeMap<u64, String>,
+    /// Verified player ids (the host checked their signatures).
+    peer_ids: HashMap<u64, [u8; 32]>,
     next_peer: u64,
     claim_seq: u64,
     xform_seq: u64,
@@ -512,6 +1028,68 @@ pub struct NetSession {
     pub players_to_spawn: Vec<u64>,
     pub host_player_done: bool,
     pub spawn_counter: u32,
+    /// The session's key stretching (host: chosen; client: from the CHALLENGE).
+    kdf: KdfParams,
+    /// Stretched session keys by parameters, and the one being computed.
+    keys: Vec<(KdfParams, [u8; 32])>,
+    kdf_job: Option<KdfJob>,
+    /// Host: keys the stateless handshake cookies.
+    cookie_key: [u8; 32],
+    /// Host: client nonces already accepted (a replayed JOIN is ignored).
+    seen_nonces: HashMap<[u8; 16], f64>,
+    join_bucket: Bucket,
+    legacy_bucket: Bucket,
+    /// Client: the handshake in progress.
+    hs: Option<Handshake>,
+    /// What to pin the host's identity under (trust on first use).
+    pin_target: Option<String>,
+    closed: bool,
+    /// Host: queued inputs of remote players' predicted objects.
+    pub inputs: HashMap<u128, InputQueue>,
+    /// Owner: newest authoritative state of each predicted object.
+    pub auth_in: HashMap<u128, AuthState>,
+    /// New host: owners' predicted states to continue from after a migration,
+    /// and the objects waiting for one (deadline).
+    anchors: HashMap<u128, AuthState>,
+    anchor_wait: HashMap<u128, f64>,
+    /// Owner: prediction history of each predicted object.
+    pub predictors: HashMap<u128, Predictor>,
+    /// Snapshot arrival jitter per origin peer.
+    pub jitter: HashMap<u64, JitterMeter>,
+    /// Per-object adaptive interpolation delay.
+    pub delays: HashMap<u128, AdaptiveDelay>,
+    /// How far behind remote objects render (reported to the host, used for lag compensation).
+    pub view_delay: f32,
+    /// Host: hitbox history for lag compensation (`net_sync` records it).
+    pub history: Arc<Mutex<HitHistory>>,
+    // Host migration.
+    succession: Option<Succession>,
+    succession_version: u32,
+    migration: Option<Migration>,
+    /// New host: members expected back, with their deadline.
+    reconnecting: HashMap<u64, f64>,
+    reconnect_expected: bool,
+    rejoins: u32,
+    /// Client: reliable messages for the host while there is none.
+    outbox: Vec<Vec<u8>>,
+    backlog: Vec<Backlog>,
+    resync: Option<Resync>,
+    probes: Vec<Probe>,
+    probe_until: f64,
+    /// Completed migrations (the UI shows the count).
+    migrations: u32,
+    // Duplicate suppression for messages resent across a migration.
+    mid_out: u32,
+    seen_mid: HashMap<u64, u32>,
+    // Session clock: (local time, value) at the last pump, the host's
+    // offset of the session clock over its own, and the host's as told.
+    clock_value: Option<(f64, f64)>,
+    clock_offset: f64,
+    host_clock_offset: f64,
+    /// Room owner key (host-generated, shared with members for migration).
+    room_key: Option<[u8; 32]>,
+    relay_addr: String,
+    relay_auth_sent: bool,
 }
 
 impl NetSession {
@@ -521,9 +1099,18 @@ impl NetSession {
     }
 
     pub fn host_with(port: u16, cfg: NetConfig) -> std::io::Result<Self> {
-        let t = UdpTransport::bind(port)?;
+        let mut t = UdpTransport::bind(port)?;
         tracing::info!("net: hosting on {:?}", t.local_addr());
+        let relay = if cfg.relay.trim().is_empty() { None } else { Some(parse_relay(&cfg.relay)?) };
+        if let Some(relay) = relay {
+            tracing::info!("net: opening a room on relay {relay}");
+            t = t.with_relay(relay, RelayRole::Host { code: cfg.room.clone() }, cfg.punch);
+        }
         let mut s = Self::host_on(Box::new(t), cfg);
+        if let Some(relay) = relay {
+            s.room_key = Some(random_bytes());
+            s.relay_addr = relay.to_string();
+        }
         if s.cfg.discovery {
             match UdpSocket::bind(("0.0.0.0", s.cfg.discovery_port)).and_then(|d| d.set_nonblocking(true).map(|_| d)) {
                 Ok(d) => s.discovery = Some(d),
@@ -537,8 +1124,12 @@ impl NetSession {
     pub fn host_on(transport: Box<dyn Transport>, cfg: NetConfig) -> Self {
         let mut s = Self::new(transport, cfg, true);
         s.local_peer = HOST_PEER;
+        s.host_peer = HOST_PEER;
         s.state = ConnState::Connected;
         s.peers.insert(HOST_PEER, s.cfg.player_name.clone());
+        s.peer_ids.insert(HOST_PEER, s.cfg.identity.public());
+        s.kdf = s.cfg.kdf.unwrap_or_else(|| KdfParams::for_secret(&s.cfg.secret));
+        s.kdf_job = Some(KdfJob::start(&s.cfg.secret, s.kdf));
         s.events.push(NetEvent::Connected { peer: HOST_PEER });
         s
     }
@@ -548,24 +1139,35 @@ impl NetSession {
         Self::join_with(addr, NetConfig::default())
     }
 
+    /// Join `addr`: `host:port` directly, or a room code (`ABC123` on the
+    /// configured relay, or `ABC123@relay:port`).
     pub fn join_with(addr: &str, cfg: NetConfig) -> std::io::Result<Self> {
-        let host = parse_addr(addr)?;
-        let t = UdpTransport::bind(0)?;
-        tracing::info!("net: joining {host}");
-        Ok(Self::join_on(Box::new(t), host, cfg))
+        match JoinTarget::parse(addr, &cfg.relay)? {
+            JoinTarget::Direct(host) => {
+                let t = UdpTransport::bind(0)?;
+                tracing::info!("net: joining {host}");
+                Ok(Self::join_on(Box::new(t), host, cfg))
+            }
+            JoinTarget::Room { code, relay } => {
+                tracing::info!("net: joining room {code} on relay {relay}");
+                let t = UdpTransport::bind(0)?.with_relay(relay, RelayRole::Client { code: code.clone() }, cfg.punch);
+                let mut s = Self::join_on(Box::new(t), virtual_addr(HOST_SLOT), cfg);
+                s.pin_target = Some(format!("room:{code}@{relay}"));
+                s.relay_addr = relay.to_string();
+                Ok(s)
+            }
+        }
     }
 
     pub fn join_on(transport: Box<dyn Transport>, host: SocketAddr, cfg: NetConfig) -> Self {
         let mut s = Self::new(transport, cfg, false);
-        let now = s.now();
-        s.host_addr = Some(host);
-        s.conns.insert(HOST_PEER, Conn::new(host, HOST_PEER, now));
-        s.addr_peer.insert(host, HOST_PEER);
-        s.send_hello();
+        s.pin_target = Some(host.to_string());
+        s.start_handshake(vec![host], None);
         s
     }
 
     fn new(transport: Box<dyn Transport>, cfg: NetConfig, is_host: bool) -> Self {
+        let kdf = KdfParams::for_secret(&cfg.secret);
         Self {
             transport,
             discovery: None,
@@ -573,13 +1175,13 @@ impl NetSession {
             clock: Clock::Real(Instant::now()),
             is_host,
             local_peer: 0,
+            host_peer: HOST_PEER,
+            epoch: 0,
             state: ConnState::Connecting,
-            host_addr: None,
-            started: 0.0,
-            last_hello: 0.0,
             conns: HashMap::new(),
             addr_peer: HashMap::new(),
             peers: BTreeMap::new(),
+            peer_ids: HashMap::new(),
             next_peer: 2,
             claim_seq: 0,
             xform_seq: 0,
@@ -604,10 +1206,51 @@ impl NetSession {
             players_to_spawn: Vec::new(),
             host_player_done: false,
             spawn_counter: 0,
+            kdf,
+            keys: Vec::new(),
+            kdf_job: None,
+            cookie_key: random_bytes(),
+            seen_nonces: HashMap::new(),
+            join_bucket: Bucket::new(64.0, 64.0),
+            legacy_bucket: Bucket::new(10.0, 10.0),
+            hs: None,
+            pin_target: None,
+            closed: false,
+            inputs: HashMap::new(),
+            auth_in: HashMap::new(),
+            anchors: HashMap::new(),
+            anchor_wait: HashMap::new(),
+            predictors: HashMap::new(),
+            jitter: HashMap::new(),
+            delays: HashMap::new(),
+            view_delay: 0.0,
+            history: Arc::new(Mutex::new(HitHistory::default())),
+            succession: None,
+            succession_version: 0,
+            migration: None,
+            reconnecting: HashMap::new(),
+            reconnect_expected: false,
+            rejoins: 0,
+            outbox: Vec::new(),
+            backlog: Vec::new(),
+            resync: None,
+            probes: Vec::new(),
+            probe_until: 0.0,
+            migrations: 0,
+            mid_out: 0,
+            seen_mid: HashMap::new(),
+            clock_value: None,
+            clock_offset: 0.0,
+            host_clock_offset: 0.0,
+            room_key: None,
+            relay_addr: String::new(),
+            relay_auth_sent: false,
         }
     }
 
     /// Drive time by hand (tests): `now()` only moves with [`Self::advance`].
+    /// Key stretching then finishes before the handshake goes on, so
+    /// handshakes take a fixed number of steps.
     pub fn use_manual_clock(&mut self) {
         let now = self.now();
         self.clock = Clock::Manual(now);
@@ -634,6 +1277,21 @@ impl NetSession {
     pub fn local_peer(&self) -> u64 {
         self.local_peer
     }
+    /// The current host's peer id (1 until a migration).
+    pub fn host_peer(&self) -> u64 {
+        self.host_peer
+    }
+    /// How many times the host changed hands.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+    /// The session's key-stretching parameters.
+    pub fn kdf(&self) -> KdfParams {
+        self.kdf
+    }
+    pub fn migrations(&self) -> u32 {
+        self.migrations
+    }
     pub fn state(&self) -> &ConnState {
         &self.state
     }
@@ -648,8 +1306,50 @@ impl NetSession {
         if self.is_host {
             0.0
         } else {
-            self.conns.get(&HOST_PEER).map(|c| c.rtt * 1000.0).unwrap_or(0.0)
+            self.conns.get(&self.host_peer).map(|c| c.rtt * 1000.0).unwrap_or(0.0)
         }
+    }
+
+    /// This install's player identity.
+    pub fn identity(&self) -> &Identity {
+        &self.cfg.identity
+    }
+    /// A peer's verified player id.
+    pub fn peer_identity(&self, peer: u64) -> Option<[u8; 32]> {
+        self.peer_ids.get(&peer).copied()
+    }
+    pub fn peer_fingerprint(&self, peer: u64) -> Option<String> {
+        self.peer_ids.get(&peer).map(fingerprint)
+    }
+    /// The replicated succession plan (who takes over if the host goes).
+    pub fn succession(&self) -> Option<&Succession> {
+        self.succession.as_ref()
+    }
+    /// Who would take over right now (None without a plan or migration off).
+    pub fn next_host(&self) -> Option<u64> {
+        if !self.cfg.migration {
+            return None;
+        }
+        if self.is_host {
+            return self.successors().first().map(|s| s.peer);
+        }
+        self.succession.as_ref()?.order.iter().map(|s| s.peer).find(|p| *p != self.host_peer)
+    }
+    /// Searching for a new host (None while settled).
+    pub fn migration_status(&self) -> Option<MigrationStatus> {
+        let m = self.migration.as_ref()?;
+        let target = m.candidates.get(m.index).map_or(0, |c| c.peer);
+        Some(MigrationStatus { previous: m.previous, target, relayed: m.relayed, seconds: (self.now() - m.started) as f32 })
+    }
+    /// New host: members still expected back after a migration.
+    pub fn reconnecting(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.reconnecting.keys().copied().collect();
+        v.sort();
+        v
+    }
+    /// Host: joins accepted but not yet confirmed.
+    pub fn half_open(&self) -> usize {
+        self.conns.values().filter(|c| !c.confirmed).count()
     }
 
     /// Everyone in the session, local peer included.
@@ -657,18 +1357,66 @@ impl NetSession {
         self.peers
             .iter()
             .map(|(&id, name)| {
-                let rtt = if id == self.local_peer {
-                    0.0
-                } else if self.is_host {
-                    self.conns.get(&id).map(|c| c.rtt * 1000.0).unwrap_or(0.0)
-                } else if id == HOST_PEER {
-                    self.rtt_ms()
-                } else {
-                    0.0
+                let conn = if id == self.local_peer || (!self.is_host && id != self.host_peer) { None } else { self.conns.get(&id) };
+                let identity = self.peer_ids.get(&id).copied();
+                let mut info = PeerInfo {
+                    id,
+                    name: name.clone(),
+                    is_host: id == self.host_peer,
+                    fingerprint: identity.map(|k| fingerprint(&k)).unwrap_or_default(),
+                    identity,
+                    ..Default::default()
                 };
-                PeerInfo { id, name: name.clone(), rtt_ms: rtt, is_host: id == HOST_PEER }
+                if let Some(c) = conn {
+                    let q = self.conn_quality(c);
+                    info.rtt_ms = q.rtt_ms;
+                    info.jitter_ms = q.jitter_ms;
+                    info.loss = 1.0 - (1.0 - q.loss_in) * (1.0 - q.loss_out);
+                    info.view_delay = c.view_delay;
+                }
+                info
             })
             .collect()
+    }
+
+    fn conn_quality(&self, c: &Conn) -> NetQuality {
+        NetQuality {
+            rtt_ms: c.rtt * 1000.0,
+            jitter_ms: c.rtt_var * 1000.0,
+            loss_in: c.sec.as_ref().map_or(0.0, |s| s.loss.loss),
+            loss_out: c.remote_loss,
+            relayed: self.transport.route_label(c.addr) == "relayed",
+        }
+    }
+
+    /// Connection quality to the host (zeros on the host).
+    pub fn quality(&self) -> NetQuality {
+        if self.is_host {
+            return NetQuality::default();
+        }
+        self.conns.get(&self.host_peer).map(|c| self.conn_quality(c)).unwrap_or_default()
+    }
+
+    /// Incoming loss on the link packets from `origin` arrive over (the
+    /// host's link to that client, or a client's link to the host).
+    pub fn link_loss(&self, origin: u64) -> f32 {
+        let peer = if self.is_host { origin } else { self.host_peer };
+        self.conns.get(&peer).and_then(|c| c.sec.as_ref()).map_or(0.0, |s| s.loss.loss)
+    }
+
+    /// Relay registration and routes (None without a relay).
+    pub fn relay_status(&self) -> Option<RelayStatus> {
+        self.transport.relay_status()
+    }
+
+    /// The room code peers join with, once the relay assigned it.
+    pub fn room_code(&self) -> Option<String> {
+        self.relay_status().filter(|r| r.phase == RelayPhase::Registered).map(|r| r.code)
+    }
+
+    /// "direct", "relayed" or "LAN" for a connected peer.
+    pub fn peer_route(&self, peer: u64) -> Option<&'static str> {
+        self.conns.get(&peer).map(|c| self.transport.route_label(c.addr))
     }
 
     /// Owner peer of a network id (0 = unowned).
@@ -684,7 +1432,9 @@ impl NetSession {
         self.local_peer != 0 && self.owner_of(id) == self.local_peer
     }
 
-    /// Whether the local peer simulates an object (owner, or host when unowned).
+    /// Whether the local peer simulates an object (owner, or host when
+    /// unowned). Unowned objects have no authority while the host is being
+    /// replaced.
     pub fn has_authority_raw(&self, id: u128) -> bool {
         if !self.is_connected() {
             return false;
@@ -737,6 +1487,8 @@ impl NetSession {
             connected: self.is_connected(),
             is_server: self.is_host,
             local_peer: self.local_peer,
+            host_peer: self.host_peer,
+            migrating: self.migration.is_some(),
             owners,
             messages: std::mem::take(&mut self.inbox),
             peers: self.peer_infos(),
@@ -746,6 +1498,10 @@ impl NetSession {
             remote_bodies: self.remote_bodies.clone(),
             reclaimed_bodies: std::mem::take(&mut self.reclaimed_bodies),
             rtt_ms: self.rtt_ms(),
+            quality: self.quality(),
+            clock: self.shared_clock().unwrap_or(0.0),
+            view_delay: self.view_delay,
+            rewind: self.is_host.then(|| self.history.clone()),
         }
     }
 
@@ -754,9 +1510,23 @@ impl NetSession {
         std::mem::take(&mut self.voice_in)
     }
 
+    fn forget_prediction(&mut self, id: u128) {
+        self.anchors.remove(&id);
+        self.anchor_wait.remove(&id);
+        self.inputs.remove(&id);
+        self.auth_in.remove(&id);
+        self.predictors.remove(&id);
+        self.delays.remove(&id);
+    }
+
     /// Forget all replicated world state (Play stopped in the editor).
     pub fn reset_world(&mut self) {
         self.world = NetWorld::default();
+        self.inputs.clear();
+        self.auth_in.clear();
+        self.predictors.clear();
+        self.delays.clear();
+        *self.history.lock().unwrap() = HitHistory::default();
         self.buffers.clear();
         self.anim_in.clear();
         self.avatar_in.clear();
@@ -768,7 +1538,7 @@ impl NetSession {
         self.remote_bodies.clear();
         self.reclaimed_bodies.clear();
         self.host_player_done = false;
-        self.players_to_spawn = if self.is_host { self.conns.keys().copied().collect() } else { Vec::new() };
+        self.players_to_spawn = if self.is_host { self.members() } else { Vec::new() };
     }
 
     fn push_event(&mut self, e: NetEvent) {
@@ -778,12 +1548,73 @@ impl NetSession {
         self.events.push(e);
     }
 
+    /// Host: every member's peer id.
+    fn members(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.conns.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    fn wait_for_keys(&self) -> bool {
+        matches!(self.clock, Clock::Manual(_))
+    }
+
+    /// The stretched session key for `p` (None while it is being computed).
+    fn session_key_for(&mut self, p: &KdfParams) -> Option<[u8; 32]> {
+        if let Some((_, k)) = self.keys.iter().find(|(q, _)| q == p) {
+            return Some(*k);
+        }
+        if self.kdf_job.as_ref().is_none_or(|j| j.params() != *p) {
+            self.kdf_job = Some(KdfJob::start(&self.cfg.secret, *p));
+        }
+        let wait = self.wait_for_keys();
+        let k = self.kdf_job.as_ref()?.poll(wait)?;
+        self.kdf_job = None;
+        self.keys.push((*p, k));
+        Some(k)
+    }
+
+    fn next_mid(&mut self) -> u32 {
+        self.mid_out = self.mid_out.wrapping_add(1).max(1);
+        let me = self.local_peer;
+        self.seen_mid.insert(me, self.mid_out);
+        self.mid_out
+    }
+
+    /// Whether a message id from `sender` is new (0 = no id, always new).
+    fn fresh_mid(&mut self, sender: u64, mid: u32) -> bool {
+        if mid == 0 {
+            return true;
+        }
+        let seen = self.seen_mid.entry(sender).or_insert(0);
+        if mid <= *seen {
+            return false;
+        }
+        *seen = mid;
+        true
+    }
+
     // ------------------------------------------------------------ raw send
 
-    fn send_raw(&mut self, data: &[u8], to: SocketAddr) {
+    /// A handshake datagram, in the clear.
+    fn send_clear(&mut self, data: &[u8], to: SocketAddr) {
         self.stats.bytes_out += data.len() as u64;
         self.stats.packets_out += 1;
         self.transport.send(data, to);
+    }
+
+    /// A game packet, sealed for the connection at `to` (dropped when there
+    /// is no secure channel yet; the reliable channel resends later).
+    fn send_raw(&mut self, data: &[u8], to: SocketAddr) {
+        let sealed = self
+            .addr_peer
+            .get(&to)
+            .and_then(|p| self.conns.get_mut(p))
+            .and_then(|c| c.sec.as_mut())
+            .map(|sec| sec.seal(&[P_SECURE], data));
+        if let Some(p) = sealed {
+            self.send_clear(&p, to);
+        }
     }
 
     fn send_to_peer(&mut self, peer: u64, data: &[u8]) {
@@ -792,24 +1623,334 @@ impl NetSession {
         }
     }
 
-    /// Unreliable send to everyone else (host: all clients; client: the host).
+    /// Unreliable send to everyone else (host: all members; client: the host).
     fn fanout(&mut self, data: &[u8], except: Option<u64>) {
-        let targets: Vec<SocketAddr> =
-            self.conns.values().filter(|c| Some(c.peer) != except).map(|c| c.addr).collect();
+        let targets: Vec<SocketAddr> = self.conns.values().filter(|c| Some(c.peer) != except).map(|c| c.addr).collect();
         for a in targets {
             self.send_raw(data, a);
         }
     }
 
+    // ------------------------------------------------------------ handshake (client)
+
+    fn start_handshake(&mut self, addrs: Vec<SocketAddr>, expect: Option<(u64, Option<[u8; 32]>)>) {
+        let now = self.now();
+        self.hs = Some(Handshake {
+            addrs,
+            addr: None,
+            nonce: random_bytes(),
+            started: now,
+            last_hello: f64::NEG_INFINITY,
+            expect,
+            challenge: None,
+            join: None,
+            sec: None,
+            hint: None,
+        });
+        self.send_hello();
+    }
+
+    /// HELLO (padded) until a CHALLENGE arrives, then the sealed JOIN.
     fn send_hello(&mut self) {
-        let Some(host) = self.host_addr else {
+        let now = self.now();
+        let Some(hs) = self.hs.as_mut() else {
             return;
         };
-        let mut b = vec![P_HELLO];
-        put_u16(&mut b, PROTOCOL);
-        put_str(&mut b, &self.cfg.player_name);
-        self.last_hello = self.now();
-        self.send_raw(&b, host);
+        hs.last_hello = now;
+        let out: Vec<(Vec<u8>, SocketAddr)> = match (&hs.join, hs.addr) {
+            (Some(j), Some(a)) => vec![(j.clone(), a)],
+            _ => {
+                let b = hello_packet(&hs.nonce, JOIN_MODE_JOIN);
+                hs.addrs.iter().map(|a| (b.clone(), *a)).collect()
+            }
+        };
+        for (b, a) in out {
+            self.send_clear(&b, a);
+        }
+    }
+
+    fn hint(&mut self, why: String) {
+        let now = self.now();
+        if let Some(hs) = self.hs.as_mut()
+            && hs.challenge.is_none()
+            && hs.hint.is_none()
+        {
+            tracing::debug!("net: handshake hint: {why}");
+            hs.hint = Some((why, now));
+        }
+    }
+
+    /// Client: a host's CHALLENGE (unauthenticated: its contents are bound
+    /// into the connection key, so tampering only breaks the join).
+    fn on_challenge(&mut self, data: &[u8], src: SocketAddr) {
+        let Some(hs) = self.hs.as_ref() else {
+            return;
+        };
+        if !hs.addrs.contains(&src) || hs.challenge.is_some() {
+            return;
+        }
+        let Some(ch) = parse_challenge(data, &hs.nonce) else {
+            self.stats.rejected += 1;
+            return;
+        };
+        if let Some((peer, _)) = hs.expect
+            && (ch.host_peer != peer || ch.epoch < self.epoch)
+        {
+            self.hint(format!("peer {} (epoch {}) answered instead of peer {peer} as the new host", ch.host_peer, ch.epoch));
+            return;
+        }
+        if let Err(why) = ch.kdf.acceptable_for(&self.cfg.secret) {
+            self.hint(why);
+            return;
+        }
+        if let Some(hs) = self.hs.as_mut() {
+            hs.addr = Some(src);
+            hs.challenge = Some(ch);
+        }
+        self.try_send_join();
+    }
+
+    /// Seal the JOIN once the session key for the CHALLENGE's parameters is ready.
+    fn try_send_join(&mut self) {
+        let Some(ch) = self.hs.as_ref().filter(|h| h.join.is_none()).and_then(|h| h.challenge.clone()) else {
+            return;
+        };
+        let Some(k) = self.session_key_for(&ch.kdf) else {
+            return;
+        };
+        let Some(nonce) = self.hs.as_ref().map(|h| h.nonce) else {
+            return;
+        };
+        let rejoin = self.local_peer;
+        let mut sec = SecureChannel::new(&conn_key(&k, &ch.transcript), false);
+        let mut header = vec![P_JOIN];
+        header.extend_from_slice(&nonce);
+        header.extend_from_slice(&ch.cookie);
+        header.push(JOIN_MODE_JOIN);
+        let mut plain = Vec::new();
+        put_u16(&mut plain, PROTOCOL);
+        plain.push(self.cfg.can_host as u8);
+        put_str(&mut plain, &self.cfg.player_name);
+        plain.extend_from_slice(&self.cfg.identity.public());
+        plain.extend_from_slice(&self.cfg.identity.sign(&join_message(&ch.transcript, rejoin)));
+        put_u64(&mut plain, rejoin);
+        put_u32(&mut plain, self.epoch);
+        let join = sec.seal_at(&header, 0, &plain);
+        sec.skip_to(1);
+        self.kdf = ch.kdf;
+        if let Some(hs) = self.hs.as_mut() {
+            hs.sec = Some(sec);
+            hs.join = Some(join);
+        }
+        self.send_hello();
+    }
+
+    /// Client: a clear REJECT. Signed ones (the host's identity from its
+    /// CHALLENGE) end the join; anything else is only a hint, believed if
+    /// no CHALLENGE turns up within [`REJECT_GRACE`].
+    fn on_clear_reject(&mut self, data: &[u8], src: SocketAddr) {
+        let Some(hs) = self.hs.as_ref() else {
+            return;
+        };
+        if !hs.addrs.contains(&src) {
+            return;
+        }
+        let mut c = Cursor::new(data, 1);
+        match c.u8() {
+            REJECT_SIGNED => {
+                let code = c.u8();
+                let reason = c.string();
+                let sig: [u8; 64] = c.arr();
+                let valid = !c.bad
+                    && hs.challenge.as_ref().is_some_and(|ch| {
+                        crate::net_identity::verify(&ch.host_pk, &reject_message(&hs.nonce, &ch.cookie, code, &reason), &sig)
+                    });
+                if valid {
+                    self.fail_handshake(&format!("rejected: {reason}"));
+                } else {
+                    self.stats.rejected += 1;
+                }
+            }
+            REJECT_HINT => {
+                let proto = c.u16();
+                let reason = c.string();
+                if !c.bad {
+                    self.hint(if proto != PROTOCOL {
+                        format!("the host speaks network protocol {proto}, this build speaks {PROTOCOL}: update both to the same version")
+                    } else {
+                        format!("rejected: {reason}")
+                    });
+                }
+            }
+            _ => {
+                // Older hosts send a bare reason.
+                let reason = Cursor::new(data, 1).string();
+                self.hint(format!("the host runs an older network protocol ({reason}); this build speaks {PROTOCOL}"));
+            }
+        }
+    }
+
+    /// The handshake failed for good (an authenticated refusal).
+    fn fail_handshake(&mut self, why: &str) {
+        self.hs = None;
+        if self.migration.is_some() {
+            self.migration = None;
+        }
+        self.disconnect_local(why);
+    }
+
+    /// Client: an authenticated packet from the host we are handshaking with.
+    fn on_handshake_plain(&mut self, data: &[u8]) {
+        match data.first() {
+            Some(&P_WELCOME) => self.on_welcome(data),
+            Some(&P_REJECT) => {
+                let reason = Cursor::new(data, 1).string();
+                self.fail_handshake(&format!("rejected: {reason}"));
+            }
+            _ => {}
+        }
+    }
+
+    fn on_welcome(&mut self, data: &[u8]) {
+        let mut c = Cursor::new(data, 1);
+        let id = c.u64();
+        let max = c.u32();
+        let name = c.string();
+        let host_peer = c.u64();
+        let epoch = c.u32();
+        let clock_offset = c.f64();
+        let _flags = c.u8();
+        let sig: [u8; 64] = c.arr();
+        let Some(mut hs) = self.hs.take() else {
+            return;
+        };
+        let (Some(ch), Some(addr)) = (hs.challenge.clone(), hs.addr) else {
+            self.hs = Some(hs);
+            return;
+        };
+        if c.bad || host_peer != ch.host_peer || !crate::net_identity::verify(&ch.host_pk, &welcome_message(&ch.transcript, id), &sig) {
+            self.stats.rejected += 1;
+            self.hs = Some(hs);
+            return;
+        }
+        if let Some((_, Some(known))) = hs.expect
+            && known != ch.host_pk
+        {
+            self.fail_handshake(&format!("peer {host_peer}'s identity doesn't match the one the session knows (refusing an impostor host)"));
+            return;
+        }
+        if self.cfg.pin_host
+            && self.migration.is_none()
+            && let Some(target) = self.pin_target.clone()
+            && let Err(why) = crate::net_identity::check_pin(&target, &ch.host_pk)
+        {
+            self.fail_handshake(&why);
+            return;
+        }
+        let now = self.now();
+        let mut conn = Conn::new(addr, host_peer, now);
+        conn.sec = hs.sec.take();
+        conn.transcript = ch.transcript;
+        conn.identity = ch.host_pk;
+        self.conns.insert(host_peer, conn);
+        self.addr_peer.insert(addr, host_peer);
+        self.peer_ids.insert(host_peer, ch.host_pk);
+        self.host_clock_offset = clock_offset;
+        self.cfg.max_players = max;
+        self.cfg.session_name = name;
+        self.epoch = epoch;
+        match self.migration.take() {
+            Some(m) => {
+                let previous = m.previous;
+                self.host_peer = host_peer;
+                if id != self.local_peer {
+                    // The new host didn't know us: we joined fresh.
+                    self.peers.remove(&self.local_peer);
+                    self.local_peer = id;
+                    self.peers.insert(id, self.cfg.player_name.clone());
+                }
+                self.migrations += 1;
+                self.push_event(NetEvent::HostChanged { host: host_peer, previous });
+                tracing::info!("net: peer {host_peer} is the new host (epoch {epoch})");
+                // Our reliable messages the old host may never have handled.
+                let out = std::mem::take(&mut self.outbox);
+                for m in out {
+                    self.send_reliable(host_peer, &m);
+                }
+            }
+            None => {
+                self.local_peer = id;
+                self.host_peer = host_peer;
+                self.state = ConnState::Connected;
+                self.peers.insert(id, self.cfg.player_name.clone());
+                self.push_event(NetEvent::Connected { peer: id });
+                tracing::info!("net: joined as peer {id}");
+            }
+        }
+        // Confirm the key right away (the host admits us on this).
+        let mut b = vec![P_PING];
+        put_f64(&mut b, now);
+        put_f32(&mut b, 0.0);
+        put_f32(&mut b, self.view_delay);
+        self.send_raw(&b, addr);
+    }
+
+    /// Client: handshake upkeep each pump (key stretching, HELLO resends,
+    /// relay join proofs, timeouts and hints).
+    fn handshake_tick(&mut self, now: f64) {
+        if let Some(kdf) = self.transport.relay_needs_join_key()
+            && let Some(p) = KdfParams::decode(&kdf)
+        {
+            match p.acceptable_for(&self.cfg.secret) {
+                Ok(()) => {
+                    if let Some(k) = self.session_key_for(&p) {
+                        self.transport.set_relay_join_key(relay_join_key(&k));
+                    }
+                }
+                Err(why) => {
+                    if self.migration.is_none() && self.state == ConnState::Connecting {
+                        self.disconnect_local(&format!("relay: {why}"));
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(hs) = self.hs.as_ref() else {
+            return;
+        };
+        if hs.challenge.is_some() && hs.join.is_none() {
+            self.try_send_join();
+        }
+        let Some(hs) = self.hs.as_ref() else {
+            return;
+        };
+        let hinted = hs.challenge.is_none() && hs.hint.as_ref().is_some_and(|(_, t)| now - t > REJECT_GRACE);
+        let resend = now - hs.last_hello > HELLO_INTERVAL;
+        if self.migration.is_some() {
+            if resend {
+                self.send_hello();
+            }
+            return;
+        }
+        // The first join.
+        let relay_failed = match self.transport.relay_status().map(|r| r.phase) {
+            Some(RelayPhase::Failed(why)) => Some(why),
+            _ => None,
+        };
+        let hint = hs.hint.as_ref().map(|(h, _)| h.clone());
+        let timed_out = now - hs.started > self.cfg.timeout as f64;
+        if let Some(why) = relay_failed {
+            self.hs = None;
+            self.disconnect_local(&format!("relay: {why}"));
+        } else if hinted {
+            self.hs = None;
+            self.disconnect_local(&hint.unwrap_or_default());
+        } else if timed_out {
+            self.hs = None;
+            self.disconnect_local(&hint.unwrap_or_else(|| "could not reach the host".into()));
+        } else if resend {
+            self.send_hello();
+        }
     }
 
     // ------------------------------------------------------------ reliable channel
@@ -817,6 +1958,10 @@ impl NetSession {
     fn send_reliable(&mut self, peer: u64, msg: &[u8]) {
         let now = self.now();
         let Some(c) = self.conns.get_mut(&peer) else {
+            // Between hosts: keep it for the next one.
+            if !self.is_host && self.migration.is_some() && peer == self.host_peer && self.outbox.len() < MAX_QUEUE {
+                self.outbox.push(msg.to_vec());
+            }
             return;
         };
         let addr = c.addr;
@@ -831,7 +1976,7 @@ impl NetSession {
             put_u32(&mut p, seq);
             p.push((k + 1 == n) as u8);
             p.extend_from_slice(chunk);
-            c.unacked.insert(seq, (p.clone(), now));
+            c.unacked.insert(seq, (p.clone(), now, k == 0));
             out.push(p);
         }
         for p in out {
@@ -839,20 +1984,21 @@ impl NetSession {
         }
     }
 
-    /// Reliable send to every client (host only), optionally skipping one.
+    /// Reliable send to every member (host only), optionally skipping one.
     fn broadcast_reliable(&mut self, msg: &[u8], except: Option<u64>) {
-        let peers: Vec<u64> = self.conns.keys().copied().filter(|p| Some(*p) != except).collect();
+        let peers: Vec<u64> = self.members().into_iter().filter(|p| Some(*p) != except).collect();
         for p in peers {
             self.send_reliable(p, msg);
         }
     }
 
-    /// Host: to all clients; client: to the host.
+    /// Host: to all members; client: to the host.
     fn upstream_or_broadcast(&mut self, msg: &[u8]) {
         if self.is_host {
             self.broadcast_reliable(msg, None);
         } else {
-            self.send_reliable(HOST_PEER, msg);
+            let host = self.host_peer;
+            self.send_reliable(host, msg);
         }
     }
 
@@ -884,6 +2030,9 @@ impl NetSession {
             }
         }
         for m in ready {
+            if !self.conns.contains_key(&peer) {
+                break;
+            }
             self.on_msg(peer, &m);
         }
     }
@@ -914,6 +2063,8 @@ impl NetSession {
     /// Receive + process all pending packets, resend, ping and time out. Call
     /// once per frame (also while not playing, to keep connections alive).
     pub fn pump(&mut self) {
+        let t = self.now();
+        self.transport.poll(t);
         let mut buf = [0u8; RECV_BUF];
         while let Some((len, src)) = self.transport.recv(&mut buf) {
             let data = buf[..len].to_vec();
@@ -923,13 +2074,11 @@ impl NetSession {
         }
         self.serve_discovery();
         let now = self.now();
-        if self.state == ConnState::Connecting && !self.is_host {
-            if now - self.started > self.cfg.timeout as f64 {
-                self.disconnect_local("could not reach the host");
-            } else if now - self.last_hello > HELLO_INTERVAL {
-                self.send_hello();
-            }
+        self.handshake_tick(now);
+        if self.is_host {
+            self.host_tick(now);
         }
+        self.migration_tick(now);
         // Resends, pings, timeouts.
         let mut resend = Vec::new();
         let mut ping = Vec::new();
@@ -937,7 +2086,7 @@ impl NetSession {
         let connected = self.state == ConnState::Connected;
         for c in self.conns.values_mut() {
             let rto = c.rto();
-            for (p, sent) in c.unacked.values_mut() {
+            for (p, sent, _) in c.unacked.values_mut() {
                 if now - *sent > rto {
                     *sent = now;
                     resend.push((p.clone(), c.addr));
@@ -955,16 +2104,20 @@ impl NetSession {
         for (p, a) in resend {
             self.send_raw(&p, a);
         }
+        let view_delay = self.view_delay;
         for a in ping {
+            let loss = self.addr_peer.get(&a).and_then(|p| self.conns.get(p)).and_then(|c| c.sec.as_ref()).map_or(0.0, |s| s.loss.loss);
             let mut b = vec![P_PING];
             put_f64(&mut b, now);
+            put_f32(&mut b, loss);
+            put_f32(&mut b, view_delay);
             self.send_raw(&b, a);
         }
         for p in dead {
             if self.is_host {
                 self.drop_peer(p, "timed out");
-            } else if self.state != ConnState::Connecting {
-                self.disconnect_local("connection to the host timed out");
+            } else if p == self.host_peer && self.state == ConnState::Connected {
+                self.host_lost(None, "connection to the host timed out");
             }
         }
         self.flush_acks();
@@ -979,6 +2132,7 @@ impl NetSession {
         }
         self.pending_vars.retain(|p| p.expires > now);
         self.pending_parents.retain(|p| p.2 > now);
+        self.update_clock(now);
     }
 
     fn serve_discovery(&mut self) {
@@ -1006,20 +2160,51 @@ impl NetSession {
             return;
         }
         tracing::info!("net: disconnected ({reason})");
+        self.hs = None;
+        self.migration = None;
         self.state = ConnState::Disconnected(reason.to_owned());
         self.push_event(NetEvent::Disconnected { reason: reason.to_owned() });
     }
 
-    /// Leave the session (clients) or close it (host), telling the others.
+    /// Leave the session. A host with members hands it to its successor
+    /// (with the latest state) when migration is on; otherwise, and for
+    /// clients, the others are told the peer left.
     pub fn disconnect(&mut self) {
-        let addrs: Vec<SocketAddr> = self.conns.values().map(|c| c.addr).collect();
-        for a in addrs {
-            for _ in 0..3 {
-                self.send_raw(&[P_BYE], a);
+        if self.is_host && self.cfg.migration && !self.members().is_empty() {
+            self.hand_off();
+        } else {
+            let addrs: Vec<SocketAddr> = self.conns.values().map(|c| c.addr).collect();
+            for a in addrs {
+                for _ in 0..3 {
+                    self.send_raw(&[P_BYE, BYE_LEAVE], a);
+                }
             }
         }
         self.conns.clear();
+        self.addr_peer.clear();
+        self.close_transport();
         self.disconnect_local("disconnected");
+    }
+
+    /// Host: end the session for everyone (no migration).
+    pub fn close_session(&mut self) {
+        let addrs: Vec<SocketAddr> = self.conns.values().map(|c| c.addr).collect();
+        for a in addrs {
+            for _ in 0..3 {
+                self.send_raw(&[P_BYE, BYE_CLOSED], a);
+            }
+        }
+        self.conns.clear();
+        self.addr_peer.clear();
+        self.close_transport();
+        self.disconnect_local("closed the session");
+    }
+
+    fn close_transport(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.transport.close();
+        }
     }
 
     // ------------------------------------------------------------ packet dispatch
@@ -1028,57 +2213,86 @@ impl NetSession {
         let Some(&tag) = data.first() else {
             return;
         };
-        if self.is_host && tag == P_HELLO {
-            self.on_hello(data, src);
-            return;
+        let host = self.is_host;
+        match tag {
+            P_SECURE => {
+                let now = self.now();
+                if let Some(&peer) = self.addr_peer.get(&src) {
+                    match self.conns.get_mut(&peer).and_then(|c| c.sec.as_mut()).and_then(|s| s.open(data, 1, now)) {
+                        Some(plain) => self.handle_plain(&plain, src, peer),
+                        None => self.stats.rejected += 1,
+                    }
+                    return;
+                }
+                if self.hs.as_ref().is_some_and(|h| h.addr == Some(src)) {
+                    match self.hs.as_mut().and_then(|h| h.sec.as_mut()).and_then(|s| s.open(data, 1, now)) {
+                        Some(plain) => self.on_handshake_plain(&plain),
+                        None => self.stats.rejected += 1,
+                    }
+                    return;
+                }
+                if let Some(i) = self.probes.iter().position(|p| p.addr == src) {
+                    match self.probes[i].sec.as_mut().and_then(|s| s.open(data, 1, now)) {
+                        Some(plain) => self.on_probe_ack(i, &plain),
+                        None => self.stats.rejected += 1,
+                    }
+                    return;
+                }
+                self.stats.rejected += 1;
+            }
+            P_HELLO if host => self.on_hello(data, src),
+            P_JOIN if host => self.on_join(data, src),
+            // Members trying us as the next host before we took over: they retry.
+            P_HELLO | P_JOIN => {}
+            P_CHALLENGE if self.probes.iter().any(|p| p.addr == src) => self.on_probe_challenge(data, src),
+            P_CHALLENGE if self.hs.is_some() => self.on_challenge(data, src),
+            P_REJECT if self.hs.is_some() => self.on_clear_reject(data, src),
+            _ => self.stats.rejected += 1,
         }
-        let Some(&peer) = self.addr_peer.get(&src) else {
+    }
+
+    /// An authenticated packet from `peer`.
+    fn handle_plain(&mut self, data: &[u8], src: SocketAddr, peer: u64) {
+        let Some(&tag) = data.first() else {
             return;
         };
         let now = self.now();
         if let Some(c) = self.conns.get_mut(&peer) {
             c.last_recv = now;
+            c.confirmed = true;
         }
         let mut c = Cursor::new(data, 1);
         match tag {
-            P_WELCOME if !self.is_host => {
-                let id = c.u64();
-                let max = c.u32();
-                let name = c.string();
-                if self.state == ConnState::Connecting && !c.bad {
-                    self.local_peer = id;
-                    self.cfg.max_players = max;
-                    self.cfg.session_name = name;
-                    self.state = ConnState::Connected;
-                    self.peers.insert(id, self.cfg.player_name.clone());
-                    self.push_event(NetEvent::Connected { peer: id });
-                    tracing::info!("net: joined as peer {id}");
-                }
-            }
-            P_REJECT if !self.is_host => {
-                let reason = c.string();
-                self.disconnect_local(&format!("rejected: {reason}"));
-            }
+            P_WELCOME => {}
             P_PING => {
                 let t = c.f64();
+                let their_loss = c.f32();
+                let view_delay = c.f32();
                 let mut b = vec![P_PONG];
                 put_f64(&mut b, t);
+                if let Some(conn) = self.conns.get_mut(&peer) {
+                    if !c.bad {
+                        conn.remote_loss = their_loss.clamp(0.0, 1.0);
+                        conn.view_delay = view_delay.clamp(0.0, 1.0);
+                    }
+                    put_f32(&mut b, conn.sec.as_ref().map_or(0.0, |s| s.loss.loss));
+                }
                 self.send_raw(&b, src);
             }
             P_PONG => {
                 let t = c.f64();
-                if let Some(conn) = self.conns.get_mut(&peer) {
-                    let sample = (now - t).max(0.0) as f32;
+                let their_loss = c.f32();
+                if let Some(conn) = self.conns.get_mut(&peer)
+                    && !c.bad
+                    && t <= now
+                {
+                    let sample = (now - t) as f32;
+                    conn.rtt_var = conn.rtt_var * 0.75 + (sample - conn.rtt).abs() * 0.25;
                     conn.rtt = conn.rtt * 0.8 + sample * 0.2;
+                    conn.remote_loss = their_loss.clamp(0.0, 1.0);
                 }
             }
-            P_BYE => {
-                if self.is_host {
-                    self.drop_peer(peer, "left");
-                } else {
-                    self.disconnect_local("the host closed the session");
-                }
-            }
+            P_BYE => self.on_bye(peer, data),
             P_REL => self.on_rel(peer, data),
             P_ACK => {
                 let n = c.u16() as usize;
@@ -1121,71 +2335,329 @@ impl NetSession {
                 let body = &data[1..];
                 self.on_rpc(peer, body, false);
             }
+            P_INPUT if self.is_host => self.on_input(peer, data),
+            P_PSTATE if !self.is_host && peer == self.host_peer => self.on_pstate(data),
             _ => {}
         }
     }
 
-    fn on_hello(&mut self, data: &[u8], src: SocketAddr) {
-        let now = self.now();
-        if let Some(&peer) = self.addr_peer.get(&src) {
-            // Duplicate HELLO: our WELCOME was lost.
-            if let Some(c) = self.conns.get_mut(&peer) {
-                c.last_recv = now;
-            }
-            self.send_welcome(peer, src);
-            return;
-        }
+    /// A sealed BYE: a member leaving (host side), or the host leaving,
+    /// handing off, closing or kicking us (client side).
+    fn on_bye(&mut self, peer: u64, data: &[u8]) {
         let mut c = Cursor::new(data, 1);
-        let proto = c.u16();
-        let name = c.string();
-        let reject = |s: &mut Self, why: &str| {
-            let mut b = vec![P_REJECT];
-            put_str(&mut b, why);
-            s.send_raw(&b, src);
-        };
-        if c.bad || proto != PROTOCOL {
-            reject(self, "protocol version mismatch");
+        let kind = if data.len() > 1 { c.u8() } else { BYE_CLOSED };
+        if self.is_host {
+            self.drop_peer(peer, "left");
             return;
         }
-        if self.peers.len() as u32 >= self.cfg.max_players {
-            reject(self, "session full");
+        if peer != self.host_peer {
             return;
         }
-        let peer = self.next_peer;
-        self.next_peer += 1;
-        let mut conn = Conn::new(src, peer, now);
-        conn.name = if name.is_empty() { format!("Player {peer}") } else { name };
-        let name = conn.name.clone();
-        self.conns.insert(peer, conn);
-        self.addr_peer.insert(src, peer);
-        self.send_welcome(peer, src);
-        // Tell everyone else, then bring the newcomer up to date.
-        let mut j = vec![M_JOINED];
-        put_u64(&mut j, peer);
-        put_str(&mut j, &name);
-        self.broadcast_reliable(&j, Some(peer));
-        self.peers.insert(peer, name.clone());
-        self.send_catchup(peer);
-        self.players_to_spawn.push(peer);
-        self.push_event(NetEvent::PeerJoined { id: peer, name: name.clone() });
-        tracing::info!("net: peer {peer} ({name}) joined from {src}");
+        match kind {
+            BYE_HANDOFF => {
+                let to = c.u64();
+                let n = c.u8() as usize;
+                let mut addrs = Vec::new();
+                let mut at = 1 + 1 + 8 + 1;
+                for _ in 0..n.min(4) {
+                    match relay_proto::read_addr(data, &mut at) {
+                        Some(a) => addrs.push(a),
+                        None => break,
+                    }
+                }
+                if c.bad {
+                    return;
+                }
+                self.host_lost(Some((to, addrs)), "the host left");
+            }
+            BYE_KICKED => {
+                let reason = c.string();
+                self.conns.clear();
+                self.addr_peer.clear();
+                self.disconnect_local(&if reason.is_empty() { "kicked by the host".to_string() } else { format!("kicked by the host: {reason}") });
+            }
+            BYE_LEAVE => self.host_lost(None, "the host left"),
+            _ => self.disconnect_local("the host closed the session"),
+        }
     }
 
-    fn send_welcome(&mut self, peer: u64, src: SocketAddr) {
+    // ------------------------------------------------------------ handshake (host)
+
+    fn cookie(&self, src: SocketAddr, nonce: &[u8; 16], bucket: u64) -> [u8; 16] {
+        let mut addr = Vec::with_capacity(20);
+        relay_proto::put_addr(&mut addr, src);
+        mac16(&self.cookie_key, &[b"citrus-net cookie v6", &addr, nonce, &bucket.to_le_bytes()])
+    }
+
+    fn cookie_valid(&self, src: SocketAddr, nonce: &[u8; 16], cookie: &[u8; 16]) -> bool {
+        let bucket = (self.now() / COOKIE_PERIOD) as u64;
+        [bucket, bucket.saturating_sub(1)].iter().any(|b| relay_proto::tags_equal(&self.cookie(src, nonce, *b), cookie))
+    }
+
+    /// The CHALLENGE bytes for `cookie` (deterministic, so the host can
+    /// rebuild the transcript from a JOIN without having kept anything).
+    fn challenge_bytes(&self, cookie: &[u8; 16]) -> Vec<u8> {
+        let mut b = vec![P_CHALLENGE];
+        put_u16(&mut b, PROTOCOL);
+        self.kdf.encode(&mut b);
+        b.extend_from_slice(&self.cfg.identity.public());
+        put_u32(&mut b, self.epoch);
+        put_u64(&mut b, self.local_peer);
+        b.extend_from_slice(cookie);
+        b
+    }
+
+    fn host_key(&mut self) -> Option<[u8; 32]> {
+        let p = self.kdf;
+        self.session_key_for(&p)
+    }
+
+    /// Host: answer a (padded) HELLO with a CHALLENGE no larger than it. No
+    /// state is kept: the cookie lets the JOIN prove it came back from the
+    /// same endpoint.
+    fn on_hello(&mut self, data: &[u8], src: SocketAddr) {
+        let proto = Cursor::new(data, 1).u16();
+        if data.len() < 3 {
+            return;
+        }
+        if proto != PROTOCOL {
+            let why = format!("protocol version mismatch (host {PROTOCOL}, you {proto})");
+            if data.len() < HELLO_SIZE {
+                // An older client: its own reject format, rate-limited
+                // (the only pre-auth reply that can exceed its request).
+                let now = self.now();
+                if self.legacy_bucket.take(now) {
+                    let mut b = vec![P_REJECT];
+                    put_str(&mut b, &why);
+                    self.send_clear(&b, src);
+                }
+            } else {
+                let mut b = vec![P_REJECT, REJECT_HINT];
+                put_u16(&mut b, PROTOCOL);
+                put_str(&mut b, &why);
+                b.truncate(data.len());
+                self.send_clear(&b, src);
+            }
+            return;
+        }
+        if data.len() < HELLO_SIZE {
+            self.stats.rejected += 1;
+            return;
+        }
+        let Some(nonce) = data.get(3..19).and_then(|n| <[u8; 16]>::try_from(n).ok()) else {
+            return;
+        };
+        let bucket = (self.now() / COOKIE_PERIOD) as u64;
+        let cookie = self.cookie(src, &nonce, bucket);
+        let ch = self.challenge_bytes(&cookie);
+        debug_assert!(ch.len() <= HELLO_SIZE);
+        self.send_clear(&ch, src);
+    }
+
+    /// A REJECT for a JOIN the host couldn't open, signed with its identity
+    /// (the client checks it against the CHALLENGE's key).
+    fn signed_reject(&mut self, src: SocketAddr, nonce: &[u8; 16], cookie: &[u8; 16], code: u8, reason: &str, limit: usize) {
+        let sig = self.cfg.identity.sign(&reject_message(nonce, cookie, code, reason));
+        let mut b = vec![P_REJECT, REJECT_SIGNED, code];
+        put_str(&mut b, reason);
+        b.extend_from_slice(&sig);
+        if b.len() <= limit {
+            self.send_clear(&b, src);
+        }
+    }
+
+    /// Host: a sealed JOIN. Cheap checks first (cookie, half-open cap, rate),
+    /// then opening it proves the secret and the signature the identity.
+    fn on_join(&mut self, data: &[u8], src: SocketAddr) {
+        let now = self.now();
+        let (Some(nonce), Some(cookie), Some(&mode)) = (
+            data.get(1..17).and_then(|n| <[u8; 16]>::try_from(n).ok()),
+            data.get(17..33).and_then(|n| <[u8; 16]>::try_from(n).ok()),
+            data.get(33),
+        ) else {
+            return;
+        };
+        if !self.cookie_valid(src, &nonce, &cookie) {
+            self.stats.rejected += 1;
+            return;
+        }
+        let Some(k) = self.host_key() else {
+            return; // still stretching the key: the client resends
+        };
+        let transcript = hash(&[b"citrus-net handshake v6", &nonce, &self.challenge_bytes(&cookie)]);
+        if mode == JOIN_MODE_PROBE {
+            if self.join_bucket.take(now) {
+                self.on_probe(data, src, &k, &transcript);
+            }
+            return;
+        }
+        if let Some(&peer) = self.addr_peer.get(&src) {
+            if self.conns.get(&peer).is_some_and(|c| c.client_nonce == nonce) {
+                // Duplicate JOIN: our WELCOME was lost.
+                if let Some(c) = self.conns.get_mut(&peer) {
+                    c.last_recv = now;
+                }
+                self.send_welcome(peer);
+                return;
+            }
+            // A new session from the same address: the old one is gone.
+            self.drop_peer(peer, "rejoined");
+        }
+        if self.seen_nonces.contains_key(&nonce) {
+            self.stats.rejected += 1;
+            return;
+        }
+        if self.half_open() >= MAX_HALF_OPEN {
+            self.stats.half_open_refused += 1;
+            return;
+        }
+        if !self.join_bucket.take(now) {
+            self.stats.half_open_refused += 1;
+            return;
+        }
+        let mut sec = SecureChannel::new(&conn_key(&k, &transcript), true);
+        let Some(plain) = sec.open(data, JOIN_HEADER, now) else {
+            self.stats.rejected += 1;
+            self.signed_reject(src, &nonce, &cookie, 1, "wrong session secret", data.len());
+            return;
+        };
+        let sealed_reject = |s: &mut Self, sec: &mut SecureChannel, why: &str| {
+            let mut b = vec![P_REJECT];
+            put_str(&mut b, why);
+            let p = sec.seal(&[P_SECURE], &b);
+            s.send_clear(&p, src);
+        };
+        let mut c = Cursor::new(&plain, 0);
+        let proto = c.u16();
+        let can_host = c.u8() != 0;
+        let name = c.string();
+        let pk: [u8; 32] = c.arr();
+        let sig: [u8; 64] = c.arr();
+        let rejoin = c.u64();
+        let _their_epoch = c.u32();
+        if c.bad || proto != PROTOCOL {
+            sealed_reject(self, &mut sec, &format!("protocol version mismatch (host {PROTOCOL}, you {proto})"));
+            return;
+        }
+        if !crate::net_identity::verify(&pk, &join_message(&transcript, rejoin), &sig) {
+            self.stats.rejected += 1;
+            sealed_reject(self, &mut sec, "invalid identity signature");
+            return;
+        }
+        let fp = fingerprint(&pk);
+        if self.cfg.ban.iter().any(|b| crate::net_identity::fingerprint_matches(b, &fp)) {
+            sealed_reject(self, &mut sec, "banned from this session");
+            tracing::info!("net: refused banned player {} from {src}", short_fingerprint(&fp));
+            return;
+        }
+        if !self.cfg.allow.is_empty() && !self.cfg.allow.iter().any(|a| crate::net_identity::fingerprint_matches(a, &fp)) {
+            sealed_reject(self, &mut sec, "not on this session's allow list");
+            return;
+        }
+        let rejoined = rejoin != 0 && self.reconnecting.contains_key(&rejoin) && self.peer_ids.get(&rejoin) == Some(&pk);
+        if !rejoined && self.peers.len() as u32 >= self.cfg.max_players {
+            sealed_reject(self, &mut sec, "session full");
+            return;
+        }
+        self.seen_nonces.insert(nonce, now);
+        let peer = if rejoined {
+            rejoin
+        } else {
+            let p = self.next_peer;
+            self.next_peer += 1;
+            p
+        };
+        if let Some(old) = self.conns.remove(&peer) {
+            self.addr_peer.remove(&old.addr);
+        }
+        let mut conn = Conn::new(src, peer, now);
+        conn.name = if name.is_empty() { format!("Player {peer}") } else { name };
+        conn.sec = Some(sec);
+        conn.client_nonce = nonce;
+        conn.identity = pk;
+        conn.transcript = transcript;
+        conn.confirmed = false;
+        conn.rejoined = rejoined;
+        conn.can_host = can_host;
+        self.conns.insert(peer, conn);
+        self.addr_peer.insert(src, peer);
+        self.send_welcome(peer);
+        self.admit(peer);
+    }
+
+    fn send_welcome(&mut self, peer: u64) {
+        let Some(c) = self.conns.get(&peer) else {
+            return;
+        };
+        let (addr, transcript, rejoined) = (c.addr, c.transcript, c.rejoined);
         let mut b = vec![P_WELCOME];
         put_u64(&mut b, peer);
         put_u32(&mut b, self.cfg.max_players);
         put_str(&mut b, &self.cfg.session_name);
-        self.send_raw(&b, src);
+        put_u64(&mut b, self.local_peer);
+        put_u32(&mut b, self.epoch);
+        put_f64(&mut b, self.clock_offset);
+        b.push(rejoined as u8);
+        b.extend_from_slice(&self.cfg.identity.sign(&welcome_message(&transcript, peer)));
+        self.send_raw(&b, addr);
     }
 
-    /// Everything a late joiner needs, in dependency order.
-    fn send_catchup(&mut self, peer: u64) {
+    /// Host: a joiner proved the secret and its identity: it becomes a
+    /// member (or, after a migration, a returning one) and is brought up to
+    /// date. Until its first sealed packet confirms the key it counts as a
+    /// half-open join.
+    fn admit(&mut self, peer: u64) {
+        let Some(c) = self.conns.get(&peer) else {
+            return;
+        };
+        let (name, rejoined, pk, addr) = (c.name.clone(), c.rejoined, c.identity, c.addr);
+        self.peer_ids.insert(peer, pk);
+        if rejoined {
+            self.reconnecting.remove(&peer);
+            self.rejoins += 1;
+            // Its predicted controllers wait for the owner's state (M_ANCHOR).
+            let until = self.now() + 1.0;
+            let mine: Vec<u128> =
+                self.world.owners.iter().filter(|(id, (o, _))| *o == peer && self.world.predicted.contains(*id)).map(|(id, _)| *id).collect();
+            for id in mine {
+                self.anchor_wait.insert(id, until);
+            }
+            self.send_catchup(peer, true);
+            self.send_backlog(peer);
+            tracing::info!("net: peer {peer} ({name}) is back after the host migration");
+        } else {
+            let mut j = vec![M_JOINED];
+            put_u64(&mut j, peer);
+            put_str(&mut j, &name);
+            j.extend_from_slice(&pk);
+            self.broadcast_reliable(&j, Some(peer));
+            self.peers.insert(peer, name.clone());
+            self.send_catchup(peer, false);
+            self.players_to_spawn.push(peer);
+            self.push_event(NetEvent::PeerJoined { id: peer, name: name.clone() });
+            tracing::info!(
+                "net: peer {peer} ({name}, {}) joined from {addr} ({})",
+                short_fingerprint(&fingerprint(&pk)),
+                self.transport.route_label(addr)
+            );
+        }
+        self.broadcast_succession();
+    }
+
+    /// Everything a late joiner (or, wrapped in RESYNC, a member rejoining
+    /// after a migration) needs, in dependency order.
+    fn send_catchup(&mut self, peer: u64, resync: bool) {
+        if resync {
+            let mut m = vec![M_RESYNC];
+            put_u32(&mut m, self.epoch);
+            self.send_reliable(peer, &m);
+        }
         let mut m = vec![M_PEERS];
         put_u32(&mut m, self.peers.len() as u32);
         for (id, name) in &self.peers {
             put_u64(&mut m, *id);
             put_str(&mut m, name);
+            m.extend_from_slice(&self.peer_ids.get(id).copied().unwrap_or([0; 32]));
         }
         self.send_reliable(peer, &m);
         if let Some(scene) = self.world.scene.clone() {
@@ -1218,7 +2690,7 @@ impl NetSession {
         }
         for (id, vars) in &self.world.vars {
             for (k, v) in vars {
-                msgs.push(enc_var(*id, k, v, HOST_PEER));
+                msgs.push(enc_var(*id, k, v, self.host_peer, 0));
             }
         }
         for (id, x) in &self.world.xforms {
@@ -1239,26 +2711,44 @@ impl NetSession {
             }
             msgs.push(m);
         }
+        if resync {
+            msgs.push(vec![M_RESYNC_END]);
+        }
         for m in msgs {
             self.send_reliable(peer, &m);
         }
     }
 
-    /// Host: a client left or timed out.
+    /// Host: a member left, timed out, was kicked, never finished joining
+    /// or never came back after a migration.
     fn drop_peer(&mut self, peer: u64, reason: &str) {
-        let Some(conn) = self.conns.remove(&peer) else {
+        let conn = self.conns.remove(&peer);
+        if let Some(c) = &conn {
+            self.addr_peer.remove(&c.addr);
+        }
+        let expected = self.reconnecting.remove(&peer).is_some();
+        if conn.is_none() && !expected {
             return;
-        };
-        self.addr_peer.remove(&conn.addr);
+        }
         self.peers.remove(&peer);
+        self.peer_ids.remove(&peer);
         self.players_to_spawn.retain(|p| *p != peer);
         let mut m = vec![M_LEFT];
         put_u64(&mut m, peer);
         put_str(&mut m, reason);
         self.broadcast_reliable(&m, None);
-        // Their objects: despawn the ones flagged, release the rest.
-        let owned: Vec<u128> =
-            self.world.owners.iter().filter(|(_, (o, _))| *o == peer).map(|(id, _)| *id).collect();
+        self.release_objects_of(peer);
+        self.offsets.remove(&peer);
+        self.jitter.remove(&peer);
+        self.push_event(NetEvent::PeerLeft { id: peer, reason: reason.to_owned() });
+        tracing::info!("net: peer {peer} {reason}");
+        self.broadcast_succession();
+    }
+
+    /// Host: a departed peer's objects: despawn the flagged ones and its
+    /// player object, release the rest to the host.
+    fn release_objects_of(&mut self, peer: u64) {
+        let owned: Vec<u128> = self.world.owners.iter().filter(|(_, (o, _))| *o == peer).map(|(id, _)| *id).collect();
         let player = self.world.player_obj.get(&peer).copied();
         for id in owned {
             if self.world.despawn_on_leave.contains(&id) || Some(id) == player {
@@ -1268,13 +2758,575 @@ impl NetSession {
             }
         }
         if let Some(p) = player
-            && self.world.spawns.iter().any(|s| s.id == p) {
-                self.despawn_raw(p);
-            }
+            && self.world.spawns.iter().any(|s| s.id == p)
+        {
+            self.despawn_raw(p);
+        }
         self.world.player_obj.remove(&peer);
-        self.offsets.remove(&peer);
-        self.push_event(NetEvent::PeerLeft { id: peer, reason: reason.to_owned() });
-        tracing::info!("net: peer {peer} {reason}");
+    }
+
+    /// Host: kick a member (it is told why and does not migrate).
+    pub fn kick(&mut self, peer: u64, reason: &str) {
+        if !self.is_host || peer == self.local_peer {
+            return;
+        }
+        if let Some(addr) = self.conns.get(&peer).map(|c| c.addr) {
+            let mut b = vec![P_BYE, BYE_KICKED];
+            put_str(&mut b, reason);
+            for _ in 0..3 {
+                self.send_raw(&b, addr);
+            }
+        }
+        let why = if reason.is_empty() { "kicked".to_string() } else { format!("kicked: {reason}") };
+        self.drop_peer(peer, &why);
+    }
+
+    /// Host: ban a member's player id (refused from now on) and kick it.
+    pub fn ban(&mut self, peer: u64) {
+        if let Some(fp) = self.peer_fingerprint(peer) {
+            self.ban_fingerprint(&fp);
+        }
+        self.kick(peer, "banned");
+    }
+
+    pub fn ban_fingerprint(&mut self, fp: &str) {
+        if !self.cfg.ban.iter().any(|b| crate::net_identity::fingerprint_matches(b, fp)) {
+            self.cfg.ban.push(fp.to_owned());
+            self.broadcast_succession();
+        }
+    }
+
+    pub fn unban(&mut self, fp: &str) {
+        let before = self.cfg.ban.len();
+        self.cfg.ban.retain(|b| !crate::net_identity::fingerprint_matches(b, fp));
+        if self.cfg.ban.len() != before {
+            self.broadcast_succession();
+        }
+    }
+
+    // ------------------------------------------------------------ host migration
+
+    /// Host: who takes over, in order: members in join order (lowest peer
+    /// id first), skipping ones that can't host. Every member computes the
+    /// same list from the same broadcast, so the election needs no vote.
+    fn successors(&self) -> Vec<Successor> {
+        self.members()
+            .into_iter()
+            .filter_map(|p| self.conns.get(&p))
+            .filter(|c| c.can_host)
+            .map(|c| {
+                let addrs = match crate::net_relay::slot_of(c.addr) {
+                    None => vec![c.addr],
+                    Some(_) => self.transport.direct_route(c.addr).into_iter().collect(),
+                };
+                Successor { peer: c.peer, addrs }
+            })
+            .collect()
+    }
+
+    fn current_succession(&mut self) -> Succession {
+        self.succession_version += 1;
+        let (relay, room) = match (self.room_key, self.transport.relay_status()) {
+            (Some(_), Some(r)) if r.phase == RelayPhase::Registered => (self.relay_addr.clone(), r.code),
+            _ => (String::new(), String::new()),
+        };
+        Succession {
+            version: self.succession_version,
+            epoch: self.epoch,
+            next_peer: self.next_peer,
+            spawn_counter: self.spawn_counter,
+            max_players: self.cfg.max_players,
+            clients_can_spawn: self.cfg.clients_can_spawn,
+            session_name: self.cfg.session_name.clone(),
+            room_key: if room.is_empty() { None } else { self.room_key },
+            relay,
+            room,
+            order: self.successors(),
+            ban: self.cfg.ban.clone(),
+            allow: self.cfg.allow.clone(),
+        }
+    }
+
+    /// Host: tell every member the current succession plan.
+    fn broadcast_succession(&mut self) {
+        if !self.is_host || !self.cfg.migration {
+            return;
+        }
+        let s = self.current_succession();
+        let m = enc_succession(&s);
+        self.broadcast_reliable(&m, None);
+    }
+
+    /// Graceful host quit: the successor gets the latest state, everyone is
+    /// told who takes over.
+    fn hand_off(&mut self) {
+        let order = self.successors();
+        let Some(next) = order.first().cloned() else {
+            return;
+        };
+        let s = self.current_succession();
+        let m = enc_succession(&s);
+        self.broadcast_reliable(&m, None);
+        self.send_catchup(next.peer, true);
+        self.flush_unacked_now();
+        let mut b = vec![P_BYE, BYE_HANDOFF];
+        put_u64(&mut b, next.peer);
+        b.push(next.addrs.len().min(4) as u8);
+        for a in next.addrs.iter().take(4) {
+            relay_proto::put_addr(&mut b, *a);
+        }
+        let addrs: Vec<SocketAddr> = self.conns.values().map(|c| c.addr).collect();
+        for a in addrs {
+            for _ in 0..3 {
+                self.send_raw(&b, a);
+            }
+        }
+        tracing::info!("net: handing the session to peer {}", next.peer);
+    }
+
+    /// Send every unacknowledged reliable packet once more right now.
+    fn flush_unacked_now(&mut self) {
+        let out: Vec<(Vec<u8>, SocketAddr)> =
+            self.conns.values().flat_map(|c| c.unacked.values().map(move |(p, _, _)| (p.clone(), c.addr))).collect();
+        for (p, a) in out {
+            self.send_raw(&p, a);
+        }
+    }
+
+    /// Client: the host is gone (timed out, left, or handed off to `to`).
+    /// Without a plan, or with migration off, the session ends.
+    fn host_lost(&mut self, to: Option<(u64, Vec<SocketAddr>)>, reason: &str) {
+        let previous = self.host_peer;
+        let handoff = to.is_some();
+        let plan = self.succession.clone().filter(|_| self.cfg.migration && self.state == ConnState::Connected);
+        let Some(plan) = plan else {
+            self.conns.remove(&previous);
+            self.disconnect_local(if reason == "the host left" { "the host left the session" } else { reason });
+            return;
+        };
+        let mut candidates: Vec<Successor> =
+            plan.order.iter().filter(|c| c.peer != previous && self.peers.contains_key(&c.peer)).cloned().collect();
+        if let Some((peer, addrs)) = to {
+            let mut first = candidates.iter().position(|c| c.peer == peer).map(|i| candidates.remove(i)).unwrap_or(Successor { peer, addrs: Vec::new() });
+            for a in addrs {
+                if !first.addrs.contains(&a) {
+                    first.addrs.push(a);
+                }
+            }
+            candidates.insert(0, first);
+        }
+        let others = self.peers.keys().filter(|p| **p != previous && **p != self.local_peer).count();
+        if candidates.is_empty() || (!handoff && others == 0) {
+            self.conns.remove(&previous);
+            self.disconnect_local(if handoff { "the host left and nobody can take over" } else { reason });
+            return;
+        }
+        // Reliable messages the old host may not have handled go to the new one.
+        let mut resend = self.conns.get(&previous).map(|c| c.unacked_messages()).unwrap_or_default();
+        resend.append(&mut self.outbox);
+        self.outbox = resend;
+        if let Some(c) = self.conns.remove(&previous) {
+            self.addr_peer.remove(&c.addr);
+        }
+        let now = self.now();
+        tracing::info!("net: lost the host ({reason}); successors: {:?}", candidates.iter().map(|c| c.peer).collect::<Vec<_>>());
+        self.migration = Some(Migration { previous, candidates, index: 0, relayed: false, attempt_started: None, started: now });
+        self.push_event(NetEvent::HostMigrating { previous });
+    }
+
+    /// Client: walk the successor list: promote when it's our turn, else
+    /// try the candidate directly, then through the relay, then the next.
+    fn migration_tick(&mut self, now: f64) {
+        let Some(m) = self.migration.as_ref() else {
+            return;
+        };
+        let Some(target) = m.candidates.get(m.index).cloned() else {
+            self.disconnect_local("lost the host: no successor could be reached");
+            return;
+        };
+        if target.peer == self.local_peer {
+            self.promote();
+            return;
+        }
+        let attempt = self.cfg.migrate_attempt.max(0.5) as f64;
+        let hinted = self.hs.as_ref().is_some_and(|h| h.challenge.is_none() && h.hint.as_ref().is_some_and(|(_, t)| now - t > REJECT_GRACE));
+        let expired = m.attempt_started.is_some_and(|t| now - t > attempt) || hinted;
+        if m.attempt_started.is_some() && !expired {
+            return;
+        }
+        let relayed = m.relayed;
+        let started = m.attempt_started.is_some();
+        // Next path: direct first, then the relay, then the next candidate.
+        let (relayed, advance) = match (started, relayed) {
+            (false, _) => (false, false),
+            (true, false) => (true, false),
+            (true, true) => (false, true),
+        };
+        if let Some(m) = self.migration.as_mut() {
+            if advance {
+                m.index += 1;
+            }
+            m.relayed = relayed;
+        }
+        if advance {
+            self.hs = None;
+            if let Some(m) = self.migration.as_mut() {
+                m.attempt_started = None;
+            }
+            return self.migration_tick(now);
+        }
+        let addrs: Vec<SocketAddr> = if relayed { self.relay_path().into_iter().collect() } else { target.addrs.clone() };
+        if let Some(m) = self.migration.as_mut() {
+            m.attempt_started = Some(now);
+        }
+        if addrs.is_empty() {
+            // No such path: skip it right away.
+            if let Some(m) = self.migration.as_mut() {
+                m.attempt_started = Some(now - attempt - 1.0);
+            }
+            self.hs = None;
+            return self.migration_tick(now);
+        }
+        tracing::info!("net: trying peer {} as the new host ({})", target.peer, if relayed { "relayed" } else { "direct" });
+        let known = self.peer_ids.get(&target.peer).copied();
+        self.start_handshake(addrs, Some((target.peer, known)));
+    }
+
+    /// The relay path to whoever holds the room's host slot (attaching the
+    /// relay first when this peer joined directly).
+    fn relay_path(&mut self) -> Option<SocketAddr> {
+        let plan = self.succession.clone()?;
+        if plan.room.is_empty() {
+            return None;
+        }
+        let in_room = self.transport.relay_status().is_some_and(|r| !matches!(r.phase, RelayPhase::Failed(_)) && r.code == plan.room);
+        if !in_room {
+            let relay = parse_relay(&plan.relay).ok()?;
+            if !self.transport.attach_relay(relay, RelayRole::Client { code: plan.room.clone() }, self.cfg.punch) {
+                return None;
+            }
+            self.relay_addr = plan.relay.clone();
+            let p = self.kdf;
+            if let Some(k) = self.session_key_for(&p) {
+                self.transport.set_relay_join_key(relay_join_key(&k));
+            }
+        }
+        Some(virtual_addr(HOST_SLOT))
+    }
+
+    /// Client: our turn: take over as host with the world as we have it.
+    fn promote(&mut self) {
+        let Some(m) = self.migration.take() else {
+            return;
+        };
+        let previous = m.previous;
+        let now = self.now();
+        let shared = self.shared_clock().unwrap_or(now);
+        let rank = m.index;
+        self.hs = None;
+        self.resync = None;
+        self.is_host = true;
+        self.host_peer = self.local_peer;
+        self.epoch += 1;
+        self.claim_seq = (self.epoch as u64) << 40;
+        self.clock_offset = shared - now;
+        self.clock_value = Some((now, shared));
+        let plan = self.succession.clone().unwrap_or_default();
+        let top = self.peers.keys().copied().max().unwrap_or(1);
+        self.next_peer = self.next_peer.max(plan.next_peer).max(top + 1);
+        self.spawn_counter = self.spawn_counter.max(plan.spawn_counter);
+        if plan.max_players > 0 {
+            self.cfg.max_players = plan.max_players;
+            self.cfg.session_name = plan.session_name.clone();
+            self.cfg.clients_can_spawn = plan.clients_can_spawn;
+        }
+        for b in &plan.ban {
+            if !self.cfg.ban.contains(b) {
+                self.cfg.ban.push(b.clone());
+            }
+        }
+        if self.cfg.allow.is_empty() {
+            self.cfg.allow = plan.allow.clone();
+        }
+        if plan.room_key.is_some() {
+            self.room_key = plan.room_key;
+            self.relay_addr = plan.relay.clone();
+        }
+        // The old host is gone; everyone else is expected back.
+        self.peers.remove(&previous);
+        self.peer_ids.remove(&previous);
+        self.offsets.remove(&previous);
+        self.jitter.remove(&previous);
+        // Members reach us after giving up on everyone ranked above (two
+        // paths each), some a little later than us: wait that long, plus slack.
+        let grace = now + self.cfg.timeout as f64 + self.cfg.migrate_attempt.max(0.5) as f64 * 2.0 * (rank as f64 + 1.0) + 2.0;
+        self.reconnecting = self.peers.keys().filter(|p| **p != self.local_peer).map(|p| (*p, grace)).collect();
+        self.reconnect_expected = !self.reconnecting.is_empty();
+        self.rejoins = 0;
+        // Objects the old host owned; player objects come back from the spawn flags.
+        self.world.player_obj.clear();
+        for s in &self.world.spawns {
+            if s.player {
+                self.world.player_obj.insert(s.owner, s.id);
+                self.world.despawn_on_leave.insert(s.id);
+            }
+        }
+        self.release_objects_of(previous);
+        self.players_to_spawn.clear();
+        self.host_player_done = true;
+        self.inputs.clear();
+        // Our own messages the old host never acknowledged: act on them as the host.
+        let out = std::mem::take(&mut self.outbox);
+        for msg in out {
+            self.replay_as_host(&msg);
+        }
+        // Take the relay room over (joining it first when we came in directly).
+        if let Some(seed) = self.room_key
+            && !plan.room.is_empty()
+        {
+            if self.transport.relay_status().is_none()
+                && let Ok(relay) = parse_relay(&self.relay_addr)
+                && self.transport.attach_relay(relay, RelayRole::Client { code: plan.room.clone() }, self.cfg.punch)
+            {
+                let p = self.kdf;
+                if let Some(k) = self.session_key_for(&p) {
+                    self.transport.set_relay_join_key(relay_join_key(&k));
+                }
+            }
+            self.transport.relay_claim_host(seed);
+        }
+        // Better-ranked successors we gave up on might be hosting too: check.
+        self.probes = m.candidates[..rank.min(m.candidates.len())]
+            .iter()
+            .flat_map(|c| c.addrs.iter().map(move |a| (c.peer, *a)))
+            .map(|(peer, addr)| Probe { peer, addr, nonce: random_bytes(), sec: None, join: None, last: f64::NEG_INFINITY })
+            .collect();
+        self.probe_until = grace;
+        self.migrations += 1;
+        self.push_event(NetEvent::PeerLeft { id: previous, reason: "the host left".into() });
+        self.push_event(NetEvent::HostChanged { host: self.local_peer, previous });
+        tracing::info!("net: took over as host (epoch {}), expecting {} member(s) back", self.epoch, self.reconnecting.len());
+    }
+
+    /// New host: act on a reliable message this peer had sent the old host
+    /// that it never acknowledged.
+    fn replay_as_host(&mut self, msg: &[u8]) {
+        let me = self.local_peer;
+        let mut c = Cursor::new(msg, 1);
+        match msg.first().copied() {
+            Some(M_RPC) | Some(M_TEXT) => self.backlog.push(Backlog { sender: me, msg: msg.to_vec() }),
+            Some(M_CLAIM) => {
+                let id = c.u128();
+                if !c.bad {
+                    self.handle_claim(id, me);
+                }
+            }
+            Some(M_RELEASE) => {
+                let id = c.u128();
+                if !c.bad && self.owner_of_raw(id) == me {
+                    self.grant(id, 0);
+                }
+            }
+            Some(M_TRANSFER) => {
+                let id = c.u128();
+                let to = c.u64();
+                if !c.bad && self.owner_of_raw(id) == me {
+                    self.grant(id, to);
+                }
+            }
+            // Spawns, despawns, variables, parents and activation are in our
+            // world already; returning members get them in the resync.
+            _ => {}
+        }
+    }
+
+    /// New host: replay the backlog to a member that just came back.
+    fn send_backlog(&mut self, peer: u64) {
+        let msgs: Vec<(u64, Vec<u8>)> = self.backlog.iter().map(|b| (b.sender, b.msg.clone())).collect();
+        for (sender, msg) in msgs {
+            if sender == peer {
+                continue;
+            }
+            let to_peer = match msg.first() {
+                Some(&M_RPC) => {
+                    let mut c = Cursor::new(&msg, 1);
+                    match dec_rpc(&mut c) {
+                        Some((from, _, target, obj, _, _)) => self.rpc_recipient(from, target, obj, peer),
+                        None => false,
+                    }
+                }
+                Some(&M_TEXT) => {
+                    let target = Cursor::new(&msg, 1).u64();
+                    target == 0 || target == peer
+                }
+                _ => false,
+            };
+            if to_peer {
+                self.send_reliable(peer, &msg);
+            }
+        }
+    }
+
+    /// Host upkeep: relay credentials, half-open joins, members that never
+    /// came back after a migration, the backlog and tie-break probes.
+    fn host_tick(&mut self, now: f64) {
+        // Keep the key stretching moving; the room opens once it is done.
+        let p = self.kdf;
+        let key = self.session_key_for(&p);
+        if !self.relay_auth_sent
+            && self.migrations == 0
+            && let (Some(seed), Some(k)) = (self.room_key, key)
+            && self.transport.relay_status().is_some()
+        {
+            self.transport.set_relay_host_auth(HostAuth {
+                owner_seed: seed,
+                join_key: relay_join_key(&k),
+                kdf: self.kdf.to_bytes(),
+                token: self.cfg.relay_token.clone(),
+            });
+            self.relay_auth_sent = true;
+        }
+        // Another member took the relay room while we host: take it back.
+        if let Some(seed) = self.room_key
+            && self.migrations > 0
+            && self.transport.relay_status().is_some_and(|r| matches!(&r.phase, RelayPhase::Failed(why) if why.contains("successor")))
+            && let Ok(relay) = parse_relay(&self.relay_addr)
+            && let Some(code) = self.succession.as_ref().map(|s| s.room.clone()).filter(|c| !c.is_empty())
+            && self.transport.attach_relay(relay, RelayRole::Client { code }, self.cfg.punch)
+        {
+            let p = self.kdf;
+            if let Some(k) = self.session_key_for(&p) {
+                self.transport.set_relay_join_key(relay_join_key(&k));
+            }
+            self.transport.relay_claim_host(seed);
+        }
+        let stale: Vec<u64> = self.conns.values().filter(|c| !c.confirmed && now - c.created > HALF_OPEN_TTL).map(|c| c.peer).collect();
+        for p in stale {
+            self.drop_peer(p, "did not finish joining");
+        }
+        let gone: Vec<u64> = self.reconnecting.iter().filter(|(_, t)| now > **t).map(|(p, _)| *p).collect();
+        for p in gone {
+            self.drop_peer(p, "did not come back after the host migration");
+        }
+        if self.reconnect_expected && self.reconnecting.is_empty() {
+            self.reconnect_expected = false;
+            self.backlog.clear();
+            if self.rejoins == 0 && self.members().is_empty() {
+                // Everyone else stayed with another host: we were cut off.
+                self.disconnect_local("lost the session: nobody reconnected after the host migration");
+                return;
+            }
+        }
+        self.seen_nonces.retain(|_, t| now - *t < COOKIE_PERIOD * 3.0);
+        self.probe_tick(now);
+    }
+
+    fn probe_tick(&mut self, now: f64) {
+        if self.probes.is_empty() {
+            return;
+        }
+        if now > self.probe_until {
+            self.probes.clear();
+            return;
+        }
+        let mut out = Vec::new();
+        for p in self.probes.iter_mut() {
+            if now - p.last >= PROBE_INTERVAL {
+                p.last = now;
+                out.push((p.join.clone().unwrap_or_else(|| hello_packet(&p.nonce, JOIN_MODE_PROBE)), p.addr));
+            }
+        }
+        for (b, a) in out {
+            self.send_clear(&b, a);
+        }
+    }
+
+    /// Prober: a better-ranked successor answered; prove we're a member.
+    fn on_probe_challenge(&mut self, data: &[u8], src: SocketAddr) {
+        let Some(i) = self.probes.iter().position(|p| p.addr == src && p.join.is_none()) else {
+            return;
+        };
+        let Some(ch) = parse_challenge(data, &self.probes[i].nonce) else {
+            return;
+        };
+        if ch.host_peer != self.probes[i].peer || ch.kdf != self.kdf {
+            return;
+        }
+        let p = self.kdf;
+        let Some(k) = self.session_key_for(&p) else {
+            return;
+        };
+        let mut sec = SecureChannel::new(&conn_key(&k, &ch.transcript), false);
+        let mut header = vec![P_JOIN];
+        header.extend_from_slice(&self.probes[i].nonce);
+        header.extend_from_slice(&ch.cookie);
+        header.push(JOIN_MODE_PROBE);
+        let mut plain = Vec::new();
+        put_u64(&mut plain, self.local_peer);
+        put_u32(&mut plain, self.epoch);
+        let join = sec.seal_at(&header, 0, &plain);
+        sec.skip_to(1);
+        self.probes[i].sec = Some(sec);
+        self.probes[i].join = Some(join.clone());
+        self.send_clear(&join, src);
+    }
+
+    /// Host: a member's probe (sealed under the session key): say we host.
+    fn on_probe(&mut self, data: &[u8], src: SocketAddr, k: &[u8; 32], transcript: &[u8; 32]) {
+        let now = self.now();
+        let mut sec = SecureChannel::new(&conn_key(k, transcript), true);
+        if sec.open(data, JOIN_HEADER, now).is_none() {
+            self.stats.rejected += 1;
+            return;
+        }
+        let mut b = vec![P_PROBE_ACK];
+        put_u64(&mut b, self.local_peer);
+        put_u32(&mut b, self.epoch);
+        put_u32(&mut b, self.members().len() as u32);
+        let p = sec.seal(&[P_SECURE], &b);
+        self.send_clear(&p, src);
+    }
+
+    /// Prober: a better-ranked successor is hosting: hand our members to it
+    /// and join it ourselves (the deterministic tie-break).
+    fn on_probe_ack(&mut self, i: usize, data: &[u8]) {
+        let mut c = Cursor::new(data, 1);
+        if data.first() != Some(&P_PROBE_ACK) {
+            return;
+        }
+        let host = c.u64();
+        if c.bad || host != self.probes[i].peer || !self.is_host {
+            return;
+        }
+        let addr = self.probes[i].addr;
+        self.epoch = self.epoch.saturating_sub(1);
+        tracing::info!("net: peer {host} is hosting too and ranks higher: handing over");
+        self.probes.clear();
+        let mut b = vec![P_BYE, BYE_HANDOFF];
+        put_u64(&mut b, host);
+        b.push(1);
+        relay_proto::put_addr(&mut b, addr);
+        let addrs: Vec<SocketAddr> = self.conns.values().map(|c| c.addr).collect();
+        for a in addrs {
+            for _ in 0..3 {
+                self.send_raw(&b, a);
+            }
+        }
+        self.conns.clear();
+        self.addr_peer.clear();
+        self.is_host = false;
+        self.reconnecting.clear();
+        self.reconnect_expected = false;
+        self.backlog.clear();
+        self.players_to_spawn.clear();
+        let me = self.local_peer;
+        let mut candidates = vec![Successor { peer: host, addrs: vec![addr] }];
+        if let Some(plan) = &self.succession {
+            candidates.extend(plan.order.iter().filter(|c| c.peer != host && c.peer != me).cloned());
+        }
+        let now = self.now();
+        self.migration = Some(Migration { previous: me, candidates, index: 0, relayed: false, attempt_started: None, started: now });
+        self.host_peer = me;
     }
 
     // ------------------------------------------------------------ reliable messages
@@ -1289,10 +3341,13 @@ impl NetSession {
             M_PEERS if !host => {
                 let n = c.u32();
                 let mut list = BTreeMap::new();
+                let mut ids = Vec::new();
                 for _ in 0..n.min(4096) {
                     let id = c.u64();
                     let name = c.string();
+                    let pk: [u8; 32] = c.arr();
                     list.insert(id, name);
+                    ids.push((id, pk));
                 }
                 if c.bad {
                     return;
@@ -1303,28 +3358,64 @@ impl NetSession {
                         self.push_event(NetEvent::PeerJoined { id: *id, name: name.clone() });
                     }
                 }
+                let gone: Vec<u64> = self.peers.keys().copied().filter(|id| !list.contains_key(id)).collect();
+                for id in gone {
+                    self.peer_ids.remove(&id);
+                    self.offsets.remove(&id);
+                    self.push_event(NetEvent::PeerLeft { id, reason: "left".into() });
+                }
+                for (id, pk) in ids {
+                    if pk != [0; 32] {
+                        self.peer_ids.insert(id, pk);
+                    }
+                }
                 self.peers = list;
             }
             M_JOINED if !host => {
                 let id = c.u64();
                 let name = c.string();
+                let pk: [u8; 32] = c.arr();
                 if !c.bad && id != self.local_peer {
                     self.peers.insert(id, name.clone());
+                    self.peer_ids.insert(id, pk);
                     self.push_event(NetEvent::PeerJoined { id, name });
                 }
             }
             M_LEFT if !host => {
                 let id = c.u64();
                 let reason = c.string();
-                self.peers.remove(&id);
-                self.offsets.remove(&id);
-                self.push_event(NetEvent::PeerLeft { id, reason });
+                if self.peers.remove(&id).is_some() {
+                    self.peer_ids.remove(&id);
+                    self.offsets.remove(&id);
+                    self.push_event(NetEvent::PeerLeft { id, reason });
+                }
             }
+            M_SUCCESSION if !host => {
+                if let Some(s) = dec_succession(&mut c) {
+                    self.succession = Some(s);
+                }
+            }
+            M_RESYNC if !host => {
+                let mine = self.world.spawns.iter().filter(|s| s.owner == self.local_peer).cloned().collect();
+                self.resync = Some(Resync { mine_before: mine, ..Default::default() });
+            }
+            M_RESYNC_END if !host => self.finish_resync(),
             M_OWNER if !host => {
                 let id = c.u128();
                 let owner = c.u64();
                 let seq = c.u64();
-                if !c.bad {
+                if c.bad {
+                    return;
+                }
+                if let Some(r) = self.resync.as_mut() {
+                    // The new host's view wins, whatever the sequence numbers.
+                    r.owners.insert(id);
+                    let prev = self.owner_of_raw(id);
+                    self.world.owners.insert(id, (owner, seq));
+                    if prev != owner {
+                        self.push_event(NetEvent::OwnershipChanged { object: ObjectId::from_raw(id), owner, previous: prev });
+                    }
+                } else {
                     self.set_owner_local(id, owner, seq);
                 }
             }
@@ -1367,11 +3458,23 @@ impl NetSession {
                         self.send_reliable(from, &d);
                         return;
                     }
+                    if self.world.spawns.iter().any(|s| s.id == rec.id) {
+                        return;
+                    }
                     if rec.owner != 0 {
                         rec.owner = from;
                     }
+                    rec.player = false;
                     self.forward_spawn(rec, Some(from));
                 } else {
+                    if let Some(r) = self.resync.as_mut() {
+                        r.spawns.insert(rec.id);
+                        if let Some(s) = self.world.spawns.iter_mut().find(|s| s.id == rec.id) {
+                            s.owner = rec.owner;
+                            s.player = rec.player;
+                            return;
+                        }
+                    }
                     self.apply_spawn(rec);
                 }
             }
@@ -1382,7 +3485,7 @@ impl NetSession {
                 }
                 if host {
                     let owner = self.owner_of_raw(id);
-                    if owner != from && !(owner == 0 && from == HOST_PEER) {
+                    if owner != from && !(owner == 0 && from == self.host_peer) {
                         return;
                     }
                     let mut d = vec![M_DESPAWN];
@@ -1391,22 +3494,32 @@ impl NetSession {
                 }
                 self.apply_despawn(id);
             }
-            M_VAR => {
+            M_VAR | M_VAR_SYNC => {
                 let id = c.u128();
                 let key = c.string();
                 let value = c.value();
                 let sender = c.u64();
+                let mid = c.u32();
                 if c.bad {
                     return;
                 }
                 let sender = if host { from } else { sender };
+                if !self.fresh_mid(sender, mid) {
+                    return;
+                }
                 if host {
                     let owner = self.owner_of_raw(id);
                     if owner != from && !self.world.var_anyone.contains(&id) {
                         tracing::debug!("net: dropped var write {key:?} from non-owner {from}");
                         return;
                     }
-                    self.broadcast_reliable(&enc_var(id, &key, &value, from), Some(from));
+                    if tag == M_VAR_SYNC && self.world.var(id, &key) == Some(&value) {
+                        return;
+                    }
+                    self.broadcast_reliable(&enc_var(id, &key, &value, from, mid), Some(from));
+                } else if self.resync.is_some() && self.owner_of_raw(id) == self.local_peer {
+                    // Ours: our copy is the newest; it is re-sent after the resync.
+                    return;
                 }
                 self.apply_var(id, key, value, sender);
             }
@@ -1435,18 +3548,34 @@ impl NetSession {
                 let exp = self.now() + PENDING_TTL;
                 self.pending_parents.push((id, parent, exp));
             }
+            M_ANCHOR if host => {
+                let id = c.u128();
+                let Some(auth) = m.get(17..).and_then(crate::net_predict::decode_auth) else {
+                    return;
+                };
+                if c.bad || self.owner_of_raw(id) != from {
+                    return;
+                }
+                self.anchor_wait.remove(&id);
+                self.inputs.entry(id).or_default().rebase(auth.ack);
+                self.anchors.insert(id, auth);
+            }
             M_RPC => self.on_rpc(from, &m[1..], true),
             M_TEXT => {
                 let target = c.u64();
                 let sender = c.u64();
+                let mid = c.u32();
                 let text = c.string();
                 if c.bad {
                     return;
                 }
+                // The host knows who really sent it.
+                let sender = if host { from } else { sender };
+                if !self.fresh_mid(sender, mid) {
+                    return;
+                }
                 if host {
-                    // The host knows who really sent it.
-                    let sender = from;
-                    self.route_text(target, sender, &text, Some(from));
+                    self.route_text(target, sender, mid, &text, Some(from));
                 } else {
                     self.inbox.push((sender, target != 0, text));
                 }
@@ -1462,6 +3591,9 @@ impl NetSession {
                 let Some(e) = dec_entry(&mut c) else {
                     return;
                 };
+                if self.resync.is_some() && self.has_authority_raw(e.id) {
+                    return;
+                }
                 let x = XformState {
                     pos: e.pos.unwrap_or(Vec3::ZERO),
                     rot: e.rot.unwrap_or(Quat::IDENTITY),
@@ -1493,8 +3625,63 @@ impl NetSession {
         }
     }
 
+    /// Client: the new host's world is in: drop what it doesn't know (ours
+    /// excepted: re-sent), and re-assert the variables of what we own.
+    fn finish_resync(&mut self) {
+        let Some(r) = self.resync.take() else {
+            return;
+        };
+        let me = self.local_peer;
+        let unknown: Vec<SpawnRecord> = self.world.spawns.iter().filter(|s| !r.spawns.contains(&s.id)).cloned().collect();
+        let mut reassert: Vec<u128> = Vec::new();
+        for s in unknown {
+            if s.owner == me || r.mine_before.iter().any(|m| m.id == s.id) {
+                let rec = SpawnRecord { owner: me, ..s.clone() };
+                self.world.owners.insert(rec.id, (me, 0));
+                let host = self.host_peer;
+                self.send_reliable(host, &enc_spawn(&rec));
+                reassert.push(rec.id);
+            } else {
+                self.apply_despawn(s.id);
+            }
+        }
+        let dropped: Vec<u128> = self.world.owners.keys().copied().filter(|id| !r.owners.contains(id) && !reassert.contains(id)).collect();
+        for id in dropped {
+            if let Some((prev, _)) = self.world.owners.remove(&id)
+                && prev != 0
+            {
+                self.push_event(NetEvent::OwnershipChanged { object: ObjectId::from_raw(id), owner: 0, previous: prev });
+            }
+        }
+        let owned: Vec<u128> = self.world.owners.iter().filter(|(_, (o, _))| *o == me).map(|(id, _)| *id).collect();
+        let host = self.host_peer;
+        // Predicted controllers we own: the new host continues from our state.
+        let anchors: Vec<(u128, AuthState)> =
+            self.predictors.iter().filter(|(id, _)| owned.contains(id)).filter_map(|(id, p)| p.newest().map(|a| (*id, a))).collect();
+        for (id, a) in anchors {
+            let mut m = vec![M_ANCHOR];
+            put_u128(&mut m, id);
+            crate::net_predict::encode_auth(&mut m, &a);
+            self.send_reliable(host, &m);
+        }
+        for id in owned {
+            let vars = self.world.vars.get(&id).cloned().unwrap_or_default();
+            for (k, v) in vars {
+                let mut m = enc_var(id, &k, &v, me, 0);
+                m[0] = M_VAR_SYNC;
+                self.send_reliable(host, &m);
+            }
+        }
+        tracing::info!("net: resynced with host {host}");
+    }
+
     fn clear_world_for_scene(&mut self, path: &str) {
         self.world = NetWorld { scene: Some(path.to_owned()), ..Default::default() };
+        self.inputs.clear();
+        self.auth_in.clear();
+        self.predictors.clear();
+        self.delays.clear();
+        *self.history.lock().unwrap() = HitHistory::default();
         self.buffers.clear();
         self.anim_in.clear();
         self.avatar_in.clear();
@@ -1507,7 +3694,7 @@ impl NetSession {
         self.hold_ops_until = self.now() + 0.5;
         if self.is_host {
             self.host_player_done = false;
-            self.players_to_spawn = self.conns.keys().copied().collect();
+            self.players_to_spawn = self.members();
         }
     }
 
@@ -1522,6 +3709,9 @@ impl NetSession {
         }
         self.world.owners.insert(id, (owner, seq));
         if prev != owner {
+            self.inputs.remove(&id);
+            self.auth_in.remove(&id);
+            self.predictors.remove(&id);
             self.push_event(NetEvent::OwnershipChanged { object: ObjectId::from_raw(id), owner, previous: prev });
         }
     }
@@ -1545,7 +3735,7 @@ impl NetSession {
             || match mode {
                 OwnershipMode::Takeover => true,
                 OwnershipMode::Request => cur == 0,
-                OwnershipMode::Fixed => by == HOST_PEER,
+                OwnershipMode::Fixed => by == self.host_peer,
             };
         if ok {
             self.grant(id, by);
@@ -1576,11 +3766,13 @@ impl NetSession {
             return;
         }
         if self.is_host {
-            self.handle_claim(id.raw(), HOST_PEER);
+            let me = self.local_peer;
+            self.handle_claim(id.raw(), me);
         } else {
             let mut m = vec![M_CLAIM];
             put_u128(&mut m, id.raw());
-            self.send_reliable(HOST_PEER, &m);
+            let host = self.host_peer;
+            self.send_reliable(host, &m);
         }
     }
 
@@ -1594,7 +3786,8 @@ impl NetSession {
         } else {
             let mut m = vec![M_RELEASE];
             put_u128(&mut m, id.raw());
-            self.send_reliable(HOST_PEER, &m);
+            let host = self.host_peer;
+            self.send_reliable(host, &m);
         }
     }
 
@@ -1609,7 +3802,8 @@ impl NetSession {
             let mut m = vec![M_TRANSFER];
             put_u128(&mut m, id.raw());
             put_u64(&mut m, to);
-            self.send_reliable(HOST_PEER, &m);
+            let host = self.host_peer;
+            self.send_reliable(host, &m);
         }
     }
 
@@ -1617,7 +3811,7 @@ impl NetSession {
 
     /// Replicate a spawn the local play session already applied.
     pub fn spawn(&mut self, source: NetSpawnSource, root_id: ObjectId, translation: Vec3, rotation: Quat, owner: u64) {
-        let rec = SpawnRecord { id: root_id.raw(), source, translation, rotation, owner };
+        let rec = SpawnRecord { id: root_id.raw(), source, translation, rotation, owner, player: false };
         self.record_spawn(&rec);
         if self.is_host {
             self.claim_seq += 1;
@@ -1628,15 +3822,16 @@ impl NetSession {
         } else if self.is_connected() {
             // Optimistic: the spawner simulates it until the host says otherwise.
             self.world.owners.insert(rec.id, (rec.owner, 0));
-            self.send_reliable(HOST_PEER, &enc_spawn(&rec));
+            let host = self.host_peer;
+            self.send_reliable(host, &enc_spawn(&rec));
         }
         self.push_event(NetEvent::Spawned { object: root_id, owner: rec.owner });
     }
 
-    /// Host: spawn something on every peer, the host included (player prefabs).
+    /// Host: spawn a peer's player object on every peer, the host included.
     pub fn spawn_everywhere(&mut self, source: NetSpawnSource, translation: Vec3, rotation: Quat, owner: u64) -> ObjectId {
         let id = ObjectId::new();
-        let rec = SpawnRecord { id: id.raw(), source, translation, rotation, owner };
+        let rec = SpawnRecord { id: id.raw(), source, translation, rotation, owner, player: true };
         self.forward_spawn(rec, None);
         id
     }
@@ -1711,6 +3906,7 @@ impl NetSession {
 
     fn apply_despawn(&mut self, id: u128) {
         self.world.forget(id);
+        self.forget_prediction(id);
         self.buffers.remove(&id);
         self.send_state.remove(&id);
         self.anim_in.remove(&id);
@@ -1728,7 +3924,8 @@ impl NetSession {
         self.world.set_var(raw, key, value.clone());
         if self.is_connected() {
             let local = self.local_peer;
-            self.upstream_or_broadcast(&enc_var(raw, key, &value, local));
+            let mid = self.next_mid();
+            self.upstream_or_broadcast(&enc_var(raw, key, &value, local, mid));
         }
         self.push_event(NetEvent::VarChanged { object: id, key: key.to_owned(), value, from: self.local_peer });
     }
@@ -1775,10 +3972,11 @@ impl NetSession {
     pub fn send_rpc(&mut self, object: Option<ObjectId>, name: &str, args: &[NetValue], target: RpcTarget, reliable: bool) {
         let me = self.local_peer;
         let obj = object.map(|o| o.raw()).unwrap_or(0);
-        let body = enc_rpc(me, target, obj, name, args);
+        let mid = if reliable && self.is_connected() { self.next_mid() } else { 0 };
+        let body = enc_rpc(me, mid, target, obj, name, args);
         let rpc = NetRpc { from: me, object, name: name.to_owned(), args: args.to_vec() };
         let owner = match self.owner_of_raw(obj) {
-            0 => HOST_PEER,
+            0 => self.host_peer,
             o => o,
         };
         let local = match target {
@@ -1797,7 +3995,8 @@ impl NetSession {
         if self.is_host {
             self.route_rpc(me, target, obj, &body, reliable, None);
         } else if !local || target == RpcTarget::All {
-            self.send_rpc_packet(HOST_PEER, &body, reliable);
+            let host = self.host_peer;
+            self.send_rpc_packet(host, &body, reliable);
         }
     }
 
@@ -1815,34 +4014,45 @@ impl NetSession {
         }
     }
 
-    /// Host: deliver an RPC to the clients its target names (the host itself
-    /// was handled by the caller), skipping `origin`.
+    /// Host: whether a member (not the host itself) receives an RPC.
+    fn rpc_recipient(&self, sender: u64, target: RpcTarget, obj: u128, peer: u64) -> bool {
+        if peer == sender || peer == self.local_peer {
+            return false;
+        }
+        match target {
+            RpcTarget::All | RpcTarget::Others => true,
+            RpcTarget::Server => false,
+            RpcTarget::Owner => self.owner_of_raw(obj) == peer,
+            RpcTarget::Peer(p) => p == peer,
+        }
+    }
+
+    /// Host: deliver an RPC to the members its target names (the host itself
+    /// was handled by the caller), skipping `origin`. Reliable ones are kept
+    /// for members still reconnecting after a migration.
     fn route_rpc(&mut self, sender: u64, target: RpcTarget, obj: u128, body: &[u8], reliable: bool, origin: Option<u64>) {
-        let clients: Vec<u64> = self.conns.keys().copied().collect();
-        let to: Vec<u64> = match target {
-            RpcTarget::All | RpcTarget::Others => clients.into_iter().filter(|p| *p != sender).collect(),
-            RpcTarget::Server => Vec::new(),
-            RpcTarget::Owner => match self.owner_of_raw(obj) {
-                0 | HOST_PEER => Vec::new(),
-                o if o != sender => vec![o],
-                _ => Vec::new(),
-            },
-            RpcTarget::Peer(p) if p != HOST_PEER && p != sender => vec![p],
-            RpcTarget::Peer(_) => Vec::new(),
-        };
+        let to: Vec<u64> = self.members().into_iter().filter(|p| self.rpc_recipient(sender, target, obj, *p)).collect();
         for p in to {
             if Some(p) != origin {
                 self.send_rpc_packet(p, body, reliable);
             }
         }
+        if reliable && !self.reconnecting.is_empty() {
+            let mut m = vec![M_RPC];
+            m.extend_from_slice(body);
+            self.backlog.push(Backlog { sender, msg: m });
+        }
     }
 
     fn on_rpc(&mut self, from: u64, body: &[u8], reliable: bool) {
         let mut c = Cursor::new(body, 0);
-        let Some((sender, target, obj, name, args)) = dec_rpc(&mut c) else {
+        let Some((sender, mid, target, obj, name, args)) = dec_rpc(&mut c) else {
             return;
         };
         let sender = if self.is_host { from } else { sender };
+        if reliable && !self.fresh_mid(sender, mid) {
+            return;
+        }
         let rpc = NetRpc {
             from: sender,
             object: (obj != 0).then(|| ObjectId::from_raw(obj)),
@@ -1851,15 +4061,15 @@ impl NetSession {
         };
         if self.is_host {
             let owner = match self.owner_of_raw(obj) {
-                0 => HOST_PEER,
+                0 => self.host_peer,
                 o => o,
             };
             let to_host = match target {
                 RpcTarget::All | RpcTarget::Others | RpcTarget::Server => true,
-                RpcTarget::Owner => owner == HOST_PEER,
-                RpcTarget::Peer(p) => p == HOST_PEER,
+                RpcTarget::Owner => owner == self.local_peer,
+                RpcTarget::Peer(p) => p == self.local_peer,
             };
-            let fwd = enc_rpc(sender, target, obj, &rpc.name, &rpc.args);
+            let fwd = enc_rpc(sender, mid, target, obj, &rpc.name, &rpc.args);
             self.route_rpc(sender, target, obj, &fwd, reliable, Some(from));
             if to_host {
                 self.rpcs.push(rpc);
@@ -1879,25 +4089,29 @@ impl NetSession {
             return;
         }
         let target = to.unwrap_or(0);
+        let mid = self.next_mid();
         if self.is_host {
             let me = self.local_peer;
-            self.route_text(target, me, text, None);
+            self.route_text(target, me, mid, text, None);
         } else {
             let mut m = vec![M_TEXT];
             put_u64(&mut m, target);
             put_u64(&mut m, self.local_peer);
+            put_u32(&mut m, mid);
             put_str(&mut m, text);
-            self.send_reliable(HOST_PEER, &m);
+            let host = self.host_peer;
+            self.send_reliable(host, &m);
         }
     }
 
-    fn route_text(&mut self, target: u64, sender: u64, text: &str, origin: Option<u64>) {
+    fn route_text(&mut self, target: u64, sender: u64, mid: u32, text: &str, origin: Option<u64>) {
         let mut m = vec![M_TEXT];
         put_u64(&mut m, target);
         put_u64(&mut m, sender);
+        put_u32(&mut m, mid);
         put_str(&mut m, text);
         if target == 0 {
-            let to: Vec<u64> = self.conns.keys().copied().filter(|p| *p != sender && Some(*p) != origin).collect();
+            let to: Vec<u64> = self.members().into_iter().filter(|p| *p != sender && Some(*p) != origin).collect();
             for p in to {
                 self.send_reliable(p, &m);
             }
@@ -1908,6 +4122,9 @@ impl NetSession {
             self.inbox.push((sender, true, text.to_owned()));
         } else {
             self.send_reliable(target, &m);
+        }
+        if !self.reconnecting.is_empty() {
+            self.backlog.push(Backlog { sender, msg: m });
         }
     }
 
@@ -1922,16 +4139,20 @@ impl NetSession {
         let now = self.now();
         let origin = self.local_peer;
         if self.is_host {
-            let clients: Vec<u64> = self.conns.keys().copied().collect();
-            for c in clients {
-                let list: Vec<SnapEntry> = entries.iter().copied().filter(|e| self.relevant(e.id, c)).collect();
+            for c in self.members() {
+                let list: Vec<SnapEntry> = entries
+                    .iter()
+                    .copied()
+                    .filter(|e| self.relevant(e.id, c) && !(self.world.predicted.contains(&e.id) && self.owner_of_raw(e.id) == c))
+                    .collect();
                 for p in build_snap_packets(origin, now, &list) {
                     self.send_to_peer(c, &p);
                 }
             }
         } else {
+            let host = self.host_peer;
             for p in build_snap_packets(origin, now, entries) {
-                self.send_to_peer(HOST_PEER, &p);
+                self.send_to_peer(host, &p);
             }
         }
     }
@@ -1965,10 +4186,11 @@ impl NetSession {
         }
         let origin = if self.is_host { peer } else { origin };
         if self.is_host {
-            // Only the owner may move an object.
-            entries.retain(|e| self.owner_of_raw(e.id) == peer);
+            // Only the owner may move an object, and nobody but the host a predicted one.
+            entries.retain(|e| self.owner_of_raw(e.id) == peer && !self.world.predicted.contains(&e.id));
         }
         let now = self.now();
+        self.jitter.entry(origin).or_default().on_packet(time, now);
         let sample = now - time;
         let off = self.offsets.entry(origin).or_insert(sample);
         if sample < *off {
@@ -1983,7 +4205,7 @@ impl NetSession {
             self.insert_snapshot(origin, time, e);
         }
         if self.is_host && !entries.is_empty() {
-            let clients: Vec<u64> = self.conns.keys().copied().filter(|p| *p != peer).collect();
+            let clients: Vec<u64> = self.members().into_iter().filter(|p| *p != peer).collect();
             for cl in clients {
                 let list: Vec<SnapEntry> = entries.iter().copied().filter(|e| self.relevant(e.id, cl)).collect();
                 for p in build_snap_packets(origin, time, &list) {
@@ -2190,23 +4412,140 @@ impl NetSession {
         self.fanout(&b, None);
     }
 
-    /// Render time (sender clock) for a buffered object from `origin`.
-    /// The host's clock as this peer estimates it (one-way delay corrected
-    /// with half the round trip): a time base every peer agrees on, for
-    /// things each client simulates itself, like the water. None until the
-    /// host has been heard from.
-    pub fn shared_clock(&self) -> Option<f64> {
-        if self.is_host {
-            return Some(self.now());
+    // ------------------------------------------------------------ prediction
+
+    /// Owner: send the unacknowledged input frames of a predicted object
+    /// (newest last; as many as fit one packet).
+    pub fn send_inputs(&mut self, id: u128, cmds: &[&InputCmd]) {
+        if !self.is_connected() || self.is_host || cmds.is_empty() {
+            return;
         }
-        let off = self.offsets.get(&HOST_PEER)?;
-        let rtt = self.conns.get(&HOST_PEER).map_or(0.0, |c| c.rtt as f64);
-        Some(self.now() - off + rtt * 0.5)
+        let mut b = vec![P_INPUT];
+        put_u128(&mut b, id);
+        let skip = cmds.len().saturating_sub(MAX_CMDS_PER_PACKET);
+        crate::net_predict::encode_cmds(&mut b, &cmds[skip..], MTU);
+        let host = self.host_peer;
+        self.send_to_peer(host, &b);
     }
 
+    fn on_input(&mut self, peer: u64, data: &[u8]) {
+        let mut c = Cursor::new(data, 1);
+        let id = c.u128();
+        if c.bad || self.owner_of_raw(id) != peer || !self.world.predicted.contains(&id) {
+            return;
+        }
+        let Some(cmds) = data.get(17..).and_then(crate::net_predict::decode_cmds) else {
+            return;
+        };
+        let q = self.inputs.entry(id).or_default();
+        for cmd in cmds {
+            q.push(cmd);
+        }
+    }
+
+    /// Host: the input frames of a remote player's predicted object to
+    /// simulate this frame (`frame_dt` = host time elapsed).
+    pub fn take_inputs(&mut self, id: u128, frame_dt: f32) -> Vec<InputCmd> {
+        let now = self.now();
+        if self.anchor_wait.get(&id).is_some_and(|t| now < *t) {
+            return Vec::new();
+        }
+        self.anchor_wait.remove(&id);
+        self.inputs.get_mut(&id).map(|q| q.take_ready(frame_dt, now)).unwrap_or_default()
+    }
+
+    /// Host: the authoritative state of a predicted object, to its owner.
+    pub fn send_auth(&mut self, id: u128, owner: u64, auth: &AuthState) {
+        let mut b = vec![P_PSTATE];
+        put_u128(&mut b, id);
+        crate::net_predict::encode_auth(&mut b, auth);
+        self.send_to_peer(owner, &b);
+    }
+
+    fn on_pstate(&mut self, data: &[u8]) {
+        let mut c = Cursor::new(data, 1);
+        let id = c.u128();
+        if c.bad || !self.has_authority_raw(id) {
+            return;
+        }
+        let Some(auth) = data.get(17..).and_then(crate::net_predict::decode_auth) else {
+            return;
+        };
+        if self.auth_in.get(&id).is_none_or(|a| auth.ack > a.ack) {
+            self.auth_in.insert(id, auth);
+        }
+    }
+
+    /// Owner: the newest authoritative state received for a predicted object.
+    pub fn take_auth(&mut self, id: u128) -> Option<AuthState> {
+        self.auth_in.remove(&id)
+    }
+
+    /// New host: the owner's state a predicted object continues from after a migration.
+    pub fn take_anchor(&mut self, id: u128) -> Option<AuthState> {
+        self.anchors.remove(&id)
+    }
+
+    /// Smoothed snapshot arrival jitter from `origin` (s).
+    pub fn jitter_of(&self, origin: u64) -> f32 {
+        self.jitter.get(&origin).map_or(0.0, |j| j.jitter)
+    }
+
+    /// The session clock as this peer estimates it: the host's clock (plus
+    /// the offset a migrated host carries over), one-way delay corrected
+    /// with half the round trip. A time base every peer agrees on, for
+    /// things each client simulates itself, like the water. It runs on
+    /// through a host migration and eases (at most half a frame per frame)
+    /// onto the new host's estimate, so it never jumps or runs backwards.
+    /// None until the host has been heard from.
+    pub fn shared_clock(&self) -> Option<f64> {
+        match self.clock_value {
+            Some((at, v)) => Some(v + (self.now() - at).max(0.0)),
+            None if self.is_host => Some(self.now() + self.clock_offset),
+            None => None,
+        }
+    }
+
+    fn clock_target(&self) -> Option<f64> {
+        if self.is_host {
+            return Some(self.now() + self.clock_offset);
+        }
+        let off = self.offsets.get(&self.host_peer)?;
+        let conn = self.conns.get(&self.host_peer)?;
+        Some(self.now() - off + conn.rtt as f64 * 0.5 + self.host_clock_offset)
+    }
+
+    fn update_clock(&mut self, now: f64) {
+        let target = self.clock_target();
+        self.clock_value = match (self.clock_value, target) {
+            (None, t) => t.map(|t| (now, t)),
+            (Some((at, v)), t) => {
+                let dt = (now - at).max(0.0);
+                let free = v + dt;
+                match t {
+                    Some(t) if (t - free).abs() > 1.0 => Some((now, t)),
+                    Some(t) => Some((now, free + (t - free).clamp(-0.5 * dt, 0.5 * dt))),
+                    None => Some((now, free)),
+                }
+            }
+        };
+    }
+
+    /// Render time (sender clock) for a buffered object from `origin`.
     pub fn render_time(&self, origin: u64, delay: f32) -> f64 {
         let off = self.offsets.get(&origin).copied().unwrap_or(0.0);
         self.now() - off - delay as f64
+    }
+}
+
+#[cfg(test)]
+impl NetSession {
+    /// Vanish without a word (a crashed process): nothing is sent, now or on drop.
+    pub(crate) fn crash(&mut self) {
+        self.closed = true;
+        self.conns.clear();
+        self.addr_peer.clear();
+        self.state = ConnState::Disconnected("crashed".into());
     }
 }
 
@@ -2215,10 +4554,15 @@ impl Drop for NetSession {
         if self.is_connected() {
             self.disconnect();
         }
+        self.close_transport();
     }
 }
 
 // ------------------------------------------------------------------ sampling
+
+/// How long Interpolate mode keeps extrapolating when the buffer runs dry
+/// (lost or late snapshots) before holding the newest pose.
+pub const LOSS_EXTRAPOLATION: f64 = 0.1;
 
 /// Transform at `render_time` from a snapshot buffer.
 pub fn sample_snapshots(buf: &SnapBuffer, render_time: f64, mode: InterpolationMode) -> Option<Snap> {
@@ -2227,11 +4571,23 @@ pub fn sample_snapshots(buf: &SnapBuffer, render_time: f64, mode: InterpolationM
         return Some(newest);
     }
     if render_time >= newest.time {
+        let ahead = render_time - newest.time;
         if mode == InterpolationMode::Extrapolate {
-            let ahead = (render_time - newest.time).min(0.25) as f32;
+            let ahead = ahead.min(0.25) as f32;
             return Some(Snap { pos: newest.pos + newest.vel * ahead, ..newest });
         }
-        return Some(newest);
+        // Starved: carry on briefly at the last known velocity (sent, or
+        // from the last two snapshots; a stopped object sends a rest
+        // snapshot, so it does not drift).
+        let vel = if newest.vel != Vec3::ZERO {
+            newest.vel
+        } else {
+            let prev = buf.snaps[buf.snaps.len() - 2];
+            let span = (newest.time - prev.time) as f32;
+            if span > 1e-4 { (newest.pos - prev.pos) / span } else { Vec3::ZERO }
+        };
+        let ahead = ahead.min(LOSS_EXTRAPOLATION) as f32;
+        return Some(Snap { pos: newest.pos + vel * ahead, ..newest });
     }
     let oldest = buf.snaps[0];
     if render_time <= oldest.time {
@@ -2364,6 +4720,7 @@ fn enc_spawn(s: &SpawnRecord) -> Vec<u8> {
     put_vec3(&mut m, s.translation);
     put_quat(&mut m, s.rotation);
     put_u64(&mut m, s.owner);
+    m.push(s.player as u8);
     m
 }
 
@@ -2376,21 +4733,26 @@ fn dec_spawn(c: &mut Cursor) -> Option<SpawnRecord> {
     let translation = c.vec3();
     let rotation = c.quat();
     let owner = c.u64();
-    (!c.bad).then_some(SpawnRecord { id, source, translation, rotation, owner })
+    let player = c.u8() & 1 != 0;
+    (!c.bad).then_some(SpawnRecord { id, source, translation, rotation, owner, player })
 }
 
-fn enc_var(id: u128, key: &str, v: &NetValue, from: u64) -> Vec<u8> {
+/// `mid`: the sender's message id (0 = none), so copies resent across a
+/// host migration are recognized.
+fn enc_var(id: u128, key: &str, v: &NetValue, from: u64, mid: u32) -> Vec<u8> {
     let mut m = vec![M_VAR];
     put_u128(&mut m, id);
     put_str(&mut m, key);
     put_value(&mut m, v);
     put_u64(&mut m, from);
+    put_u32(&mut m, mid);
     m
 }
 
-fn enc_rpc(from: u64, target: RpcTarget, obj: u128, name: &str, args: &[NetValue]) -> Vec<u8> {
+fn enc_rpc(from: u64, mid: u32, target: RpcTarget, obj: u128, name: &str, args: &[NetValue]) -> Vec<u8> {
     let mut b = Vec::new();
     put_u64(&mut b, from);
+    put_u32(&mut b, mid);
     match target {
         RpcTarget::All => b.push(0),
         RpcTarget::Others => b.push(1),
@@ -2410,10 +4772,11 @@ fn enc_rpc(from: u64, target: RpcTarget, obj: u128, name: &str, args: &[NetValue
     b
 }
 
-type RpcParts = (u64, RpcTarget, u128, String, Vec<NetValue>);
+type RpcParts = (u64, u32, RpcTarget, u128, String, Vec<NetValue>);
 
 fn dec_rpc(c: &mut Cursor) -> Option<RpcParts> {
     let from = c.u64();
+    let mid = c.u32();
     let target = match c.u8() {
         0 => RpcTarget::All,
         1 => RpcTarget::Others,
@@ -2428,7 +4791,138 @@ fn dec_rpc(c: &mut Cursor) -> Option<RpcParts> {
     for _ in 0..n {
         args.push(c.value());
     }
-    (!c.bad).then_some((from, target, obj, name, args))
+    (!c.bad).then_some((from, mid, target, obj, name, args))
+}
+
+/// A padded HELLO: protocol, client nonce, mode.
+fn hello_packet(nonce: &[u8; 16], mode: u8) -> Vec<u8> {
+    let mut b = vec![P_HELLO];
+    put_u16(&mut b, PROTOCOL);
+    b.extend_from_slice(nonce);
+    b.push(mode);
+    b.resize(HELLO_SIZE, 0);
+    b
+}
+
+/// A CHALLENGE, with the transcript the connection key binds.
+fn parse_challenge(data: &[u8], nonce: &[u8; 16]) -> Option<Challenge> {
+    let mut c = Cursor::new(data, 1);
+    if c.u16() != PROTOCOL {
+        return None;
+    }
+    let kdf = KdfParams::decode(c.take(crate::net_secure::KDF_BYTES))?;
+    let host_pk: [u8; 32] = c.arr();
+    let epoch = c.u32();
+    let host_peer = c.u64();
+    let cookie: [u8; 16] = c.arr();
+    if c.bad {
+        return None;
+    }
+    let transcript = hash(&[b"citrus-net handshake v6", nonce, data]);
+    Some(Challenge { kdf, host_pk, epoch, host_peer, cookie, transcript })
+}
+
+fn join_message(transcript: &[u8; 32], rejoin: u64) -> Vec<u8> {
+    let mut m = b"citrus-net join v6".to_vec();
+    m.extend_from_slice(transcript);
+    m.extend_from_slice(&rejoin.to_le_bytes());
+    m
+}
+
+fn welcome_message(transcript: &[u8; 32], peer: u64) -> Vec<u8> {
+    let mut m = b"citrus-net welcome v6".to_vec();
+    m.extend_from_slice(transcript);
+    m.extend_from_slice(&peer.to_le_bytes());
+    m
+}
+
+fn reject_message(nonce: &[u8; 16], cookie: &[u8; 16], code: u8, reason: &str) -> Vec<u8> {
+    let mut m = b"citrus-net reject v6".to_vec();
+    m.extend_from_slice(nonce);
+    m.extend_from_slice(cookie);
+    m.push(code);
+    m.extend_from_slice(reason.as_bytes());
+    m
+}
+
+fn enc_succession(s: &Succession) -> Vec<u8> {
+    let mut m = vec![M_SUCCESSION];
+    put_u32(&mut m, s.version);
+    put_u32(&mut m, s.epoch);
+    put_u64(&mut m, s.next_peer);
+    put_u32(&mut m, s.spawn_counter);
+    put_u32(&mut m, s.max_players);
+    m.push(s.clients_can_spawn as u8);
+    put_str(&mut m, &s.session_name);
+    put_str(&mut m, &s.relay);
+    put_str(&mut m, &s.room);
+    match &s.room_key {
+        Some(k) => {
+            m.push(1);
+            m.extend_from_slice(k);
+        }
+        None => m.push(0),
+    }
+    put_u16(&mut m, s.order.len().min(4096) as u16);
+    for c in s.order.iter().take(4096) {
+        put_u64(&mut m, c.peer);
+        m.push(c.addrs.len().min(4) as u8);
+        for a in c.addrs.iter().take(4) {
+            relay_proto::put_addr(&mut m, *a);
+        }
+    }
+    for list in [&s.ban, &s.allow] {
+        put_u16(&mut m, list.len().min(4096) as u16);
+        for f in list.iter().take(4096) {
+            put_str(&mut m, f);
+        }
+    }
+    m
+}
+
+fn dec_succession(c: &mut Cursor) -> Option<Succession> {
+    let mut s = Succession {
+        version: c.u32(),
+        epoch: c.u32(),
+        next_peer: c.u64(),
+        spawn_counter: c.u32(),
+        max_players: c.u32(),
+        clients_can_spawn: c.u8() != 0,
+        session_name: c.string(),
+        relay: c.string(),
+        room: c.string(),
+        ..Default::default()
+    };
+    if c.u8() == 1 {
+        s.room_key = Some(c.arr());
+    }
+    let n = c.u16();
+    for _ in 0..n {
+        let peer = c.u64();
+        let k = c.u8();
+        let mut addrs = Vec::new();
+        for _ in 0..k {
+            let mut at = c.p;
+            match relay_proto::read_addr(c.d, &mut at) {
+                Some(a) => {
+                    c.p = at;
+                    addrs.push(a);
+                }
+                None => {
+                    c.bad = true;
+                    break;
+                }
+            }
+        }
+        s.order.push(Successor { peer, addrs });
+    }
+    for list in [&mut s.ban, &mut s.allow] {
+        let n = c.u16();
+        for _ in 0..n {
+            list.push(c.string());
+        }
+    }
+    (!c.bad).then_some(s)
 }
 
 const E_POS: u8 = 1;
@@ -2778,7 +5272,7 @@ mod tests {
     const DT: f64 = 1.0 / 60.0;
 
     fn cfg(name: &str) -> NetConfig {
-        NetConfig { player_name: name.to_string(), discovery: false, ..Default::default() }
+        NetConfig { player_name: name.to_string(), discovery: false, secret: String::new(), relay: String::new(), punch: true, ..Default::default() }
     }
 
     fn host(hub: &MemHub) -> NetSession {
@@ -3055,8 +5549,20 @@ mod tests {
         assert!((mid.pos.x - 2.5).abs() < 1e-4);
         let ahead = sample_snapshots(&buf, 0.45, InterpolationMode::Extrapolate).unwrap();
         assert!((ahead.pos.x - 4.5).abs() < 1e-3);
-        let held = sample_snapshots(&buf, 0.45, InterpolationMode::Interpolate).unwrap();
-        assert_eq!(held.pos.x, 4.0);
+        // Starved Interpolate extrapolates briefly, then holds.
+        let brief = sample_snapshots(&buf, 0.45, InterpolationMode::Interpolate).unwrap();
+        assert!((brief.pos.x - 4.5).abs() < 1e-3);
+        let held = sample_snapshots(&buf, 0.9, InterpolationMode::Interpolate).unwrap();
+        assert!((held.pos.x - 5.0).abs() < 1e-3, "capped at LOSS_EXTRAPOLATION");
+        // Without sent velocities the last two snapshots give it; a rest
+        // snapshot (same position) stops it.
+        for s in buf.snaps.iter_mut() {
+            s.vel = Vec3::ZERO;
+        }
+        let est = sample_snapshots(&buf, 0.45, InterpolationMode::Interpolate).unwrap();
+        assert!((est.pos.x - 4.5).abs() < 1e-3);
+        buf.snaps.push_back(Snap { time: 0.5, pos: Vec3::X * 4.0, rot: Quat::IDENTITY, scale: Vec3::ONE, vel: Vec3::ZERO });
+        assert_eq!(sample_snapshots(&buf, 0.6, InterpolationMode::Interpolate).unwrap().pos.x, 4.0);
 
         let many: Vec<SnapEntry> = (0..200).map(|i| SnapEntry { id: i, ..e }).collect();
         let packets = build_snap_packets(1, 0.0, &many);
@@ -3093,6 +5599,182 @@ mod tests {
     }
 
     #[test]
+    fn join_secret_gates_the_session_and_forged_packets_are_dropped() {
+        let hub = MemHub::new();
+        let mut h = NetSession::host_on(Box::new(hub.endpoint()), NetConfig { secret: "open sesame".into(), ..cfg("Host") });
+        h.use_manual_clock();
+        let join = |secret: &str, name: &str| {
+            let mut c = NetSession::join_on(Box::new(hub.endpoint()), h.local_addr().unwrap(), NetConfig { secret: secret.into(), ..cfg(name) });
+            c.use_manual_clock();
+            c
+        };
+        let mut bad = join("open sesame?", "Mallory");
+        let mut good = join("open sesame", "Alice");
+        step(&mut [&mut h, &mut bad, &mut good], 20);
+        assert!(matches!(bad.state(), ConnState::Disconnected(r) if r.contains("wrong session secret")), "{:?}", bad.state());
+        assert!(good.is_connected());
+        assert_eq!(h.peer_count(), 2, "only the peer with the secret joined");
+
+        // Stray, forged and replayed datagrams change nothing.
+        let mut evil = hub.endpoint();
+        let host_addr = h.local_addr().unwrap();
+        let rejected = h.stats.rejected;
+        evil.send(&[P_SECURE, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25], host_addr);
+        evil.send(&[P_REL, 0, 0, 0, 0, 1, M_TEXT], host_addr);
+        evil.send(&[P_BYE], host_addr);
+        let mut buf = [0u8; 64];
+        let _ = evil.recv(&mut buf);
+        step(&mut [&mut h, &mut good], 5);
+        assert!(h.stats.rejected >= rejected + 3);
+        assert!(good.is_connected() && h.peer_count() == 2);
+        // A captured sealed packet replayed from the same address is a duplicate.
+        good.send_message(None, "once");
+        let sealed = {
+            let mut hb = hub.inner.lock().unwrap();
+            let q = hb.queues.get_mut(&host_addr).unwrap();
+            let (d, from, at) = q.back().cloned().unwrap();
+            q.push_back((d, from, at));
+            from
+        };
+        assert_eq!(sealed, good.local_addr().unwrap());
+        step(&mut [&mut h, &mut good], 5);
+        let texts: Vec<String> = h.view().messages.into_iter().map(|m| m.2).collect();
+        assert_eq!(texts, vec!["once".to_string()], "the replayed copy was dropped");
+    }
+
+    #[test]
+    fn rtt_jitter_and_loss_are_measured_both_ways() {
+        let hub = MemHub::new();
+        let mut h = host(&hub);
+        let mut a = client(&hub, &h, "A");
+        hub.set_latency(0.04, 0.0);
+        for _ in 0..60 {
+            hub.advance(DT);
+            step(&mut [&mut h, &mut a], 1);
+        }
+        assert!(a.is_connected());
+        hub.set_loss(0.1);
+        for k in 0..900 {
+            hub.advance(DT);
+            step(&mut [&mut h, &mut a], 1);
+            // Steady unreliable traffic both ways.
+            let id = ObjectId::from_raw(k as u128 + 1);
+            a.send_snapshot(&[SnapEntry { id: id.raw(), pos: Some(Vec3::X), ..Default::default() }]);
+            h.send_snapshot(&[SnapEntry { id: id.raw(), pos: Some(Vec3::Y), ..Default::default() }]);
+        }
+        let q = a.quality();
+        assert!((q.rtt_ms - 80.0).abs() < 25.0, "rtt {q:?}");
+        assert!(q.loss_in > 0.04 && q.loss_in < 0.2, "incoming loss {q:?}");
+        assert!(q.loss_out > 0.04 && q.loss_out < 0.2, "outgoing loss reported back {q:?}");
+        let v = a.view();
+        assert!((v.rtt_ms - q.rtt_ms).abs() < 1e-3 && v.quality == q, "exposed to gameplay");
+        let host_view = h.peer_infos().into_iter().find(|p| p.id == 2).unwrap();
+        assert!(host_view.rtt_ms > 40.0 && host_view.loss > 0.05, "{host_view:?}");
+    }
+
+    #[test]
+    fn join_targets_parse() {
+        let r = parse_relay("127.0.0.1").unwrap();
+        assert_eq!(r.port(), relay_proto::DEFAULT_PORT);
+        assert_eq!(JoinTarget::parse("10.0.0.2:9000", "").unwrap(), JoinTarget::Direct("10.0.0.2:9000".parse().unwrap()));
+        assert_eq!(
+            JoinTarget::parse("abc-234", "127.0.0.1:5000").unwrap(),
+            JoinTarget::Room { code: "ABC234".into(), relay: "127.0.0.1:5000".parse().unwrap() }
+        );
+        assert_eq!(
+            JoinTarget::parse("XYZ789@127.0.0.1", "").unwrap(),
+            JoinTarget::Room { code: "XYZ789".into(), relay: "127.0.0.1:47800".parse().unwrap() }
+        );
+        assert!(JoinTarget::parse("ABC234", "").is_err(), "a room code needs a relay");
+    }
+
+    fn pump_with_relay(relay: &mut citrus_relay::Relay, all: &mut [&mut NetSession], until: impl Fn(&[&mut NetSession]) -> bool) -> bool {
+        for _ in 0..1500 {
+            relay.poll();
+            for s in all.iter_mut() {
+                s.pump();
+            }
+            if until(all) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
+    fn relay_session(punch: bool) -> (citrus_relay::Relay, NetSession, NetSession) {
+        let mut relay = citrus_relay::Relay::bind("127.0.0.1:0", citrus_relay::RelayConfig::default()).expect("relay");
+        let ra = relay.local_addr().unwrap().to_string();
+        let net_cfg = |name: &str| NetConfig { relay: ra.clone(), punch, secret: "s3cret".into(), ..cfg(name) };
+        let mut host = NetSession::host_with(0, net_cfg("Host")).expect("host");
+        assert!(pump_with_relay(&mut relay, &mut [&mut host], |s| s[0].room_code().is_some()), "the relay assigned a room");
+        let code = host.room_code().unwrap();
+        assert_eq!(code.len(), 6);
+        let mut client = NetSession::join_with(&code.to_lowercase(), net_cfg("Client")).expect("join by code");
+        assert!(pump_with_relay(&mut relay, &mut [&mut host, &mut client], |s| s[1].is_connected()), "joined through the relay");
+        (relay, host, client)
+    }
+
+    // In-process relay over UDP loopback, punching off: everything is relayed.
+    #[test]
+    fn relay_forwards_a_session_by_room_code() {
+        let (mut relay, mut host, mut client) = relay_session(false);
+        assert_eq!(client.local_peer(), 2);
+        assert_eq!(host.peer_route(2), Some("relayed"));
+        assert_eq!(client.peer_route(HOST_PEER), Some("relayed"));
+        client.send_message(None, "via relay");
+        host.send_message(None, "back");
+        let mut got_host = false;
+        let mut got_client = false;
+        for _ in 0..500 {
+            relay.poll();
+            host.pump();
+            client.pump();
+            got_host |= host.view().messages.iter().any(|m| m.2 == "via relay");
+            got_client |= client.view().messages.iter().any(|m| m.2 == "back");
+            if got_host && got_client {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(got_host && got_client, "chat crossed the relay both ways");
+        assert!(relay.stats().packets_relayed > 4 && client.quality().relayed);
+        // A wrong secret is refused end to end, through the relay.
+        let ra = relay.local_addr().unwrap().to_string();
+        let code = host.room_code().unwrap();
+        let mut intruder = NetSession::join_with(&format!("{code}@{ra}"), NetConfig { relay: String::new(), secret: "guess".into(), ..cfg("X") }).unwrap();
+        assert!(pump_with_relay(&mut relay, &mut [&mut host, &mut client, &mut intruder], |s| matches!(s[2].state(), ConnState::Disconnected(_))));
+        assert_eq!(host.peer_count(), 2);
+    }
+
+    // Loopback always punches through: the route upgrades to direct and the
+    // session keeps working.
+    #[test]
+    fn hole_punch_upgrades_to_a_direct_path() {
+        let (mut relay, mut host, mut client) = relay_session(true);
+        assert!(
+            pump_with_relay(&mut relay, &mut [&mut host, &mut client], |s| s[0].peer_route(2) == Some("direct") && s[1].peer_route(HOST_PEER) == Some("direct")),
+            "both sides went direct"
+        );
+        let relayed_before = relay.stats().packets_relayed;
+        client.send_message(None, "direct");
+        let mut got = false;
+        for _ in 0..300 {
+            relay.poll();
+            host.pump();
+            client.pump();
+            if host.view().messages.iter().any(|m| m.2 == "direct") {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(got);
+        assert!(relay.stats().packets_relayed - relayed_before < 4, "traffic left the relay");
+        assert!(!client.quality().relayed);
+    }
+
+    #[test]
     fn lan_discovery_finds_host() {
         let port = 47000 + (std::process::id() % 900) as u16;
         let mut host = NetSession::host_with(0, NetConfig { session_name: "Lan Test".into(), discovery_port: port, ..cfg("Host") })
@@ -3111,5 +5793,521 @@ mod tests {
             }
         }
         assert!(found || host.discovery.is_none(), "discovery answered");
+    }
+
+    // ------------------------------------------------------------ host migration
+
+    /// Short timeouts so migrations happen in a few simulated seconds.
+    fn mcfg(name: &str) -> NetConfig {
+        NetConfig { timeout: 2.0, migrate_attempt: 1.0, identity: Identity::generate(), ..cfg(name) }
+    }
+
+    fn mhost(hub: &MemHub) -> NetSession {
+        let mut h = NetSession::host_on(Box::new(hub.endpoint()), mcfg("Host"));
+        h.use_manual_clock();
+        h
+    }
+
+    fn mjoin(hub: &MemHub, addr: SocketAddr, cfg: NetConfig) -> NetSession {
+        let mut c = NetSession::join_on(Box::new(hub.endpoint()), addr, cfg);
+        c.use_manual_clock();
+        c
+    }
+
+    /// Step everyone (and the hub's clock); whoever hosts keeps sending a
+    /// snapshot of `obj`, so clients can estimate its clock.
+    fn mstep(hub: &MemHub, all: &mut [&mut NetSession], obj: u128, frames: usize) {
+        for _ in 0..frames {
+            hub.advance(DT);
+            for s in all.iter_mut() {
+                s.advance(DT);
+                s.pump();
+                if s.is_host() && s.is_connected() {
+                    s.send_snapshot(&[SnapEntry { id: obj, pos: Some(Vec3::X), ..Default::default() }]);
+                }
+            }
+        }
+    }
+
+    fn names(s: &NetSession) -> Vec<String> {
+        s.peer_infos().into_iter().map(|p| p.name).collect()
+    }
+
+    /// The host crashes with three clients: the first in line takes over,
+    /// the others reconnect to it, ownership, spawns and variables carry on,
+    /// unowned objects move to the new host, the shared (water) clock never
+    /// jumps, gameplay gets the events, and the new host serves normally.
+    #[test]
+    fn host_crash_hands_the_session_to_the_next_in_line() {
+        let hub = MemHub::new();
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let mut b = mjoin(&hub, ha, mcfg("Bob"));
+        let mut c = mjoin(&hub, ha, mcfg("Cy"));
+        let clock = ObjectId::new().raw();
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c], clock, 20);
+        assert_eq!((a.local_peer(), b.local_peer(), c.local_peer()), (2, 3, 4));
+        let bobs = ObjectId::new();
+        b.request_ownership(bobs);
+        let crate_ = ObjectId::new();
+        h.spawn(NetSpawnSource::Prefab("prefabs/crate.prefab".into()), crate_, Vec3::ZERO, Quat::IDENTITY, 0);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c], clock, 10);
+        b.set_var(bobs, "hp", NetValue::Int(80));
+        h.set_var(crate_, "loot", NetValue::Int(3));
+        b.send_message(None, "before");
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c], clock, 10);
+        assert_eq!(b.next_host(), Some(2), "everyone knows who is next");
+        assert_eq!(h.next_host(), Some(2));
+        for s in [&mut a, &mut b, &mut c] {
+            events(s);
+        }
+        let mut prev: Vec<f64> = [&a, &b, &c].iter().map(|s| s.shared_clock().expect("host clock known")).collect();
+        h.crash();
+        hub.cut(ha);
+        // In flight when the host died: these reach everyone exactly once,
+        // through the new host.
+        b.send_message(None, "during");
+        b.set_var(bobs, "hp", NetValue::Int(70));
+        a.send_message(None, "from ann");
+        for frame in 0..(6.0 / DT) as usize {
+            mstep(&hub, &mut [&mut a, &mut b, &mut c], clock, 1);
+            for (k, s) in [&a, &b, &c].iter().enumerate() {
+                let t = s.shared_clock().expect("the clock runs on");
+                let d = t - prev[k];
+                assert!((DT * 0.49..=DT * 1.51).contains(&d), "peer {k}: clock step {d} at frame {frame}");
+                prev[k] = t;
+            }
+        }
+        assert!(a.is_host() && a.host_peer() == 2 && a.epoch() == 1, "Ann took over");
+        assert!(a.reconnecting().is_empty(), "everyone came back");
+        for s in [&b, &c] {
+            assert!(s.is_connected() && !s.is_host() && s.host_peer() == 2 && s.epoch() == 1);
+            assert!(s.quality().rtt_ms > 0.0);
+        }
+        for s in [&a, &b, &c] {
+            assert_eq!(names(s), vec!["Ann", "Bob", "Cy"], "same player list, same peer ids");
+            assert_eq!(s.owner_of(bobs), 3, "ownership kept");
+            assert_eq!(s.owner_of(crate_), 0);
+            assert_eq!(s.world.var(crate_.raw(), "loot"), Some(&NetValue::Int(3)));
+            assert!(s.world.spawns.iter().any(|sp| sp.id == crate_.raw()));
+        }
+        assert!(a.has_authority_raw(crate_.raw()) && !b.has_authority_raw(crate_.raw()), "unowned objects follow the host");
+        let ev = events(&mut b);
+        assert!(ev.iter().any(|e| matches!(e, NetEvent::HostMigrating { previous: 1 })));
+        assert!(ev.iter().any(|e| matches!(e, NetEvent::HostChanged { host: 2, previous: 1 })));
+        assert!(ev.iter().any(|e| matches!(e, NetEvent::PeerLeft { id: 1, .. })));
+        let v = a.view();
+        assert!(v.events.iter().any(|e| matches!(e, NetEvent::HostChanged { host: 2, .. })) && v.is_server && v.host_peer == 2);
+        let (ta, tb) = (a.shared_clock().unwrap(), b.shared_clock().unwrap());
+        assert!((ta - tb).abs() < 0.05, "clocks agree: {ta} vs {tb}");
+        let heard: Vec<String> = c.view().messages.into_iter().map(|m| m.2).collect();
+        assert_eq!(heard.iter().filter(|m| *m == "during").count(), 1, "resent once: {heard:?}");
+        assert_eq!(heard.iter().filter(|m| *m == "from ann").count(), 1, "the new host's own unsent message: {heard:?}");
+        assert!(!heard.iter().any(|m| m == "before"), "nothing delivered twice: {heard:?}");
+        for s in [&a, &c] {
+            assert_eq!(s.world.var(bobs.raw(), "hp"), Some(&NetValue::Int(70)), "the in-flight write landed");
+        }
+        // The new host serves: ownership requests, variables, chat.
+        c.request_ownership(crate_);
+        mstep(&hub, &mut [&mut a, &mut b, &mut c], clock, 10);
+        assert_eq!(b.owner_of(crate_), 4);
+        c.set_var(crate_, "loot", NetValue::Int(1));
+        b.send_message(None, "still here");
+        mstep(&hub, &mut [&mut a, &mut b, &mut c], clock, 10);
+        assert!(c.view().messages.iter().any(|m| m.2 == "still here"));
+        assert_eq!(b.world.var(crate_.raw(), "loot"), Some(&NetValue::Int(1)));
+    }
+
+    /// A host that quits hands off at once (no timeout) with its latest
+    /// state; its own player object goes, the others' stay theirs.
+    #[test]
+    fn graceful_handoff_moves_the_session_at_once() {
+        let hub = MemHub::new();
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let mut b = mjoin(&hub, ha, mcfg("Bob"));
+        let clock = ObjectId::new().raw();
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], clock, 20);
+        let mine = h.spawn_everywhere(NetSpawnSource::Prefab("prefabs/player.prefab".into()), Vec3::ZERO, Quat::IDENTITY, 1);
+        let anns = h.spawn_everywhere(NetSpawnSource::Prefab("prefabs/player.prefab".into()), Vec3::X, Quat::IDENTITY, 2);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], clock, 10);
+        // Written in the host's last frame: the handoff carries it.
+        h.set_var(anns, "score", NetValue::Int(5));
+        h.disconnect();
+        drop(h);
+        mstep(&hub, &mut [&mut a, &mut b], clock, 30);
+        assert!(a.is_host() && b.is_connected() && b.host_peer() == 2, "half a second, no timeout: {:?}", b.state());
+        for s in [&a, &b] {
+            assert!(s.world.spawns.iter().all(|sp| sp.id != mine.raw()), "the old host's player is gone");
+            assert!(s.world.spawns.iter().any(|sp| sp.id == anns.raw() && sp.player && sp.owner == 2));
+            assert_eq!(s.world.var(anns.raw(), "score"), Some(&NetValue::Int(5)));
+            assert_eq!(names(s), vec!["Ann", "Bob"]);
+        }
+        // The new host still despawns a leaving player's object.
+        assert_eq!(a.world.player_obj.get(&2), Some(&anns.raw()));
+    }
+
+    /// The host and its first successor die together: the next in line
+    /// takes over; then that one dies too and the next after it hosts.
+    #[test]
+    fn when_the_successor_fails_too_the_next_in_line_hosts() {
+        let hub = MemHub::new();
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let mut b = mjoin(&hub, ha, mcfg("Bob"));
+        let mut c = mjoin(&hub, ha, mcfg("Cy"));
+        let mut d = mjoin(&hub, ha, mcfg("Di"));
+        let clock = ObjectId::new().raw();
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c, &mut d], clock, 20);
+        let item = ObjectId::new();
+        d.request_ownership(item);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c, &mut d], clock, 10);
+        h.crash();
+        a.crash();
+        hub.cut(ha);
+        hub.cut(a.local_addr().unwrap());
+        mstep(&hub, &mut [&mut b, &mut c, &mut d], clock, (12.0 / DT) as usize);
+        assert!(b.is_host() && b.host_peer() == 3);
+        for s in [&c, &d] {
+            assert!(s.is_connected() && s.host_peer() == 3, "{:?}", s.state());
+        }
+        assert_eq!(names(&c), vec!["Bob", "Cy", "Di"], "Ann never came back");
+        assert_eq!(c.owner_of(item), 5);
+        // Bob dies after taking over: Cy is next.
+        b.crash();
+        hub.cut(b.local_addr().unwrap());
+        mstep(&hub, &mut [&mut c, &mut d], clock, (6.0 / DT) as usize);
+        assert!(c.is_host() && c.epoch() == 2);
+        assert!(d.is_connected() && d.host_peer() == 4 && d.owner_of(item) == 5);
+    }
+
+    /// A partition makes two members take over at once; once they can see
+    /// each other, the lower-ranked one hands its members to the
+    /// higher-ranked one and joins it (deterministic tie-break).
+    #[test]
+    fn two_promoted_hosts_settle_on_the_better_ranked_one() {
+        let hub = MemHub::new();
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let mut b = mjoin(&hub, ha, mcfg("Bob"));
+        let mut c = mjoin(&hub, ha, mcfg("Cy"));
+        let mut d = mjoin(&hub, ha, mcfg("Di"));
+        let clock = ObjectId::new().raw();
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c, &mut d], clock, 20);
+        let (aa, ba, da) = (a.local_addr().unwrap(), b.local_addr().unwrap(), d.local_addr().unwrap());
+        h.crash();
+        hub.cut(ha);
+        hub.cut_link(ba, aa);
+        hub.cut_link(da, aa);
+        mstep(&hub, &mut [&mut a, &mut b, &mut c, &mut d], clock, (5.0 / DT) as usize);
+        assert!(a.is_host() && b.is_host(), "split: both took over");
+        assert_eq!((c.host_peer(), d.host_peer()), (2, 3));
+        hub.heal();
+        hub.cut(ha);
+        mstep(&hub, &mut [&mut a, &mut b, &mut c, &mut d], clock, (5.0 / DT) as usize);
+        assert!(a.is_host() && !b.is_host(), "Bob stepped down for Ann");
+        for s in [&b, &c, &d] {
+            assert!(s.is_connected() && s.host_peer() == 2, "{:?}", s.state());
+        }
+        assert!(a.reconnecting().is_empty());
+        assert_eq!(names(&d), vec!["Ann", "Bob", "Cy", "Di"]);
+    }
+
+    /// Someone joining while the host is being replaced gets in once the
+    /// successor took over, with a fresh peer id and the whole world.
+    #[test]
+    fn a_late_joiner_during_a_migration_joins_the_new_host() {
+        let hub = MemHub::new();
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let mut b = mjoin(&hub, ha, mcfg("Bob"));
+        let clock = ObjectId::new().raw();
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], clock, 20);
+        let item = ObjectId::new();
+        h.spawn(NetSpawnSource::Prefab("prefabs/crate.prefab".into()), item, Vec3::ZERO, Quat::IDENTITY, 0);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], clock, 10);
+        h.crash();
+        hub.cut(ha);
+        let mut late = mjoin(&hub, a.local_addr().unwrap(), NetConfig { timeout: 10.0, ..mcfg("Late") });
+        mstep(&hub, &mut [&mut a, &mut b, &mut late], clock, (5.0 / DT) as usize);
+        assert!(a.is_host());
+        assert!(late.is_connected() && late.local_peer() == 4, "fresh id after everyone known: {}", late.local_peer());
+        assert_eq!(names(&late), vec!["Ann", "Bob", "Late"]);
+        assert!(late.world.spawns.iter().any(|s| s.id == item.raw()), "full world");
+        assert_eq!(names(&b), vec!["Ann", "Bob", "Late"]);
+    }
+
+    // ------------------------------------------------------------ security
+
+    /// Forged rejections during the join, and forged BYEs / kicks / rejects
+    /// afterwards (spoofed as the host), change nothing; a real kick works
+    /// and doesn't start a migration.
+    #[test]
+    fn forged_rejects_and_kicks_are_ignored() {
+        let hub = MemHub::new();
+        hub.set_latency(0.05, 0.0);
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, mcfg("Ann"));
+        let mut b = mjoin(&hub, ha, mcfg("Bob"));
+        let aa = a.local_addr().unwrap();
+        let mut hint = vec![P_REJECT, REJECT_HINT];
+        put_u16(&mut hint, PROTOCOL);
+        put_str(&mut hint, "go away");
+        let mut signed = vec![P_REJECT, REJECT_SIGNED, 1];
+        put_str(&mut signed, "wrong session secret");
+        signed.extend_from_slice(&[7u8; 64]);
+        hub.inject(ha, aa, &hint);
+        hub.inject(ha, aa, &signed);
+        hub.inject(ha, aa, &[P_REJECT, 4, 0, b'n', b'o', b'p', b'e']);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], 0, 30);
+        assert!(a.is_connected(), "forged rejections didn't stop the join: {:?}", a.state());
+        let rejected = a.stats.rejected;
+        let mut kick = vec![P_BYE, BYE_KICKED];
+        put_str(&mut kick, "forged");
+        hub.inject(ha, aa, &kick);
+        hub.inject(ha, aa, &[P_BYE]);
+        hub.inject(ha, aa, &signed);
+        let mut fake = vec![P_SECURE];
+        fake.extend_from_slice(&[0u8; 40]);
+        hub.inject(ha, aa, &fake);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], 0, 30);
+        assert!(a.is_connected() && h.peer_count() == 3);
+        assert!(a.stats.rejected >= rejected + 4, "{} -> {}", rejected, a.stats.rejected);
+        h.kick(2, "bye");
+        mstep(&hub, &mut [&mut h, &mut a, &mut b], 0, 30);
+        assert!(matches!(a.state(), ConnState::Disconnected(r) if r.contains("kicked by the host: bye")), "{:?}", a.state());
+        assert!(a.migration_status().is_none(), "a kicked client doesn't look for a new host");
+        assert!(b.is_connected() && h.peer_count() == 2);
+    }
+
+    /// Passphrases go through Argon2id with the host's parameters (carried
+    /// in the CHALLENGE); a wrong one is refused with a signed REJECT; a
+    /// host offering weak stretching for a passphrase is refused by the
+    /// client; generated secrets skip stretching.
+    #[test]
+    fn passphrases_are_stretched_with_the_hosts_argon2_parameters() {
+        use crate::net_secure::MIN_M_KIB;
+        let hub = MemHub::new();
+        let params = KdfParams { mode: KdfMode::Stretched, m_kib: MIN_M_KIB, passes: 2, ..KdfParams::for_secret("correct horse") };
+        let host_with = |secret: &str, kdf: Option<KdfParams>| {
+            let mut h = NetSession::host_on(Box::new(hub.endpoint()), NetConfig { secret: secret.into(), kdf, ..mcfg("Host") });
+            h.use_manual_clock();
+            h
+        };
+        let mut h = host_with("correct horse", Some(params));
+        let ha = h.local_addr().unwrap();
+        let mut good = mjoin(&hub, ha, NetConfig { secret: "correct horse".into(), ..mcfg("Good") });
+        let mut bad = mjoin(&hub, ha, NetConfig { secret: "correct horse!".into(), ..mcfg("Bad") });
+        mstep(&hub, &mut [&mut h, &mut good, &mut bad], 0, 30);
+        assert!(good.is_connected());
+        assert_eq!(good.kdf(), params, "the client used exactly the host's Argon2id parameters and salt");
+        assert!(matches!(bad.state(), ConnState::Disconnected(r) if r.contains("wrong session secret")), "{:?}", bad.state());
+        assert_eq!(h.peer_count(), 2);
+
+        let weak = KdfParams { m_kib: 1024, passes: 1, ..params };
+        let mut h2 = host_with("pass phrase", Some(weak));
+        let mut c2 = mjoin(&hub, h2.local_addr().unwrap(), NetConfig { secret: "pass phrase".into(), ..mcfg("C2") });
+        mstep(&hub, &mut [&mut h2, &mut c2], 0, (3.0 / DT) as usize);
+        assert!(matches!(c2.state(), ConnState::Disconnected(r) if r.contains("weak key stretching")), "{:?}", c2.state());
+
+        let g = generate_secret();
+        let mut h3 = host_with(&g, None);
+        let mut c3 = mjoin(&hub, h3.local_addr().unwrap(), NetConfig { secret: g.clone(), ..mcfg("C3") });
+        mstep(&hub, &mut [&mut h3, &mut c3], 0, 20);
+        assert!(c3.is_connected() && c3.kdf().mode == KdfMode::Random);
+    }
+
+    /// The host learns every player's verified id; clients see them too;
+    /// bans kick and keep a player out, allow lists keep everyone else
+    /// out, and a new host after a migration keeps enforcing the bans.
+    #[test]
+    fn player_ids_are_verified_and_ban_and_allow_lists_enforced() {
+        let hub = MemHub::new();
+        let (ann, bob) = (Identity::generate(), Identity::generate());
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut a = mjoin(&hub, ha, NetConfig { identity: ann.clone(), ..mcfg("Ann") });
+        let mut b = mjoin(&hub, ha, NetConfig { identity: bob.clone(), ..mcfg("Bob") });
+        let mut c = mjoin(&hub, ha, mcfg("Cy"));
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c], 0, 20);
+        assert_eq!(h.peer_identity(2), Some(ann.public()));
+        assert_eq!(h.peer_fingerprint(3), Some(bob.fingerprint()));
+        let seen = c.peer_infos().into_iter().find(|p| p.id == 3).unwrap();
+        assert_eq!(seen.fingerprint, bob.fingerprint(), "clients learn the verified ids");
+        assert_eq!(seen.identity, Some(bob.public()));
+        h.ban(3);
+        mstep(&hub, &mut [&mut h, &mut a, &mut b, &mut c], 0, 20);
+        assert!(matches!(b.state(), ConnState::Disconnected(r) if r.contains("banned")), "{:?}", b.state());
+        let mut again = mjoin(&hub, ha, NetConfig { identity: bob.clone(), ..mcfg("Bob again") });
+        mstep(&hub, &mut [&mut h, &mut a, &mut c, &mut again], 0, 20);
+        assert!(matches!(again.state(), ConnState::Disconnected(r) if r.contains("banned from this session")), "{:?}", again.state());
+        // The ban travels with the succession plan.
+        h.crash();
+        hub.cut(ha);
+        mstep(&hub, &mut [&mut a, &mut c], 0, (5.0 / DT) as usize);
+        assert!(a.is_host() && c.host_peer() == 2);
+        let mut third = mjoin(&hub, a.local_addr().unwrap(), NetConfig { identity: bob.clone(), ..mcfg("Bob 3") });
+        mstep(&hub, &mut [&mut a, &mut c, &mut third], 0, 20);
+        assert!(matches!(third.state(), ConnState::Disconnected(r) if r.contains("banned")), "{:?}", third.state());
+        // Allow list: only listed ids get in.
+        let mut h2 = NetSession::host_on(Box::new(hub.endpoint()), NetConfig { allow: vec![ann.fingerprint()], ..mcfg("Host 2") });
+        h2.use_manual_clock();
+        let h2a = h2.local_addr().unwrap();
+        let mut a2 = mjoin(&hub, h2a, NetConfig { identity: ann.clone(), ..mcfg("Ann") });
+        let mut b2 = mjoin(&hub, h2a, NetConfig { identity: bob.clone(), ..mcfg("Bob") });
+        mstep(&hub, &mut [&mut h2, &mut a2, &mut b2], 0, 20);
+        assert!(a2.is_connected());
+        assert!(matches!(b2.state(), ConnState::Disconnected(r) if r.contains("allow list")), "{:?}", b2.state());
+    }
+
+    /// HELLOs leave no state and get replies no larger than themselves;
+    /// JOINs with a made-up cookie are dropped silently; joins that never
+    /// confirm are capped and expire.
+    #[test]
+    fn handshakes_keep_no_state_until_a_valid_join_and_half_open_joins_are_capped() {
+        let hub = MemHub::new();
+        let mut h = NetSession::host_on(Box::new(hub.endpoint()), NetConfig { max_players: 200, ..mcfg("Host") });
+        h.use_manual_clock();
+        let ha = h.local_addr().unwrap();
+        let mut probe = hub.endpoint();
+        let hello = hello_packet(&[1; 16], JOIN_MODE_JOIN);
+        for _ in 0..50 {
+            probe.send(&hello, ha);
+        }
+        let mut short = vec![P_HELLO];
+        put_u16(&mut short, PROTOCOL);
+        probe.send(&short, ha);
+        h.advance(DT);
+        h.pump();
+        let mut buf = [0u8; 2048];
+        let mut replies = 0;
+        while let Some((len, _)) = probe.recv(&mut buf) {
+            assert!(len <= hello.len(), "reply {len} > request {}", hello.len());
+            assert_eq!(buf[0], P_CHALLENGE);
+            replies += 1;
+        }
+        assert_eq!(replies, 50, "the unpadded HELLO got nothing");
+        assert_eq!((h.peer_count(), h.half_open()), (1, 0), "no state for HELLOs");
+        let mut join = vec![P_JOIN];
+        join.extend_from_slice(&[1; 16]);
+        join.extend_from_slice(&[9; 16]);
+        join.push(JOIN_MODE_JOIN);
+        join.extend_from_slice(&[0; 80]);
+        let rejected = h.stats.rejected;
+        probe.send(&join, ha);
+        h.advance(DT);
+        h.pump();
+        assert!(probe.recv(&mut buf).is_none() && h.stats.rejected == rejected + 1, "bad cookie: dropped, no reply");
+        // Joiners that never confirm their key: only MAX_HALF_OPEN are held.
+        let mut ghosts: Vec<NetSession> = (0..40).map(|k| mjoin(&hub, ha, mcfg(&format!("g{k}")))).collect();
+        h.advance(DT);
+        h.pump();
+        for g in ghosts.iter_mut() {
+            g.advance(DT);
+            g.pump();
+        }
+        h.advance(DT);
+        h.pump();
+        assert_eq!(h.half_open(), MAX_HALF_OPEN);
+        assert!(h.stats.half_open_refused >= 8);
+        for _ in 0..(6.0 / DT) as usize {
+            h.advance(DT);
+            h.pump();
+        }
+        assert_eq!((h.half_open(), h.peer_count()), (0, 1), "they expired");
+        drop(ghosts);
+        let mut real = mjoin(&hub, ha, mcfg("Real"));
+        mstep(&hub, &mut [&mut h, &mut real], 0, 20);
+        assert!(real.is_connected());
+    }
+
+    /// An older client gets a clear version error; a mismatched padded
+    /// HELLO gets one that fits inside it.
+    #[test]
+    fn protocol_mismatch_is_explained() {
+        let hub = MemHub::new();
+        let mut h = mhost(&hub);
+        let ha = h.local_addr().unwrap();
+        let mut old = hub.endpoint();
+        old.send(&[P_HELLO, 5, 0], ha);
+        let mut newer = hello_packet(&[2; 16], JOIN_MODE_JOIN);
+        newer[1] = 99;
+        old.send(&newer, ha);
+        h.advance(DT);
+        h.pump();
+        let mut buf = [0u8; 2048];
+        let (n, _) = old.recv(&mut buf).expect("legacy reject");
+        assert!(String::from_utf8_lossy(&buf[3..n]).contains("protocol version mismatch (host 6, you 5)"));
+        let (n, _) = old.recv(&mut buf).expect("hint reject");
+        assert!(n <= newer.len() && buf[1] == REJECT_HINT);
+    }
+
+    // ------------------------------------------------------------ relayed migration
+
+    /// Over UDP with an in-process relay: one client came in by room code
+    /// (relayed), one directly. The host crashes; the relayed client is next
+    /// in line and claims the room's host slot with the room owner key; the
+    /// direct client has no direct path to it, so it falls back to the
+    /// relay, joins the room and reaches the new host there.
+    #[test]
+    fn relayed_migration_moves_the_room_and_direct_clients_fall_back_to_the_relay() {
+        let mut relay = citrus_relay::Relay::bind("127.0.0.1:0", citrus_relay::RelayConfig::default()).expect("relay");
+        let ra = relay.local_addr().unwrap().to_string();
+        let secret = generate_secret();
+        let c = |name: &str| NetConfig {
+            relay: ra.clone(),
+            punch: false,
+            secret: secret.clone(),
+            timeout: 1.5,
+            migrate_attempt: 1.0,
+            identity: Identity::generate(),
+            ..cfg(name)
+        };
+        let mut host = NetSession::host_with(0, c("Host")).expect("host");
+        assert!(pump_with_relay(&mut relay, &mut [&mut host], |s| s[0].room_code().is_some()), "room opened");
+        let code = host.room_code().unwrap();
+        let mut bea = NetSession::join_with(&code, c("Bea")).expect("join by code");
+        assert!(pump_with_relay(&mut relay, &mut [&mut host, &mut bea], |s| s[1].is_connected()));
+        let port = host.local_addr().unwrap().port();
+        let mut lan = NetSession::join_with(&format!("127.0.0.1:{port}"), c("Lan")).expect("direct join");
+        assert!(pump_with_relay(&mut relay, &mut [&mut host, &mut bea, &mut lan], |s| {
+            s[2].is_connected() && s[1].succession().is_some_and(|p| p.order.len() == 2 && !p.room.is_empty())
+                && s[2].succession().is_some_and(|p| p.room_key.is_some())
+        }));
+        assert_eq!((bea.local_peer(), lan.local_peer()), (2, 3));
+        assert!(lan.relay_status().is_none(), "Lan came in directly");
+        host.crash();
+        let done = |s: &[&mut NetSession]| s[0].is_host() && s[1].is_connected() && s[1].host_peer() == 2 && s[0].reconnecting().is_empty();
+        let mut ok = false;
+        for _ in 0..4 {
+            if pump_with_relay(&mut relay, &mut [&mut bea, &mut lan], done) {
+                ok = true;
+                break;
+            }
+        }
+        assert!(ok, "bea host {} / lan {:?} host {}", bea.is_host(), lan.state(), lan.host_peer());
+        assert_eq!(relay.stats().claims, 1, "the room moved to the new host");
+        assert_eq!(relay.room_info(&code), Some((true, 2)));
+        assert_eq!(lan.peer_route(2), Some("relayed"), "fell back to the relay");
+        assert!(bea.relay_status().is_some_and(|r| r.host));
+        lan.send_message(None, "via the new host");
+        let mut got = false;
+        for _ in 0..500 {
+            relay.poll();
+            bea.pump();
+            lan.pump();
+            if bea.view().messages.iter().any(|m| m.2 == "via the new host") {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(got, "chat reaches the new host through the relay");
     }
 }

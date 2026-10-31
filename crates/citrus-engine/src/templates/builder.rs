@@ -49,6 +49,7 @@ impl Scene {
             enabled: true,
             static_geometry: false,
             lightmap_scale: 1.0,
+            cast_shadows: citrus_core::ShadowCasting::On,
             layer: 0,
             material: MaterialRef::File(mat_path("default")),
             extra_materials: Vec::new(),
@@ -292,19 +293,7 @@ pub fn keys(k: &[Key]) -> Vec<InputSource> {
 }
 
 fn blank(name: &str, kind: ActionKind) -> ActionBinding {
-    ActionBinding {
-        name: name.into(),
-        kind,
-        buttons: Vec::new(),
-        pos_x: Vec::new(),
-        neg_x: Vec::new(),
-        pos_y: Vec::new(),
-        neg_y: Vec::new(),
-        analog_x: None,
-        analog_y: None,
-        deadzone: 0.0,
-        scale: 1.0,
-    }
+    ActionBinding { deadzone: 0.0, ..ActionBinding::empty(name, kind) }
 }
 
 pub fn button(name: &str, inputs: Vec<InputSource>) -> ActionBinding {
@@ -363,13 +352,10 @@ pub fn pad_axis(a: PadAxis) -> InputSource {
 }
 
 pub fn bindings(kb: Vec<ActionBinding>, gamepad: Vec<ActionBinding>) -> citrus_core::Bindings {
-    citrus_core::Bindings {
-        schemes: vec![
-            ControlScheme { name: "KB+Mouse".into(), actions: kb },
-            ControlScheme { name: "Gamepad".into(), actions: gamepad },
-        ],
-        active: 0,
-    }
+    citrus_core::Bindings::from_schemes(vec![
+        ControlScheme { name: "KB+Mouse".into(), actions: kb },
+        ControlScheme { name: "Gamepad".into(), actions: gamepad },
+    ])
 }
 
 /// Shooter bindings (FPS / TPS): WASD, mouse look, jump, sprint, crouch,

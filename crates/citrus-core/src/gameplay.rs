@@ -59,6 +59,8 @@ pub struct ScreenInfo {
     pub ui_cancel: bool,
     /// Headset and controllers (inactive without VR).
     pub vr: crate::VrFrame,
+    /// Live input bindings, device in use and rebind capture state.
+    pub controls: crate::ControlsInfo,
 }
 
 /// Immediate physics queries, implemented by the engine's physics world.
@@ -631,6 +633,119 @@ impl ComponentCtx<'_> {
     pub fn pour_container(&mut self, target: impl Into<ObjectRef>, litres: f32) {
         let litres = litres.max(0.0);
         self.modify::<crate::WaterContainer>(target, move |c| c.runtime.pour += litres);
+    }
+
+    // ---- input bindings ----
+
+    /// The live bindings: project defaults with the player's overrides on top.
+    pub fn input_bindings(&self) -> &crate::Bindings {
+        &self.screen.controls.bindings
+    }
+
+    /// The scheme resolving input this frame.
+    pub fn control_scheme(&self) -> Option<&crate::ControlScheme> {
+        self.input_bindings().active_scheme()
+    }
+
+    /// The device the player used last (VR while a headset runs).
+    pub fn input_device(&self) -> crate::InputDevice {
+        self.screen.controls.device
+    }
+
+    /// Whether the active scheme has an action called `name`.
+    pub fn has_action(&self, name: &str) -> bool {
+        self.control_scheme().is_some_and(|s| s.action(name).is_some())
+    }
+
+    /// Inputs bound to more than one action in `scheme` ("" = active).
+    pub fn binding_conflicts(&self, scheme: &str) -> Vec<crate::BindingConflict> {
+        self.input_bindings().scheme(scheme).map(|s| s.conflicts()).unwrap_or_default()
+    }
+
+    /// Bind `source` at `index` of `slot` ("" scheme = active; an index past
+    /// the end adds a binding). Other actions keep the input too; use
+    /// [`Self::rebind_with`] to swap or steal it. Saved to the player's
+    /// overrides, not the project.
+    pub fn rebind(&mut self, scheme: &str, action: &str, slot: crate::BindingSlot, index: usize, source: crate::InputSource) {
+        self.rebind_with(scheme, action, slot, index, source, crate::ConflictPolicy::Allow);
+    }
+
+    pub fn rebind_with(
+        &mut self,
+        scheme: &str,
+        action: &str,
+        slot: crate::BindingSlot,
+        index: usize,
+        source: crate::InputSource,
+        policy: crate::ConflictPolicy,
+    ) {
+        self.input_command(crate::InputCommand::Rebind {
+            scheme: scheme.into(),
+            action: action.into(),
+            slot,
+            index,
+            source,
+            policy,
+        });
+    }
+
+    pub fn unbind(&mut self, scheme: &str, action: &str, slot: crate::BindingSlot, index: usize) {
+        self.input_command(crate::InputCommand::Unbind { scheme: scheme.into(), action: action.into(), slot, index });
+    }
+
+    /// Deadzone / sensitivity / inversion of an action (e.g. "Invert look").
+    pub fn tune_action(&mut self, scheme: &str, action: &str, tuning: crate::ActionTuning) {
+        self.input_command(crate::InputCommand::Tune { scheme: scheme.into(), action: action.into(), tuning });
+    }
+
+    /// Listen for the next input the player presses (inputs already held are
+    /// ignored until released, Escape cancels). Read the result with
+    /// [`Self::captured_input`]; gameplay input is held off meanwhile.
+    pub fn capture_next_input(&mut self, kind: crate::CaptureKind, device: Option<crate::InputDevice>) {
+        let owner = self.self_id();
+        self.input_command(crate::InputCommand::Capture { owner, request: crate::CaptureRequest { kind, device } });
+    }
+
+    pub fn cancel_input_capture(&mut self) {
+        let owner = self.self_id();
+        self.input_command(crate::InputCommand::CancelCapture(owner));
+    }
+
+    /// This object's capture is still waiting for input.
+    pub fn is_capturing_input(&self) -> bool {
+        self.screen.controls.capturing == Some(self.self_id())
+    }
+
+    /// The result of this object's capture, on the frame it lands.
+    pub fn captured_input(&self) -> Option<crate::CaptureResult> {
+        self.screen.controls.captured.filter(|(o, _)| *o == self.self_id()).map(|(_, r)| r)
+    }
+
+    /// Drop every player override (back to the project's bindings).
+    pub fn reset_bindings(&mut self) {
+        self.input_command(crate::InputCommand::ResetAll);
+    }
+
+    pub fn reset_scheme_bindings(&mut self, scheme: &str) {
+        self.input_command(crate::InputCommand::ResetScheme(scheme.into()));
+    }
+
+    pub fn reset_action_binding(&mut self, scheme: &str, action: &str) {
+        self.input_command(crate::InputCommand::ResetAction { scheme: scheme.into(), action: action.into() });
+    }
+
+    /// Use this scheme from now on (turns automatic switching off).
+    pub fn set_control_scheme(&mut self, name: &str) {
+        self.input_command(crate::InputCommand::SetScheme(name.into()));
+    }
+
+    /// Follow the device in use (VR / gamepad / keyboard + mouse).
+    pub fn set_auto_control_scheme(&mut self, on: bool) {
+        self.input_command(crate::InputCommand::SetAutoSwitch(on));
+    }
+
+    pub fn input_command(&mut self, cmd: crate::InputCommand) {
+        self.commands.push(ComponentCommand::Input(cmd));
     }
 
     // ---- full-body tracking ----

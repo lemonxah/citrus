@@ -36,8 +36,13 @@ impl CombineMode {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PhysicsMaterial {
-    /// Coulomb friction coefficient (0 = ice, ~0.5 wood, 1+ rubber).
+    /// Coulomb friction coefficient while sliding (0 = ice, ~0.5 wood, 1+
+    /// rubber).
     pub friction: f32,
+    /// Friction holding things at rest, usually a little above `friction`
+    /// (it takes more to start something sliding than to keep it going).
+    /// None = the same as `friction`.
+    pub static_friction: Option<f32>,
     pub friction_combine: CombineMode,
     /// Restitution 0..1 (1 = keeps all its speed on a bounce).
     pub bounciness: f32,
@@ -59,6 +64,7 @@ impl Default for PhysicsMaterial {
     fn default() -> Self {
         Self {
             friction: 0.5,
+            static_friction: None,
             friction_combine: CombineMode::Average,
             bounciness: 0.0,
             bounce_combine: CombineMode::Average,
@@ -71,19 +77,25 @@ impl Default for PhysicsMaterial {
 }
 
 impl PhysicsMaterial {
+    /// Static friction: `static_friction`, or `friction` when unset.
+    pub fn static_mu(&self) -> f32 {
+        self.static_friction.unwrap_or(self.friction).max(0.0)
+    }
+
     /// A few starting points for the editor.
     pub const PRESETS: [(&'static str, PhysicsMaterial); 6] = [
-        ("Wood", Self::preset(0.5, 0.2, 600.0)),
-        ("Metal", Self::preset(0.4, 0.1, 7850.0)),
-        ("Rubber", Self::preset(1.0, 0.8, 1100.0)),
-        ("Ice", Self::preset(0.02, 0.05, 917.0)),
-        ("Stone", Self::preset(0.7, 0.05, 2600.0)),
-        ("Foam", Self::preset(0.6, 0.3, 50.0)),
+        ("Wood", Self::preset(0.5, 0.6, 0.2, 600.0)),
+        ("Metal", Self::preset(0.4, 0.55, 0.1, 7850.0)),
+        ("Rubber", Self::preset(0.9, 1.1, 0.8, 1100.0)),
+        ("Ice", Self::preset(0.02, 0.08, 0.05, 917.0)),
+        ("Stone", Self::preset(0.6, 0.75, 0.05, 2600.0)),
+        ("Foam", Self::preset(0.6, 0.8, 0.3, 50.0)),
     ];
 
-    const fn preset(friction: f32, bounciness: f32, density: f32) -> Self {
+    const fn preset(friction: f32, static_friction: f32, bounciness: f32, density: f32) -> Self {
         Self {
             friction,
+            static_friction: Some(static_friction),
             friction_combine: CombineMode::Average,
             bounciness,
             bounce_combine: CombineMode::Average,

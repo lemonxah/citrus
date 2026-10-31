@@ -15,6 +15,8 @@ mod face_ui;
 mod water_ui;
 pub use water_ui::{RIVER_PATH_HINT, RiverHandle, RiverPathEdit, river_handle};
 mod physics_ui;
+mod input_ui;
+pub use input_ui::{BindingsEditor, RebindTarget, bindings_editor_ui};
 mod waterfall_ui;
 mod water_container_ui;
 pub use physics_ui::{physics_settings_ui, physmat_editor_ui};
@@ -38,7 +40,7 @@ pub use code_editor::{
 // ComponentRegistry, the structs, ComponentCtx, Transform, …) come from
 // citrus-core. Import those directly, not through the editor.
 pub use components::{
-    ASSET_TEMPLATES_KEY, AssetEditor, AssetTemplate, ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents,
+    ASSET_TEMPLATES_KEY, AUTHORED_COLLISION_KEY, AssetEditor, AssetTemplate, ComponentsResponse, DRAG_FILE_KEY, DRAG_OBJECT_KEY, EditorComponents,
     Gizmo, GizmoEdit, GizmoSpec, Inspect, InspectCtx, MIXED_COMPONENTS_KEY, OPEN_ANIM_CONTROLLER_KEY,
     OPEN_FILE_KEY, PING_FILE_KEY, PROJECT_ROOT_KEY, asset_browse_button, asset_chip, asset_new_button, components_ui,
     resolve_slot,

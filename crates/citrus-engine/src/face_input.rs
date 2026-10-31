@@ -48,6 +48,7 @@ impl FaceInput {
         }
     }
 
+    #[cfg(any(feature = "editor", test))]
     pub fn osc_port(&self) -> Option<u16> {
         self.osc.as_ref().map(|o| o.port)
     }

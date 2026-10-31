@@ -1,4 +1,7 @@
 #version 450
+#ifdef MULTIVIEW
+#extension GL_EXT_multiview : require
+#endif
 // citrus standard shader, fragment stage (phase 1: PBR/toon hybrid core).
 // Feature toggles are specialization constants: each material's enabled
 // feature set selects a pipeline variant; disabled features compile out.
@@ -418,7 +421,7 @@ float shadow_factor(Light light, vec3 world_pos, vec3 nrm, vec3 ldir) {
         // whose projected uv sits inside [margin, 1-margin] (margin = PCF kernel
         // radius, so taps never reach the border). Coarser cascades enclose the
         // finer ones, so this always converges.
-        float depth = -(frame.view * vec4(world_pos, 1.0)).z;
+        float depth = -(VIEW_MATRIX * vec4(world_pos, 1.0)).z;
         int start = vcount - 1;
         for (int c = 0; c < vcount && c < 4; ++c) {
             if (depth < frame.cascade_splits[c]) { start = c; break; }
@@ -983,7 +986,7 @@ void main() {
     if (fx.parallax.x > 0.0) {
         vec3 Tg = normalize(v_tangent.xyz - N * dot(v_tangent.xyz, N));
         vec3 Bg = cross(N, Tg) * v_tangent.w;
-        vec3 to_eye = frame.camera_pos.xyz - v_world_pos;
+        vec3 to_eye = CAMERA_POS.xyz - v_world_pos;
         vec3 vt = normalize(vec3(dot(to_eye, Tg), dot(to_eye, Bg), dot(to_eye, N)));
         vec2 a0 = v_uv * fx.albedo_st.xy + fx.albedo_st.zw;
         vec2 a1 = parallax_uv(a0, vt, fx.parallax.x);
@@ -1073,16 +1076,16 @@ void main() {
         roughness = clamp(look0.x, 0.02, 1.0);
         metallic = 0.0;
         ao = 1.0;
-        vec3 Vw = normalize(frame.camera_pos.xyz - v_world_pos);
+        vec3 Vw = normalize(CAMERA_POS.xyz - v_world_pos);
         float clarity = clamp(deep.w, 0.0, 1.0);
         float shore = 0.0;
         float contact_depth = 1e4;
         float transmit = 0.35;
         if (frame.water.y > 0.5) {
-            vec3 cam = frame.camera_pos.xyz;
+            vec3 cam = CAMERA_POS.xyz;
             vec3 I = -Vw;
             vec2 screen = vec2(max(frame.postfx2.w, 1.0), max(frame.postfx3.w, 1.0));
-            float surf_dist = length((frame.view * vec4(v_world_pos, 1.0)).xyz);
+            float surf_dist = length((VIEW_MATRIX * vec4(v_world_pos, 1.0)).xyz);
             float flat_path = max(water_scene_dist(gl_FragCoord.xy) - surf_dist, 0.0);
             // Behind the surface: down from above, up from below.
             vec3 into = gl_FrontFacing ? -up : up;
@@ -1104,7 +1107,7 @@ void main() {
                 vec2 hit = rp;
                 float keep = 0.0;
                 for (int k = 0; k < 2; ++k) {
-                    vec4 c = frame.view_proj * vec4(v_world_pos + T * len, 1.0);
+                    vec4 c = VIEW_PROJ * vec4(v_world_pos + T * len, 1.0);
                     if (c.w <= 1e-4) {
                         keep = 0.0;
                         break;
@@ -1198,7 +1201,7 @@ void main() {
         roughness = clamp(sqrt(sqrt(a2)), 0.02, 1.0);
     }
 
-    vec3 V = normalize(frame.camera_pos.xyz - v_world_pos);
+    vec3 V = normalize(CAMERA_POS.xyz - v_world_pos);
     float NdotV = max(dot(N, V), 1e-4);
     vec3 f0 = mix(vec3(0.04), albedo.rgb, metallic);
     vec3 diffuse_color = albedo.rgb * (1.0 - metallic);
@@ -1359,8 +1362,8 @@ void main() {
         // hold (moving emitters, realtime lights) and it adds on top.
         if (frame.debug.z > 1.5) {
             vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
-            vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;
-            vec3 Nv = normalize(mat3(frame.view) * N);
+            vec3 Pv = (VIEW_MATRIX * vec4(v_world_pos, 1.0)).xyz;
+            vec3 Nv = normalize(mat3(VIEW_MATRIX) * N);
             flux_gi = screen_gi_upsample(suv, Pv, Nv);
             indirect += flux_gi;
         }
@@ -1371,8 +1374,8 @@ void main() {
         vec2 suv = gl_FragCoord.xy / vec2(frame.postfx2.w, frame.postfx3.w);
         // View-space position + normal so the upsample can reject only true depth
         // edges, keeping coplanar neighbours on steep/grazing faces (no GI noise).
-        vec3 Pv = (frame.view * vec4(v_world_pos, 1.0)).xyz;
-        vec3 Nv = normalize(mat3(frame.view) * N);
+        vec3 Pv = (VIEW_MATRIX * vec4(v_world_pos, 1.0)).xyz;
+        vec3 Nv = normalize(mat3(VIEW_MATRIX) * N);
         flux_gi = screen_gi_upsample(suv, Pv, Nv);
         indirect = flux_gi;
         // Mixed lighting: the gather is dynamic-only, so a non-lightmapped object
@@ -1522,7 +1525,7 @@ void main() {
     // reflectivity (a, the env-reflection weight's luminance). The resolve pass
     // uses the stored normal directly for an exact reflection ray. The global
     // reflection mode decides whether the resolve runs at all.
-    vec3 Nv = normalize(mat3(frame.view) * N);
+    vec3 Nv = normalize(mat3(VIEW_MATRIX) * N);
     float reflectivity = dot(reflectance, vec3(0.2126, 0.7152, 0.0722));
     // Packed for the 10:10:10:2 target: roughness (6 bits) in b's high bits,
     // reflectivity (6 bits) split over b's low 4 and a's 2. Unpacked with an
@@ -1548,7 +1551,7 @@ void main() {
     // scaled by its mask + strength and combined by its per-layer blend mode.
     // Default matcaps are black with strength 0 so unused layers cost nothing.
     if (fx.matcap.x > 0.0 || fx.matcap.y > 0.0 || fx.matcap.z > 0.0) {
-        vec3 vn = normalize(mat3(frame.view) * N);
+        vec3 vn = normalize(mat3(VIEW_MATRIX) * N);
         vec2 muv = vn.xy * 0.5 + 0.5;
         color = blend_matcap(color, texture(t_matcap0, muv).rgb,
                              texture(t_matcap0_mask, uv).r * fx.matcap.x, fx.matcap_blend.x);

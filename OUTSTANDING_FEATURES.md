@@ -21,6 +21,8 @@ The earlier P0/P1 gaps from the June audit are now **done**:
 - cloth: Bone Cloth, Mesh Cloth (self-collision), Cloth Colliders with capsule auto-fit, Wind Zones, VRM spring-bone import
 - face tracking (OpenXR + OSC), lip sync, SlimeVR, voice v2 (Opus, adaptive jitter buffer, proximity)
 - water: ocean / lake / river bodies, Gerstner waves with wind seas, buoyancy, drag and flow, interactive ripples, surface rendering with refraction and foam
+- water simulation (shallow-water + dispersive layers, ground bed and beach run-up, viscosity and fluid templates), underwater view and audio, waterfalls, carryable water, swimming (desktop controllers and VR)
+- physics materials with static and dynamic friction, authored UCX_ collision, per-object Cast Shadows
 - multi-object editing with mixed values, Group Into Empty
 
 **Priority:** P1 = expected of a serious engine · P2 = advanced / polish.
@@ -30,20 +32,19 @@ The earlier P0/P1 gaps from the June audit are now **done**:
 
 | Feature | State | Effort | Note |
 |---|---|---|---|
-| GPU-driven culling / indirect draws | ❌ | L | CPU instancing landed; GPU culling for very large counts. |
+| GPU-driven culling / indirect draws | ◑ | M | Landed (compute frustum + optional Hi-Z culling, indirect draws for main, prepass, shadows and VR eyes); follow-ups: GPU-side shadow-cache signature, per-instance lightmap layer so lightmapped statics batch, two-phase Hi-Z (no one-frame disocclusion delay). Untested on a GPU so far. |
 | GPU instancing across materials | ❌ | M | Instance draws that share a mesh but differ in material values (per-instance colours / parameters in an instance buffer, like Unity's per-instance properties), so material variants don't break batches. |
 | Render-to-texture: portals | ◑ | S | Cameras-to-texture with Hz throttling, off-screen skip and live resize landed; screens inside screens and portals open. |
 | Reflection probes: >2 blending | ◑ | M | Per-probe cubes and two-probe blending landed everywhere (forward, SSR, RT, custom shaders); three or more at one pixel is open. |
-| Android / Quest bring-up | ◑ | L | Builds, packages into a signed APK (`tools/android/build_apk.sh`) and extracts assets on first run; Vulkan 1.1 fallback, ASTC and the Quest OpenXR loader still needed, and it has never run on a device (review §2). |
+| Android / Quest bring-up | ◑ | S | Builds and packages (Android + Meta Quest targets, OpenXR on Android, Vulkan 1.1 fallback, ASTC cook, XR-only multiview frames, mobile tier). Never run on a device: on-device validation, `XR_FB_foveation`, an ASTC HDR encoder, cooking model-embedded textures. |
 | Windows on real hardware | ◑ | S | Cross-build verified under Wine only; needs the VC++ runtime. |
-| Undo coverage | ◑ | M | Component and tab edits aren't undoable; structural edits (delete, reorder, group) aren't either. |
+| Undo coverage | ◑ | M | Transform, component, material and Cast Shadows edits are undoable; tab edits (Environment, animation tabs) and structural edits (delete, reorder, group) aren't. |
 | Water: shoreline | ◑ | M | Underwater fog, waterline, blur, caustics and the ripple field in the shader landed; a depth bake for shore wave damping is open. |
-| Swimming in deep water | ❌ | M | Characters swim where the water is deeper than they stand: buoyant body, stroke movement on the surface and diving below it, breath, climbing out at the edge; underwater audio and view already follow the camera. |
 | Asset cook | ◑ | S | Builds ship only reachable files; packing them into one archive is open. |
-| Compressed bakes | ❌ | S | Lightmaps (3 x 2048^2 = 50 MB here) and reflection-probe cubemaps (100 MB) are stored uncompressed; BC6H would cut them ~8x on disk and in VRAM. |
-| NAT relay / internet play | ❌ | L | Star topology over UDP; port forwarding needed. |
-| Client prediction / lag compensation | ❌ | L | The owner simulates; others interpolate. |
-| Net encryption / auth | ❌ | M | LAN or trusted servers only. |
+| Compressed bakes | ◑ | S | BC6H `.lightmap` v2 / `.reflprobe` v4 with a fallback for GPUs without BC (E5B9G9R9 / RGBA16F decoded at load): lightmaps 48 MB -> 3 MB, probe 96 MB -> 8 MB. Left: ASTC HDR for Quest (a new `upload_format` branch), an in-editor visual check. |
+| NAT relay / internet play | ◑ | S | Authenticated relay (cookies, owner-keyed rooms, join proofs, operator token, per-IP / pending / backoff limits), hole punching with relay fallback, room handover to a migration successor. Left: client-to-client relay paths; any member can claim the room. |
+| Client prediction / lag compensation | ◑ | S | Pawn, First / Third Person Controller and VR Player predicted, surviving host migration; adaptive interpolation; `ray_cast_at` / `ray_cast_rewound`. Left: custom movement components, listen-server smoothing, lag-compensation history restarts on a new host. |
+| Net encryption / auth | ◑ | S | Argon2id passphrases, transcript-bound keys, authenticated REJECT / BYE / kick, Ed25519 player identities with allow / ban lists and host pinning, stateless cookies, half-open cap. Left: accounts; first contact can be stalled by an on-path attacker; the relay join key travels in the clear. |
 
 ## P2
 
@@ -65,8 +66,6 @@ The earlier P0/P1 gaps from the June audit are now **done**:
 
 ## Suggested sequence
 
-1. GPU-driven culling for very large scenes.
-2. Android / Quest 3 bring-up.
-3. BC6H-compressed bakes (lightmaps, reflection probes: ~8x smaller), asset cook.
-4. Internet play: a relay or Steam networking, then prediction.
-5. Avatar scaling to the player's height, in-editor pin painting for Mesh Cloth.
+1. Android / Quest 3: on-device validation.
+2. Asset cook (pack shipped files into one archive).
+3. Avatar scaling to the player's height, in-editor pin painting for Mesh Cloth.
