@@ -1,11 +1,12 @@
 # zestengine
 
 ZestEngine is a standalone 3D game engine in Rust + Vulkan with a dockable in-engine
-editor. It's a general-purpose desktop engine: scenes, materials, FBX/glTF
-import, a component + hot-reloadable Rust-plugin system, custom shaders, realtime
-global illumination (**Flux** — see below), a lighting bake, audio, physics
-(rapier3d), and building standalone games straight from the editor. VR (OpenXR)
-is on the roadmap, not a prerequisite.
+editor. It's a general-purpose desktop + VR engine: scenes, materials, FBX/glTF
+import, a component + hot-reloadable Rust-plugin system, custom shaders and a
+visual shader graph, realtime global illumination (**Flux** — see below), a
+lighting bake, audio (Steam Audio + voice chat), physics (rapier3d), water
+simulation, networking, OpenXR VR, and building standalone games straight from
+the editor.
 
 ![ZestEngine](crates/zestengine-assets/zestengine.jpg)
 
@@ -33,12 +34,14 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 
 - **[Features.md](Features.md)** — the feature map: everything implemented vs
   planned, with status markers. Start here.
-- **[TODO.md](TODO.md)** — working list, changelog, and design notes for
-  upcoming work.
-- **[BUGS.md](BUGS.md)** — open bugs, verify-after-rebuild items, crash/stability.
+- **[OUTSTANDING_FEATURES.md](OUTSTANDING_FEATURES.md)** — the remaining-work
+  backlog (partial / missing features) with per-item notes.
 - **[docs/components.md](docs/components.md)** — the component model, the in-game
   API (`ComponentCtx`), object references, and writing a Rust plugin.
 - **[docs/shaders.md](docs/shaders.md)** — the zestengine standard shader.
+- **[docs/networking.md](docs/networking.md)** — sessions, prediction, relay.
+- **[docs/user-content.md](docs/user-content.md)** — UGC packages and WASM scripts.
+- **[CONSOLE_BRINGUP.md](CONSOLE_BRINGUP.md)** — console port audit + plan.
 
 ## Stack
 
@@ -51,21 +54,23 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 | Editor GUI | [egui](https://crates.io/crates/egui) + egui_dock, rendered in-engine |
 | Worlds/props | glTF 2.0, FBX (ufbx) |
 | Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones; Bone Cloth for hair / skirts with auto-fitted body colliders |
-| Audio | [rodio](https://crates.io/crates/rodio) (.wav/.flac/.mp3) |
-| Default shader | zestengine standard uber-shader, Poiyomi-inspired — see [docs/shaders.md](docs/shaders.md) |
+| Audio | [rodio](https://crates.io/crates/rodio) (.wav/.flac/.mp3), Steam Audio spatialisation, Opus voice chat |
+| Shaders | zestengine standard uber-shader (Poiyomi-inspired) + runtime custom GLSL + the visual shader graph — see [docs/shaders.md](docs/shaders.md) |
 | Windowing | winit |
 
 ## Workspace layout
 
 ```
 crates/
-  zestengine          binary entry point (desktop now, +VR at M4)
+  zestengine          binary entry point (desktop + VR)
   zestengine-core     egui-free runtime API: components, ComponentCtx, ObjectId/Ref
   zestengine-engine   app loop, scene, timing, input, editor host
   zestengine-render   ash Vulkan renderer (context, swapchain, frames, bake)
-  zestengine-xr       OpenXR session/swapchains/input          (stub)
+  zestengine-xr       OpenXR session/swapchains/input
   zestengine-assets   glTF/FBX, .material/.scene/project files, bake sidecars
   zestengine-editor   egui editor panels (inspector, files, code editor, components)
+  zestengine-hub      project launcher window (recent projects, templates)
+  zestengine-relay    networking relay server
 plugins/
   components      example Rust component plugin (Orbit)
 ```
@@ -173,17 +178,16 @@ collisions, transform writeback) in both the editor's Play mode and a built game
 joints, raycast/overlap queries and trigger events, terrain trimesh colliders, and
 a wheeled **Vehicle** (raycast suspension, steering, throttle/brake, grip).
 
-**Lighting bake — IN TESTING, NOT YET VERIFIED.** A GPU lightmap + light-probe
-bake (Vulkan ray query: BLAS/TLAS, path-traced direct + soft shadows +
-multi-bounce indirect, SH-L1 probes) with a "Baker's Man" editor tab and
-`.lightmap`/`.lightdata` sidecars. Runtime sampling: Phase 5a (flat probe-average
-ambient) and **5b (per-fragment probe SH)** are in — baked probes upload to a
-storage buffer and the standard shader trilinearly samples SH-L1 per fragment for
-the indirect term, and per-object **lightmaps** (5c) are sampled by `uv1` for static
-geometry — in both the editor and a built game (the runtime loads the scene's
-`.lightmap`/`.lightdata`, which bundle with the scene). The standard shader's PBR is
-energy-conserving (Cook-Torrance Fresnel kS / diffuse kD). The GPU bake output still
-needs visual validation.
+**Lighting bake.** A GPU lightmap + light-probe bake (Vulkan ray query: BLAS/TLAS,
+path-traced direct + soft shadows + multi-bounce indirect, SH-L1 probes) with a
+"Baker's Man" editor tab and `.lightmap` / `.reflprobe` sidecars. Runtime
+sampling: per-fragment probe SH-L1 for the indirect term and per-object
+lightmaps sampled by `uv1` for static geometry — in both the editor and a built
+game (the sidecars bundle with the scene). Bakes ship compressed: BC6H lightmaps
+and probe cubes with E5B9G9R9 / RGBA16F fallbacks for GPUs without BC, ASTC on
+Quest builds; the Baker tab shows the measured lightmap error against the raw
+bake. The standard shader's PBR is energy-conserving (Cook-Torrance Fresnel kS /
+diffuse kD).
 
 ## Planned
 
@@ -241,22 +245,24 @@ first build.
 ```sh
 just                          # list recipes
 just current                  # workspace version
-just check                    # check all workspace targets
+just check                    # check every workspace target
 just test                     # workspace tests
 just fmt                      # format Rust sources
-just build                    # release workspace build
-just run                      # editor on this checkout's project
-just run "/path/to/My Game"    # editor on another project
-just hub                      # Project Hub (also builds the editor)
-just install                  # build + install to /usr using sudo (Linux)
-just install "$HOME/.local" "" # install for this user without sudo
+just build                    # release workspace build (editor, hub, relay, example plugin)
+just run [project-dir]        # editor on this checkout's project, or another project
+just hub                      # Project Hub (builds its editor)
+just install prefix="$HOME/.local" sudo=""   # user install; defaults to prefix=/usr with sudo
 just bump 0.2.0               # update workspace version + Cargo.lock
 just release 0.2.0 "changes"   # bump, commit, tag, push, GitHub release
+just deb                      # build a .deb in an Ubuntu 24.04 container
+just rpm                      # build an .rpm in a Fedora container
+just nix                      # build with Nix (result symlinked at ./result)
 ```
 
 Installation puts the editor, hub, relay and `libphonon.so` together under
-`<prefix>/lib/zestengine`, adds links in `<prefix>/bin`, and installs a desktop
-launcher that opens the Project Hub. For a user install, put `$HOME/.local/bin`
+`<prefix>/lib/zestengine`, links them in `<prefix>/bin`, and installs a desktop
+launcher + icons. `just install` targets `/usr` via sudo by default; for a user
+install use `just install prefix="$HOME/.local" sudo=""` and put `$HOME/.local/bin`
 on `PATH`. Keep this source checkout available: generated game projects use
 local engine crate paths. The install is a local developer install.
 
@@ -290,7 +296,9 @@ its `.zestengine/` folder) is shown as its picture.
 ### Editor
 
 Dockable layout (drag tabs to rearrange): **Viewport**, **Scene**, **Inspector**,
-**Files**, **Log**, **Baker**, and **Code** tabs. Menu bar: File (new project,
+**Files**, **Log**, **Baker**, **Environment**, **Camera**, **Code**, **UI
+Editor**, **Animation**, **Animator Controller**, **Shader Graph**, **Sequencer**,
+**Occlusion**, and **Project Settings** tabs. Menu bar: File (new project,
 project settings, build game, new/open/save scenes), Edit (undo/redo), Tools
 (plugins, bake), View (stats, layout, camera preview), Help.
 
@@ -323,7 +331,10 @@ The same is available headless:
 ```sh
 zestengine --new-project <parent-dir> <name>   # scaffold a project
 zestengine --build [project-dir]                # cargo build --release + bundle assets
+zestengine --build <dir> --target windows       # cross-compile with cargo xwin
 ```
 
-The output `build/` folder is self-contained and relocatable; run the executable
-inside it.
+Windows builds need `cargo install cargo-xwin` and
+`rustup target add x86_64-pc-windows-msvc` (also available in the editor as
+**File → Build Game for Windows**). The output `build/` folder is self-contained
+and relocatable; run the executable inside it.
