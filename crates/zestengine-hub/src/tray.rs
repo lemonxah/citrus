@@ -27,15 +27,22 @@ pub fn start(proxy: EventLoopProxy<HubEvent>) -> Option<ksni::blocking::Handle<H
 impl HubTray {
     /// Wayland only lets a window take focus with the XDG activation token
     /// the tray host sends with the click, which KDE delivers just after it.
-    fn show(&self) {
-        let token = (0..100).find_map(|_| {
+    fn activation_token() -> Option<String> {
+        (0..100).find_map(|_| {
             let token = ksni::current_xdg_activation_token();
             if token.is_none() {
                 std::thread::sleep(Duration::from_millis(1));
             }
             token
-        });
-        let _ = self.proxy.send_event(HubEvent::Show(token));
+        })
+    }
+
+    fn show(&self) {
+        let _ = self.proxy.send_event(HubEvent::Show(Self::activation_token()));
+    }
+
+    fn toggle(&self) {
+        let _ = self.proxy.send_event(HubEvent::Toggle(Self::activation_token()));
     }
 }
 
@@ -46,7 +53,7 @@ impl ksni::Tray for HubTray {
         vec![ksni::Icon { width: 256, height: 256, data: self.icon.clone() }]
     }
     fn activate(&mut self, _: i32, _: i32) {
-        self.show();
+        self.toggle();
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;

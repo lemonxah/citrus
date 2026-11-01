@@ -367,6 +367,21 @@ impl GpuSkinner {
         }
     }
 
+    /// Drop one registered mesh (its GPU resources were freed). The pipeline
+    /// and the other meshes stay alive.
+    pub fn remove(&mut self, device: &ash::Device, allocator: &mut Allocator, mesh: usize) {
+        self.pending.retain(|(m, _)| *m != mesh);
+        if let Some(mut skin) = self.skins.remove(&mesh) {
+            skin.base.destroy(device, allocator);
+            skin.prev_out.destroy(device, allocator);
+            skin.prev_palette.destroy(device, allocator);
+            for mut p in skin.palettes.drain(..) {
+                p.destroy(device, allocator);
+            }
+            unsafe { device.destroy_descriptor_pool(skin.pool, None) };
+        }
+    }
+
     pub fn destroy(&mut self, device: &ash::Device, allocator: &mut Allocator) {
         for (_, mut skin) in self.skins.drain() {
             skin.base.destroy(device, allocator);

@@ -67,6 +67,9 @@ pub(crate) struct RtWaterFrame {
     pub bodies: [GpuWater; MAX_WATER_BODIES],
     /// Ripple field per body slot (null = none).
     pub ripples: [vk::ImageView; MAX_WATER_BODIES],
+    /// Shore-depth field per body slot (null = none; sampled through the
+    /// body's `extra` shore window to calm the displaced waves).
+    pub shores: [vk::ImageView; MAX_WATER_BODIES],
 }
 
 impl RtWaterFrame {
@@ -76,6 +79,9 @@ impl RtWaterFrame {
             k = fnv(k, *w as u64);
         }
         for v in self.ripples {
+            k = fnv(k, vk::Handle::as_raw(v));
+        }
+        for v in self.shores {
             k = fnv(k, vk::Handle::as_raw(v));
         }
         k
@@ -134,8 +140,17 @@ impl RtWater {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(MAX_WATER_BODIES as u32)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_WATER_BODIES as u32)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let binding_flags = [vk::DescriptorBindingFlags::empty(), vk::DescriptorBindingFlags::PARTIALLY_BOUND];
+        let binding_flags = [
+            vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+        ];
         let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -198,7 +213,7 @@ impl RtWater {
                     },
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: (FRAMES_IN_FLIGHT * MAX_WATER_BODIES) as u32,
+                        descriptor_count: (FRAMES_IN_FLIGHT * MAX_WATER_BODIES * 2) as u32,
                     },
                 ]),
                 None,
@@ -321,6 +336,16 @@ impl RtWater {
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
                 })
                 .collect();
+            let shore_infos: Vec<[vk::DescriptorImageInfo; 1]> = water
+                .shores
+                .iter()
+                .map(|&v| {
+                    [vk::DescriptorImageInfo::default()
+                        .sampler(self.sampler)
+                        .image_view(v)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
+                })
+                .collect();
             let mut writes = vec![vk::WriteDescriptorSet::default()
                 .dst_set(set)
                 .dst_binding(0)
@@ -332,6 +357,18 @@ impl RtWater {
                         vk::WriteDescriptorSet::default()
                             .dst_set(set)
                             .dst_binding(1)
+                            .dst_array_element(i as u32)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .image_info(info),
+                    );
+                }
+            }
+            for (i, info) in shore_infos.iter().enumerate() {
+                if info[0].image_view != vk::ImageView::null() {
+                    writes.push(
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(2)
                             .dst_array_element(i as u32)
                             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                             .image_info(info),

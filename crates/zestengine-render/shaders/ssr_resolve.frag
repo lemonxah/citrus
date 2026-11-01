@@ -19,6 +19,8 @@ layout(set = 0, binding = 1) uniform sampler2D u_gbuf;  // reflectance.rgb, roug
 layout(set = 0, binding = 2) uniform sampler2D u_depth; // scene depth prepass
 layout(set = 0, binding = 3) uniform samplerCube u_env; // prefiltered environment
 layout(set = 0, binding = 5) uniform samplerCube u_env_b; // second reflection probe
+layout(set = 0, binding = 11) uniform samplerCube u_env_c; // third reflection probe
+layout(set = 0, binding = 12) uniform samplerCube u_env_d; // fourth reflection probe
 
 layout(set = 0, binding = 4) uniform SsrData {
     mat4 proj;
@@ -39,13 +41,21 @@ layout(set = 0, binding = 4) uniform SsrData {
     vec4 refl2_extents;
     vec4 refl2_box;
     vec4 refl_blend;   // x slot 0 blend, y slot 1 blend, z slot 1 on top
+    vec4 refl3_center; // third probe (binding 11)
+    vec4 refl3_extents;
+    vec4 refl3_box;
+    vec4 refl4_center; // fourth probe (binding 12)
+    vec4 refl4_extents;
+    vec4 refl4_box;
+    vec4 refl_blend2;  // x slot 2 blend, y slot 3 blend
 } u;
-
-#include "probe_blend.glsl"
 
 // Max roughness mip of the CURRENTLY bound cube, queried at runtime (correct for
 // the 64px skybox cube or a higher-res captured probe cube). Matches standard.frag.
+// Declared before probe_blend.glsl so its `probe_env` can use it.
 #define ENV_MAX_LOD (float(textureQueryLevels(u_env) - 1))
+
+#include "probe_blend.glsl"
 
 // The scene renders with a Y-flipped (negative-height) viewport, so a sampling
 // UV maps to NDC with a flipped Y. This constant matches the forward pass.
@@ -329,6 +339,11 @@ void main() {
                 float wb = probe_b_weight(worldPos, u.refl_box.xyz, u.refl_extents.xyz, u.refl_blend.x,
                                           u.refl2_box.xyz, u.refl2_extents.xyz, u.refl_blend.y, u.refl_blend.z > 0.5);
                 env = mix(env, env_b, wb);
+            }
+            // 3+ probes: the forward pass normalises all active slots, so do the
+            // same here (the two-probe path above stays byte-for-byte unchanged).
+            if (u.refl3_center.w > 0.0) {
+                env = probe_env(worldPos, Rw_raw, roughness, true);
             }
             vec4 ssr = trace(P, N);
             if (ssr.a > 0.0) {

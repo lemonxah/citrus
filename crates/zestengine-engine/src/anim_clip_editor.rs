@@ -48,6 +48,8 @@ pub struct AnimClipTab {
     vscroll: f32,
     drag: Option<KeyDrag>,
     scrubbing: bool,
+    /// Value lane shown in the curve editor (0..`TrackProperty::lanes`).
+    curve_lane: usize,
     /// Asked the editor to show this tab.
     pub open_request: bool,
     files: Vec<String>,
@@ -74,6 +76,7 @@ impl Default for AnimClipTab {
             vscroll: 0.0,
             drag: None,
             scrubbing: false,
+            curve_lane: 0,
             open_request: false,
             files: Vec::new(),
         }
@@ -108,6 +111,25 @@ fn quat_to_euler_deg(q: [f32; 4]) -> [f32; 3] {
 
 fn euler_deg_to_quat(e: [f32; 3]) -> [f32; 4] {
     Quat::from_euler(EulerRot::XYZ, e[0].to_radians(), e[1].to_radians(), e[2].to_radians()).to_array()
+}
+
+/// Short label for one value lane of a track property, as shown in the curve
+/// editor's lane selector.
+fn lane_name(property: TrackProperty, lane: usize) -> &'static str {
+    match property {
+        TrackProperty::Rotation => match lane {
+            0 => "X",
+            1 => "Y",
+            2 => "Z",
+            _ => "W",
+        },
+        TrackProperty::LightIntensity => "I",
+        _ => match lane {
+            0 => "X",
+            1 => "Y",
+            _ => "Z",
+        },
+    }
 }
 
 /// Rig of the target hierarchy plus the scene index of each node.
@@ -301,7 +323,7 @@ impl AnimClipTab {
 
         egui::TopBottomPanel::bottom("zestengine-anim-clip-keys")
             .resizable(true)
-            .default_height(118.0)
+            .default_height(300.0)
             .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(egui::Margin::symmetric(12, 8)))
             .show_inside(ui, |ui| edited |= self.key_inspector(ui));
 
@@ -953,79 +975,85 @@ impl AnimClipTab {
                     }
                     1 => {
                         let (t, k) = self.selected[0];
-                        let Some(track) = self.clip.tracks.get_mut(t) else {
-                            return;
+                        let property = match self.clip.tracks.get(t) {
+                            Some(track) => track.property,
+                            None => return,
                         };
-                        let property = track.property;
-                        let Some(key) = track.keys.get_mut(k) else {
-                            return;
-                        };
-                        widgets::eyebrow(ui, &format!("Key  {}", property.label()));
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Time").color(theme::TEXT_MUTED));
-                            if ui.add(egui::DragValue::new(&mut key.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed() {
-                                edited = true;
-                            }
-                            ui.label(egui::RichText::new("Curve").color(theme::TEXT_MUTED));
-                            egui::ComboBox::from_id_salt("zestengine-key-interp").selected_text(key.interp.label()).show_ui(ui, |ui| {
-                                for i in KeyInterp::ALL {
-                                    edited |= ui.selectable_value(&mut key.interp, i, i.label()).changed();
+                        {
+                            let Some(track) = self.clip.tracks.get_mut(t) else {
+                                return;
+                            };
+                            let Some(key) = track.keys.get_mut(k) else {
+                                return;
+                            };
+                            widgets::eyebrow(ui, &format!("Key  {}", property.label()));
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Time").color(theme::TEXT_MUTED));
+                                if ui.add(egui::DragValue::new(&mut key.time).speed(0.01).range(0.0..=600.0).max_decimals(3).suffix(" s")).changed() {
+                                    edited = true;
                                 }
-                            });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Value").color(theme::TEXT_MUTED));
-                            match property {
-                                TrackProperty::Rotation => {
-                                    let mut e = quat_to_euler_deg(key.value);
-                                    if widgets::vec3_field(ui, &mut e, 1, 0.5) {
-                                        key.value = euler_deg_to_quat(e);
-                                        edited = true;
-                                    }
-                                }
-                                TrackProperty::LightIntensity => {
-                                    edited |= ui.add(egui::DragValue::new(&mut key.value[0]).speed(0.05)).changed();
-                                }
-                                _ => {
-                                    let mut v = [key.value[0], key.value[1], key.value[2]];
-                                    if widgets::vec3_field(ui, &mut v, 3, 0.01) {
-                                        key.value[..3].copy_from_slice(&v);
-                                        edited = true;
-                                    }
-                                }
-                            }
-                        });
-                        // A Custom (bezier) key exposes its tangents (derivatives
-                        // w.r.t. time). Rotation keeps automatic tangents (editing
-                        // quaternion derivatives by hand is error-prone).
-                        if key.interp == KeyInterp::Custom {
-                            for (label, slot) in [("Tangent out", &mut key.tangent_out), ("Tangent in", &mut key.tangent_in)] {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
-                                    match property {
-                                        TrackProperty::Rotation => {
-                                            ui.label(egui::RichText::new("auto").color(theme::TEXT_DIM));
-                                        }
-                                        TrackProperty::LightIntensity => {
-                                            let mut t = slot.unwrap_or([0.0; 4]);
-                                            if ui.add(egui::DragValue::new(&mut t[0]).speed(0.05)).changed() {
-                                                *slot = Some(t);
-                                                edited = true;
-                                            }
-                                        }
-                                        _ => {
-                                            let mut t = slot.unwrap_or([0.0; 4]);
-                                            let mut v = [t[0], t[1], t[2]];
-                                            if widgets::vec3_field(ui, &mut v, 3, 0.01) {
-                                                t[..3].copy_from_slice(&v);
-                                                *slot = Some(t);
-                                                edited = true;
-                                            }
-                                        }
+                                ui.label(egui::RichText::new("Curve").color(theme::TEXT_MUTED));
+                                egui::ComboBox::from_id_salt("zestengine-key-interp").selected_text(key.interp.label()).show_ui(ui, |ui| {
+                                    for i in KeyInterp::ALL {
+                                        edited |= ui.selectable_value(&mut key.interp, i, i.label()).changed();
                                     }
                                 });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Value").color(theme::TEXT_MUTED));
+                                match property {
+                                    TrackProperty::Rotation => {
+                                        let mut e = quat_to_euler_deg(key.value);
+                                        if widgets::vec3_field(ui, &mut e, 1, 0.5) {
+                                            key.value = euler_deg_to_quat(e);
+                                            edited = true;
+                                        }
+                                    }
+                                    TrackProperty::LightIntensity => {
+                                        edited |= ui.add(egui::DragValue::new(&mut key.value[0]).speed(0.05)).changed();
+                                    }
+                                    _ => {
+                                        let mut v = [key.value[0], key.value[1], key.value[2]];
+                                        if widgets::vec3_field(ui, &mut v, 3, 0.01) {
+                                            key.value[..3].copy_from_slice(&v);
+                                            edited = true;
+                                        }
+                                    }
+                                }
+                            });
+                            // A Custom (bezier) key exposes its tangents (derivatives
+                            // w.r.t. time). Rotation keeps automatic tangents (editing
+                            // quaternion derivatives by hand is error-prone).
+                            if key.interp == KeyInterp::Custom {
+                                for (label, slot) in [("Tangent out", &mut key.tangent_out), ("Tangent in", &mut key.tangent_in)] {
+                                    ui.horizontal(|ui| {
+                                        ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
+                                        match property {
+                                            TrackProperty::Rotation => {
+                                                ui.label(egui::RichText::new("auto").color(theme::TEXT_DIM));
+                                            }
+                                            TrackProperty::LightIntensity => {
+                                                let mut t = slot.unwrap_or([0.0; 4]);
+                                                if ui.add(egui::DragValue::new(&mut t[0]).speed(0.05)).changed() {
+                                                    *slot = Some(t);
+                                                    edited = true;
+                                                }
+                                            }
+                                            _ => {
+                                                let mut t = slot.unwrap_or([0.0; 4]);
+                                                let mut v = [t[0], t[1], t[2]];
+                                                if widgets::vec3_field(ui, &mut v, 3, 0.01) {
+                                                    t[..3].copy_from_slice(&v);
+                                                    *slot = Some(t);
+                                                    edited = true;
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         }
+                        edited |= self.curve_editor(ui, t, k);
                     }
                     n => {
                         widgets::eyebrow(ui, &format!("{n} keys"));
@@ -1075,6 +1103,240 @@ impl AnimClipTab {
         if edited {
             for tr in &mut self.clip.tracks {
                 tr.sort();
+            }
+        }
+        edited
+    }
+
+    /// Graphical curve editor for the selected key: plots the track around the
+    /// key and, for Custom (bezier) non-rotation keys, exposes draggable
+    /// incoming / outgoing tangent handles. The handles edit the same
+    /// `Keyframe::tangent_in` / `tangent_out` values as the numeric fields.
+    fn curve_editor(&mut self, ui: &mut egui::Ui, t: usize, k: usize) -> bool {
+        let Some(property) = self.clip.tracks.get(t).map(|tr| tr.property) else {
+            return false;
+        };
+        let interp = self.clip.tracks.get(t).and_then(|tr| tr.keys.get(k)).map(|key| key.interp);
+        let lanes = property.lanes().max(1);
+        let mut lane = self.curve_lane.min(lanes - 1);
+
+        ui.horizontal(|ui| {
+            widgets::eyebrow(ui, "Curve");
+            ui.label(egui::RichText::new("lane").color(theme::TEXT_MUTED));
+            egui::ComboBox::from_id_salt("zestengine-curve-lane")
+                .selected_text(lane_name(property, lane))
+                .show_ui(ui, |ui| {
+                    for l in 0..lanes {
+                        ui.selectable_value(&mut self.curve_lane, l, lane_name(property, l));
+                    }
+                });
+        });
+        lane = self.curve_lane.min(lanes - 1);
+
+        let Some(track) = self.clip.tracks.get(t) else {
+            return false;
+        };
+        let Some(key) = track.keys.get(k) else {
+            return false;
+        };
+        let t_key = key.time;
+        let key_v = key.value[lane];
+
+        // Show the segment(s) touching this key, with a little context on the
+        // open side when it is the first or last key.
+        let prev_t = track.keys[..k].last().map(|p| p.time);
+        let next_t = track.keys.get(k + 1).map(|n| n.time);
+        let mut t_min = prev_t.unwrap_or(t_key - 0.5);
+        let mut t_max = next_t.unwrap_or(t_key + 0.5);
+        if (t_max - t_min).abs() < 1e-4 {
+            t_min = t_key - 0.5;
+            t_max = t_key + 0.5;
+        }
+        let pad = (t_max - t_min).max(1e-3) * 0.12;
+        t_min -= pad;
+        t_max += pad;
+        let h_dt = (t_max - t_min) * 0.16;
+
+        // Sample the window to get the value range and the plotted curve.
+        let n = 96;
+        let mut samples = Vec::with_capacity(n + 1);
+        let mut v_min = f32::INFINITY;
+        let mut v_max = f32::NEG_INFINITY;
+        let mut note = |v: f32| {
+            v_min = v_min.min(v);
+            v_max = v_max.max(v);
+        };
+        for i in 0..=n {
+            let time = t_min + (t_max - t_min) * i as f32 / n as f32;
+            let v = track.sample(time)[lane];
+            samples.push((time, v));
+            note(v);
+        }
+        note(key_v);
+        let custom = key.interp == KeyInterp::Custom && property != TrackProperty::Rotation;
+        // A tangent only shapes a segment when that segment uses Custom: the
+        // outgoing one is driven by this key, the incoming one by the previous
+        // key. Endpoint sides have no segment, so they expose no handle.
+        let out_active = custom && next_t.is_some();
+        let in_active = custom && prev_t.is_some() && track.keys[k - 1].interp == KeyInterp::Custom;
+        let eps = (t_max - t_min) * 1e-3;
+        let m_out = if out_active {
+            (track.sample(t_key + eps)[lane] - track.sample(t_key)[lane]) / eps
+        } else {
+            0.0
+        };
+        let m_in = if in_active {
+            (track.sample(t_key)[lane] - track.sample(t_key - eps)[lane]) / eps
+        } else {
+            0.0
+        };
+        if out_active {
+            note(key_v + m_out * h_dt);
+        }
+        if in_active {
+            note(key_v - m_in * h_dt);
+        }
+        if (v_max - v_min).abs() < 1e-4 {
+            v_max = v_min + 1.0;
+        }
+        let v_pad = (v_max - v_min) * 0.15;
+        v_min -= v_pad;
+        v_max += v_pad;
+
+        let height = (ui.available_height() - 8.0).clamp(96.0, 220.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        let painter = ui.painter_at(rect).with_clip_rect(rect);
+        painter.rect_filled(rect, CornerRadius::ZERO, theme::BG_VIEWPORT);
+        painter.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0_f32, theme::LINE_PANEL), egui::StrokeKind::Inside);
+
+        let inner = rect.shrink2(Vec2::new(12.0, 12.0));
+        let x_of = |time: f32| inner.left() + (time - t_min) / (t_max - t_min) * inner.width();
+        let y_of = |v: f32| inner.bottom() - (v - v_min) / (v_max - v_min) * inner.height();
+        let y_to_v = |y: f32| v_min + (inner.bottom() - y) / inner.height() * (v_max - v_min);
+
+        // Hint for keys whose tangents cannot be dragged here.
+        if property == TrackProperty::Rotation {
+            painter.text(
+                inner.left_top() + Vec2::new(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                "rotation tangents stay automatic",
+                theme::mono(theme::SIZE_TINY),
+                theme::TEXT_DIM,
+            );
+        } else if interp != Some(KeyInterp::Custom) {
+            painter.text(
+                inner.left_top() + Vec2::new(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                "set Curve to Custom to drag tangents",
+                theme::mono(theme::SIZE_TINY),
+                theme::TEXT_DIM,
+            );
+        }
+
+        // Grid: the selected key's time and the zero line.
+        let xk = x_of(t_key);
+        painter.line_segment([Pos2::new(xk, inner.top()), Pos2::new(xk, inner.bottom())], Stroke::new(1.0_f32, theme::with_alpha(theme::LINE_PANEL, 0.8)));
+        if v_min < 0.0 && v_max > 0.0 {
+            let y0 = y_of(0.0);
+            painter.line_segment([Pos2::new(inner.left(), y0), Pos2::new(inner.right(), y0)], Stroke::new(1.0_f32, theme::with_alpha(theme::LINE_PANEL, 0.8)));
+        }
+
+        let points: Vec<Pos2> = samples.iter().map(|&(time, v)| Pos2::new(x_of(time), y_of(v))).collect();
+        painter.add(Shape::line(points, Stroke::new(1.5_f32, theme::accent())));
+
+        for (j, kk) in track.keys.iter().enumerate() {
+            if kk.time < t_min || kk.time > t_max {
+                continue;
+            }
+            let c = Pos2::new(x_of(kk.time), y_of(kk.value[lane]));
+            let s = 4.0;
+            let pts = vec![
+                c + Vec2::new(0.0, -s),
+                c + Vec2::new(s, 0.0),
+                c + Vec2::new(0.0, s),
+                c + Vec2::new(-s, 0.0),
+            ];
+            let fill = if j == k { theme::accent() } else { theme::TEXT_SECONDARY };
+            painter.add(Shape::convex_polygon(pts, fill, Stroke::new(1.0_f32, theme::BG_CHROME)));
+        }
+
+        // Tangent handles for the active Custom segments. Each handle is a fixed
+        // horizontal distance from the key, so its vertical position (and drag)
+        // encodes the tangent slope dv/dt.
+        let mut out_resp: Option<egui::Response> = None;
+        let mut in_resp: Option<egui::Response> = None;
+        if out_active || in_active {
+            let key_pos = Pos2::new(xk, y_of(key_v));
+            let style = |resp: &egui::Response, set: bool| -> (egui::Color32, bool) {
+                if resp.dragged() || resp.hovered() {
+                    (theme::accent(), true)
+                } else if set {
+                    (theme::TEXT_STRONG, true)
+                } else {
+                    (theme::TEXT_DIM, false)
+                }
+            };
+            if out_active {
+                let out_h = Pos2::new(x_of(t_key + h_dt), y_of(key_v + m_out * h_dt));
+                painter.line_segment([key_pos, out_h], Stroke::new(1.0_f32, theme::with_alpha(theme::accent(), if key.tangent_out.is_some() { 1.0 } else { 0.45 })));
+
+                let out_rect = Rect::from_center_size(out_h, Vec2::splat(14.0));
+                let out_id = ui.make_persistent_id(("zestengine-curve-out", t, k, lane));
+                let resp = ui.interact(out_rect, out_id, Sense::drag());
+                let (fill, solid) = style(&resp, key.tangent_out.is_some());
+                if solid {
+                    painter.circle_filled(out_h, 4.5, fill);
+                } else {
+                    painter.circle_stroke(out_h, 4.5, Stroke::new(1.5_f32, fill));
+                }
+                out_resp = Some(resp);
+            }
+            if in_active {
+                let in_h = Pos2::new(x_of(t_key - h_dt), y_of(key_v - m_in * h_dt));
+                painter.line_segment([key_pos, in_h], Stroke::new(1.0_f32, theme::with_alpha(theme::accent(), if key.tangent_in.is_some() { 1.0 } else { 0.45 })));
+
+                let in_rect = Rect::from_center_size(in_h, Vec2::splat(14.0));
+                let in_id = ui.make_persistent_id(("zestengine-curve-in", t, k, lane));
+                let resp = ui.interact(in_rect, in_id, Sense::drag());
+                let (fill, solid) = style(&resp, key.tangent_in.is_some());
+                if solid {
+                    painter.circle_filled(in_h, 4.5, fill);
+                } else {
+                    painter.circle_stroke(in_h, 4.5, Stroke::new(1.5_f32, fill));
+                }
+                in_resp = Some(resp);
+            }
+        }
+
+        let mut new_out: Option<f32> = None;
+        let mut new_in: Option<f32> = None;
+        if let Some(resp) = out_resp {
+            if resp.dragged() && let Some(p) = resp.interact_pointer_pos() {
+                new_out = Some((y_to_v(p.y) - key_v) / h_dt);
+            }
+        }
+        if let Some(resp) = in_resp {
+            if resp.dragged() && let Some(p) = resp.interact_pointer_pos() {
+                new_in = Some((key_v - y_to_v(p.y)) / h_dt);
+            }
+        }
+
+        let mut edited = false;
+        if new_out.is_some() || new_in.is_some() {
+            if let Some(track) = self.clip.tracks.get_mut(t) {
+                if let Some(key) = track.keys.get_mut(k) {
+                    if let Some(m) = new_out {
+                        let mut tg = key.tangent_out.unwrap_or([0.0; 4]);
+                        tg[lane] = m;
+                        key.tangent_out = Some(tg);
+                    }
+                    if let Some(m) = new_in {
+                        let mut tg = key.tangent_in.unwrap_or([0.0; 4]);
+                        tg[lane] = m;
+                        key.tangent_in = Some(tg);
+                    }
+                    edited = true;
+                }
             }
         }
         edited

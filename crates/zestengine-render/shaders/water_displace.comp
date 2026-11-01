@@ -36,6 +36,9 @@ layout(set = 0, binding = 0, std140) uniform WaterData {
 } u;
 // Each body's ripple field (r height); only bound for bodies that have one.
 layout(set = 0, binding = 1) uniform sampler2D u_ripple[MAX_WATER_BODIES];
+// Each body's baked shore depth (r metres over local XZ); only bound for
+// bodies that have one (`extra.yz` carries the calm depth + half extent).
+layout(set = 0, binding = 2) uniform sampler2D u_shore[MAX_WATER_BODIES];
 
 layout(push_constant) uniform Push {
     uint64_t src;
@@ -51,6 +54,20 @@ layout(push_constant) uniform Push {
 // standard_common.glsl's water_band.
 float water_band(float k, float foot) {
     return k > 0.0 ? smoothstep(2.0, 4.0, 6.2831853 / (k * max(foot, 1e-5))) : 1.0;
+}
+
+// standard.vert's water_shore: share of the waves left at local `xz` (0..1),
+// calm over water shallower than the body's shore depth.
+float water_shore(int slot, vec2 xz) {
+    vec4 e = u.bodies[slot].extra;
+    if (e.y <= 0.0 || e.z <= 0.0) {
+        return 1.0;
+    }
+    vec2 uv = xz / (2.0 * e.zw) + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        return 1.0;
+    }
+    return smoothstep(0.0, e.y, textureLod(u_shore[nonuniformEXT(slot)], uv, 0.0).r);
 }
 
 void main() {
@@ -78,6 +95,9 @@ void main() {
         d.z += w * b.x * a.y * c;
         d.y += w * b.y * s;
     }
+    // The Gerstner waves calm over the shallows near a shore (the raster's
+    // `d *= shoal` in standard.vert; the ripple layer is added after, as there).
+    d *= water_shore(slot, xz);
     vec4 r = u.bodies[slot].ripple;
     if (pc.ripple != 0u && r.z > 0.0) {
         vec2 ruv = (xz - r.xy) / r.z + 0.5;

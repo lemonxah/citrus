@@ -64,6 +64,16 @@ pub struct HitHistory {
 }
 
 impl HitHistory {
+    /// Empty the history and restart the clock at `now` (session clock).
+    /// A host taking over after a migration has none of the old host's
+    /// recorded hitboxes, so its lag-compensation history starts fresh at
+    /// the handover moment; any poses from an earlier stint as host are
+    /// dropped so rewound ray casts never serve stale hitboxes.
+    pub fn restart(&mut self, now: f64) {
+        self.tracks.clear();
+        self.now = now;
+    }
+
     /// Record an object's pose (call once per frame per object).
     pub fn record(&mut self, id: ObjectId, time: f64, pos: Vec3, rot: Quat, scale: Vec3, shapes: &[HitShape]) {
         self.now = self.now.max(time);

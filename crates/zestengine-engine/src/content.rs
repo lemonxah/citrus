@@ -27,6 +27,7 @@ use zestengine_core::{
 use zestengine_render::Renderer;
 use glam::{Quat, Vec3};
 
+use crate::resource_tracker::{ResourceSet, ResourceTracker};
 use crate::scene::LoadedScene;
 use crate::scene_loader::{LoadStage, LoadedSceneData, SceneFlow};
 use crate::shaders::ShaderLibrary;
@@ -382,6 +383,15 @@ struct Package {
     instances: Vec<String>,
 }
 
+/// Scene cache entries a content origin added; removed again when it unloads
+/// so a later spawn re-installs fresh resources instead of reusing freed ones.
+#[derive(Default)]
+struct OriginCaches {
+    models: Vec<String>,
+    material_files: Vec<PathBuf>,
+    texture_files: Vec<(PathBuf, bool)>,
+}
+
 /// Host access for [`ContentManager::update`].
 pub(crate) struct ContentHost<'a> {
     pub renderer: &'a mut Renderer,
@@ -420,6 +430,14 @@ pub struct ContentManager {
     remote_requests: HashMap<ObjectId, String>,
     /// World switch requested through SceneFlow: (content id, request).
     pending_world: Option<(String, ContentRequest)>,
+    /// Renderer resource indices each live origin references.
+    resources: ResourceTracker,
+    /// Every renderer index allocated by a content spawn (safe-to-free set is
+    /// the intersection of `free_set_for` with this, so base-scene resources
+    /// are never freed).
+    content_owned: ResourceSet,
+    /// Scene cache entries each origin installed.
+    origin_caches: HashMap<String, OriginCaches>,
     counter: u64,
 }
 
@@ -438,6 +456,9 @@ impl ContentManager {
             worn: HashMap::new(),
             remote_requests: HashMap::new(),
             pending_world: None,
+            resources: ResourceTracker::new(),
+            content_owned: ResourceSet::default(),
+            origin_caches: HashMap::new(),
             counter: 0,
         }
     }
@@ -508,6 +529,9 @@ impl ContentManager {
         self.avatars.clear();
         self.worn.clear();
         self.remote_requests.clear();
+        self.resources = ResourceTracker::new();
+        self.content_owned = ResourceSet::default();
+        self.origin_caches.clear();
         if let Some((id, request)) = self.pending_world.take() {
             if let Some(p) = self.packages.get_mut(&id)
                 && p.extracted.entry.to_string_lossy() == path
@@ -578,7 +602,7 @@ impl ContentManager {
             },
             ContentCommand::Unload(id) => {
                 if let Some(id) = self.resolve(&id) {
-                    self.unload(&id, host.scene, out);
+                    self.unload(&id, host, out);
                 }
             }
         }
@@ -746,6 +770,20 @@ impl ContentManager {
                 entries[root_local].rotation = Quat::IDENTITY.to_array();
             }
         }
+        let mesh_base = host.renderer.mesh_count();
+        let texture_base = host.renderer.texture_count();
+        let material_base = host.renderer.material_count();
+        let candidate_models: Vec<String> = match &p.pending {
+            Some(data) => data.models.keys().cloned().collect(),
+            None => p.file.model_paths(),
+        };
+        let new_models: Vec<String> = candidate_models
+            .into_iter()
+            .filter(|path| !host.scene.has_model_template(path))
+            .collect();
+        let material_cache_before: HashSet<PathBuf> = host.scene.material_cache_keys().into_iter().collect();
+        let texture_cache_before: HashSet<(PathBuf, bool)> = host.scene.texture_cache_keys().into_iter().collect();
+
         match p.pending.take() {
             Some(mut data) => {
                 data.file.entries = entries;
@@ -762,14 +800,43 @@ impl ContentManager {
         p.installed = true;
         p.instances.push(origin.clone());
 
+        // Record what this origin references and which renderer indices it
+        // newly allocated, so `free_origin` can release them later.
+        let newly = ResourceSet {
+            meshes: (mesh_base..host.renderer.mesh_count()).collect(),
+            textures: (texture_base..host.renderer.texture_count()).collect(),
+            materials: (material_base..host.renderer.material_count()).collect(),
+        };
+        let mut set = Self::resources_for(host.scene, &origin);
+        set.meshes.extend(&newly.meshes);
+        set.textures.extend(&newly.textures);
+        set.materials.extend(&newly.materials);
+        self.content_owned.meshes.extend(&newly.meshes);
+        self.content_owned.textures.extend(&newly.textures);
+        self.content_owned.materials.extend(&newly.materials);
+        self.resources.record(&origin, set);
+
+        let material_cache_after: HashSet<PathBuf> = host.scene.material_cache_keys().into_iter().collect();
+        let texture_cache_after: HashSet<(PathBuf, bool)> = host.scene.texture_cache_keys().into_iter().collect();
+        self.origin_caches.insert(
+            origin.clone(),
+            OriginCaches {
+                models: new_models,
+                material_files: material_cache_after.difference(&material_cache_before).cloned().collect(),
+                texture_files: texture_cache_after.difference(&texture_cache_before).cloned().collect(),
+            },
+        );
+
         if let ContentPlacement::AvatarOf(player) = placement {
             if host.scene.index_of(*player).is_none() {
-                host.scene.unload_origin(&origin);
-                p.instances.retain(|o| *o != origin);
+                if let Some(pkg) = self.packages.get_mut(id) {
+                    pkg.instances.retain(|o| *o != origin);
+                }
+                self.free_origin(&origin, host.renderer, host.scene);
                 anyhow::bail!("player object not found");
             }
             if let Some((old, _)) = self.avatars.remove(player) {
-                host.scene.unload_origin(&old);
+                self.free_origin(&old, host.renderer, host.scene);
                 for pk in self.packages.values_mut() {
                     pk.instances.retain(|o| *o != old);
                 }
@@ -821,20 +888,78 @@ impl ContentManager {
         }
     }
 
-    fn unload(&mut self, id: &str, scene: &mut LoadedScene, out: &mut ContentUpdate) {
-        let Some(p) = self.packages.remove(id) else { return };
+    fn unload(&mut self, id: &str, host: &mut ContentHost, out: &mut ContentUpdate) {
+        let Some(mut p) = self.packages.remove(id) else { return };
+        if let Some(mut pending) = p.pending.take() {
+            free_pending_gpu(&mut pending, host.renderer);
+        }
         for origin in &p.instances {
-            if scene.unload_origin(origin) > 0 {
+            if self.free_origin(origin, host.renderer, host.scene) > 0 {
                 out.structure_changed = true;
             }
         }
         self.avatars.retain(|_, (o, _)| !p.instances.contains(o));
         self.worn.retain(|_, w| w != id);
         self.sources.retain(|_, v| v != id);
-        // Pending (uploaded but never installed) GPU data and installed
-        // templates are released with the scene's renderer resources on the
-        // next world switch.
         out.events.push(ContentEvent::Unloaded { id: id.to_owned() });
+    }
+
+    /// The renderer resource indices an origin's live objects reference.
+    fn resources_for(scene: &LoadedScene, origin: &str) -> ResourceSet {
+        let mut set = ResourceSet::default();
+        for object in &scene.objects {
+            if scene.object_origin.get(&object.id).map(String::as_str) != Some(origin) {
+                continue;
+            }
+            for render in object.render_slots() {
+                if let Some(mesh) = scene.mesh_handle(render.mesh) {
+                    set.meshes.insert(mesh.index());
+                }
+                if let Some(material) = scene.materials.get(render.material) {
+                    set.materials.insert(material.handle.index());
+                    for texture in material.bound_textures.iter().flatten() {
+                        set.textures.insert(texture.index());
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// Remove an origin's objects and free the GPU resources it alone owns.
+    /// Returns the number of objects removed.
+    fn free_origin(&mut self, origin: &str, renderer: &mut Renderer, scene: &mut LoadedScene) -> usize {
+        let removed = scene.unload_origin(origin);
+        let referenced = self.resources.free_set_for(origin);
+        let free = ResourceSet {
+            meshes: referenced.meshes.intersection(&self.content_owned.meshes).copied().collect(),
+            textures: referenced.textures.intersection(&self.content_owned.textures).copied().collect(),
+            materials: referenced.materials.intersection(&self.content_owned.materials).copied().collect(),
+        };
+        let _ = renderer.free_resources(&free.meshes, &free.textures, &free.materials);
+        for mesh in &free.meshes {
+            self.content_owned.meshes.remove(mesh);
+        }
+        for texture in &free.textures {
+            self.content_owned.textures.remove(texture);
+        }
+        for material in &free.materials {
+            self.content_owned.materials.remove(material);
+        }
+        self.resources.clear(origin);
+        if let Some(caches) = self.origin_caches.remove(origin) {
+            for path in caches.models {
+                scene.remove_model_template(&path);
+            }
+            for path in caches.material_files {
+                scene.remove_material_cache(&path);
+            }
+            for key in caches.texture_files {
+                scene.remove_texture_cache(&key);
+            }
+        }
+        scene.clear_lazy_caches();
+        removed
     }
 
     /// Remove every instance from the scene and forget installed state (the
@@ -848,6 +973,20 @@ impl ContentManager {
         self.remote_requests.clear();
         self.pending_world = None;
         self.queued.clear();
+        self.resources = ResourceTracker::new();
+        self.content_owned = ResourceSet::default();
+        self.origin_caches.clear();
+    }
+}
+
+fn free_pending_gpu(data: &mut LoadedSceneData, renderer: &mut Renderer) {
+    if let Some(prepared) = data.prepared.take() {
+        for (_, scene) in prepared {
+            renderer.free_prepared(scene);
+        }
+    }
+    if let Some((_, prepared)) = data.material_textures.take() {
+        renderer.free_prepared(prepared);
     }
 }
 

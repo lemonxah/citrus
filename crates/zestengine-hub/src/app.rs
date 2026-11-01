@@ -54,9 +54,9 @@ struct App {
     error: Option<anyhow::Error>,
 }
 
-/// `Show` carries the tray click's XDG activation token, if the host sent one.
+/// `Show` and `Toggle` carry the tray's XDG activation token, if the host sent one.
 #[derive(Clone, Debug)]
-pub(crate) enum HubEvent { Show(Option<String>), Quit }
+pub(crate) enum HubEvent { Show(Option<String>), Toggle(Option<String>), Quit }
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -125,7 +125,9 @@ impl App {
     /// destroyed (see `minimize_to_tray`).
     fn show(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
         if let Some(window) = &self.window {
-            window.set_minimized(false);
+            if self.minimized {
+                window.set_minimized(false);
+            }
             window.focus_window();
             self.wake();
             return;
@@ -145,6 +147,17 @@ impl App {
         self.adopt_window(window);
         if let Some(hub) = self.hub.as_mut() {
             hub.refresh();
+        }
+    }
+
+    /// A tray click toggles: a shown window minimises to the tray, a hidden or
+    /// minimised one is restored. On Wayland "hidden" means the window was
+    /// destroyed by `minimize_to_tray`, so restoring makes a new one.
+    fn toggle(&mut self, event_loop: &ActiveEventLoop, token: Option<String>) {
+        if self.window.is_none() || self.minimized {
+            self.show(event_loop, token);
+        } else {
+            self.minimize_to_tray();
         }
     }
 
@@ -221,6 +234,7 @@ impl ApplicationHandler<HubEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: HubEvent) {
         match event {
             HubEvent::Show(token) => self.show(event_loop, token),
+            HubEvent::Toggle(token) => self.toggle(event_loop, token),
             HubEvent::Quit => {
                 tracing::info!("exiting: Quit from the tray");
                 event_loop.exit();

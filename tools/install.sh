@@ -34,6 +34,10 @@ for binary in zestengine zestengine-hub zestengine-relay; do
 done
 "${elevate[@]}" install -Dm644 pkg/zestengine.desktop "$prefix/share/applications/zestengine.desktop"
 "${elevate[@]}" install -Dm644 pkg/zestengine.svg "$prefix/share/icons/hicolor/scalable/apps/zestengine.svg"
+for size in 16 32 48 64 128 256 512; do
+    "${elevate[@]}" install -Dm644 "pkg/icons/zestengine-${size}.png" \
+        "$prefix/share/icons/hicolor/${size}x${size}/apps/zestengine.png"
+done
 if command -v gtk-update-icon-cache >/dev/null; then
     "${elevate[@]}" gtk-update-icon-cache -q -t "$prefix/share/icons/hicolor" || true
 fi

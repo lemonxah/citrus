@@ -33,3 +33,42 @@ float probe_b_weight(vec3 p, vec3 box0, vec3 ext0, float blend0, vec3 box1, vec3
     float f1 = probe_influence(p, box1, ext1, blend1);
     return b_on_top ? f1 : f1 * (1.0 - f0);
 }
+
+// Forward-pass multi-probe blend (3+ probes): slot 0 is the fallback and every
+// active slot contributes `sample * intensity * influence`, normalised by the
+// total influence. `extra` must be true only when at least one of slots 2/3 is
+// active, so the two-probe path above is left untouched.
+vec3 probe_env(vec3 worldPos, vec3 R_raw, float roughness, bool extra) {
+    if (!extra) return vec3(0.0);
+    float wsum = 0.0;
+    vec3 acc = vec3(0.0);
+    float intensity = u.refl_center.w;
+    if (intensity > 0.0) {
+        vec3 R = probe_box_dir(worldPos, R_raw, u.refl_center.xyz, u.refl_box.xyz, u.refl_extents.xyz, u.refl_extents.w > 0.5);
+        float w = probe_influence(worldPos, u.refl_box.xyz, u.refl_extents.xyz, u.refl_blend.x);
+        acc += textureLod(u_env, R, roughness * ENV_MAX_LOD).rgb * intensity * w;
+        wsum += w;
+    }
+    float i2 = u.refl2_center.w;
+    if (i2 > 0.0) {
+        vec3 R2 = probe_box_dir(worldPos, R_raw, u.refl2_center.xyz, u.refl2_box.xyz, u.refl2_extents.xyz, u.refl2_extents.w > 0.5);
+        float w = probe_influence(worldPos, u.refl2_box.xyz, u.refl2_extents.xyz, u.refl_blend.y);
+        acc += textureLod(u_env_b, R2, roughness * float(textureQueryLevels(u_env_b) - 1)).rgb * i2 * w;
+        wsum += w;
+    }
+    float i3 = u.refl3_center.w;
+    if (i3 > 0.0) {
+        vec3 R3 = probe_box_dir(worldPos, R_raw, u.refl3_center.xyz, u.refl3_box.xyz, u.refl3_extents.xyz, u.refl3_extents.w > 0.5);
+        float w = probe_influence(worldPos, u.refl3_box.xyz, u.refl3_extents.xyz, u.refl_blend2.x);
+        acc += textureLod(u_env_c, R3, roughness * float(textureQueryLevels(u_env_c) - 1)).rgb * i3 * w;
+        wsum += w;
+    }
+    float i4 = u.refl4_center.w;
+    if (i4 > 0.0) {
+        vec3 R4 = probe_box_dir(worldPos, R_raw, u.refl4_center.xyz, u.refl4_box.xyz, u.refl4_extents.xyz, u.refl4_extents.w > 0.5);
+        float w = probe_influence(worldPos, u.refl4_box.xyz, u.refl4_extents.xyz, u.refl_blend2.y);
+        acc += textureLod(u_env_d, R4, roughness * float(textureQueryLevels(u_env_d) - 1)).rgb * i4 * w;
+        wsum += w;
+    }
+    return wsum > 1e-4 ? acc / wsum : vec3(0.0);
+}

@@ -69,3 +69,17 @@ release new_version msg="":
     git tag -a "v$version" -m "$title"
     git push --atomic origin "$branch" "refs/tags/v$version"
     gh release create "v$version" --verify-tag --title "$title" --generate-notes
+
+# ---- Packages ---------------------------------------------------------------
+# The .deb works on the Ubuntu release it was built for and newer.
+# The .rpm works on that Fedora release only.
+
+deb image="ubuntu:24.04":
+    pkg/deb/build-deb.sh --container {{image}}
+
+rpm image="fedora:latest":
+    pkg/rpm/build-rpm.sh --container {{image}}
+
+# Build with Nix. The result is symlinked at ./result.
+nix:
+    nix build ./pkg/nix

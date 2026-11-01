@@ -61,6 +61,8 @@ layout(set = 0, binding = 2) uniform sampler2D u_depth;
 layout(set = 0, binding = 3) uniform sampler2D u_gbuf;
 layout(set = 0, binding = 4) uniform samplerCube u_env;
 layout(set = 0, binding = 11) uniform samplerCube u_env_b; // second reflection probe
+layout(set = 0, binding = 12) uniform samplerCube u_env_c; // third reflection probe
+layout(set = 0, binding = 13) uniform samplerCube u_env_d; // fourth reflection probe
 layout(set = 0, binding = 5) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 6, scalar) readonly buffer Instances { Instance data[]; } instances;
 layout(set = 0, binding = 7, scalar) readonly buffer Lights { Light data[]; } lights;
@@ -79,9 +81,20 @@ layout(set = 0, binding = 8, scalar) uniform RtData {
     vec4 refl2_extents;
     vec4 refl2_box;
     vec4 refl_blend;   // x slot 0 blend, y slot 1 blend, z slot 1 on top
+    vec4 refl3_center; // third probe (binding 12)
+    vec4 refl3_extents;
+    vec4 refl3_box;
+    vec4 refl4_center; // fourth probe (binding 13)
+    vec4 refl4_extents;
+    vec4 refl4_box;
+    vec4 refl_blend2;  // x slot 2 blend, y slot 3 blend
     vec4 water;        // x water clock
     GpuWater water_bodies[MAX_WATER_BODIES];
 } u;
+
+// Max roughness mip of the RT env cube (fixed 6-mip prefilter). Declared before
+// probe_blend.glsl so its `probe_env` can use it.
+const float ENV_MAX_LOD = 6.0;
 
 #include "probe_blend.glsl"
 
@@ -89,7 +102,6 @@ layout(set = 0, binding = 9) uniform sampler2D u_tex[];
 layout(set = 0, binding = 10) uniform sampler2DArray u_lightmap;
 
 const float PI = 3.14159265359;
-const float ENV_MAX_LOD = 6.0;
 const bool FLIP_Y = true;
 
 vec3 oct_decode(vec2 e) {
@@ -170,6 +182,11 @@ vec3 sample_env(vec3 worldPos, vec3 R, float roughness) {
         float wb = probe_b_weight(worldPos, u.refl_box.xyz, u.refl_extents.xyz, u.refl_blend.x,
                                   u.refl2_box.xyz, u.refl2_extents.xyz, u.refl_blend.y, u.refl_blend.z > 0.5);
         env = mix(env, env_b, wb);
+    }
+    // 3+ probes: match the forward pass's normalised multi-probe blend; the
+    // two-probe path above stays byte-for-byte unchanged.
+    if (u.refl3_center.w > 0.0) {
+        env = probe_env(worldPos, R_raw, roughness, true);
     }
     return env;
 }

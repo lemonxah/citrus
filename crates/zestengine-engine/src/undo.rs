@@ -29,6 +29,18 @@ pub struct ObjectState {
     pub components: Vec<zestengine_assets::ComponentData>,
 }
 
+/// The skybox image sources. Kept as their own state because the equirect 360°
+/// image lives on the scene (`LoadedScene::skybox`) while the 6-face cubemap
+/// lives on the environment (`WorldEnvironment::skybox_faces`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkyboxState {
+    /// Project-relative equirectangular image (None = procedural sky).
+    pub equirect: Option<String>,
+    /// Cubemap faces in +X,-X,+Y,-Y,+Z,-Z order (overrides the equirect image
+    /// once all six are set).
+    pub faces: Option<[String; 6]>,
+}
+
 #[derive(Clone)]
 pub enum UndoEntry {
     /// Transform / rename of a scene object.
@@ -62,6 +74,11 @@ pub enum UndoEntry {
         before: Box<zestengine_assets::WorldEnvironment>,
         after: Box<zestengine_assets::WorldEnvironment>,
     },
+    /// A skybox image change (equirect 360° image or cubemap faces).
+    Skybox {
+        before: Box<SkyboxState>,
+        after: Box<SkyboxState>,
+    },
     /// A structural edit: the whole object list before and after.
     Structure {
         before: Box<crate::scene::ObjectsSnapshot>,
@@ -80,6 +97,7 @@ impl UndoEntry {
             (UndoEntry::Object { index: a, .. }, UndoEntry::Object { index: b, .. }) => a == b,
             (UndoEntry::Material { index: a, .. }, UndoEntry::Material { index: b, .. }) => a == b,
             (UndoEntry::Environment { .. }, UndoEntry::Environment { .. }) => true,
+            (UndoEntry::Skybox { .. }, UndoEntry::Skybox { .. }) => true,
             (UndoEntry::FileMaterial { path: a, .. }, UndoEntry::FileMaterial { path: b, .. }) => {
                 a == b
             }
@@ -102,6 +120,9 @@ impl UndoEntry {
                 *after = new;
             }
             (UndoEntry::Environment { after, .. }, UndoEntry::Environment { after: new, .. }) => {
+                *after = new;
+            }
+            (UndoEntry::Skybox { after, .. }, UndoEntry::Skybox { after: new, .. }) => {
                 *after = new;
             }
             (UndoEntry::FileMaterial { after, .. }, UndoEntry::FileMaterial { after: new, .. }) => {

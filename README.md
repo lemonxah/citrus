@@ -7,6 +7,8 @@ global illumination (**Flux** — see below), a lighting bake, audio, physics
 (rapier3d), and building standalone games straight from the editor. VR (OpenXR)
 is on the roadmap, not a prerequisite.
 
+![ZestEngine](crates/zestengine-assets/zestengine.jpg)
+
 ## Flux — realtime global illumination
 
 Flux is ZestEngine's built-in realtime GI: a Lumen-style screen-space technique that

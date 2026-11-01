@@ -450,6 +450,28 @@ pub struct MeshHandle(pub(crate) usize);
 pub struct TextureHandle(pub(crate) usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaterialHandle(pub(crate) usize);
+
+impl MeshHandle {
+    /// The renderer-internal resource index (used by resource liveness
+    /// tracking to free exactly the resources an origin owns).
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl TextureHandle {
+    /// The renderer-internal resource index.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl MaterialHandle {
+    /// The renderer-internal resource index.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
 /// A registered custom fragment shader (compiled SPIR-V).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShaderId(pub(crate) usize);

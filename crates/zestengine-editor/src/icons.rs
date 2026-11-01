@@ -249,19 +249,33 @@ pub fn icon(ui: &mut Ui, icon: Icon, size: f32, color: Color32) -> Response {
     response
 }
 
-/// The ZestEngine logo (spec §11): accent disc, dark ring, six segment lines and a
-/// centre dot, on a 20×20 grid.
-pub fn paint_logo(painter: &Painter, rect: Rect, accent: Color32, dark: Color32) {
-    let s = rect.width().min(rect.height()) / 20.0;
-    let o = rect.center() - Vec2::splat(10.0 * s);
-    let p = |x: f32, y: f32| o + Vec2::new(x, y) * s;
-    painter.circle_filled(p(10.0, 10.0), 9.0 * s, accent);
-    let st = Stroke::new((1.2 * s).max(1.0), dark);
-    painter.circle_stroke(p(10.0, 10.0), 6.6 * s, st);
-    painter.line_segment([p(10.0, 3.4), p(10.0, 16.6)], st);
-    painter.line_segment([p(4.3, 6.7), p(15.7, 13.3)], st);
-    painter.line_segment([p(4.3, 13.3), p(15.7, 6.7)], st);
-    painter.circle_filled(p(10.0, 10.0), 1.6 * s, dark);
+fn logo_color_image() -> &'static egui::ColorImage {
+    static IMG: OnceLock<egui::ColorImage> = OnceLock::new();
+    IMG.get_or_init(|| {
+        let image = image::load_from_memory(include_bytes!("../assets/zestengine-logo.png"))
+            .expect("zestengine logo png")
+            .into_rgba8();
+        let (w, h) = image.dimensions();
+        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], image.as_raw())
+    })
+}
+
+fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::new("zestengine-official-logo");
+    if let Some(handle) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id)) {
+        return handle;
+    }
+    let handle = ctx.load_texture("zestengine-logo", logo_color_image().clone(), egui::TextureOptions::LINEAR);
+    ctx.data_mut(|data| data.insert_temp(id, handle.clone()));
+    handle
+}
+
+/// The official ZestEngine mark, from `pkg/zestengine_logo.svg`.
+/// `accent`'s alpha dims the mark; its colour does not recolour it.
+pub fn paint_logo(painter: &Painter, rect: Rect, accent: Color32, _dark: Color32) {
+    let texture = logo_texture(painter.ctx());
+    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    painter.image(texture.id(), rect, uv, Color32::from_white_alpha(accent.a()));
 }
 
 // ------------------------------------------------------------ path parsing
@@ -489,49 +503,18 @@ fn tokenize(d: &str) -> Vec<Tok> {
 
 const APP_ICON_SIZE: u32 = 256;
 
-/// The same orange slice as `paint_logo`, rasterized for window and desktop icons.
+/// The official mark, scaled for window and desktop icons.
 pub fn app_icon_rgba() -> (u32, u32, Vec<u8>) {
-    let size = APP_ICON_SIZE;
-    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
-    let accent = crate::theme::ACCENT_DEFAULT;
-    let dark = crate::theme::BG_CHROME;
-    // Work in paint_logo's 20×20 coordinate space, with four samples per axis.
-    for y in 0..size {
-        for x in 0..size {
-            let mut rgba = [0_u32; 4];
-            for sy in 0..4 {
-                for sx in 0..4 {
-                    let dx = (x as f32 + (sx as f32 + 0.5) / 4.0) * 20.0 / size as f32 - 10.0;
-                    let dy = (y as f32 + (sy as f32 + 0.5) / 4.0) * 20.0 / size as f32 - 10.0;
-                    let radius = dx.hypot(dy);
-                    if radius > 9.0 {
-                        continue;
-                    }
-                    let on_spoke = [(0.0_f32, 6.6_f32), (5.7, 3.3), (5.7, -3.3)]
-                        .iter()
-                        .any(|&(vx, vy)| {
-                            let t = ((dx * vx + dy * vy) / (vx * vx + vy * vy)).clamp(-1.0, 1.0);
-                            (dx - t * vx).hypot(dy - t * vy) <= 0.6
-                        });
-                    let color = if radius <= 1.6 || (radius - 6.6).abs() <= 0.6 || on_spoke { dark } else { accent };
-                    rgba[0] += color.r() as u32;
-                    rgba[1] += color.g() as u32;
-                    rgba[2] += color.b() as u32;
-                    rgba[3] += 255;
-                }
-            }
-            // Keep partially covered edge pixels in straight-alpha format.
-            let samples = rgba[3] / 255;
-            let div = |v: u32| v.checked_div(samples).unwrap_or(0) as u8;
-            pixels.extend_from_slice(&[
-                div(rgba[0]),
-                div(rgba[1]),
-                div(rgba[2]),
-                if samples == 0 { 0 } else { (rgba[3] / 16) as u8 },
-            ]);
-        }
-    }
-    (size, size, pixels)
+    static ICON: OnceLock<(u32, u32, Vec<u8>)> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let image = image::load_from_memory(include_bytes!("../assets/zestengine-logo.png"))
+            .expect("zestengine logo png")
+            .resize(APP_ICON_SIZE, APP_ICON_SIZE, image::imageops::FilterType::Lanczos3)
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        (width, height, image.into_raw())
+    })
+    .clone()
 }
 
 /// Refresh the user icon for Wayland, including older green ZestEngine icons.

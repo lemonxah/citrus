@@ -5788,6 +5788,43 @@ impl LoadedScene {
         removed
     }
 
+    /// Renderer mesh handle for a scene-local mesh index.
+    pub fn mesh_handle(&self, index: usize) -> Option<MeshHandle> {
+        self.mesh_handles.get(index).copied()
+    }
+
+    pub fn has_model_template(&self, path: &str) -> bool {
+        self.model_templates.contains_key(path)
+    }
+
+    pub fn remove_model_template(&mut self, path: &str) {
+        self.model_templates.remove(path);
+    }
+
+    pub fn material_cache_keys(&self) -> Vec<PathBuf> {
+        self.material_file_cache.keys().cloned().collect()
+    }
+
+    pub fn remove_material_cache(&mut self, path: &Path) {
+        self.material_file_cache.remove(path);
+    }
+
+    pub fn texture_cache_keys(&self) -> Vec<(PathBuf, bool)> {
+        self.texture_file_cache.keys().cloned().collect()
+    }
+
+    pub fn remove_texture_cache(&mut self, key: &(PathBuf, bool)) {
+        self.texture_file_cache.remove(key);
+    }
+
+    /// Drop lazily-built mesh/material caches whose entries may reference
+    /// resources a content origin has freed. They are recreated on demand.
+    pub fn clear_lazy_caches(&mut self) {
+        self.primitive_meshes.clear();
+        self.default_material = None;
+        self.builtin_template = None;
+    }
+
     /// Add `entries` to a live scene (runtime prefab spawn): imports any model
     /// not loaded yet (synchronously), creates the objects, and pushes the
     /// materials they use to the renderer. Returns the first new index.

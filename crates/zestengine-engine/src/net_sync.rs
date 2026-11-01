@@ -290,11 +290,17 @@ pub fn sync(scene: &mut LoadedScene, s: &mut NetSession, dt: f32) {
         s.view_delay = delays.iter().sum::<f32>() / delays.len() as f32;
     }
     if is_host {
+        // Hit history is queried against the session clock (`net_view_time`
+        // and `ray_cast_rewound` use `NetView::clock`), so record on the
+        // same base. On a migrated host the local clock (`now`) is offset
+        // from the session clock; recording on `now` would misalign every
+        // rewind across the handover.
+        let clock = s.shared_clock().unwrap_or(now);
         let mut h = s.history.lock().unwrap_or_else(|e| e.into_inner());
         for (id, pos, rot, scale, shapes) in &hits {
-            h.record(*id, now, *pos, *rot, *scale, shapes);
+            h.record(*id, clock, *pos, *rot, *scale, shapes);
         }
-        h.prune(now);
+        h.prune(clock);
     }
     for (i, pos, rot, scale) in transform_writes {
         set_world_pose(scene, i, pos, rot, scale);

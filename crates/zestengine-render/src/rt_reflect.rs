@@ -179,6 +179,15 @@ pub(crate) struct RtUniforms {
     pub refl2_extents: [f32; 4],
     pub refl2_box: [f32; 4],
     pub refl_blend: [f32; 4],
+    /// Third/fourth reflection probes (bindings 12/13), as in the frame UBO.
+    pub refl3_center: [f32; 4],
+    pub refl3_extents: [f32; 4],
+    pub refl3_box: [f32; 4],
+    pub refl4_center: [f32; 4],
+    pub refl4_extents: [f32; 4],
+    pub refl4_box: [f32; 4],
+    /// x = slot 2 blend distance, y = slot 3 blend distance.
+    pub refl_blend2: [f32; 4],
     /// x water clock, y body count.
     pub water: [f32; 4],
     pub water_bodies: [GpuWater; MAX_WATER_BODIES],
@@ -272,6 +281,17 @@ impl RtReflect {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Third/fourth reflection probe cubes (3+ probe blend).
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(12)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(13)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
             // Every renderer texture, indexed per hit (descriptor indexing).
             vk::DescriptorSetLayoutBinding::default()
                 .binding(9)
@@ -353,7 +373,7 @@ impl RtReflect {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: FRAMES_IN_FLIGHT as u32 * (6 + MAX_RT_TEXTURES),
+                            descriptor_count: FRAMES_IN_FLIGHT as u32 * (8 + MAX_RT_TEXTURES),
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -713,6 +733,8 @@ impl RtReflect {
         gbuf_view: vk::ImageView,
         env_view: vk::ImageView,
         env_b_view: vk::ImageView,
+        env_c_view: vk::ImageView,
+        env_d_view: vk::ImageView,
         textures: &[vk::ImageView],
         lightmap: (vk::ImageView, vk::Sampler),
         uniforms: &RtUniforms,
@@ -781,6 +803,8 @@ impl RtReflect {
         let gbuf_i = img(gbuf_view);
         let env_i = img(env_view);
         let env_b_i = img(env_b_view);
+        let env_c_i = img(env_c_view);
+        let env_d_i = img(env_d_view);
         let lm_i = [vk::DescriptorImageInfo::default()
             .sampler(lightmap.1)
             .image_view(lightmap.0)
@@ -807,6 +831,8 @@ impl RtReflect {
             w(8, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ubo_info),
             w(10, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&lm_i),
             w(11, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_b_i),
+            w(12, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_c_i),
+            w(13, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&env_d_i),
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 

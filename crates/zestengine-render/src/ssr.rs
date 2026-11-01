@@ -54,6 +54,15 @@ pub(crate) struct SsrUniforms {
     pub refl2_extents: [f32; 4],
     pub refl2_box: [f32; 4],
     pub refl_blend: [f32; 4],
+    /// Third/fourth reflection probes (bindings 11/12), as in the frame UBO.
+    pub refl3_center: [f32; 4],
+    pub refl3_extents: [f32; 4],
+    pub refl3_box: [f32; 4],
+    pub refl4_center: [f32; 4],
+    pub refl4_extents: [f32; 4],
+    pub refl4_box: [f32; 4],
+    /// x = slot 2 blend distance, y = slot 3 blend distance.
+    pub refl_blend2: [f32; 4],
 }
 
 /// Per-render-target SSR resources.
@@ -114,7 +123,7 @@ pub(crate) struct SsrResolve {
 impl SsrResolve {
     pub fn new(device: &ash::Device) -> Result<Self> {
         // Bindings: 0 scene colour, 1 gbuf, 2 depth, 3 env cube, 4 uniforms,
-        // 5 second probe cube.
+        // 5 second probe cube, 11/12 third/fourth probe cubes.
         let sampler_binding = |b: u32| {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(b)
@@ -133,6 +142,8 @@ impl SsrResolve {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             sampler_binding(5),
+            sampler_binding(11),
+            sampler_binding(12),
         ];
         let set_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -285,7 +296,7 @@ impl SsrResolve {
                 &vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&[
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: 6,
+                        descriptor_count: 8,
                     },
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -378,6 +389,8 @@ impl SsrResolve {
         depth_view: vk::ImageView,
         env_view: vk::ImageView,
         env_b_view: vk::ImageView,
+        env_c_view: vk::ImageView,
+        env_d_view: vk::ImageView,
         uniforms: &SsrUniforms,
     ) {
         target.ubo.write(0, bytemuck::bytes_of(uniforms));
@@ -400,6 +413,14 @@ impl SsrResolve {
             .sampler(self.sampler)
             .image_view(env_b_view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let env_c_info = [vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(env_c_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let env_d_info = [vk::DescriptorImageInfo::default()
+            .sampler(self.sampler)
+            .image_view(env_d_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(target.resolve_set)
@@ -421,6 +442,16 @@ impl SsrResolve {
                 .dst_binding(5)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&env_b_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(target.resolve_set)
+                .dst_binding(11)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&env_c_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(target.resolve_set)
+                .dst_binding(12)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&env_d_info),
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 

@@ -3,6 +3,9 @@ example-game
 *.lightmap
 target
 **/*.spv
+/pkg/deb/*.deb
+/pkg/deb/zestengine_*/
+/pkg/rpm/rpmbuild/
 .zestengine_texcache
 **/.zestengine_texcache
 target-win

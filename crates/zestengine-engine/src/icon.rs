@@ -1,4 +1,4 @@
-//! App icon (the zestengine slice from `zestengine_editor::icons`) plus desktop integration.
+//! App icon (the official mark from `zestengine_editor::icons`) plus desktop integration.
 //!
 //! X11/Windows take the icon directly from winit. Wayland compositors look
 //! it up via the window's `app_id`, which points to a `.desktop` file, so we

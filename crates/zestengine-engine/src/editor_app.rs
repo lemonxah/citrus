@@ -36,7 +36,7 @@ use zestengine_render::{CameraData, FrameInput, LightData, Renderer};
 use crate::gizmo::{GizmoState, GizmoTool};
 use crate::scene::{LoadedScene, RenderInfo, material_from_model, model_from_material, relative_to};
 use crate::shaders::ShaderLibrary;
-use crate::undo::{ObjectState, UndoEntry, UndoStack};
+use crate::undo::{ObjectState, SkyboxState, UndoEntry, UndoStack};
 
 /// Startup steps the splash's progress bar counts: Vulkan, plugins, project,
 /// scene parse, scene install, open.
@@ -220,6 +220,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         show_stats: true,
         show_stats_overlay: false,
         show_help: false,
+        about_open: false,
         project_settings_dirty: false,
         show_new_project: false,
         show_open_project: false,
@@ -1156,6 +1157,7 @@ struct EngineApp {
     /// outside the main egui pass.
     last_render_stats: zestengine_render::RenderStats,
     show_help: bool,
+    about_open: bool,
     /// Set by the dockable Project Settings tab when it edits the project;
     /// saved once after the dock pass (see `redraw`).
     project_settings_dirty: bool,
@@ -1351,6 +1353,20 @@ impl Default for ProfHistory {
 
 /// Round up to a "nice" axis maximum (1/2/5 × 10ⁿ) so the y grid lands on
 /// readable values.
+fn about_color_image() -> Option<egui::ColorImage> {
+    use std::sync::OnceLock;
+    static IMG: OnceLock<Option<egui::ColorImage>> = OnceLock::new();
+    IMG.get_or_init(|| {
+        let bytes = include_bytes!("../../zestengine-assets/zestengine.jpg");
+        image::load_from_memory(bytes).ok().map(|img| {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw())
+        })
+    })
+    .clone()
+}
+
 fn nice_ceil(v: f32) -> f32 {
     if v <= 0.0 {
         return 1.0;
@@ -3079,7 +3095,10 @@ impl EngineApp {
                     | EditorAction::SetCanvasMode(..)
                     | EditorAction::ImportModel(_)
                     | EditorAction::NewScene
+                    | EditorAction::SetSkybox(_)
                     | EditorAction::ClearSkybox
+                    | EditorAction::SetSkyboxFace(..)
+                    | EditorAction::ClearSkyboxFaces
             ) {
                 self.scene_dirty = true;
             }
@@ -4150,19 +4169,24 @@ impl EngineApp {
                     }
                 }
                 EditorAction::SetSkybox(path) => {
+                    let before = self.skybox_state();
                     let rel = path
                         .strip_prefix(&self.project_root)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .into_owned();
                     self.scene.skybox = Some(rel);
+                    self.record_skybox(before);
                     self.apply_skybox();
                 }
                 EditorAction::ClearSkybox => {
+                    let before = self.skybox_state();
                     self.scene.skybox = None;
+                    self.record_skybox(before);
                     self.apply_skybox();
                 }
                 EditorAction::SetSkyboxFace(i, path) => {
+                    let before = self.skybox_state();
                     let rel = path
                         .strip_prefix(&self.project_root)
                         .unwrap_or(&path)
@@ -4176,10 +4200,13 @@ impl EngineApp {
                     if i < 6 {
                         faces[i] = rel;
                     }
+                    self.record_skybox(before);
                     self.apply_skybox();
                 }
                 EditorAction::ClearSkyboxFaces => {
+                    let before = self.skybox_state();
                     self.scene.environment.skybox_faces = None;
+                    self.record_skybox(before);
                     self.apply_skybox();
                 }
                 EditorAction::TogglePlay => self.toggle_play(),
@@ -4969,6 +4996,9 @@ impl EngineApp {
                 });
                 top_menu(&mut bar, ui, "Help", |ui| {
                     ui.checkbox(&mut self.show_help, "Controls");
+                    if ui.button("About").clicked() {
+                        self.about_open = true;
+                    }
                 });
 
             });
@@ -5095,6 +5125,22 @@ impl EngineApp {
                     ui.label("Ctrl+Z / Ctrl+Shift+Z — undo / redo");
                     ui.label("Drag a .material from Files onto a mesh or a material slot");
                     ui.label("Double-click a model file in Files to import it");
+                });
+        }
+        if self.about_open {
+            egui::Window::new("About ZestEngine")
+                .open(&mut self.about_open)
+                .show(ctx, |ui| {
+                    if let Some(color) = about_color_image() {
+                        let size = egui::vec2(color.size[0] as f32, color.size[1] as f32);
+                        let max_w = 520.0_f32.min(size.x);
+                        let scale = if size.x > max_w { max_w / size.x } else { 1.0 };
+                        let tex = ctx.load_texture("zestengine-about", color, egui::TextureOptions::LINEAR);
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), size * scale)));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(format!("ZestEngine {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("A standalone 3D game engine in Rust + Vulkan.");
                 });
         }
     }
@@ -6697,6 +6743,23 @@ impl EngineApp {
         self.scene_panel.set_collapsed(set);
     }
 
+    /// Snapshot the skybox image sources (equirect + cubemap faces).
+    fn skybox_state(&self) -> SkyboxState {
+        SkyboxState {
+            equirect: self.scene.skybox.clone(),
+            faces: self.scene.environment.skybox_faces.clone(),
+        }
+    }
+
+    /// Record a skybox image change into the shared undo stack.
+    fn record_skybox(&mut self, before: SkyboxState) {
+        let after = self.skybox_state();
+        self.undo_stack.record(
+            UndoEntry::Skybox { before: Box::new(before), after: Box::new(after) },
+            false,
+        );
+    }
+
     /// Push the scene's skybox (or the procedural sky) to the renderer.
     fn apply_skybox(&mut self) {
         let skybox = self.scene.skybox.clone();
@@ -7744,10 +7807,18 @@ impl EngineApp {
         match entry {
             UndoEntry::Environment { before, after } => {
                 let mut env = *if undo { before } else { after };
-                // Skybox images go through their own load actions (not part of
-                // this history): keep the ones on screen.
+                // Skybox image sources are tracked by their own `Skybox` entries:
+                // keep the ones currently on screen so an environment undo never
+                // reverts them.
                 env.skybox_faces = self.scene.environment.skybox_faces.clone();
                 self.scene.environment = env;
+                self.scene_dirty = true;
+            }
+            UndoEntry::Skybox { before, after } => {
+                let state = if undo { before } else { after };
+                self.scene.skybox = state.equirect.clone();
+                self.scene.environment.skybox_faces = state.faces.clone();
+                self.apply_skybox();
                 self.scene_dirty = true;
             }
             UndoEntry::Structure { before, after } => {

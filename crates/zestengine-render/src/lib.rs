@@ -3453,6 +3453,11 @@ pub struct Renderer {
     meshes: Vec<GpuMesh>,
     textures: Vec<GpuTexture>,
     materials: Vec<Material>,
+    /// Renderer resource indices freed by `free_resources` but still present
+    /// as tombstones (indices stay stable, so live handles keep working).
+    freed_meshes: HashSet<usize>,
+    freed_textures: HashSet<usize>,
+    freed_materials: HashSet<usize>,
 
     egui: Option<egui_ash_renderer::Renderer>,
     /// A second egui renderer dedicated to the VR UI panel (its own in-flight
@@ -3805,6 +3810,7 @@ impl Renderer {
         let material_pool = unsafe {
             ctx.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
                     .max_sets(material_sets)
                     .pool_sizes(&material_pool_sizes),
                 None,
@@ -3812,16 +3818,19 @@ impl Renderer {
         };
         let custom_pool = unsafe {
             ctx.device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default().max_sets(MAX_MATERIALS).pool_sizes(&[
-                    vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::UNIFORM_BUFFER,
-                        descriptor_count: MAX_MATERIALS,
-                    },
-                    vk::DescriptorPoolSize {
-                        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                        descriptor_count: MAX_MATERIALS * pipeline::CUSTOM_TEXTURES as u32,
-                    },
-                ]),
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                    .max_sets(MAX_MATERIALS)
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::UNIFORM_BUFFER,
+                            descriptor_count: MAX_MATERIALS,
+                        },
+                        vk::DescriptorPoolSize {
+                            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                            descriptor_count: MAX_MATERIALS * pipeline::CUSTOM_TEXTURES as u32,
+                        },
+                    ]),
                 None,
             )?
         };
@@ -4396,6 +4405,9 @@ impl Renderer {
             meshes: Vec::new(),
             textures: Vec::new(),
             materials: Vec::new(),
+            freed_meshes: HashSet::new(),
+            freed_textures: HashSet::new(),
+            freed_materials: HashSet::new(),
             egui: Some(egui),
             egui_pending_free: Vec::new(),
             skinner: None,
@@ -5376,8 +5388,11 @@ impl Renderer {
                     if h.0 == self_tex {
                         continue;
                     }
+                    // Only cameras actually rendered this frame can order this
+                    // pass; a throttled/absent camera's screen keeps showing its
+                    // last frame and must not poison the topological sort.
                     if let Some(dep) = target_by_texture.get(&h.0)
-                        && wanted.contains(dep)
+                        && wanted_ids.contains(dep)
                         && *dep != id
                     {
                         need.insert(*dep);
@@ -6000,6 +6015,100 @@ impl Renderer {
             })
             .collect();
         (meshes, textures, prepared.skinned)
+    }
+
+    /// Current renderer-side resource counts (used to attribute resources
+    /// installed by a content origin).
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
+    }
+
+    pub fn texture_count(&self) -> usize {
+        self.textures.len()
+    }
+
+    pub fn material_count(&self) -> usize {
+        self.materials.len()
+    }
+
+    /// Destroy a `PreparedScene` that was never installed (its GPU allocations
+    /// are owned by the prepared buffers, not the renderer arrays).
+    pub fn free_prepared(&mut self, mut prepared: PreparedScene) {
+        unsafe { let _ = self.ctx.device.device_wait_idle(); }
+        let allocator = self.allocator();
+        let mut alloc = allocator.lock().unwrap();
+        for mut mesh in prepared.meshes.drain(..) {
+            mesh.vertex_buffer.destroy(&self.ctx.device, &mut alloc);
+            mesh.index_buffer.destroy(&self.ctx.device, &mut alloc);
+        }
+        for mut texture in prepared.textures.drain(..) {
+            texture.destroy(&self.ctx.device, &mut alloc);
+        }
+    }
+
+    /// Free scene resources by renderer index, in place: the slot stays as a
+    /// tombstone so every surviving handle keeps its index. Only resources the
+    /// caller has proven unreferenced may be passed here.
+    pub fn free_resources(
+        &mut self,
+        meshes: &HashSet<usize>,
+        textures: &HashSet<usize>,
+        materials: &HashSet<usize>,
+    ) -> Result<()> {
+        unsafe { self.ctx.device.device_wait_idle()? };
+        let allocator = self.allocator();
+        let fallback_view = self.default_textures[0].view;
+        let mut alloc = allocator.lock().unwrap();
+        for &mesh in meshes {
+            if mesh >= self.meshes.len() || self.freed_meshes.contains(&mesh) {
+                continue;
+            }
+            if let Some(skinner) = self.skinner.as_mut() {
+                skinner.remove(&self.ctx.device, &mut alloc, mesh);
+            }
+            let m = &mut self.meshes[mesh];
+            m.vertex_buffer.destroy(&self.ctx.device, &mut alloc);
+            m.index_buffer.destroy(&self.ctx.device, &mut alloc);
+            self.freed_meshes.insert(mesh);
+        }
+        for &texture in textures {
+            if texture >= self.textures.len() || self.freed_textures.contains(&texture) {
+                continue;
+            }
+            let t = &mut self.textures[texture];
+            t.destroy(&self.ctx.device, &mut alloc);
+            t.view = fallback_view;
+            t.image = vk::Image::null();
+            if let Some((view, _)) = self.ripple_mips.remove(&texture) {
+                unsafe { self.ctx.device.destroy_image_view(view, None) };
+            }
+            self.freed_textures.insert(texture);
+        }
+        self.tex_pending.retain(|(t, _)| !self.freed_textures.contains(t));
+        let device = self.ctx.device.clone();
+        let material_pool = self.material_pool;
+        let custom_pool = self.custom_pool;
+        for &material in materials {
+            if material >= self.materials.len() || self.freed_materials.contains(&material) {
+                continue;
+            }
+            let m = &mut self.materials[material];
+            m.fx_ubo.destroy(&device, &mut alloc);
+            if let Some(mut ubo) = m.custom_ubo.take() {
+                ubo.destroy(&device, &mut alloc);
+            }
+            if m.set != vk::DescriptorSet::null() {
+                unsafe { let _ = device.free_descriptor_sets(material_pool, &[m.set]); };
+            }
+            if m.custom_set != vk::DescriptorSet::null() {
+                unsafe { let _ = device.free_descriptor_sets(custom_pool, &[m.custom_set]); };
+            }
+            m.set = vk::DescriptorSet::null();
+            m.custom_set = vk::DescriptorSet::null();
+            self.freed_materials.insert(material);
+        }
+        drop(alloc);
+        Ok(())
     }
 
     pub fn create_material(&mut self, desc: &MaterialDesc) -> Result<MaterialHandle> {
@@ -7675,23 +7784,39 @@ impl Renderer {
         if self.camera_target_pool != vk::DescriptorPool::null() {
             unsafe { self.ctx.device.reset_descriptor_pool(self.camera_target_pool, vk::DescriptorPoolResetFlags::empty())? };
         }
-        for mesh in &mut self.meshes {
+        for (i, mesh) in self.meshes.iter_mut().enumerate() {
+            if self.freed_meshes.contains(&i) {
+                continue;
+            }
             mesh.vertex_buffer.destroy(&self.ctx.device, &mut alloc);
             mesh.index_buffer.destroy(&self.ctx.device, &mut alloc);
         }
         self.meshes.clear();
-        for texture in &mut self.textures {
+        self.freed_meshes.clear();
+        for (i, texture) in self.textures.iter_mut().enumerate() {
+            if self.freed_textures.contains(&i) {
+                continue;
+            }
             texture.destroy(&self.ctx.device, &mut alloc);
         }
         self.textures.clear();
+        self.freed_textures.clear();
         self.tex_pending.clear();
-        for material in &mut self.materials {
+        for (_, (view, _)) in self.ripple_mips.drain() {
+            unsafe { self.ctx.device.destroy_image_view(view, None) };
+        }
+        self.tex_view_cache.clear();
+        for (i, material) in self.materials.iter_mut().enumerate() {
+            if self.freed_materials.contains(&i) {
+                continue;
+            }
             material.fx_ubo.destroy(&self.ctx.device, &mut alloc);
             if let Some(mut ubo) = material.custom_ubo.take() {
                 ubo.destroy(&self.ctx.device, &mut alloc);
             }
         }
         self.materials.clear();
+        self.freed_materials.clear();
         if let Some(skinner) = self.skinner.as_mut() {
             skinner.clear(&self.ctx.device, &mut alloc);
         }
@@ -9165,10 +9290,17 @@ impl Renderer {
                             ],
                             screen: [render_extent_vk.width as f32, render_extent_vk.height as f32, 0.0, 0.0],
                             quality: rt_quality(&self.flux_settings),
-                            refl2_center: refl2[0],
-                            refl2_extents: refl2[1],
-                            refl2_box: refl2[2],
-                            refl_blend: refl2[3],
+                            refl2_center: refl2.refl2_center,
+                            refl2_extents: refl2.refl2_extents,
+                            refl2_box: refl2.refl2_box,
+                            refl3_center: refl2.refl3_center,
+                            refl3_extents: refl2.refl3_extents,
+                            refl3_box: refl2.refl3_box,
+                            refl4_center: refl2.refl4_center,
+                            refl4_extents: refl2.refl4_extents,
+                            refl4_box: refl2.refl4_box,
+                            refl_blend: refl2.refl_blend,
+                            refl_blend2: refl2.refl_blend2,
                             water: [input.water_time, input.water.len().min(MAX_WATER_BODIES) as f32, 0.0, 0.0],
                             water_bodies: water_bodies(input),
                         };
@@ -9187,7 +9319,7 @@ impl Renderer {
                             && let Err(e) = rt.record(
                                 &self.ctx, &allocator, command_pool, cb, frame_index, &self.meshes,
                                 &instances, &rt_water, &lights, resolved_image, resolved_view, scene_view,
-                                depth_view, gbuf_view, env_view, self.reflection_env_b.view, &tex_views, (self.lightmaps.view, self.lightmap_sampler), &rt_uniforms, render_extent_vk,
+                                depth_view, gbuf_view, env_view, self.reflection_env_b.view, self.reflection_env_c.view, self.reflection_env_d.view, &tex_views, (self.lightmaps.view, self.lightmap_sampler), &rt_uniforms, render_extent_vk,
                             ) {
                                 tracing::warn!("RT reflection record failed: {e:#}");
                             }
@@ -9219,6 +9351,8 @@ impl Renderer {
                             depth_view,
                             env_view,
                             self.reflection_env_b.view,
+                            self.reflection_env_c.view,
+                            self.reflection_env_d.view,
                             &uniforms,
                         );
                         Some(self.ssr_targets[self.frame_index].post_set)
@@ -10778,19 +10912,20 @@ impl Renderer {
     /// The shadow layers to re-render this frame, with their casters.
     fn shadow_work(&mut self, views: &[ShadowView], draws: &[DrawCmd]) -> Vec<(usize, Mat4, Vec<usize>)> {
         let dim = self.shadow_atlas.dim;
-        // Per view: the casters inside its frustum (transparent objects and
-        // Cast Shadows = Off don't cast) and a signature of the view + casters. A layer
-        // whose signature is unchanged keeps last frame's depth (static lights
-        // over static geometry stop re-rendering every frame).
+        // All eligible shadow casters (transparent objects and Cast Shadows =
+        // Off don't cast), shared by every view. The GPU cull (gpu_cull.comp)
+        // frustum-culls them per view, so the shadow pass culls on the GPU like
+        // the main camera; the CPU fallback in record_shadows culls the same
+        // list. The cache signature below is computed over this full caster
+        // input rather than a per-view frustum subset, so it stays consistent
+        // with what the GPU cull actually tests. A layer whose signature is
+        // unchanged keeps last frame's depth (static lights over static
+        // geometry stop re-rendering every frame).
+        let casters: Vec<usize> = (0..draws.len())
+            .filter(|&i| shadow_caster(&draws[i], &self.materials[draws[i].material.0].features))
+            .collect();
         let mut work: Vec<(usize, Mat4, Vec<usize>)> = Vec::new();
         for view in views {
-            let planes = frustum_planes(view.view_proj);
-            let casters: Vec<usize> = (0..draws.len())
-                .filter(|&i| {
-                    shadow_caster(&draws[i], &self.materials[draws[i].material.0].features)
-                        && sphere_in_planes(&planes, &draws[i], false)
-                })
-                .collect();
             let mut sig: u64 = 0xcbf29ce484222325 ^ dim as u64;
             let mut mix = |v: u64| {
                 sig ^= v;
@@ -10810,7 +10945,7 @@ impl Renderer {
             }
             if !self.shadow_layers_valid || self.shadow_layer_sig[view.layer] != sig {
                 self.shadow_layer_sig[view.layer] = sig;
-                work.push((view.layer, view.view_proj, casters));
+                work.push((view.layer, view.view_proj, casters.clone()));
             }
         }
         work
@@ -10908,8 +11043,15 @@ impl Renderer {
                     device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 }
                 if !self.record_gpu_shadow_layer(device, cb, *layer, *view_proj) {
-                    // Casters grouped by mesh: each run is one instanced draw.
-                    let mut sorted = casters.clone();
+                    // CPU fallback: the GPU cull path frustum-culls casters in
+                    // gpu_cull.comp; do the same here before grouping by mesh
+                    // (each run is one instanced draw).
+                    let planes = frustum_planes(*view_proj);
+                    let mut sorted: Vec<usize> = casters
+                        .iter()
+                        .copied()
+                        .filter(|&i| sphere_in_planes(&planes, &draws[i], false))
+                        .collect();
                     sorted.sort_unstable_by_key(|&i| draws[i].mesh.0);
                     let mats: Vec<[[f32; 4]; 4]> =
                         sorted.iter().map(|&i| draws[i].transform.to_cols_array_2d()).collect();
@@ -11057,10 +11199,17 @@ impl Renderer {
             ],
             fog_sun: [sun.x, sun.y, sun.z, input.time],
             screen: [ext.width as f32, ext.height as f32, 0.0, 0.0],
-            refl2_center: refl2[0],
-            refl2_extents: refl2[1],
-            refl2_box: refl2[2],
-            refl_blend: refl2[3],
+            refl2_center: refl2.refl2_center,
+            refl2_extents: refl2.refl2_extents,
+            refl2_box: refl2.refl2_box,
+            refl3_center: refl2.refl3_center,
+            refl3_extents: refl2.refl3_extents,
+            refl3_box: refl2.refl3_box,
+            refl4_center: refl2.refl4_center,
+            refl4_extents: refl2.refl4_extents,
+            refl4_box: refl2.refl4_box,
+            refl_blend: refl2.refl_blend,
+            refl_blend2: refl2.refl_blend2,
         }
     }
 
@@ -11126,11 +11275,27 @@ impl Renderer {
                 ripples[slot] = t.view;
             }
         }
+        // The shore-depth texture is bound to the water material (slot 14) and
+        // indexed by the material's water slot; the RT instance table only
+        // carries the ripple field (slot 15), so pull the shore view from the
+        // material itself.
+        let mut shores = [vk::ImageView::null(); MAX_WATER_BODIES];
+        for d in input.draws {
+            let Some(m) = self.materials.get(d.material.0) else { continue };
+            if !m.features.water {
+                continue;
+            }
+            let slot = (m.water_slot as usize).min(MAX_WATER_BODIES - 1);
+            if let Some(t) = m.slots[14].and_then(|t| self.textures.get(t.0)) {
+                shores[slot] = t.view;
+            }
+        }
         rt_water::RtWaterFrame {
             animate: self.flux_settings.reflection_mode == 2,
             time: input.water_time,
             bodies: water_bodies(input),
             ripples,
+            shores,
         }
     }
 
@@ -12444,10 +12609,17 @@ impl Renderer {
                 params: [fs.ssr_roughness_cutoff, fs.ssr_intensity, lights.len() as f32, input.light.env_intensity],
                 screen: [ext.width as f32, ext.height as f32, 0.0, 0.0],
                 quality: rt_quality(&fs),
-                refl2_center: refl2[0],
-                refl2_extents: refl2[1],
-                refl2_box: refl2[2],
-                refl_blend: refl2[3],
+                refl2_center: refl2.refl2_center,
+                refl2_extents: refl2.refl2_extents,
+                refl2_box: refl2.refl2_box,
+                refl3_center: refl2.refl3_center,
+                refl3_extents: refl2.refl3_extents,
+                refl3_box: refl2.refl3_box,
+                refl4_center: refl2.refl4_center,
+                refl4_extents: refl2.refl4_extents,
+                refl4_box: refl2.refl4_box,
+                refl_blend: refl2.refl_blend,
+                refl_blend2: refl2.refl_blend2,
                 water: [input.water_time, input.water.len().min(MAX_WATER_BODIES) as f32, 0.0, 0.0],
                 water_bodies: water_bodies(input),
             };
@@ -12465,7 +12637,7 @@ impl Renderer {
                 && let Err(e) = rt.record(
                     &self.ctx, &allocator, command_pool, cb, frame_index, &self.meshes,
                     &instances, &rt_water, &lights, resolved_image, resolved_view, hdr_view, dep_view,
-                    vp_gbuf_view, env_view, self.reflection_env_b.view, &tex_views, (self.lightmaps.view, self.lightmap_sampler), &rt_uniforms, ext,
+                    vp_gbuf_view, env_view, self.reflection_env_b.view, self.reflection_env_c.view, self.reflection_env_d.view, &tex_views, (self.lightmaps.view, self.lightmap_sampler), &rt_uniforms, ext,
                 ) {
                     tracing::warn!("viewport RT reflection failed: {e:#}");
                 }
@@ -12489,7 +12661,7 @@ impl Renderer {
             let env_view = self.reflection_env.view;
             let mut target = self.viewport_ssr.take().unwrap();
             self.ssr_resolve
-                .record(device, cb, &mut target, hdr_view, dep_view, env_view, self.reflection_env_b.view, &uniforms);
+                .record(device, cb, &mut target, hdr_view, dep_view, env_view, self.reflection_env_b.view, self.reflection_env_c.view, self.reflection_env_d.view, &uniforms);
             let set = target.post_set;
             self.viewport_ssr = Some(target);
             set
@@ -12547,24 +12719,92 @@ fn water_bodies(input: &FrameInput) -> [GpuWater; MAX_WATER_BODIES] {
     bodies
 }
 
-fn refl2_uniforms(input: &FrameInput) -> [[f32; 4]; 4] {
-    let mut blend = [
-        input.reflection_probe.map_or(0.0, |p| p.blend_distance.max(0.0)),
+/// Reflection-probe data for the passes that composite over the forward
+/// reflection (SSR, RT), matching the frame UBO's probe slots 1-3.
+struct ReflProbeUniforms {
+    refl2_center: [f32; 4],
+    refl2_extents: [f32; 4],
+    refl2_box: [f32; 4],
+    refl3_center: [f32; 4],
+    refl3_extents: [f32; 4],
+    refl3_box: [f32; 4],
+    refl4_center: [f32; 4],
+    refl4_extents: [f32; 4],
+    refl4_box: [f32; 4],
+    refl_blend: [f32; 4],
+    refl_blend2: [f32; 4],
+}
+
+fn refl_slot_uniforms(p: &ReflectionProbeBox) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    (
+        [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)],
+        [
+            p.half_extents[0],
+            p.half_extents[1],
+            p.half_extents[2],
+            if p.box_projection { 1.0 } else { 0.0 },
+        ],
+        [p.center[0], p.center[1], p.center[2], 0.0],
+    )
+}
+
+/// Probe slots 1-3 for the SSR/RT reflection resolve, plus the per-slot blend
+/// distances. The third/fourth slots come straight from `reflection_probes`, so
+/// those passes can blend the same 3+ probes the forward pass already blends.
+fn refl2_uniforms(input: &FrameInput) -> ReflProbeUniforms {
+    let mut refl_blend = [
+        input
+            .reflection_probe
+            .map_or(0.0, |p| p.blend_distance.max(0.0)),
         0.0,
         0.0,
         0.0,
     ];
-    let Some(p) = input.reflection_probe_b else {
-        return [[0.0; 4], [0.0; 4], [0.0; 4], blend];
-    };
-    blend[1] = p.blend_distance.max(0.0);
-    blend[2] = input.reflection_primary.min(1) as f32;
-    [
-        [p.capture[0], p.capture[1], p.capture[2], p.intensity.max(0.0)],
-        [p.half_extents[0], p.half_extents[1], p.half_extents[2], if p.box_projection { 1.0 } else { 0.0 }],
-        [p.center[0], p.center[1], p.center[2], 0.0],
-        blend,
-    ]
+    let (refl2_center, refl2_extents, refl2_box) = input
+        .reflection_probe_b
+        .as_ref()
+        .map(refl_slot_uniforms)
+        .unwrap_or(([0.0; 4], [0.0; 4], [0.0; 4]));
+    if let Some(p) = input.reflection_probe_b {
+        refl_blend[1] = p.blend_distance.max(0.0);
+        refl_blend[2] = input.reflection_primary.min(1) as f32;
+    }
+    let (refl3_center, refl3_extents, refl3_box) = input
+        .reflection_probes
+        .get(2)
+        .copied()
+        .flatten()
+        .as_ref()
+        .map(refl_slot_uniforms)
+        .unwrap_or(([0.0; 4], [0.0; 4], [0.0; 4]));
+    let (refl4_center, refl4_extents, refl4_box) = input
+        .reflection_probes
+        .get(3)
+        .copied()
+        .flatten()
+        .as_ref()
+        .map(refl_slot_uniforms)
+        .unwrap_or(([0.0; 4], [0.0; 4], [0.0; 4]));
+    let mut refl_blend2 = [0.0; 4];
+    if let Some(p) = input.reflection_probes.get(2).copied().flatten() {
+        refl_blend2[0] = p.blend_distance.max(0.0);
+    }
+    if let Some(p) = input.reflection_probes.get(3).copied().flatten() {
+        refl_blend2[1] = p.blend_distance.max(0.0);
+    }
+    ReflProbeUniforms {
+        refl2_center,
+        refl2_extents,
+        refl2_box,
+        refl3_center,
+        refl3_extents,
+        refl3_box,
+        refl4_center,
+        refl4_extents,
+        refl4_box,
+        refl_blend,
+        refl_blend2,
+    }
 }
 
 fn device_bind(device: &ash::Device, cb: vk::CommandBuffer, pipeline: vk::Pipeline) {
@@ -12613,7 +12853,10 @@ impl Drop for Renderer {
         let allocator = self.allocator.as_ref().unwrap().clone();
         {
             let mut alloc = allocator.lock().unwrap();
-            for mesh in &mut self.meshes {
+            for (i, mesh) in self.meshes.iter_mut().enumerate() {
+                if self.freed_meshes.contains(&i) {
+                    continue;
+                }
                 mesh.vertex_buffer.destroy(device, &mut alloc);
                 mesh.index_buffer.destroy(device, &mut alloc);
             }
@@ -12632,7 +12875,10 @@ impl Drop for Renderer {
             if self.camera_target_pool != vk::DescriptorPool::null() {
                 unsafe { device.destroy_descriptor_pool(self.camera_target_pool, None) };
             }
-            for texture in &mut self.textures {
+            for (i, texture) in self.textures.iter_mut().enumerate() {
+                if self.freed_textures.contains(&i) {
+                    continue;
+                }
                 texture.destroy(device, &mut alloc);
             }
             if let Some(skinner) = &mut self.skinner {
@@ -12673,7 +12919,10 @@ impl Drop for Renderer {
             for ubo in &mut self.frame_ubos {
                 ubo.destroy(device, &mut alloc);
             }
-            for material in &mut self.materials {
+            for (i, material) in self.materials.iter_mut().enumerate() {
+                if self.freed_materials.contains(&i) {
+                    continue;
+                }
                 material.fx_ubo.destroy(device, &mut alloc);
                 if let Some(mut ubo) = material.custom_ubo.take() {
                     ubo.destroy(device, &mut alloc);

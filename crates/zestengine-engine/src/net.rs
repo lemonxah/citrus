@@ -3151,6 +3151,12 @@ impl NetSession {
         self.claim_seq = (self.epoch as u64) << 40;
         self.clock_offset = shared - now;
         self.clock_value = Some((now, shared));
+        // Lag-compensation history restarts on the new host. A crashed old
+        // host leaves nothing to copy, and a successor that previously
+        // hosted (then stepped down for a better-ranked one) must not keep
+        // serving those stale hitboxes; seed the clock so rewinds clamp to
+        // the handover moment before the first frame is recorded.
+        self.history.lock().unwrap_or_else(|e| e.into_inner()).restart(shared);
         let plan = self.succession.clone().unwrap_or_default();
         let top = self.peers.keys().copied().max().unwrap_or(1);
         self.next_peer = self.next_peer.max(plan.next_peer).max(top + 1);
