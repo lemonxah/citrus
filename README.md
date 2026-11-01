@@ -81,16 +81,27 @@ what's already in:
 
 **Rendering** — PBR standard shader (metal/rough, normal/emission); directional
 / point / spot lights with shadow maps; procedural + equirect skybox; always-on-top
-selection outline; camera preview tab; stats overlay; vsync toggle.
+selection outline; camera preview tab; stats overlay; vsync toggle. Also in:
+GPU-driven culling with indirect draws (compute frustum + two-phase Hi-Z); up to
+four blended reflection probes per pixel (forward, SSR and ray-traced reflections);
+render-to-texture cameras with nested screens and portals; deferred projected
+decals (depth + normal from the G-buffer); water with shore-calm waves and ripples
+across the raster, displaced and RT-reflection paths; per-instance material
+colour/parameters (`PerInstance`) without breaking instanced batches.
 
 **Assets & formats** — glTF and FBX import; built-in primitives; `.material`,
-`.scene`, and `project.zestengine` files; `.wav`/`.flac`/`.mp3` audio.
+`.scene`, and `project.zestengine` files; `.wav`/`.flac`/`.mp3` audio; heightmap
+terrain import (PNG/JPG/EXR/HDR); `.shadergraph` node graphs, `.seq` sequencer
+timelines and `.behaviour` behaviour trees (all RON, hot-reloadable).
 
 **Editor** — dockable panels (egui_dock); transform gizmos (move **W** / rotate
 **R** / scale **E**) with snapping, pivot/orientation modes, camera-relative
 handles; scene tree with reparenting; Unity-style project file browser (with LSP
 problem badges, live FS updates); unified inspector; play mode; undo/redo;
-viewport widget filter and billboards; log console.
+viewport widget filter and billboards; log console. Plus dedicated tabs: a
+**Shader Graph** node editor with GLSL codegen, a **Sequencer** timeline for
+cinematics, terrain tools (heightmap import + splat paint), a behaviour-tree
+editor, and the Animation / Animator Controller editors.
 
 **Code editor** — dockable tabs with syntect highlighting, line numbers,
 debounced auto-save; rust-analyzer LSP (diagnostics, completion, hover,
@@ -98,13 +109,16 @@ go-to-definition, references); a **vim mode** (motions, operators, visual,
 `:` command line with live regex `:s`/`:%s` preview, undo/redo, `gd`/`gr`).
 
 **Components & scripting** — `TypedComponent` system with built-ins
-(Light, Camera, Audio, Colliders, Spin, Bob, Light Probe Volume); cargo-built,
+(Light, Camera, Audio, Colliders, Spin, Bob, Light Probe Volume, Terrain,
+Decal Projector, Per Instance, Vehicle, Perception / Behaviour Tree); cargo-built,
 hot-reloadable **Rust plugins** (runtime behaviour in `zestengine-core`, editor
 inspector/gizmo behind an `editor` feature); stable **object identity**
 (`ObjectId` UUID) with `ObjectRef` cross-object references set by dragging from
 the Scene tree; an in-game API (`ComponentCtx`) for transforms (incl.
 parent-aware world writes), object lookups, and runtime scene switching; runtime
-custom **GLSL shaders**. Full reference in [docs/components.md](docs/components.md).
+custom **GLSL shaders**; a sandboxed **WASM `Script`** component (wasmtime, no
+host I/O, fuel + memory caps) for user-generated content; humanoid animation
+**retargeting** between skeletons. Full reference in [docs/components.md](docs/components.md).
 
 **Projects & game builds** — **File → New Project** scaffolds a standalone cargo
 project (`scenes/ materials/ shaders/ textures/ src/main.rs` + a `plugins/components`
@@ -121,10 +135,11 @@ editable `src/main.rs`. Unsaved-changes prompt on exit.
 **Audio** — spatial / non-spatial `AudioSource` + `AudioListener` with distance
 attenuation, driven in play mode.
 
-**Physics / collision** — Box / Sphere / Mesh colliders with editable viewport
-widgets, plus a `RigidBody` component driving a rapier3d simulation (gravity,
-collisions, transform writeback) in both the editor's Play mode and a built game.
-A foundational slice; joints, queries, and trigger events are still to come.
+**Physics / collision** — Box / Sphere / Capsule / Mesh colliders with editable
+viewport widgets, a `RigidBody` component driving a rapier3d simulation (gravity,
+collisions, transform writeback) in both the editor's Play mode and a built game,
+joints, raycast/overlap queries and trigger events, terrain trimesh colliders, and
+a wheeled **Vehicle** (raycast suspension, steering, throttle/brake, grip).
 
 **Lighting bake — IN TESTING, NOT YET VERIFIED.** A GPU lightmap + light-probe
 bake (Vulkan ray query: BLAS/TLAS, path-traced direct + soft shadows +
