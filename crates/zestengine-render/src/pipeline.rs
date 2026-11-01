@@ -12,8 +12,27 @@ use ash::vk;
 
 use crate::types::{AlphaMode, MaterialFeatures, Vertex};
 
-/// Bytes per instance in the instance vertex stream (one column-major mat4).
-pub const INSTANCE_STRIDE: u32 = 64;
+/// Bytes per instance in the instance vertex stream: one column-major mat4,
+/// then the per-instance base colour and one parameter vec4.
+pub const INSTANCE_STRIDE: u32 = 96;
+
+/// One instance record in the instance-rate vertex stream (binding 1).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct InstanceData {
+    pub model: [[f32; 4]; 4],
+    pub color: [f32; 4],
+    pub param: [f32; 4],
+}
+
+impl InstanceData {
+    /// Model matrix only; the unused per-instance lanes default to identity.
+    pub fn from_model(model: [[f32; 4]; 4]) -> Self {
+        Self { model, color: [1.0; 4], param: [0.0; 4] }
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<InstanceData>() == INSTANCE_STRIDE as usize);
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/standard.frag.spv"));
 const ERROR_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/error.frag.spv"));
@@ -50,6 +69,8 @@ pub(crate) struct PipelineKey {
     /// Water surface: Gerstner displacement in the vertex stage, the water
     /// shading path in the fragment stage.
     pub water: bool,
+    /// Per-instance material properties (base colour + one parameter vec4).
+    pub per_instance: bool,
     /// Error/missing-material fallback: pink swirl, ignores other flags.
     pub error: bool,
     /// Selection outline: inverted hull, front-face culled flat purple.
@@ -109,6 +130,7 @@ impl PipelineKey {
             },
             double_sided: f.double_sided,
             water: f.water,
+            per_instance: f.per_instance,
             error: false,
             outline: false,
             depth_only: false,
@@ -135,6 +157,7 @@ impl PipelineKey {
             alpha_mode: 0,
             double_sided: true,
             water: false,
+            per_instance: false,
             error: true,
             outline: false,
             depth_only: false,
@@ -161,6 +184,7 @@ impl PipelineKey {
             alpha_mode: 0,
             double_sided: false,
             water: false,
+            per_instance: false,
             error: false,
             outline: true,
             depth_only: false,
@@ -187,6 +211,7 @@ impl PipelineKey {
             alpha_mode: 0,
             double_sided: false,
             water: false,
+            per_instance: false,
             error: false,
             outline: false,
             depth_only: true,
@@ -213,6 +238,7 @@ impl PipelineKey {
             alpha_mode: 0,
             double_sided: false,
             water: false,
+            per_instance: false,
             error: false,
             outline: false,
             depth_only: false,
@@ -239,6 +265,7 @@ impl PipelineKey {
             alpha_mode: 0,
             double_sided: false,
             water: false,
+            per_instance: false,
             error: false,
             outline: false,
             depth_only: false,
@@ -605,15 +632,16 @@ impl PipelineCache {
     }
 
     fn create_variant(&self, device: &ash::Device, key: PipelineKey) -> Result<vk::Pipeline> {
-        let spec_data: [u32; 6] = [
+        let spec_data: [u32; 7] = [
             key.toon as u32,
             key.normal_map as u32,
             key.emission as u32,
             key.alpha_mode,
             key.water as u32,
             key.velocity as u32,
+            key.per_instance as u32,
         ];
-        let spec_entries: Vec<_> = (0..6u32)
+        let spec_entries: Vec<_> = (0..7u32)
             .map(|id| vk::SpecializationMapEntry {
                 constant_id: id,
                 offset: id * 4,
@@ -706,17 +734,33 @@ impl PipelineCache {
                 .binding(0)
                 .stride(size_of::<Vertex>() as u32)
                 .input_rate(vk::VertexInputRate::VERTEX),
-            // Per-instance model matrix (standard / outline vertex shaders).
+            // Per-instance model matrix, base colour and one parameter vec4
+            // (standard / outline vertex shaders).
             vk::VertexInputBindingDescription::default()
                 .binding(1)
                 .stride(INSTANCE_STRIDE)
                 .input_rate(vk::VertexInputRate::INSTANCE),
         ];
-        let instance_attributes = [0u32, 1, 2, 3].map(|c| vk::VertexInputAttributeDescription {
-            location: 8 + c,
+        let mut instance_attributes: Vec<_> = (0..4)
+            .map(|c| vk::VertexInputAttributeDescription {
+                location: 8 + c,
+                binding: 1,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: c * 16,
+            })
+            .collect();
+        // Per-instance colour (offset 64) and parameter vec4 (offset 80).
+        instance_attributes.push(vk::VertexInputAttributeDescription {
+            location: 13,
             binding: 1,
             format: vk::Format::R32G32B32A32_SFLOAT,
-            offset: c * 16,
+            offset: 64,
+        });
+        instance_attributes.push(vk::VertexInputAttributeDescription {
+            location: 14,
+            binding: 1,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: 80,
         });
         let mut attributes = vec![
             vk::VertexInputAttributeDescription {

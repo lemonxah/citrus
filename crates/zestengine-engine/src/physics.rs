@@ -1209,6 +1209,113 @@ impl PhysicsWorld {
         }
     }
 
+    /// Raycast-suspension wheeled vehicles: each wheel casts down from its
+    /// rest position and pushes the body up, then the driven / steered wheels
+    /// apply throttle, braking and lateral grip at the contact point. Control
+    /// inputs are written by the `Vehicle` component's `fixed_update` (the
+    /// same Move / Jump / Sprint actions as the character controllers).
+    pub fn drive_vehicles(&mut self, scene: &LoadedScene, world: &[Mat4]) {
+        let down_world = self.gravity().normalize_or(Vec3::NEG_Y);
+        let mut forces: Vec<(RigidBodyHandle, Vec3, Vec3)> = Vec::new();
+        for (i, o) in scene.objects.iter().enumerate() {
+            let Some(vehicle) = o.components.iter().find_map(|c| c.as_any().downcast_ref::<zestengine_core::Vehicle>()) else {
+                continue;
+            };
+            let Some(body) = self.bodies.get(&o.id) else {
+                continue;
+            };
+            if body.kind != BodyKind::Dynamic || vehicle.wheels.is_empty() {
+                continue;
+            }
+            let handle = body.handle;
+            let Some(rb) = self.rigid_bodies.get(handle) else {
+                continue;
+            };
+            let (scale, _, _) = world[i].to_scale_rotation_translation();
+            let pose = *rb.position();
+            let rot = gq(&pose.rotation);
+            let trans = gv(pose.translation);
+            let up = rot * Vec3::Y;
+            let down = -up;
+            let mass = rb.mass().max(1e-3);
+            let body_vel = gv(rb.linvel());
+            let body_forward = rot * Vec3::NEG_Z;
+            let forward_speed = body_vel.dot(body_forward);
+            let driven = vehicle.wheels.iter().filter(|w| w.drive).count().max(1) as f32;
+            let filter = QueryFilter::default().exclude_rigid_body(handle).exclude_sensors();
+            let qp = self.broad_phase.as_query_pipeline(
+                self.narrow_phase.query_dispatcher(),
+                &self.rigid_bodies,
+                &self.colliders,
+                filter,
+            );
+            for wheel in &vehicle.wheels {
+                let anchor = trans + rot * (Vec3::from(wheel.anchor) * scale);
+                let rest = wheel.rest_length.max(0.0);
+                let origin = anchor + down * rest;
+                let max_dist = wheel.radius + wheel.travel.max(0.0) + rest.max(0.05);
+                let ray = Ray::new(rv(origin), rv(down));
+                let Some((_, toi)) = qp.cast_ray(&ray, max_dist, true) else {
+                    continue;
+                };
+                if toi > wheel.radius {
+                    continue;
+                }
+                let contact = origin + down * toi;
+                let compression = (wheel.radius - toi).clamp(0.0, wheel.travel.max(0.0));
+                let v_point = gv(rb.velocity_at_point(rv(contact)));
+                let approach = down.dot(v_point);
+                let suspension = zestengine_core::vehicle::suspension_force(wheel, compression, approach).max(0.0);
+                if suspension > 0.0 {
+                    forces.push((handle, up * suspension, contact));
+                }
+
+                let steer = if wheel.steer { vehicle.steer * vehicle.steering_degrees.to_radians() } else { 0.0 };
+                let forward = (rot * (Quat::from_rotation_y(steer) * Vec3::NEG_Z)).normalize_or(body_forward);
+                let long = v_point.dot(forward);
+                let lateral = v_point - forward * long - up * v_point.dot(up);
+                let mut grip = wheel.grip.max(0.0);
+                if vehicle.handbrake && !wheel.steer {
+                    grip *= 0.3;
+                }
+                if lateral.length_squared() > 1e-8 && grip > 0.0 {
+                    let desired = (-lateral / FIXED_DT) * mass;
+                    let max_friction = grip * suspension;
+                    forces.push((handle, desired.clamp_length_max(max_friction.max(0.0)), contact));
+                }
+
+                if wheel.drive {
+                    let engine_per_wheel = vehicle.engine_force.max(0.0) / driven;
+                    let taper = 1.0 - (forward_speed.abs() / vehicle.top_speed.max(1e-3)).clamp(0.0, 1.0);
+                    let brake = if vehicle.handbrake && !wheel.steer {
+                        1.0
+                    } else {
+                        vehicle.brake.clamp(0.0, 1.0)
+                    };
+                    let long_force = zestengine_core::vehicle::drive_force(
+                        engine_per_wheel,
+                        vehicle.throttle.clamp(0.0, 1.0) * taper,
+                        brake,
+                        long,
+                    );
+                    let max_traction = grip * suspension;
+                    forces.push((handle, forward * long_force.clamp(-max_traction, max_traction), contact));
+                }
+            }
+
+            if vehicle.downforce > 0.0 {
+                let k = (forward_speed.abs() / vehicle.top_speed.max(1e-3)).clamp(0.0, 1.0).powi(2);
+                let com = gv(rb.center_of_mass());
+                forces.push((handle, down_world * (vehicle.downforce * k), com));
+            }
+        }
+        for (handle, force, point) in forces {
+            if let Some(rb) = self.rigid_bodies.get_mut(handle) {
+                rb.add_force_at_point(rv(force), rv(point), true);
+            }
+        }
+    }
+
     /// Networking: a dynamic body another peer simulates turns kinematic and
     /// follows its scene transform; when authority returns it turns dynamic
     /// again, starting at `vel`.
@@ -2059,6 +2166,55 @@ mod tests {
             events.extend(pw.take_events());
         }
         events
+    }
+
+    fn run_vehicle(pw: &mut PhysicsWorld, scene: &mut LoadedScene, steps: usize) {
+        for _ in 0..steps {
+            pw.sync_structure(scene);
+            let ids = scene.id_index();
+            let world = scene.world_transforms();
+            pw.push_poses(scene, &ids, &world);
+            pw.drive_vehicles(scene, &world);
+            pw.step();
+            pw.reset_forces();
+            pw.write_back(scene, &ids, 1.0);
+        }
+    }
+
+    #[test]
+    fn vehicle_drives_forward_on_suspension() {
+        let mut scene = LoadedScene::empty();
+        floor(&mut scene);
+        let mut vehicle = zestengine_core::Vehicle::default();
+        vehicle.throttle = 0.0;
+        vehicle.steer = 0.0;
+        vehicle.downforce = 0.0;
+        let car = obj(
+            &mut scene,
+            Vec3::new(0.0, 1.65, 0.0),
+            vec![
+                Box::new(BoxCollider { size: [1.8, 0.5, 3.6], ..Default::default() }),
+                Box::new(RbComponent { mass: 800.0, ..Default::default() }),
+                Box::new(vehicle),
+            ],
+        );
+        let ci = scene.index_of(car).unwrap();
+        let mut pw = PhysicsWorld::build(&scene);
+        // Settle onto the suspension before driving.
+        run_vehicle(&mut pw, &mut scene, 90);
+        let settle = scene.world_transform(ci).w_axis;
+        assert!(settle.y > 1.2 && settle.y < 2.5, "settles on its wheels: {settle:?}");
+        let vehicle = scene.objects[ci]
+            .components
+            .iter_mut()
+            .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Vehicle>())
+            .unwrap();
+        vehicle.throttle = 1.0;
+        let start = scene.world_transform(ci).w_axis;
+        run_vehicle(&mut pw, &mut scene, 120);
+        let end = scene.world_transform(ci).w_axis;
+        assert!(end.z - start.z < -1.0, "the car rolls forward (-Z): {start:?} -> {end:?}");
+        assert!(end.y > 1.2 && end.y < 3.0, "stays on its wheels: {end:?}");
     }
 
     fn run_water(pw: &mut PhysicsWorld, scene: &mut LoadedScene, steps: usize) {

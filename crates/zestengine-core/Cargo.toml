@@ -16,3 +16,8 @@ serde.workspace = true
 ron.workspace = true
 tracing.workspace = true
 getrandom.workspace = true
+wasmtime.workspace = true
+
+[dev-dependencies]
+# Parse the checked-in WAT example in the Script unit tests.
+wat = "1"

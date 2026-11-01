@@ -538,6 +538,7 @@ fn material_for(
             },
             double_sided: material.features.double_sided.enabled,
             water: false,
+            per_instance: false,
         },
         albedo,
         normal,

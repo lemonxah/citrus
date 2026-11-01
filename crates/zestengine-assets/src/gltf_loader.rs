@@ -112,6 +112,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
                 alpha_mode,
                 double_sided: material.double_sided(),
                 water: false,
+                per_instance: false,
             },
             albedo,
             normal,

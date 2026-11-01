@@ -8,6 +8,7 @@ mod anim_clip;
 mod anim_controller;
 mod asset_meta;
 mod bake_file;
+mod behaviour_tree;
 mod collision;
 mod fbx_loader;
 mod gltf_loader;
@@ -21,6 +22,7 @@ mod post_file;
 mod procedural;
 mod project_file;
 mod scene_file;
+mod sequencer;
 mod shader_file;
 mod shader_props;
 mod shader_graph;
@@ -59,17 +61,20 @@ pub use material_file::{
     MATERIAL_EXTENSION, MaterialFile, MaterialTextures, load_material_file, load_texture_file,
     save_material_file,
 };
-pub use meshlet::{Meshlet, build_meshlets};
+pub use meshlet::{Meshlet, build_lod_meshlets, build_meshlets};
 pub use bake_file::{
     LIGHTDATA_EXTENSION, LIGHTMAP_EXTENSION, LightDataFile, LightmapEntry, LightmapFile, LightmapFileInfo, LightmapLayers,
     ProbeVolumeData, load_lightdata, load_lightmap_layers, lightmap_file_info, load_lightmaps, read_lightmap_layers, save_lightdata,
     save_lightmap_layers, save_lightmaps, write_atomic,
 };
+pub use behaviour_tree::{
+    BEHAVIOUR_TREE_EXTENSION, BehaviourTree, load_behaviour_tree, save_behaviour_tree,
+};
 pub use post_file::{
     Bloom, ChromaticAberration, ColorGrading, POSTFX_EXTENSION, PostFxProfile, TonemapMode,
     Vignette, blend_over, blend_profiles, load_postfx, save_postfx,
 };
-pub use procedural::{BUCKET_FLOOR, BUCKET_WALL, heightfield_mesh, primitive_mesh, test_scene};
+pub use procedural::{BUCKET_FLOOR, BUCKET_WALL, heightfield_mesh, heightfield_mesh_with_weights, import_heightmap, primitive_mesh, test_scene};
 pub use project_file::{
     PROJECT_FILE_NAME, ProjectFile, ProjectSettings, load_project_file, save_project_file,
 };
@@ -77,6 +82,10 @@ pub use scene_file::{
     ComponentData, EditorCamera, FluxQuality, GiMode, MaterialRef, ModelInstanceRef, ModelPart, ObjectSource, PrimitiveShape,
     ProbeFallback, RealtimeGi, SCENE_EXTENSION, SceneEntry, BakeSettings, SceneFile,
     VoxelGridMode, WorldEnvironment, load_scene_file, save_scene_file,
+};
+pub use sequencer::{
+    SEQUENCER_EXTENSION, SeqChannel, SeqCurve, SeqInterp, SeqKey, SeqTrack, SeqTrackKind, Sequencer,
+    load_sequencer, save_sequencer,
 };
 pub use tex_cache::{
     ASTC_CACHE_EXTENSION, AstcBlocks, astc_blocks, astc_cache_blob, compress_embedded_texture, encode_astc_level, load_texture_bc, seed_astc_cache,
@@ -93,7 +102,11 @@ pub use shader_file::{
     scoped_shader_target_env, shader_lang_for, shader_target_env, variant_path, ShaderTargetEnv,
     ShaderTargetEnvGuard,
 };
-pub use shader_graph::{ShaderGraph, ShaderNode, generate_glsl, topo_order};
+pub use shader_graph::{
+    SHADER_GRAPH_EXTENSION, GraphNode, GraphNodeKind, GraphTextureSlot, GraphValueType,
+    ShaderGraph, default_graph, generate_glsl, graph_shader_source, infer_types,
+    is_shader_graph_path, load_graph, load_shader_graph, save_shader_graph, topo_order, validate,
+};
 
 use std::path::{Path, PathBuf};
 

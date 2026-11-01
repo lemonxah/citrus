@@ -12,11 +12,12 @@ use std::collections::HashMap;
 
 use zestengine_core::{
     Animator, JointKind, PortalMode, ScenePortal, NavAgent, NavMeshSurface, ParticleEmitter, PhysicsJoint, AudioListener, AudioRolloff, AudioSource, AcousticMaterial, AcousticPreset, AudioProbeVolume, Bob, BodyKind, BoxCollider, CameraComponent,
+    ai::{BehaviourTreeAgent, PerceptionComponent},
     CharacterController, Component, UiAlign, UiButton, UiCanvas, UiImage, UiPanel, UiRect, UiRenderMode,
     UiScaleMode, UiSlider, UiText, UiTextField, UiToggle, UiAction, UiFillDirection, UiPauseMenu, UiProgressBar, ComponentRegistry, ControlMode, FluxVolume, FluxVoxelLight, LightComponent, LightKind,
     LightMode, LightProbeVolume, LodComponent, LodLevel, MeshCollider, ObjectId, ObjectRef, Pawn,
     PlanarReflection, ReflectionProbe, RigidBody, ShadowType,
-    Spin, AvatarDescriptor, CapsuleCollider, ColliderAxis,
+    Spin, AvatarDescriptor, CapsuleCollider, ColliderAxis, DecalProjector,
     SpawnPoint, SphereCollider, Sync, Terrain, TerrainCollider, TypedComponent, VolumeComponent,
     COLLISION_LAYERS,
 };
@@ -579,6 +580,7 @@ impl EditorComponents {
         e.register::<LightProbeVolume>();
         e.register::<ReflectionProbe>();
         e.register::<PlanarReflection>();
+        e.register::<DecalProjector>();
         e.register::<FluxVoxelLight>();
         e.register::<FluxVolume>();
         e.register::<AudioSource>();
@@ -600,6 +602,8 @@ impl EditorComponents {
         e.register::<PhysicsJoint>();
         e.register::<NavMeshSurface>();
         e.register::<NavAgent>();
+        e.register::<PerceptionComponent>();
+        e.register::<BehaviourTreeAgent>();
         e.register::<ParticleEmitter>();
         e.register::<ScenePortal>();
         e.register::<AvatarDescriptor>();
@@ -874,6 +878,7 @@ pub fn component_icon(name: &str) -> (crate::icons::Icon, egui::Color32) {
         "Flux Volume" | "Light Probe Volume" | "FluxVoxel Light" => (Icon::FluxVolume, theme::TYPE_GI),
         "Audio Source" | "Audio Listener" => (Icon::Audio, theme::TYPE_GROUP),
         "Animator" | "LOD Group" | "Bone Cloth" | "Mesh Cloth" => (Icon::Model, theme::TYPE_MESH),
+        "Behaviour Tree" | "Perception" => (Icon::Target, theme::TYPE_GI),
         "Cloth Colliders" => (Icon::Target, theme::TYPE_MESH),
         "Wind Zone" => (Icon::FluxVolume, theme::TYPE_GROUP),
         "Humanoid IK" | "Face Tracking" | "Lip Sync" => (Icon::Target, theme::TYPE_CAMERA),
@@ -1606,6 +1611,198 @@ impl Gizmo for NavAgent {
             g.push(GizmoSpec::Lines { segments: s, color, world: true });
         }
         g
+    }
+}
+
+impl Inspect for PerceptionComponent {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Vision range", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.perception.vision_range).speed(0.5).range(0.0..=1000.0))
+        });
+        property_row(ui, "Vision angle", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.perception.vision_angle).speed(1.0).range(0.0..=180.0).suffix(" deg"))
+        });
+        property_row(ui, "Hearing range", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.perception.hearing_range).speed(0.5).range(0.0..=1000.0))
+        });
+        changed |= ctx.object_ref(ui, "Target", &mut self.target);
+        ui.label(egui::RichText::new("Seeds blackboard: has_target, target_id, target_position").small().weak());
+        changed
+    }
+}
+
+impl Gizmo for PerceptionComponent {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        use glam::Vec3;
+        let forward = Vec3::NEG_Z;
+        let (a, b) = basis_of(forward);
+        let half = self.perception.half_angle();
+        let mut ring = Vec::new();
+        circle_segments(&mut ring, Vec3::ZERO, a, b, self.perception.vision_range.max(0.1), -half, half, 32);
+        let mut s = vec![GizmoSpec::Lines {
+            segments: ring,
+            color: egui::Color32::from_rgb(120, 210, 255),
+            world: false,
+        }];
+        let tip = forward * self.perception.vision_range.max(0.1);
+        for t in [-half, 0.0_f32, half] {
+            let d = a * t.sin() + forward * t.cos();
+            s.push(GizmoSpec::Lines {
+                segments: vec![(Vec3::ZERO, d * self.perception.vision_range.max(0.1))],
+                color: egui::Color32::from_rgb(120, 210, 255),
+                world: false,
+            });
+        }
+        s.push(GizmoSpec::Lines {
+            segments: vec![(Vec3::ZERO, tip)],
+            color: egui::Color32::from_rgb(120, 210, 255),
+            world: false,
+        });
+        s
+    }
+}
+
+impl Inspect for BehaviourTreeAgent {
+    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        property_row(ui, "Asset", &mut changed, |ui| ui.text_edit_singleline(&mut self.asset));
+        ui.label(egui::RichText::new("Project-relative .behaviour path (authoring)").small().weak());
+        changed |= edit_bt_node(ui, &mut self.root, 0);
+        changed
+    }
+}
+
+impl Gizmo for BehaviourTreeAgent {}
+
+pub fn edit_bt_node(ui: &mut Ui, node: &mut zestengine_core::ai::BtNode, depth: usize) -> bool {
+    use zestengine_core::ai::{BtAction, BtNode};
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        if depth > 0 {
+            ui.label("↳");
+        }
+        let mut kind = node_kind(node);
+        let mut resp = egui::ComboBox::from_id_salt(("zestengine-bt-kind", depth, kind))
+            .selected_text(kind_label(kind))
+            .show_ui(ui, |ui| {
+                let mut clicked = false;
+                for k in [0u8, 1, 2, 3, 4, 5] {
+                    clicked |= ui.selectable_value(&mut kind, k, kind_label(k)).clicked();
+                }
+                clicked
+            });
+        if resp.inner == Some(true) {
+            resp.response.mark_changed();
+        }
+        if kind != node_kind(node) {
+            *node = match kind {
+                0 => BtNode::Success,
+                1 => BtNode::Failure,
+                2 => BtNode::Selector { children: Vec::new() },
+                3 => BtNode::Sequence { children: Vec::new() },
+                4 => BtNode::Invert { child: Box::new(BtNode::Success) },
+                5 => BtNode::Condition { key: "has_target".into(), value: true, invert: false },
+                _ => BtNode::Action { action: BtAction::Idle, param: String::new() },
+            };
+            changed = true;
+        }
+    });
+
+    match node {
+        BtNode::Success | BtNode::Failure => {}
+        BtNode::Invert { child } => {
+            ui.indent(("zestengine-bt-indent", depth), |ui| {
+                changed |= edit_bt_node(ui, child, depth + 1);
+            });
+        }
+        BtNode::Condition { key, value, invert } => {
+            changed |= ui.text_edit_singleline(key).changed();
+            changed |= ui.checkbox(value, "value").changed();
+            changed |= ui.checkbox(invert, "invert").changed();
+        }
+        BtNode::Action { action, param } => {
+            let mut act = *action;
+            let mut resp = egui::ComboBox::from_id_salt(("zestengine-bt-action", depth))
+                .selected_text(act.label())
+                .show_ui(ui, |ui| {
+                    let mut clicked = false;
+                    for k in BtAction::ALL {
+                        clicked |= ui.selectable_value(&mut act, k, k.label()).clicked();
+                    }
+                    clicked
+                });
+            if resp.inner == Some(true) {
+                resp.response.mark_changed();
+            }
+            if act != *action {
+                *action = act;
+                changed = true;
+            }
+            changed |= ui.text_edit_singleline(param).changed();
+        }
+        BtNode::Selector { children } | BtNode::Sequence { children } => {
+            let mut remove = None;
+            let mut up = None;
+            let mut down = None;
+            let child_count = children.len();
+            for (i, child) in children.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    changed |= edit_bt_node(ui, child, depth + 1);
+                    if ui.small_button("↑").clicked() && i > 0 {
+                        up = Some(i);
+                    }
+                    if ui.small_button("↓").clicked() && i + 1 < child_count {
+                        down = Some(i);
+                    }
+                    if ui.small_button("✕").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                children.remove(i);
+                changed = true;
+            }
+            if let Some(i) = up {
+                children.swap(i, i - 1);
+                changed = true;
+            }
+            if let Some(i) = down {
+                children.swap(i, i + 1);
+                changed = true;
+            }
+            if ui.small_button("+ Add child").clicked() {
+                children.push(BtNode::Action { action: BtAction::Idle, param: String::new() });
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn node_kind(node: &zestengine_core::ai::BtNode) -> u8 {
+    use zestengine_core::ai::BtNode;
+    match node {
+        BtNode::Success => 0,
+        BtNode::Failure => 1,
+        BtNode::Selector { .. } => 2,
+        BtNode::Sequence { .. } => 3,
+        BtNode::Invert { .. } => 4,
+        BtNode::Condition { .. } => 5,
+        BtNode::Action { .. } => 6,
+    }
+}
+
+fn kind_label(kind: u8) -> &'static str {
+    match kind {
+        0 => "Success",
+        1 => "Failure",
+        2 => "Selector",
+        3 => "Sequence",
+        4 => "Invert",
+        5 => "Condition",
+        _ => "Action",
     }
 }
 
@@ -2428,6 +2625,64 @@ impl Inspect for PlanarReflection {
     }
 }
 impl Gizmo for PlanarReflection {}
+
+impl Inspect for DecalProjector {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
+        let mut changed = false;
+        changed |= ctx.file_field(
+            ui,
+            "Texture",
+            &mut self.texture,
+            "texture/foo.png",
+            &["png", "jpg", "jpeg", "tga", "bmp", "webp", "exr", "hdr"],
+        );
+        vec2_row(ui, "Size", &mut self.size, 0.02, &mut changed);
+        for s in &mut self.size {
+            *s = s.max(0.01);
+        }
+        property_row(ui, "Depth", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.depth).speed(0.02).range(0.01..=1000.0))
+        });
+        property_row(ui, "Fade", &mut changed, |ui| {
+            ui.add(DragValue::new(&mut self.fade).speed(0.01).range(0.0..=1.0))
+        });
+        vec2_row(ui, "Tiling", &mut self.tiling, 0.02, &mut changed);
+        for t in &mut self.tiling {
+            *t = t.max(0.01);
+        }
+        rgba_row(ui, "Tint", &mut self.tint, &mut changed);
+        changed
+    }
+}
+
+impl Gizmo for DecalProjector {
+    fn gizmos(&self) -> Vec<GizmoSpec> {
+        let half = glam::Vec3::new(self.size[0].max(0.0) * 0.5, self.size[1].max(0.0) * 0.5, self.depth.max(0.0) * 0.5);
+        let center = glam::Vec3::new(0.0, 0.0, -half.z);
+        let corners = [
+            center + glam::Vec3::new(-half.x, -half.y, -half.z),
+            center + glam::Vec3::new(half.x, -half.y, -half.z),
+            center + glam::Vec3::new(half.x, half.y, -half.z),
+            center + glam::Vec3::new(-half.x, half.y, -half.z),
+            center + glam::Vec3::new(-half.x, -half.y, half.z),
+            center + glam::Vec3::new(half.x, -half.y, half.z),
+            center + glam::Vec3::new(half.x, half.y, half.z),
+            center + glam::Vec3::new(-half.x, half.y, half.z),
+        ];
+        let mut segments = Vec::new();
+        for i in 0..4 {
+            let j = (i + 1) & 3;
+            segments.push((corners[i], corners[j]));
+            segments.push((corners[4 + i], corners[4 + j]));
+            segments.push((corners[i], corners[4 + i]));
+        }
+        vec![GizmoSpec::Lines {
+            segments,
+            color: egui::Color32::from_rgb(120, 200, 255),
+            world: false,
+        }]
+    }
+}
 
 impl Gizmo for ReflectionProbe {
     fn gizmos(&self) -> Vec<GizmoSpec> {

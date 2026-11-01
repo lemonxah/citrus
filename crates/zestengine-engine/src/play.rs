@@ -259,6 +259,7 @@ impl PlaySession {
             let ids = w.scene.id_index();
             let world = w.scene.world_transforms();
             self.physics.push_poses(w.scene, &ids, &world);
+            self.physics.drive_vehicles(w.scene, &world);
             let vortices = crate::water_fx::scene_vortices(w.scene, &world, self.water_time());
             let mut water = self.physics.apply_water(w.scene, &world, self.water_time(), &vortices);
             water.fx_pushes.append(&mut w.scene.water_fx_pushes);

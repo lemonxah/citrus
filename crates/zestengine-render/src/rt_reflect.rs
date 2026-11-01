@@ -226,6 +226,8 @@ pub(crate) struct RtReflect {
     tex_sampler: vk::Sampler,
     /// Texture-table signature written into each frame's set (rewrite on change).
     tex_sig: Vec<u64>,
+    /// Shore-depth table signature written into each frame's set (rewrite on change).
+    shore_sig: Vec<u64>,
     /// Displaced water BLASes (per frame slot) while RT reflections are on.
     water: RtWater,
 }
@@ -298,6 +300,13 @@ impl RtReflect {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(MAX_RT_TEXTURES)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            // Per-body shore-depth fields (binding 14, partially bound), for
+            // the water shading normal's shore calm.
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(14)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_WATER_BODIES as u32)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         let binding_flags = [
             vk::DescriptorBindingFlags::empty(),
@@ -311,6 +320,7 @@ impl RtReflect {
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::empty(),
             vk::DescriptorBindingFlags::empty(),
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
             vk::DescriptorBindingFlags::PARTIALLY_BOUND,
         ];
         let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -373,7 +383,7 @@ impl RtReflect {
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                            descriptor_count: FRAMES_IN_FLIGHT as u32 * (8 + MAX_RT_TEXTURES),
+                            descriptor_count: FRAMES_IN_FLIGHT as u32 * (8 + MAX_RT_TEXTURES + MAX_WATER_BODIES as u32),
                         },
                         vk::DescriptorPoolSize {
                             ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
@@ -424,6 +434,7 @@ impl RtReflect {
             tlas_slots: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
             tex_sampler,
             tex_sig: vec![0; FRAMES_IN_FLIGHT],
+            shore_sig: vec![u64::MAX; FRAMES_IN_FLIGHT],
             blas: HashMap::new(),
             retired: (0..FRAMES_IN_FLIGHT).map(|_| (Vec::new(), Vec::new())).collect(),
             frames: (0..FRAMES_IN_FLIGHT).map(|_| None).collect(),
@@ -862,6 +873,36 @@ impl RtReflect {
                 .image_info(&infos);
             unsafe { device.update_descriptor_sets(&[write], &[]) };
             self.tex_sig[frame] = tsig;
+        }
+
+        // Shore-depth table (binding 14): rewritten only when the water bodies'
+        // shore textures change. Null views are legal in a partially bound
+        // array; bodies without a shore field never sample theirs (water_shore
+        // guards on `extra` first).
+        let mut hsig: u64 = 0xcbf29ce484222325;
+        for v in water.shores {
+            hsig ^= vk::Handle::as_raw(v);
+            hsig = hsig.wrapping_mul(0x100000001b3);
+        }
+        if self.shore_sig[frame] != hsig {
+            let infos: Vec<vk::DescriptorImageInfo> = water
+                .shores
+                .iter()
+                .map(|&v| {
+                    vk::DescriptorImageInfo::default()
+                        .sampler(self.sampler)
+                        .image_view(v)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                })
+                .collect();
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(14)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos);
+            unsafe { device.update_descriptor_sets(&[write], &[]) };
+            self.shore_sig[frame] = hsig;
         }
 
         // Output image UNDEFINED -> GENERAL for the compute write.

@@ -490,6 +490,7 @@ mod tests {
             heights: vec![0.0; n],
             material: String::new(),
             texture_weights: Vec::new(),
+            ..Default::default()
         }
     }
 

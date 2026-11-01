@@ -14,6 +14,8 @@ layout(constant_id = 4) const bool FEAT_WATER = false;
 // Motion-vector pass (velocity pipeline variants): write the screen-space
 // reprojection difference into the RG16F velocity attachment.
 layout(constant_id = 5) const bool WRITE_VELOCITY = false;
+// Per-instance material properties (base colour + one parameter vec4).
+layout(constant_id = 6) const bool FEAT_PER_INSTANCE = false;
 
 #include "standard_common.glsl"
 
@@ -546,6 +548,9 @@ layout(location = 6) flat in float v_lightmap;
 // Current/previous-frame clip positions (from the vertex stage).
 layout(location = 7) in vec4 v_cur_clip;
 layout(location = 8) in vec4 v_prev_clip;
+// Per-instance material properties (read only when FEAT_PER_INSTANCE).
+layout(location = 9) in vec4 v_instance_color;
+layout(location = 10) in vec4 v_instance_param;
 
 layout(location = 0) out vec4 o_color;
 // Deferred-SSR G-buffer (gbuf pipeline variants only): the specular reflectance
@@ -1017,7 +1022,9 @@ void main() {
     vec2 uv_orm = v_uv_d * fx.orm_st.xy + fx.orm_st.zw;
     vec2 uv_emission = v_uv_d * fx.emission_st.xy + fx.emission_st.zw;
 
-    vec4 albedo = texture(t_albedo, uv) * pc.base_color * v_color;
+    vec4 base_color = FEAT_PER_INSTANCE ? v_instance_color : pc.base_color;
+    vec4 params0 = FEAT_PER_INSTANCE ? v_instance_param : pc.params0;
+    vec4 albedo = texture(t_albedo, uv) * base_color * v_color;
     albedo.a *= texture(t_opacity, uv).r; // dedicated opacity map (default white)
     if (ALPHA_MODE == 1u && albedo.a < pc.params1.x) {
         discard;
@@ -1043,8 +1050,8 @@ void main() {
     float ao = mix(1.0, orm.r * ao_s, pc.params1.z);
     // Toon rim strength now comes from the FX block (so occlusion stays usable).
     float rim_strength = FEAT_TOON ? fx.toon.x : 0.0;
-    float roughness = clamp(orm.g * rough_s * pc.params0.y, 0.045, 1.0);
-    float metallic = clamp(orm.b * metal_s * pc.params0.x, 0.0, 1.0);
+    float roughness = clamp(orm.g * rough_s * params0.y, 0.045, 1.0);
+    float metallic = clamp(orm.b * metal_s * params0.x, 0.0, 1.0);
 
     // Water: wave normal plus ripples, a body coloured by depth absorption,
     // the opaque scene refracted through it, and shore + crest foam.
@@ -1340,7 +1347,7 @@ void main() {
                 // Cel ramp: quantize N·L into `steps` bands with a soft edge at each
                 // boundary (a clean toon terminator without hard aliasing). `steps`
                 // controls band count, params0.w blends toon<->smooth-PBR.
-                float steps = max(pc.params0.z, 2.0);
+                float steps = max(params0.z, 2.0);
                 float scaled = clamp(NdotL, 0.0, 1.0) * steps;
                 float lower = floor(scaled);
                 float sm = clamp(fx.toon.y, 0.01, 0.49);
@@ -1349,7 +1356,7 @@ void main() {
                 // Specular as a crisp toon highlight, only on lit bands.
                 vec3 lit_toon = (kd * diffuse_color / PI) * banded
                     + spec * smoothstep(0.0, 0.02, banded);
-                lit = mix(lit, lit_toon, clamp(pc.params0.w, 0.0, 1.0));
+                lit = mix(lit, lit_toon, clamp(params0.w, 0.0, 1.0));
             }
 
             color += lit * radiance * shadow_factor(light, v_world_pos, N, L) * caustic_gain;

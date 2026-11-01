@@ -21,6 +21,10 @@ use zestengine_assets::{
 };
 use zestengine_core::{Animator, BlendTree, LayerPlayback};
 
+// Humanoid retargeting exposed through the animation system: a precomputed
+// role-to-role mapping plus the one-shot pose/clip helpers.
+pub use crate::humanoid::{HumanoidRetarget, retarget_clip, retarget_locals};
+
 pub const CH_T: u8 = 1;
 pub const CH_R: u8 = 2;
 pub const CH_S: u8 = 4;

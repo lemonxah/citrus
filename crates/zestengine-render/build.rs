@@ -61,6 +61,8 @@ fn main() {
         "bloom.comp",
         // Deferred SSR resolve (fullscreen, current-frame screen-space reflections).
         "ssr_resolve.frag",
+        // Deferred projected decals (fullscreen box projectors over opaque geometry).
+        "decal.frag",
         // Underwater view fog / caustics over the HDR scene.
         "underwater.frag",
         // VR overlay quad (left-hand UI panel + pointer markers in the eye images).

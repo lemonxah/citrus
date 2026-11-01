@@ -8,6 +8,7 @@ mod alloc;
 mod bloom;
 mod bake;
 mod context;
+mod decal;
 mod egui_window;
 mod frame;
 mod fsr3;
@@ -183,7 +184,7 @@ use winit::window::Window;
 use alloc::Buffer;
 use context::GpuContext;
 use frame::{FRAMES_IN_FLIGHT, Frame};
-use pipeline::{INSTANCE_STRIDE, PipelineCache, PipelineKey};
+use pipeline::{INSTANCE_STRIDE, InstanceData, PipelineCache, PipelineKey};
 use swapchain::Swapchain;
 use texture::GpuTexture;
 
@@ -2364,10 +2365,10 @@ impl InstanceRing {
         self.used = 0;
     }
 
-    /// Append `mats` and return the buffer and byte offset they start at.
-    fn push(&mut self, device: &ash::Device, allocator: &mut Allocator, mats: &[[[f32; 4]; 4]]) -> Result<(vk::Buffer, u64)> {
-        if self.buf.is_none() || self.used + mats.len() > self.capacity {
-            let capacity = ((self.used + mats.len()) * 2).max(1024);
+    /// Append `data` and return the buffer and byte offset it starts at.
+    fn push(&mut self, device: &ash::Device, allocator: &mut Allocator, data: &[InstanceData]) -> Result<(vk::Buffer, u64)> {
+        if self.buf.is_none() || self.used + data.len() > self.capacity {
+            let capacity = ((self.used + data.len()) * 2).max(1024);
             let buf = Buffer::new(
                 device,
                 allocator,
@@ -2384,8 +2385,8 @@ impl InstanceRing {
         }
         let offset = (self.used * INSTANCE_STRIDE as usize) as u64;
         let buf = self.buf.as_mut().unwrap();
-        buf.write(offset as usize, bytemuck::cast_slice(mats));
-        self.used += mats.len();
+        buf.write(offset as usize, bytemuck::cast_slice(data));
+        self.used += data.len();
         Ok((buf.handle, offset))
     }
 
@@ -3302,6 +3303,8 @@ pub struct Renderer {
     last_time: f32,
     /// Underwater view fog over the HDR scene (every view kind).
     underwater: underwater::UnderwaterPass,
+    /// Deferred projected-decal pass (shared pipeline + frame sets).
+    decal: decal::DecalPass,
     /// Editor-viewport deferred-SSR target (recreated with `viewport_target`).
     viewport_ssr: Option<ssr::SsrTarget>,
     /// Ray-traced reflections (1 bounce); `None` when the GPU lacks ray query.
@@ -3689,6 +3692,7 @@ impl Renderer {
         // sized to the swapchain (the game path). The viewport owns its own.
         let ssr_resolve = ssr::SsrResolve::new(&ctx.device)?;
         let underwater = underwater::UnderwaterPass::new(&ctx.device, &mut allocator.lock().unwrap())?;
+        let decal = decal::DecalPass::new(&ctx.device, &mut allocator.lock().unwrap())?;
         // Ray-traced reflections (only on GPUs with ray query / the bake's accel
         // loader). Falls back to SSR when absent.
         let rt_reflect = if ctx.accel.is_some() && RenderTier::for_platform().reflections() {
@@ -4336,6 +4340,7 @@ impl Renderer {
             fsr3_reset: true,
             last_time: 0.0,
             underwater,
+            decal,
             viewport_ssr: None,
             rt_reflect,
             xr_render: None,
@@ -4936,8 +4941,8 @@ impl Renderer {
         self.last_stats
     }
 
-    /// Append per-instance model matrices to the active instance ring.
-    fn push_instances(&mut self, mats: &[[[f32; 4]; 4]]) -> Result<(vk::Buffer, u64)> {
+    /// Append per-instance records to the active instance ring.
+    fn push_instances(&mut self, data: &[InstanceData]) -> Result<(vk::Buffer, u64)> {
         let allocator = self.allocator();
         let mut a = allocator.lock().unwrap();
         let device = &self.ctx.device;
@@ -4945,7 +4950,7 @@ impl Renderer {
             Some(i) => &mut self.xr_render.as_mut().expect("xr render").slots[i].instances,
             None => &mut self.instance_rings[self.frame_index],
         };
-        ring.push(device, &mut a, mats)
+        ring.push(device, &mut a, data)
     }
 
     fn allocator(&self) -> Arc<Mutex<Allocator>> {
@@ -9109,9 +9114,11 @@ impl Renderer {
                     // (also needed for transparent objects, which never write
                     // depth in the main pass — without it the hull's interior
                     // shows through and the whole object turns purple).
-                    let mats: Vec<[[f32; 4]; 4]> =
-                        outline_draws.iter().map(|&i| input.draws[i].transform.to_cols_array_2d()).collect();
-                    let (inst_buf, inst_off) = self.push_instances(&mats)?;
+                    let instances: Vec<InstanceData> = outline_draws
+                        .iter()
+                        .map(|&i| InstanceData::from_model(input.draws[i].transform.to_cols_array_2d()))
+                        .collect();
+                    let (inst_buf, inst_off) = self.push_instances(&instances)?;
                     device.cmd_bind_vertex_buffers(cb, 1, &[inst_buf], &[inst_off]);
                     let mut depth_key = PipelineKey::depth_only();
                     depth_key.gbuf = true;
@@ -9225,6 +9232,15 @@ impl Renderer {
                     }
 
                 device.cmd_end_rendering(cb);
+
+                if game && !input.decals.is_empty() {
+                    let decal_frame = self.decal_frame(input);
+                    self.record_decals(
+                        &device, cb, input, scene_view,
+                        self.depth.image, self.depth.view,
+                        gbuf_image, gbuf_view, render_extent_vk, &decal_frame,
+                    );
+                }
 
                 if game {
                     self.gpu_zone_end(cb, gpu_zone::SCENE);
@@ -10303,6 +10319,17 @@ impl Renderer {
 
     /// Record the opaque+transparent scene draws (no outline, no egui) for one
     /// pass, binding `frame_set` as set 0. Returns draw statistics.
+    /// Effective per-instance material values: the draw's override when set,
+    /// else the material's own values. The shader only reads these when the
+    /// material opts in (`MaterialFeatures::per_instance`); otherwise the
+    /// push-constant lanes stay authoritative.
+    fn instance_values(&self, draw: &DrawCmd, material: &Material) -> ([f32; 4], [f32; 4]) {
+        let p = &material.params;
+        let color = draw.instance_color.unwrap_or(p.base_color);
+        let param = draw.instance_param.unwrap_or([p.metallic, p.roughness, p.toon_steps, p.pbr_toon_blend]);
+        (color, param)
+    }
+
     /// Push constants for one scene draw (model + material / per-object lanes).
     fn draw_push(&self, draw: &DrawCmd, material: &Material, input: &FrameInput) -> PushData {
         let p = &material.params;
@@ -10489,8 +10516,16 @@ impl Renderer {
             self.materials_seen_scratch = materials_seen;
             return Ok(stats);
         }
-        let mats: Vec<[[f32; 4]; 4]> = order.iter().map(|&i| input.draws[i].transform.to_cols_array_2d()).collect();
-        let (inst_buf, inst_off) = self.push_instances(&mats)?;
+        let instances: Vec<InstanceData> = order
+            .iter()
+            .map(|&i| {
+                let d = &input.draws[i];
+                let material = &self.materials[d.material.0];
+                let (color, param) = self.instance_values(d, material);
+                InstanceData { model: d.transform.to_cols_array_2d(), color, param }
+            })
+            .collect();
+        let (inst_buf, inst_off) = self.push_instances(&instances)?;
         unsafe { device.cmd_bind_vertex_buffers(cb, 1, &[inst_buf], &[inst_off]) };
         let mut batch: Option<SceneBatch> = None;
         for (k, &i) in order.iter().enumerate() {
@@ -11053,9 +11088,11 @@ impl Renderer {
                         .filter(|&i| sphere_in_planes(&planes, &draws[i], false))
                         .collect();
                     sorted.sort_unstable_by_key(|&i| draws[i].mesh.0);
-                    let mats: Vec<[[f32; 4]; 4]> =
-                        sorted.iter().map(|&i| draws[i].transform.to_cols_array_2d()).collect();
-                    let (inst_buf, inst_off) = self.push_instances(&mats)?;
+                    let instances: Vec<InstanceData> = sorted
+                        .iter()
+                        .map(|&i| InstanceData::from_model(draws[i].transform.to_cols_array_2d()))
+                        .collect();
+                    let (inst_buf, inst_off) = self.push_instances(&instances)?;
                     let push = ShadowPush {
                         light_vp: view_proj.to_cols_array_2d(),
                         model: Mat4::IDENTITY.to_cols_array_2d(),
@@ -12312,7 +12349,7 @@ impl Renderer {
         let ssr_on =
             self.flux_settings.reflection_mode == 1 && self.flux_settings.ssr_enabled;
         let fog_on = input.fog.is_some_and(|f| f.density > 0.0);
-        let vt_gbuf = (rt_on || ssr_on || fog_on) && self.viewport_ssr.is_some();
+        let vt_gbuf = (rt_on || ssr_on || fog_on || !input.decals.is_empty()) && self.viewport_ssr.is_some();
         let (vp_gbuf_image, vp_gbuf_view) = self
             .viewport_ssr
             .as_ref()
@@ -12549,6 +12586,13 @@ impl Renderer {
         self.draw_mode = DrawMode::Normal;
         self.viewport_draw_stats = stats?;
         unsafe { device.cmd_end_rendering(cb) };
+        if !input.decals.is_empty() && vt_gbuf {
+            let decal_frame = self.decal_frame(input);
+            self.record_decals(
+                device, cb, input, hdr_view,
+                dep_img, dep_view, vp_gbuf_image, vp_gbuf_view, ext, &decal_frame,
+            );
+        }
         self.gpu_zone_end(cb, gpu_zone::SCENE);
         if let Some(fx) = input.postfx.underwater.as_ref() {
             self.underwater.record(
@@ -12650,7 +12694,7 @@ impl Renderer {
             );
             self.viewport_ssr = Some(target);
             post_set
-        } else if vt_gbuf {
+        } else if ssr_on || fog_on {
             image_barrier(
                 device, cb, vp_gbuf_image, vk::ImageAspectFlags::COLOR,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -12705,6 +12749,67 @@ impl Renderer {
         );
         self.gpu_zone_end(cb, gpu_zone::POST);
         Ok(())
+    }
+
+    fn decal_frame(&self, input: &FrameInput) -> decal::DecalFrame {
+        let proj = jitter_proj(
+            input.camera.proj,
+            self.jitter,
+            [self.render_extent[0] as f32, self.render_extent[1] as f32],
+        );
+        let inv_view = input.camera.view.inverse();
+        decal::DecalFrame {
+            inv_view_proj: (inv_view * proj.inverse()).to_cols_array_2d(),
+            inv_view: inv_view.to_cols_array_2d(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_decals(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        input: &FrameInput,
+        scene_view: vk::ImageView,
+        depth_image: vk::Image,
+        depth_view: vk::ImageView,
+        gbuf_image: vk::Image,
+        gbuf_view: vk::ImageView,
+        extent: vk::Extent2D,
+        frame: &decal::DecalFrame,
+    ) {
+        if input.decals.is_empty() {
+            return;
+        }
+        image_barrier(
+            device, cb, depth_image, vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+        );
+        image_barrier(
+            device, cb, gbuf_image, vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+        );
+        self.decal.record(
+            device, cb, self.frame_index, scene_view, depth_view, gbuf_view, extent,
+            frame, input.decals, &self.textures, self.default_textures[0].view,
+        );
+        image_barrier(
+            device, cb, depth_image, vk::ImageAspectFlags::DEPTH,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        );
+        image_barrier(
+            device, cb, gbuf_image, vk::ImageAspectFlags::COLOR,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+        );
     }
 }
 
@@ -12981,6 +13086,7 @@ impl Drop for Renderer {
             }
             self.ssr_resolve.destroy(device);
             self.underwater.destroy(device, &mut alloc);
+            self.decal.destroy(device, &mut alloc);
             if let Some(mut rt) = self.rt_reflect.take() {
                 rt.destroy(&self.ctx, &mut alloc);
             }
@@ -13263,6 +13369,8 @@ mod shadow_casting_tests {
             planar_index: -1,
             occluded: false,
             shadow_casting,
+            instance_color: None,
+            instance_param: None,
         }
     }
 
@@ -13332,6 +13440,7 @@ mod cascade_tests {
             water_time: 0.0,
             water: &[],
             draws: &[],
+            decals: &[],
             lightmap_preview: false,
             gi_debug: 0,
             render_viewport: true,

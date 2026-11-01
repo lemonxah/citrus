@@ -93,6 +93,8 @@ pub struct FileBrowserResponse {
     pub create_physmat_in: Option<PathBuf>,
     pub create_anim_controller_in: Option<PathBuf>,
     pub create_anim_clip_in: Option<PathBuf>,
+    pub create_behaviour_tree_in: Option<PathBuf>,
+    pub create_shader_graph_in: Option<PathBuf>,
     pub create_scene_in: Option<PathBuf>,
     pub create_shader_in: Option<PathBuf>,
     pub create_folder_in: Option<PathBuf>,
@@ -845,6 +847,10 @@ impl FileBrowser {
             response.create_shader_in = Some(dir.to_owned());
             ui.close();
         }
+        if ui.button("New Shader Graph").clicked() {
+            response.create_shader_graph_in = Some(dir.to_owned());
+            ui.close();
+        }
         if ui.button("New Post FX Profile").clicked() {
             response.create_postfx_in = Some(dir.to_owned());
             ui.close();
@@ -855,6 +861,10 @@ impl FileBrowser {
         }
         if ui.button("New Animator Controller").clicked() {
             response.create_anim_controller_in = Some(dir.to_owned());
+            ui.close();
+        }
+        if ui.button("New Behaviour Tree").clicked() {
+            response.create_behaviour_tree_in = Some(dir.to_owned());
             ui.close();
         }
         if ui.button("New Animation Clip").clicked() {
@@ -1304,7 +1314,7 @@ fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 const KNOWN_EXTS: &[&str] = &[
     "rs", "gltf", "glb", "vrm", "fbx", "material", "scene", "zestengine", "lightmap", "lightdata", "png",
     "jpg", "jpeg", "tga", "bmp", "exr", "vert", "frag", "hlsl", "glsl", "slang", "spv", "postfx", "physmat", "toml", "ron",
-    "json", "md", "anim", "animctrl",
+    "json", "md", "anim", "animctrl", "seq",
 ];
 
 fn lower_ext(path: &Path) -> Option<String> {
@@ -1323,6 +1333,7 @@ enum IconKind {
     PhysMat,
     AnimController,
     AnimClip,
+    Sequencer,
     Lightmap,
     Lightdata,
     Config,
@@ -1342,6 +1353,7 @@ fn icon_kind(path: &Path) -> IconKind {
         Some("physmat") => IconKind::PhysMat,
         Some("animctrl") => IconKind::AnimController,
         Some("anim") => IconKind::AnimClip,
+        Some("seq") => IconKind::Sequencer,
         Some("lightmap") => IconKind::Lightmap,
         Some("lightdata") => IconKind::Lightdata,
         Some("toml" | "ron" | "json") => IconKind::Config,
@@ -1395,6 +1407,7 @@ fn phosphor_icon(kind: IconKind) -> &'static str {
         IconKind::PhysMat => ph::BASKETBALL,
         IconKind::AnimController => ph::FLOW_ARROW,
         IconKind::AnimClip => ph::FILM_STRIP,
+        IconKind::Sequencer => ph::FILM_STRIP,
         IconKind::Lightmap => ph::MAP_TRIFOLD,
         IconKind::Lightdata => ph::DATABASE,
         IconKind::Config => ph::GEAR_SIX,

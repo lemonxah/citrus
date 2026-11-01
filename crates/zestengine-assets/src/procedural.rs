@@ -313,6 +313,26 @@ fn plane(size: f32, uv_tiles: f32) -> MeshData {
     mesh_with_lightmap(vertices, vec![0, 2, 1, 0, 3, 2])
 }
 
+/// Decode a heightmap image and resample it into a `(grid + 1)²` row-major
+/// height grid (Z outer, X inner). Heights are the source's luminance in
+/// metres: a pure 0..1 greyscale image maps to `[0, 1]` metres, ready to be
+/// scaled/offset by the caller. Any colour space or HDR source is reduced to
+/// luminance first, so `.png`/`.jpg`/`.exr`/`.hdr` all work.
+pub fn import_heightmap(path: &std::path::Path, grid: u32) -> anyhow::Result<Vec<f32>> {
+    use anyhow::Context as _;
+    let img = crate::material_file::open_image_compat(path)
+        .with_context(|| format!("loading heightmap {}", path.display()))?;
+    let n = grid as usize + 1;
+    let resized = image::imageops::resize(&img.to_luma32f(), n as u32, n as u32, image::imageops::FilterType::Triangle);
+    let mut heights = Vec::with_capacity(n * n);
+    for z in 0..n {
+        for x in 0..n {
+            heights.push(resized.get_pixel(x as u32, z as u32).0[0]);
+        }
+    }
+    Ok(heights)
+}
+
 /// Tessellate a heightfield into a single square mesh. `heights` is a
 /// `(resolution + 1)²` row-major grid over Z (outer) then X (inner); `size_xz`
 /// is the world-space extent of the square in meters. Vertices sit on the XZ
@@ -320,9 +340,24 @@ fn plane(size: f32, uv_tiles: f32) -> MeshData {
 /// central differences, and a whole-map 0..1 UV set that also serves as the
 /// lightmap (non-overlapping). Front faces are wound to follow the normals.
 pub fn heightfield_mesh(size_xz: f32, resolution: u32, heights: &[f32]) -> MeshData {
+    heightfield_mesh_with_weights(size_xz, resolution, heights, None)
+}
+
+/// [`heightfield_mesh`] with per-vertex splat weights written into `color`
+/// (RGBA = the four splat layers). `weights`, when given, is row-major over
+/// Z then X and must match `(resolution + 1)²` entries; otherwise every
+/// vertex is `(1, 0, 0, 0)` so a splat material shows only layer 0.
+pub fn heightfield_mesh_with_weights(
+    size_xz: f32,
+    resolution: u32,
+    heights: &[f32],
+    weights: Option<&[[f32; 4]]>,
+) -> MeshData {
     assert!(resolution >= 1, "heightfield resolution must be >= 1");
     let n = (resolution + 1) as usize;
     assert_eq!(heights.len(), n * n, "heights must be (resolution + 1)^2");
+    assert!(weights.is_none_or(|w| w.len() == n * n), "weights must be (resolution + 1)^2");
+    let weight_of = |i: usize| weights.map_or([1.0, 0.0, 0.0, 0.0], |w| w[i]);
 
     let step = size_xz / resolution as f32;
     let half = size_xz * 0.5;
@@ -351,6 +386,7 @@ pub fn heightfield_mesh(size_xz: f32, resolution: u32, heights: &[f32]) -> MeshD
                 position: [px, py, pz],
                 normal: normal.to_array(),
                 uv: [x as f32 / resolution as f32, z as f32 / resolution as f32],
+                color: weight_of(z * n + x),
                 tangent: [tangent.x, tangent.y, tangent.z, 1.0],
                 ..Default::default()
             });
@@ -550,5 +586,31 @@ mod tests {
         assert_eq!(y_at(5.0, -5.0), 1.0);
         assert_eq!(y_at(-5.0, 5.0), 2.0);
         assert_eq!(y_at(5.0, 5.0), 3.0);
+    }
+
+    #[test]
+    fn heightmap_import_resamples_to_the_grid_and_reads_luminance() {
+        let dir = std::env::temp_dir().join(format!("zestengine-hm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2x2 red/green/blue/white, resampled to a 2x2 grid (3x3 vertices).
+        let img = image::RgbaImage::from_raw(2, 2, vec![
+            255, 0, 0, 255, 0, 255, 0, 255,
+            0, 0, 255, 255, 255, 255, 255, 255,
+        ]).unwrap();
+        let path = dir.join("h.png");
+        img.save(&path).unwrap();
+        let heights = import_heightmap(&path, 2).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(heights.len(), 9);
+        // Red is darker than blue, which is darker than white.
+        assert!(heights[0] < heights[8]);
+        assert!(heights.iter().all(|h| (0.0..=1.0).contains(h)));
+    }
+
+    #[test]
+    fn heightfield_weights_fill_vertex_color() {
+        let m = heightfield_mesh_with_weights(1.0, 1, &[0.0, 0.0, 0.0, 0.0], Some(&[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]));
+        assert_eq!(m.vertices[0].color, [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(m.vertices[3].color, [0.0, 0.0, 0.0, 1.0]);
     }
 }

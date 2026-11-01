@@ -16,7 +16,7 @@ mod ron_fields;
 mod viseme;
 mod voice_codec;
 mod bundle;
-mod humanoid;
+pub mod humanoid;
 pub mod resource_tracker;
 mod body;
 pub mod audio_mixer;
@@ -116,6 +116,10 @@ mod ui_editor;
 mod anim_controller_editor;
 #[cfg(feature = "editor")]
 mod anim_clip_editor;
+#[cfg(feature = "editor")]
+mod sequencer_editor;
+#[cfg(feature = "editor")]
+mod shader_graph_editor;
 mod ui_templates;
 #[cfg(feature = "editor")]
 pub use editor_app::{AppConfig, run};

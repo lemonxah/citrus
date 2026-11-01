@@ -16,6 +16,8 @@ layout(location = 12) in vec3 a_prev_position;
 
 // Water surfaces displace their grid with the Gerstner waves here.
 layout(constant_id = 4) const bool FEAT_WATER = false;
+// Per-instance material properties (base colour + one parameter vec4).
+layout(constant_id = 6) const bool FEAT_PER_INSTANCE = false;
 
 #include "standard_common.glsl"
 
@@ -46,6 +48,8 @@ layout(location = 8) in vec4 a_model0;
 layout(location = 9) in vec4 a_model1;
 layout(location = 10) in vec4 a_model2;
 layout(location = 11) in vec4 a_model3;
+layout(location = 13) in vec4 a_instance_color;
+layout(location = 14) in vec4 a_instance_param;
 
 layout(push_constant) uniform Push {
     mat4 model;
@@ -69,6 +73,10 @@ layout(location = 6) flat out float v_lightmap;
 // fragment divides by w and writes the screen-space difference).
 layout(location = 7) out vec4 v_cur_clip;
 layout(location = 8) out vec4 v_prev_clip;
+// Per-instance material properties (read by the fragment only when the
+// material opts in via FEAT_PER_INSTANCE).
+layout(location = 9) out vec4 v_instance_color;
+layout(location = 10) out vec4 v_instance_param;
 // Bit-identical positions in the depth prepass and the main pass (the main
 // pass depth-tests EQUAL against the prepass).
 invariant gl_Position;
@@ -130,6 +138,8 @@ void main() {
     v_uv = FEAT_WATER ? water_rest : a_uv;
     v_uv1 = uv1;
     v_color = color;
+    v_instance_color = a_instance_color;
+    v_instance_param = a_instance_param;
     gl_Position = VIEW_PROJ * world;
     v_cur_clip = gl_Position;
     v_prev_clip = frame.prev_view_proj * (model * vec4(a_prev_position, 1.0));

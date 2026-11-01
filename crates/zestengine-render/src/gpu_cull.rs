@@ -128,16 +128,25 @@ pub(crate) struct GpuDraw {
     model: [[f32; 4]; 4],
     /// Object-space bounding sphere: center xyz, radius w (<= 0: never culled).
     sphere: [f32; 4],
+    /// Per-instance base colour.
+    color: [f32; 4],
+    /// Per-instance material parameters.
+    param: [f32; 4],
 }
 
 impl GpuDraw {
     /// `lightmap`: pack the draw's baked-lightmap layer into the instance
     /// (col0.w = layer + 1; the vertex shaders read it and clear it), so
     /// lightmapped statics batch together instead of one batch per layer.
-    fn of(d: &DrawCmd, lightmap: bool) -> Self {
+    fn of(d: &DrawCmd, lightmap: bool, color: [f32; 4], param: [f32; 4]) -> Self {
         let mut model = d.transform.to_cols_array_2d();
         model[0][3] = if lightmap && d.lightmap_layer >= 0 { d.lightmap_layer as f32 + 1.0 } else { 0.0 };
-        Self { model, sphere: d.mesh_center.extend(d.bound_radius).to_array() }
+        Self {
+            model,
+            sphere: d.mesh_center.extend(d.bound_radius).to_array(),
+            color,
+            param,
+        }
     }
 }
 
@@ -194,7 +203,7 @@ struct CullPush {
 const _: () = assert!(size_of::<CullPush>() == 72);
 const _: () = assert!(size_of::<IndirectCmd>() == size_of::<vk::DrawIndexedIndirectCommand>());
 const _: () = assert!(size_of::<GpuView>() == 208);
-const _: () = assert!(size_of::<GpuDraw>() == 80);
+const _: () = assert!(size_of::<GpuDraw>() == 112);
 
 /// New capacity (bytes) of a growable buffer that must hold `needed`: never
 /// shrinks, grows to a power of two so steady growth reallocates rarely.
@@ -242,10 +251,10 @@ impl CullBuilder {
 
     /// Queue draw `index` for culling into `batch`; its data uploads once
     /// however many views reference it.
-    fn add_candidate(&mut self, index: usize, d: &DrawCmd, batch: u32) {
+    fn add_candidate(&mut self, index: usize, d: &DrawCmd, color: [f32; 4], param: [f32; 4], batch: u32) {
         let slot = match self.draw_slot[index] {
             u32::MAX => {
-                self.draws.push(GpuDraw::of(d, self.pack_lightmap));
+                self.draws.push(GpuDraw::of(d, self.pack_lightmap, color, param));
                 let s = self.draws.len() as u32 - 1;
                 self.draw_slot[index] = s;
                 s
@@ -1323,6 +1332,7 @@ impl Renderer {
             }
             let material = &self.materials[d.material.0];
             let mut push = self.draw_push(d, material, input);
+            let (inst_color, inst_param) = self.instance_values(d, material);
             if !input.lightmap_preview {
                 // The layer rides in each instance (GpuDraw::of): one batch
                 // for all of the mesh's lightmapped copies.
@@ -1352,7 +1362,7 @@ impl Renderer {
                 g.scene.len() - 1
             });
             let s = &mut g.scene[k];
-            g.builder.add_candidate(i, d, s.batch);
+            g.builder.add_candidate(i, d, inst_color, inst_param, s.batch);
             if local_lights {
                 s.bounds = merge_bounds(s.bounds, draw_bounds(d));
             }
@@ -1493,7 +1503,7 @@ impl Renderer {
                     batches.push(ShadowIndirect { mesh: d.mesh.0, batch, cmd_offset: 0, inst_offset: 0 });
                     batches.len() - 1
                 });
-                g.builder.add_candidate(i, d, batches[k].batch);
+                g.builder.add_candidate(i, d, [1.0; 4], [0.0; 4], batches[k].batch);
             }
             g.shadow.push((*layer, batches));
         }
@@ -1854,6 +1864,8 @@ mod tests {
             planar_index: -1,
             occluded: false,
             shadow_casting: crate::ShadowCasting::On,
+            instance_color: None,
+            instance_param: None,
         }
     }
 
@@ -1917,7 +1929,7 @@ mod tests {
                 for _ in 0..4000 {
                     let d = random_draw(&mut rng);
                     let cpu = sphere_in_planes(&planes, &d, near);
-                    let gpu = classify(&v, &GpuDraw::of(&d, false)) == 0;
+                    let gpu = classify(&v, &GpuDraw::of(&d, false, [1.0; 4], [0.0; 4])) == 0;
                     assert_eq!(cpu, gpu, "near={near} draw={:?} r={}", d.transform, d.bound_radius);
                     kept[cpu as usize] += 1;
                 }
@@ -1930,8 +1942,8 @@ mod tests {
     fn distance_and_size_hooks_only_cull_when_set() {
         let vp = views()[0];
         let mut v = GpuView::new(vp, Vec3::new(3.0, 4.0, 10.0), true);
-        let near_big = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -5.0)), Vec3::ZERO, 1.0), false);
-        let far_small = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -150.0)), Vec3::ZERO, 0.05), false);
+        let near_big = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -5.0)), Vec3::ZERO, 1.0), false, [1.0; 4], [0.0; 4]);
+        let far_small = GpuDraw::of(&draw(Mat4::from_translation(Vec3::new(0.0, 1.0, -150.0)), Vec3::ZERO, 0.05), false, [1.0; 4], [0.0; 4]);
         assert_eq!(classify(&v, &near_big), 0);
         assert_eq!(classify(&v, &far_small), 0);
         v.cam[3] = 100.0;
@@ -1949,6 +1961,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GpuView, hiz), 160);
         assert_eq!(std::mem::offset_of!(GpuView, lod), 192);
         assert_eq!(std::mem::offset_of!(GpuDraw, sphere), 64);
+        assert_eq!(std::mem::offset_of!(GpuDraw, color), 80);
+        assert_eq!(std::mem::offset_of!(GpuDraw, param), 96);
         assert_eq!(std::mem::offset_of!(IndirectCmd, instance_count), 4);
         assert_eq!(std::mem::offset_of!(IndirectCmd, first_instance), 16);
         assert_eq!(INDIRECT_STRIDE, 20);
@@ -1991,13 +2005,13 @@ mod tests {
         let m0 = b.add_batch(main, 36);
         let m1 = b.add_batch(main, 36);
         for (i, cmd) in d.iter().enumerate() {
-            b.add_candidate(i, cmd, if i % 2 == 0 { m0 } else { m1 });
+            b.add_candidate(i, cmd, [1.0; 4], [0.0; 4], if i % 2 == 0 { m0 } else { m1 });
         }
         let main_count = b.candidates.len() as u32;
         let shadow = b.add_view(GpuView::new(Mat4::IDENTITY, Vec3::ZERO, false));
         let s = b.add_batch(shadow, 36);
         for (i, cmd) in d.iter().enumerate() {
-            b.add_candidate(i, cmd, s);
+            b.add_candidate(i, cmd, [1.0; 4], [0.0; 4], s);
         }
         b.finalize();
         for (k, c) in b.candidates.iter().enumerate() {
@@ -2021,11 +2035,11 @@ mod tests {
         let c = b.add_batch(main, 600);
         let s = b.add_batch(shadow, 36);
         for i in [0, 2, 4] {
-            b.add_candidate(i, &d[i], a);
+            b.add_candidate(i, &d[i], [1.0; 4], [0.0; 4], a);
         }
-        b.add_candidate(1, &d[1], c);
+        b.add_candidate(1, &d[1], [1.0; 4], [0.0; 4], c);
         for i in [0, 1, 2, 3] {
-            b.add_candidate(i, &d[i], s);
+            b.add_candidate(i, &d[i], [1.0; 4], [0.0; 4], s);
         }
         assert_eq!(b.finalize(), 8);
         // Each draw is uploaded once, whichever views reference it.
@@ -2331,11 +2345,11 @@ mod tests {
     fn lightmap_layers_ride_in_the_instance_matrix() {
         let mut d = draw(Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)), Vec3::ZERO, 1.0);
         d.lightmap_layer = 4;
-        let packed = GpuDraw::of(&d, true);
+        let packed = GpuDraw::of(&d, true, [1.0; 4], [0.0; 4]);
         assert_eq!(packed.model[0][3], 5.0, "layer + 1 in col0.w");
         assert_eq!(packed.model[3], [1.0, 2.0, 3.0, 1.0], "the transform is otherwise untouched");
-        assert_eq!(GpuDraw::of(&d, false).model[0][3], 0.0, "lightmap preview keeps the push lane");
+        assert_eq!(GpuDraw::of(&d, false, [1.0; 4], [0.0; 4]).model[0][3], 0.0, "lightmap preview keeps the push lane");
         d.lightmap_layer = -1;
-        assert_eq!(GpuDraw::of(&d, true).model[0][3], 0.0, "no lightmap: 0, the shader falls back to the push lane");
+        assert_eq!(GpuDraw::of(&d, true, [1.0; 4], [0.0; 4]).model[0][3], 0.0, "no lightmap: 0, the shader falls back to the push lane");
     }
 }

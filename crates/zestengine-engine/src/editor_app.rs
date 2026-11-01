@@ -165,6 +165,8 @@ pub fn run(config: AppConfig) -> Result<()> {
         ui_editor: Default::default(),
         anim_ctrl_tab: Default::default(),
         anim_clip_tab: Default::default(),
+        sequencer_tab: Default::default(),
+        shader_graph_tab: Default::default(),
         ui_rect_editor: Default::default(),
         game_ui_frame: crate::game_ui::UiFrame::default(),
         world_ui: crate::game_ui::WorldUi::default(),
@@ -609,6 +611,10 @@ enum Tab {
     AnimController,
     /// Animation clip (keyframe timeline) editor.
     AnimClip,
+    /// Cinematics sequencer (timeline of scene-anchored transform/camera tracks).
+    Sequencer,
+    /// Visual shader graph (node-based surface shader) editor.
+    ShaderGraph,
     /// Occlusion culling: bake settings, Bake / Clear, visualization.
     Occlusion,
     /// Project-wide settings (name, VR, boot scene, input, build target...).
@@ -997,6 +1003,8 @@ struct EngineApp {
     ui_editor: crate::ui_editor::UiEditorTab,
     anim_ctrl_tab: crate::anim_controller_editor::AnimControllerTab,
     anim_clip_tab: crate::anim_clip_editor::AnimClipTab,
+    sequencer_tab: crate::sequencer_editor::SequencerTab,
+    shader_graph_tab: crate::shader_graph_editor::ShaderGraphTab,
     /// Move / resize handles for screen UI in the viewport overlay.
     ui_rect_editor: crate::ui_edit::UiRectEditor,
     /// UI clicks / hover since the last play tick.
@@ -2595,6 +2603,8 @@ impl EngineApp {
                 planar_index: -1,
                 occluded: false,
                 shadow_casting: zestengine_render::ShadowCasting::On,
+                instance_color: None,
+                instance_param: None,
             });
         }
     }
@@ -4969,6 +4979,8 @@ impl EngineApp {
                         (Tab::UiEditor, "UI Editor"),
                         (Tab::AnimController, "Animator Controller"),
                         (Tab::AnimClip, "Animation"),
+                        (Tab::Sequencer, "Sequencer"),
+                        (Tab::ShaderGraph, "Shader Graph"),
                         (Tab::Scene, "Scene"),
                         (Tab::Inspector, "Inspector"),
                         (Tab::Environment, "Environment"),
@@ -5920,6 +5932,7 @@ impl EngineApp {
             self.set_game_cursor(false);
             // Pawn camera possession is play-only; revert to the default camera.
             self.scene.active_camera_override = None;
+            self.sequencer_tab.end_play(&mut self.scene);
             if self.play_scene_switched {
                 // A component switched scenes during play; the snapshot indices
                 // no longer match the loaded scene. Return to the scene we
@@ -5945,6 +5958,9 @@ impl EngineApp {
             self.playing = true;
             self.focus_game_tab = true;
             self.play_time = 0.0;
+            if self.sequencer_tab.is_open() {
+                self.sequencer_tab.begin_play(&self.scene);
+            }
             // Components start on the first tick.
             let mut session = crate::play::PlaySession::new(&self.scene, &self.project_root, self.audio.take());
             session.set_mixer(self.project.audio_mixer.clone());
@@ -7286,6 +7302,7 @@ impl EngineApp {
         self.last_shader_scan = Some(Instant::now());
         self.shader_files = scan_project_files(&self.project_root, "frag");
         self.shader_files.extend(scan_project_files(&self.project_root, zestengine_assets::HLSL_SHADER_EXTENSION));
+        self.shader_files.extend(scan_project_files(&self.project_root, zestengine_assets::SHADER_GRAPH_EXTENSION));
         self.shader_files.sort();
         if let Some(renderer) = self.renderer.as_mut() {
             let changed = self.shaders.poll_reload(renderer, &self.project_root);
@@ -7787,7 +7804,9 @@ impl EngineApp {
         // The animation tabs keep their own document histories.
         match self.dock_state.find_active_focused().map(|(_, tab)| tab.clone()) {
             Some(Tab::AnimClip) => return self.anim_clip_tab.history_step(undo),
+            Some(Tab::Sequencer) => return self.sequencer_tab.history_step(undo),
             Some(Tab::AnimController) => return self.anim_ctrl_tab.history_step(undo),
+            Some(Tab::ShaderGraph) => return,
             _ => {}
         }
         let Some(entry) = (if undo {
@@ -8366,6 +8385,8 @@ impl EngineApp {
                 ui_editor: &mut self.ui_editor,
                 anim_ctrl_tab: &mut self.anim_ctrl_tab,
                 anim_clip_tab: &mut self.anim_clip_tab,
+                sequencer_tab: &mut self.sequencer_tab,
+                shader_graph_tab: &mut self.shader_graph_tab,
                 occlusion_ui: &mut self.occlusion_ui,
                 ui_rect_editor: &mut self.ui_rect_editor,
                 active_tabs_prev: &active_prev,
@@ -8465,6 +8486,27 @@ impl EngineApp {
                         self.dock_state.set_focused_node_and_surface((surface, node));
                     }
                     self.dock_state.push_to_focused_leaf(tab);
+                }
+            }
+            if crate::shader_graph_editor::take_open_request(ctx, &mut self.shader_graph_tab, &self.project_root) {
+                let tab = Tab::ShaderGraph;
+                if let Some(loc) = self.dock_state.find_tab(&tab) {
+                    self.dock_state.set_active_tab(loc);
+                } else {
+                    if let Some((surface, node, _)) = self.dock_state.find_tab(&Tab::Viewport) {
+                        self.dock_state.set_focused_node_and_surface((surface, node));
+                    }
+                    self.dock_state.push_to_focused_leaf(tab);
+                }
+            }
+            if std::mem::take(&mut self.sequencer_tab.open_request) {
+                if let Some(loc) = self.dock_state.find_tab(&Tab::Sequencer) {
+                    self.dock_state.set_active_tab(loc);
+                } else {
+                    if let Some((surface, node, _)) = self.dock_state.find_tab(&Tab::Viewport) {
+                        self.dock_state.set_focused_node_and_surface((surface, node));
+                    }
+                    self.dock_state.push_to_focused_leaf(Tab::Sequencer);
                 }
             }
 
@@ -8729,6 +8771,7 @@ impl EngineApp {
         self.scene.ensure_camera_components(&self.components);
         self.scene.ensure_light_components(&self.components);
         self.scene.ensure_camera_ids();
+        self.sequencer_tab.tick(&mut self.scene, dt);
         // Highlight every multi-selected object (anchor + extras) in the viewport.
         let selected = self.selected_object_indices();
         let draws_t = Instant::now();
@@ -8897,6 +8940,7 @@ impl EngineApp {
         };
         let preview_postfx = preview_postfx.unwrap_or(postfx);
         let planar = self.scene.planar_surfaces();
+        let decals = self.scene.gather_decals(renderer, &self.project_root);
         // Full light set (incl. baked) for the reflection-probe cube capture, so
         // a baked scene's reflections aren't captured in the dark. Only gathered
         // while a capture is queued or running (empty = use `lights`).
@@ -8932,6 +8976,7 @@ impl EngineApp {
             water_time: self.water.time(),
             water: self.water.bodies(),
             draws: &self.scene.draws,
+            decals: &decals,
             lightmap_preview: self.lightmap_preview,
             gi_debug: self.gi_debug,
             // The editor renders the scene into the viewport texture (RTT), never
@@ -9138,6 +9183,8 @@ struct EditorTabs<'a> {
     ui_editor: &'a mut crate::ui_editor::UiEditorTab,
     anim_ctrl_tab: &'a mut crate::anim_controller_editor::AnimControllerTab,
     anim_clip_tab: &'a mut crate::anim_clip_editor::AnimClipTab,
+    sequencer_tab: &'a mut crate::sequencer_editor::SequencerTab,
+    shader_graph_tab: &'a mut crate::shader_graph_editor::ShaderGraphTab,
     occlusion_ui: &'a mut OcclusionUi,
     ui_rect_editor: &'a mut crate::ui_edit::UiRectEditor,
     playing: bool,
@@ -9247,7 +9294,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
     /// Tabs that scroll their own panels: a dock scroll bar on top would
     /// cover theirs (the Animator's side panels, the code editor).
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
-        let own = matches!(tab, Tab::AnimController | Tab::AnimClip | Tab::Code(_));
+        let own = matches!(tab, Tab::AnimController | Tab::AnimClip | Tab::Sequencer | Tab::ShaderGraph | Tab::Code(_));
         [!own, !own]
     }
 
@@ -9256,7 +9303,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
         // Panel padding (spec §2.7) for tabs that don't draw their own header
         // strip or fill edge to edge.
         let mut padded_ui;
-        let ui: &mut egui::Ui = if matches!(tab, Tab::Viewport | Tab::Scene | Tab::UiEditor | Tab::AnimController | Tab::AnimClip | Tab::Files | Tab::Code(_)) {
+        let ui: &mut egui::Ui = if matches!(tab, Tab::Viewport | Tab::Scene | Tab::UiEditor | Tab::AnimController | Tab::AnimClip | Tab::Sequencer | Tab::ShaderGraph | Tab::Files | Tab::Code(_)) {
             ui
         } else {
             let rect = ui.max_rect().shrink2(egui::vec2(zestengine_editor::theme::PAD, 8.0));
@@ -9294,6 +9341,16 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 } else {
                     self.anim_clip_tab.ui(ui, self.scene, selected, self.project_root, self.playing);
                 }
+            }
+            Tab::ShaderGraph => {
+                self.shader_graph_tab.ui(ui, self.project_root);
+            }
+            Tab::Sequencer => {
+                let selected = match self.selection {
+                    Selection::Object(i) => Some(*i),
+                    _ => None,
+                };
+                self.sequencer_tab.ui(ui, self.scene, selected, self.project_root, self.playing);
             }
             Tab::Environment => {
                 // Undo: compare the settings around the tab (RON: the type has
@@ -9547,6 +9604,10 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                         self.actions.push(EditorAction::ImportModel(path));
                     } else if ext.as_deref().is_some_and(|e| CODE_EXTENSIONS.contains(&e)) {
                         self.actions.push(EditorAction::OpenCodeFile(path));
+                    } else if ext.as_deref() == Some(zestengine_assets::SHADER_GRAPH_EXTENSION) {
+                        let rel = crate::anim_controller_editor::rel_path(self.project_root, &path);
+                        self.shader_graph_tab.open(self.project_root, &rel);
+                        self.shader_graph_tab.open_request = true;
                     } else {
                         self.actions.push(EditorAction::SelectFile(path));
                     }
@@ -9573,6 +9634,12 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 }
                 if let Some(dir) = response.create_anim_clip_in {
                     crate::anim_controller_editor::create_asset(&dir, false, self.project_root, self.anim_ctrl_tab, self.anim_clip_tab);
+                }
+                if let Some(dir) = response.create_behaviour_tree_in {
+                    create_behaviour_tree(&dir, self.project_root);
+                }
+                if let Some(dir) = response.create_shader_graph_in {
+                    crate::shader_graph_editor::create_asset(&dir, self.project_root, self.shader_graph_tab);
                 }
                 if let Some(dir) = response.create_postfx_in {
                     self.actions.push(EditorAction::CreatePostFx(dir));
@@ -13086,6 +13153,15 @@ impl EditorTabs<'_> {
                         Some("animctrl" | "anim") => {
                             crate::anim_controller_editor::file_inspector(ui, path, self.project_root, self.anim_ctrl_tab, self.anim_clip_tab);
                         }
+                        Some("behaviour") => {
+                            behaviour_tree_editor_ui(ui, path);
+                        }
+                        Some("shadergraph") => {
+                            crate::shader_graph_editor::file_inspector(ui, path, self.project_root, self.shader_graph_tab);
+                        }
+                        Some("seq") => {
+                            crate::sequencer_editor::file_inspector(ui, path, self.project_root, self.sequencer_tab);
+                        }
                         Some("postfx") => {
                             ui.heading("Post FX Profile");
                             ui.label(egui::RichText::new(&path_display).small().weak());
@@ -14251,6 +14327,30 @@ fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
         .unwrap_or_else(|| make(0))
 }
 
+fn create_behaviour_tree(dir: &Path, _root: &Path) {
+    let path = unique_path(dir, "New Behaviour", zestengine_assets::BEHAVIOUR_TREE_EXTENSION);
+    let tree = zestengine_assets::BehaviourTree {
+        root: zestengine_core::ai::BtNode::Sequence { children: Vec::new() },
+        ..Default::default()
+    };
+    if let Err(e) = zestengine_assets::save_behaviour_tree(&path, &tree) {
+        tracing::error!("creating behaviour tree: {e:#}");
+    }
+}
+
+fn behaviour_tree_editor_ui(ui: &mut egui::Ui, path: &Path) {
+    let mut tree = zestengine_assets::load_behaviour_tree(path).unwrap_or_default();
+    ui.heading("Behaviour Tree");
+    ui.label(egui::RichText::new(path.display().to_string()).small().weak());
+    ui.separator();
+    let mut changed = false;
+    changed |= ui.text_edit_singleline(&mut tree.name).changed();
+    changed |= zestengine_editor::edit_bt_node(ui, &mut tree.root, 0);
+    if changed && let Err(e) = zestengine_assets::save_behaviour_tree(path, &tree) {
+        tracing::error!("saving behaviour tree: {e:#}");
+    }
+}
+
 impl Drop for EngineApp {
     fn drop(&mut self) {
         // The XR swapchains live on the renderer's device (fields drop in
@@ -14806,6 +14906,8 @@ fn tab_label(tab: &Tab) -> String {
         Tab::UiEditor => format!("{}  UI Editor", ph::LAYOUT),
         Tab::AnimController => format!("{}  Animator Controller", ph::FLOW_ARROW),
         Tab::AnimClip => format!("{}  Animation", ph::FILM_STRIP),
+        Tab::Sequencer => format!("{}  Sequencer", ph::FILM_STRIP),
+        Tab::ShaderGraph => format!("{}  Shader Graph", ph::FLOW_ARROW),
         Tab::Scene => "Scene".to_owned(),
         Tab::Inspector => "Inspector".to_owned(),
         Tab::Environment => "Environment".to_owned(),
@@ -14946,12 +15048,14 @@ enum PaletteCmd {
     UiTemplate(crate::ui_templates::UiTemplate),
 }
 
-const PALETTE_TABS: [(Tab, &str); 12] = [
+const PALETTE_TABS: [(Tab, &str); 14] = [
     (Tab::Viewport, "Scene"),
     (Tab::Camera, "Camera"),
     (Tab::UiEditor, "UI Editor"),
     (Tab::AnimController, "Animator Controller"),
     (Tab::AnimClip, "Animation"),
+    (Tab::Sequencer, "Sequencer"),
+    (Tab::ShaderGraph, "Shader Graph"),
     (Tab::Scene, "Scene"),
     (Tab::Inspector, "Inspector"),
     (Tab::Environment, "Environment"),

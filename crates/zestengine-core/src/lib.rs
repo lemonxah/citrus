@@ -16,9 +16,14 @@ use serde::{Deserialize, Serialize};
 
 mod audio_mixer;
 pub mod ai;
+pub use ai::{
+    BehaviourTreeAgent, Blackboard, BtAction, BtNode, BtStatus, BtValue, Perception, PerceptionComponent,
+    PerceptionState, tick,
+};
 pub mod destruction;
 pub mod sequencer;
 pub mod vehicle;
+pub use vehicle::{Vehicle, Wheel};
 mod cloth;
 mod cloth_mesh;
 pub use cloth_mesh::{MeshCloth, MeshClothRuntime, MeshClothSim, MeshParticle, PinSource};
@@ -116,6 +121,8 @@ mod content;
 pub use content::{
     AvatarDescriptor, ContentCommand, ContentEvent, ContentInfo, ContentKind, ContentPlacement, ContentRequest,
 };
+pub mod script;
+pub use script::Script;
 pub use input::{
     ActionBinding, ActionKind, ActionValue, Bindings, ControlScheme, InputSource, InputState, Key,
     MouseAxis, MouseButton, PadAxis, PadButton, RawInput, VrAxis, VrButton, resolve,
@@ -916,6 +923,7 @@ impl ComponentRegistry {
         registry.register::<FluxVolume>();
         registry.register::<ReflectionProbe>();
         registry.register::<PlanarReflection>();
+        registry.register::<PerInstance>();
         registry.register::<AudioSource>();
         registry.register::<AudioListener>();
         registry.register::<AcousticMaterial>();
@@ -940,8 +948,11 @@ impl ComponentRegistry {
         registry.register::<NavMeshSurface>();
         registry.register::<NavAgent>();
         registry.register::<ParticleEmitter>();
+        registry.register::<crate::ai::PerceptionComponent>();
+        registry.register::<crate::ai::BehaviourTreeAgent>();
         registry.register::<ScenePortal>();
         registry.register::<Pawn>();
+        registry.register::<Vehicle>();
         registry.register::<SpawnPoint>();
         registry.register::<Sync>();
         registry.register::<NetworkObject>();
@@ -977,6 +988,7 @@ impl ComponentRegistry {
         registry.register::<UiProgressBar>();
         registry.register::<UiPauseMenu>();
         registry.register::<AvatarDescriptor>();
+        registry.register::<crate::script::Script>();
         kit::register_kit(&mut registry);
         registry
     }
@@ -1792,6 +1804,25 @@ impl TypedComponent for PlanarReflection {
     const NAME: &'static str = "Planar Reflection";
 }
 
+/// Per-instance material overrides (Unity per-instance properties). Read by
+/// the forward pass only when the material opts in
+/// (`MaterialFeatures::per_instance`); objects without one use the material's
+/// own values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PerInstance {
+    /// Per-instance base colour; `None` = use the material's base colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 4]>,
+    /// Per-instance material parameters (metallic, roughness, toon steps,
+    /// toon/PBR blend); `None` = use the material's values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub param: Option<[f32; 4]>,
+}
+
+impl TypedComponent for PerInstance {
+    const NAME: &'static str = "Per Instance";
+}
+
 /// How a spatial audio source quietens with distance.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum AudioRolloff {
@@ -2137,11 +2168,34 @@ pub struct Terrain {
     pub heights: Vec<f32>,
     /// Project-relative `.material` path ("" = project default).
     pub material: String,
+    /// Project-relative heightmap image to import into `heights` (PNG, JPG,
+    /// EXR or HDR; luminance is used). Empty = no source (sculpted heights).
+    #[serde(default)]
+    pub heightmap: String,
+    /// Metres the heightmap's full 0..1 luminance range spans.
+    #[serde(default = "default_heightmap_scale")]
+    pub heightmap_scale: f32,
+    /// Metres added to the imported height (0..1 black is at this height).
+    #[serde(default)]
+    pub heightmap_offset: f32,
+    /// The `heightmap` source the heights were last imported from ("" = none),
+    /// so changing the source re-imports. Not meant to be edited by hand.
+    #[serde(default)]
+    pub heightmap_imported_path: String,
+    /// The scale/offset the last import applied; changing them re-imports.
+    #[serde(default)]
+    pub heightmap_imported_scale: f32,
+    #[serde(default)]
+    pub heightmap_imported_offset: f32,
     /// Per-vertex painted texture-layer weights (RGBA = up to 4 layers),
     /// row-major over Z then X like `heights`.
     /// Empty means "not painted yet" and defaults to layer 0 at runtime/editor.
     #[serde(default)]
     pub texture_weights: Vec<[f32; 4]>,
+}
+
+fn default_heightmap_scale() -> f32 {
+    10.0
 }
 
 impl Default for Terrain {
@@ -2151,7 +2205,13 @@ impl Default for Terrain {
             size: 100.0,
             resolution,
             heights: vec![0.0; (resolution as usize + 1).pow(2)],
-            material: String::new(),
+            material: "materials/terrain_splat.material".into(),
+            heightmap: String::new(),
+            heightmap_scale: 10.0,
+            heightmap_offset: 0.0,
+            heightmap_imported_path: String::new(),
+            heightmap_imported_scale: 0.0,
+            heightmap_imported_offset: 0.0,
             texture_weights: Vec::new(),
         }
     }
@@ -2340,6 +2400,13 @@ pub struct DecalProjector {
     pub fade: f32,
     /// UV tiling over the box.
     pub tiling: [f32; 2],
+    /// Linear RGBA tint multiplied with the decal texture.
+    #[serde(default = "default_decal_tint")]
+    pub tint: [f32; 4],
+}
+
+fn default_decal_tint() -> [f32; 4] {
+    [1.0, 1.0, 1.0, 1.0]
 }
 
 impl Default for DecalProjector {
@@ -2350,6 +2417,7 @@ impl Default for DecalProjector {
             depth: 1.0,
             fade: 0.1,
             tiling: [1.0, 1.0],
+            tint: default_decal_tint(),
         }
     }
 }
@@ -4008,6 +4076,12 @@ mod terrain_tests {
             resolution: 4,
             heights: (0..25).map(|i| i as f32).collect(),
             material: "ground.mat".into(),
+            heightmap: "heightmap.png".into(),
+            heightmap_scale: 25.0,
+            heightmap_offset: -2.0,
+            heightmap_imported_path: "heightmap.png".into(),
+            heightmap_imported_scale: 25.0,
+            heightmap_imported_offset: -2.0,
             texture_weights: (0..25)
                 .map(|i| {
                     let t = i as f32 / 24.0;
@@ -4021,6 +4095,12 @@ mod terrain_tests {
         assert_eq!(back.resolution, t.resolution);
         assert_eq!(back.heights, t.heights);
         assert_eq!(back.material, "ground.mat");
+        assert_eq!(back.heightmap, "heightmap.png");
+        assert_eq!(back.heightmap_scale, 25.0);
+        assert_eq!(back.heightmap_offset, -2.0);
+        assert_eq!(back.heightmap_imported_path, "heightmap.png");
+        assert_eq!(back.heightmap_imported_scale, 25.0);
+        assert_eq!(back.heightmap_imported_offset, -2.0);
         assert_eq!(back.texture_weights, t.texture_weights);
     }
 

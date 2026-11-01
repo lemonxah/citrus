@@ -188,6 +188,7 @@ impl Scene {
                 heights,
                 material: mat_path(material),
                 texture_weights: Vec::new(),
+                ..Default::default()
             },
         );
         self.with(i, TerrainCollider::default());

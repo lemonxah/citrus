@@ -416,6 +416,11 @@ pub struct LoadedScene {
     /// Each model's parts as imported (scene files store model instances as
     /// their changes against these).
     model_parts: HashMap<String, Vec<zestengine_assets::ModelPart>>,
+    /// Meshlet clusters generated for LOD templates, keyed by template key
+    /// (see `prepare_lods`). The outer Vec parallels the model's meshes; the
+    /// inner Vec is that mesh's clusters. Only generated (decimated) levels are
+    /// present — authored LOD models keep their own pipeline path.
+    lod_meshlets: HashMap<String, Vec<Vec<zestengine_assets::Meshlet>>>,
     /// Builtin test-scene meshes: (first mesh index, template materials).
     builtin_template: Option<(usize, Vec<usize>)>,
     material_file_cache: HashMap<PathBuf, usize>,
@@ -724,6 +729,7 @@ impl LoadedScene {
             model_mesh_base: HashMap::new(),
             model_templates: HashMap::new(),
             model_parts: HashMap::new(),
+            lod_meshlets: HashMap::new(),
             builtin_template: None,
             extra_draws: Vec::new(),
             water_splashes: Vec::new(),
@@ -4659,6 +4665,59 @@ impl LoadedScene {
         out
     }
 
+    /// World-space projected decals gathered from enabled `Decal Projector`
+    /// components. Textures load through the same cache as material slots.
+    pub fn gather_decals(
+        &mut self,
+        renderer: &mut Renderer,
+        project_root: &Path,
+    ) -> Vec<zestengine_render::Decal> {
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            if !self.is_active(i) {
+                continue;
+            }
+            if self.visible_layers & (1u32 << (self.objects[i].layer as u32 & 31)) == 0 {
+                continue;
+            }
+            let Some(decal) = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| {
+                    if !zestengine_core::component_enabled(c.as_ref()) {
+                        return None;
+                    }
+                    c.as_any().downcast_ref::<zestengine_core::DecalProjector>()
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            if decal.texture.trim().is_empty() {
+                continue;
+            }
+            let texture = match self.load_texture_cached(renderer, project_root, Path::new(&decal.texture), true) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    tracing::error!("loading decal texture {}: {e:#}", decal.texture);
+                    continue;
+                }
+            };
+            let world = self.world_transform(i);
+            out.push(zestengine_render::Decal {
+                texture,
+                world_to_local: world.inverse(),
+                forward: world.transform_vector3(Vec3::Z).normalize_or(Vec3::Z),
+                size: decal.size,
+                depth: decal.depth.max(0.001),
+                fade: decal.fade.clamp(0.0, 1.0),
+                tiling: decal.tiling,
+                tint: decal.tint,
+            });
+        }
+        out
+    }
+
     /// Scene fog parameters for the renderer, or `None` when fog is disabled.
     pub fn fog_params(&self) -> Option<zestengine_render::FogParams> {
         let e = &self.environment;
@@ -4945,6 +5004,11 @@ impl LoadedScene {
             let Ok(lod) = self.lod_level(i, transform.w_axis.truncate()) else {
                 continue;
             };
+            let per_instance = self.objects[i]
+                .components
+                .iter()
+                .find_map(|c| c.as_any().downcast_ref::<zestengine_core::PerInstance>())
+                .copied();
             // One draw per material slot (slot 0 + extras), all at this transform.
             for (k, mut render) in self.objects[i].render_slots().enumerate() {
                 if let Some((base, count)) = lod {
@@ -4970,6 +5034,8 @@ impl LoadedScene {
                     planar_index: planar_idx[i],
                     occluded,
                     shadow_casting: render_shadow_casting(self.objects[i].cast_shadows),
+                    instance_color: per_instance.and_then(|p| p.color),
+                    instance_param: per_instance.and_then(|p| p.param),
                 });
             }
         }
@@ -5449,6 +5515,53 @@ impl LoadedScene {
     /// Runs every frame from the host; cheap once each mesh is current.
     pub fn sync_terrain_meshes(&mut self, renderer: &mut Renderer, shaders: &mut ShaderLibrary, project_root: &Path) {
         for i in 0..self.objects.len() {
+            // Import a newly-assigned heightmap before the mesh snapshot is
+            // compared (importing writes the heights, which then rebuilds the
+            // mesh and collider).
+            let needs_import = {
+                let Some(t) = self.objects[i]
+                    .components
+                    .iter()
+                    .find_map(|c| c.as_any().downcast_ref::<zestengine_core::Terrain>())
+                else {
+                    continue;
+                };
+                !t.heightmap.is_empty()
+                    && (t.heightmap_imported_path != t.heightmap
+                        || (t.heightmap_imported_scale - t.heightmap_scale).abs() > f32::EPSILON
+                        || (t.heightmap_imported_offset - t.heightmap_offset).abs() > f32::EPSILON)
+            };
+            if needs_import {
+                let Some(t) = self.objects[i]
+                    .components
+                    .iter_mut()
+                    .find_map(|c| c.as_any_mut().downcast_mut::<zestengine_core::Terrain>())
+                else {
+                    continue;
+                };
+                let path = t.heightmap.clone();
+                let abs = zestengine_core::asset_ref::resolve_path(project_root, &path);
+                match zestengine_assets::import_heightmap(&abs, t.resolution) {
+                    Ok(mut heights) => {
+                        for h in &mut heights {
+                            *h = *h * t.heightmap_scale + t.heightmap_offset;
+                        }
+                        t.heights = heights;
+                        t.heightmap_imported_path = path;
+                        t.heightmap_imported_scale = t.heightmap_scale;
+                        t.heightmap_imported_offset = t.heightmap_offset;
+                    }
+                    Err(e) => {
+                        // Leave the existing heights; retry next frame would
+                        // just repeat the same failure, so record the failed
+                        // source to stop the loop and log it.
+                        tracing::error!("importing terrain heightmap {path}: {e:#}");
+                        t.heightmap_imported_path = path;
+                        t.heightmap_imported_scale = t.heightmap_scale;
+                        t.heightmap_imported_offset = t.heightmap_offset;
+                    }
+                }
+            }
             let Some(terrain) = self.objects[i]
                 .components
                 .iter()
@@ -5460,20 +5573,8 @@ impl LoadedScene {
             if self.terrain_meshes.get(&i).is_some_and(|(snap, _)| *snap == terrain) {
                 continue;
             }
-            let material = if terrain.material.is_empty() {
-                match self.default_material {
-                    Some(m) => m,
-                    None => match self.ensure_default_material(renderer) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!("terrain material: {e:#}");
-                            continue;
-                        }
-                    },
-                }
-            } else {
-                let abs = zestengine_core::asset_ref::resolve_path(project_root, &terrain.material);
-                self.material_from_file(renderer, shaders, &abs, project_root)
+            let Some(material) = self.terrain_material(renderer, shaders, project_root, &terrain) else {
+                continue;
             };
             let mesh = match self.upload_terrain_mesh(renderer, &terrain) {
                 Ok(m) => m,
@@ -5487,10 +5588,49 @@ impl LoadedScene {
         }
     }
 
+    /// Resolve the terrain's material: its assigned `.material` file when it
+    /// exists, else the project default. A missing assigned file falls back
+    /// instead of drawing the error shader (a terrain in a project without the
+    /// splat material still renders).
+    fn terrain_material(
+        &mut self,
+        renderer: &mut Renderer,
+        shaders: &mut ShaderLibrary,
+        project_root: &Path,
+        terrain: &zestengine_core::Terrain,
+    ) -> Option<usize> {
+        if !terrain.material.is_empty() {
+            let abs = zestengine_core::asset_ref::resolve_path(project_root, &terrain.material);
+            if abs.is_file() {
+                return Some(self.material_from_file(renderer, shaders, &abs, project_root));
+            }
+            tracing::warn!("terrain material missing: {}; using default", abs.display());
+        }
+        match self.default_material {
+            Some(m) => Some(m),
+            None => match self.ensure_default_material(renderer) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::error!("terrain material: {e:#}");
+                    None
+                }
+            },
+        }
+    }
+
     /// Generate and upload the heightfield mesh for a `Terrain` component,
     /// mirroring the primitive-mesh upload path.
     fn upload_terrain_mesh(&mut self, renderer: &mut Renderer, terrain: &zestengine_core::Terrain) -> Result<usize> {
-        let data = zestengine_assets::heightfield_mesh(terrain.size, terrain.resolution, &terrain.heights);
+        let data = if terrain.texture_weights.len() == (terrain.resolution as usize + 1).pow(2) {
+            zestengine_assets::heightfield_mesh_with_weights(
+                terrain.size,
+                terrain.resolution,
+                &terrain.heights,
+                Some(&terrain.texture_weights),
+            )
+        } else {
+            zestengine_assets::heightfield_mesh(terrain.size, terrain.resolution, &terrain.heights)
+        };
         self.mesh_handles.push(renderer.upload_mesh(&data)?);
         self.mesh_geometry.push((
             data.vertices.iter().map(|v| Vec3::from(v.position)).collect(),
@@ -5533,20 +5673,39 @@ impl LoadedScene {
         }
         for (key, source, keep) in wanted {
             let result = zestengine_assets::load_model_with_meta(project_root.join(&source)).and_then(|mut asset| {
+                let mut meshlets_per_mesh = Vec::new();
                 if let Some(keep) = keep {
                     for mesh in &mut asset.meshes {
-                        *mesh = zestengine_assets::simplify::simplify(mesh, keep);
+                        // Decimate then cluster in one pass so the generated LOD
+                        // and its meshlets share the same index space.
+                        let (lod, clusters) = zestengine_assets::build_lod_meshlets(mesh, keep, 64, 126);
+                        *mesh = lod;
+                        meshlets_per_mesh.push(clusters);
                     }
                     // Blendshapes index the original vertices.
                     asset.morphs.clear();
                 }
-                self.install_model_template(renderer, &key, &asset, None)
+                self.install_model_template(renderer, &key, &asset, None)?;
+                Ok(meshlets_per_mesh)
             });
-            if let Err(e) = result {
-                tracing::warn!("LOD model {key}: {e:#}");
-                self.lod_failed.insert(key);
+            match result {
+                Ok(meshlets_per_mesh) if !meshlets_per_mesh.is_empty() => {
+                    self.lod_meshlets.insert(key, meshlets_per_mesh);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("LOD model {key}: {e:#}");
+                    self.lod_failed.insert(key);
+                }
             }
         }
+    }
+
+    /// Meshlet clusters generated for a LOD template key (see
+    /// [`Self::prepare_lods`]), the outer Vec parallel to that model's meshes.
+    /// `None` when the template is an authored model or has not been generated.
+    pub fn lod_meshlets(&self, template_key: &str) -> Option<&[Vec<zestengine_assets::Meshlet>]> {
+        self.lod_meshlets.get(template_key).map(Vec::as_slice)
     }
 
     /// LOD level for object `i` at its world position, with a 5 % distance
@@ -6428,6 +6587,7 @@ pub fn features_from_model(m: &MaterialModel) -> MaterialFeatures {
         },
         double_sided: m.double_sided,
         water: false,
+        per_instance: false,
     }
 }
 

@@ -77,6 +77,10 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 hmac = "0.12"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 
+# Sandboxed WASM scripting for user-generated content (the Script component).
+# No WASI / component-model: the host exposes a narrow imported-function API only.
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
+
 # internal crates
 zestengine-engine = { path = "crates/zestengine-engine" }
 zestengine-render = { path = "crates/zestengine-render" }

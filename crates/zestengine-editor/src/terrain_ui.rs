@@ -96,7 +96,7 @@ impl TerrainPaintTool {
 impl Gizmo for Terrain {}
 
 impl Inspect for Terrain {
-    fn inspector_ui(&mut self, ui: &mut Ui, _ctx: &InspectCtx) -> bool {
+    fn inspector_ui(&mut self, ui: &mut Ui, ctx: &InspectCtx) -> bool {
         let mut changed = false;
         changed |= ui
             .add(
@@ -113,6 +113,28 @@ impl Inspect for Terrain {
             self.resolution,
             (self.resolution as usize + 1).pow(2)
         ));
+
+        widgets::eyebrow(ui, "Heightmap");
+        changed |= ctx.file_field(ui, "Heightmap", &mut self.heightmap, "import a greyscale image", &["png", "jpg", "jpeg", "tga", "bmp", "exr", "hdr", "gif", "webp"]);
+        widgets::property_row(ui, "Height Scale", |ui| {
+            changed |= ui
+                .add(DragValue::new(&mut self.heightmap_scale).speed(0.1).range(0.0..=1_000_000.0).suffix(" m"))
+                .on_hover_text("Metres the heightmap's 0..1 luminance spans")
+                .changed();
+        });
+        widgets::property_row(ui, "Height Offset", |ui| {
+            changed |= ui
+                .add(DragValue::new(&mut self.heightmap_offset).speed(0.1).suffix(" m"))
+                .on_hover_text("Metres added to the imported heights (0..1 black is at this height)")
+                .changed();
+        });
+        if !self.heightmap.is_empty() && widgets::secondary_button(ui, Some(Icon::Reset), "Re-import heightmap")
+            .on_hover_text("Reload the heightmap image into the height grid")
+            .clicked()
+        {
+            self.heightmap_imported_path.clear();
+            changed = true;
+        }
 
         widgets::eyebrow(ui, "Sculpt");
         let egui_ctx = ui.ctx().clone();

@@ -11,7 +11,7 @@
 //! VRM/Unity `leftUpperArm`/`leftLowerArm`); an Avatar Descriptor bone map
 //! overrides it.
 
-use zestengine_assets::Skeleton;
+use zestengine_assets::{AnimationClip, Skeleton};
 use zestengine_core::{TRACKER_SLOTS, TrackerCalibration, TrackerTargets, solve_two_bone};
 use glam::{Mat4, Quat, Vec3};
 
@@ -167,7 +167,6 @@ impl HumanoidRig {
 
 /// The 20 humanoid roles as aligned (source, target) joint indices, `None`
 /// where a skeleton lacks that bone under a recognized name.
-#[allow(dead_code)] // retargeting helpers, wired into the runtime in a follow-up.
 fn role_pairs(src: &HumanoidRig, tgt: &HumanoidRig) -> [(Option<usize>, Option<usize>); 20] {
     [
         (src.hips, tgt.hips),
@@ -193,15 +192,109 @@ fn role_pairs(src: &HumanoidRig, tgt: &HumanoidRig) -> [(Option<usize>, Option<u
     ]
 }
 
+/// A precomputed role-to-role mapping that retargets animated local poses
+/// between two humanoid skeletons of different bone names and proportions.
+///
+/// Build one [`HumanoidRetarget`] per (source, target) skeleton pair — from the
+/// rigs produced by [`HumanoidRig::map`] / [`HumanoidRig::map_with_overrides`] —
+/// and reuse it every frame. Each mapped bone carries the source's global
+/// rotation offset from its rest pose into the target's rest pose, so a clip
+/// authored for the source plays on the target with the target's own rest
+/// proportions. The hips (root) translation is scaled by the target/source
+/// hip-to-head rest length; every other bone keeps its target rest translation
+/// and scale, and bones without a role stay at the target rest pose.
+#[derive(Clone, Debug)]
+pub struct HumanoidRetarget {
+    src_skel: Skeleton,
+    tgt_skel: Skeleton,
+    pairs: Vec<(usize, usize)>,
+    src_rest: Vec<Mat4>,
+    tgt_rest: Vec<Mat4>,
+    src_hips: Option<usize>,
+    tgt_hips: Option<usize>,
+    /// Target/source hip-to-head rest length.
+    scale: f32,
+}
+
+impl HumanoidRetarget {
+    /// Build the mapping between `src_rig` (on `src_skel`) and `tgt_rig` (on
+    /// `tgt_skel`). Roles missing on either side simply drop that pair.
+    pub fn new(src_skel: &Skeleton, src_rig: &HumanoidRig, tgt_skel: &Skeleton, tgt_rig: &HumanoidRig) -> Self {
+        let src_rest = src_skel.world_matrices(&src_skel.rest_locals());
+        let tgt_rest = tgt_skel.world_matrices(&tgt_skel.rest_locals());
+        let pairs = role_pairs(src_rig, tgt_rig).into_iter().filter_map(|(s, t)| s.zip(t)).collect();
+        let height = |skel: &Skeleton, rig: &HumanoidRig| -> f32 {
+            let rest = skel.world_matrices(&skel.rest_locals());
+            match (rig.hips, rig.head) {
+                (Some(h), Some(d)) => (rest[d].w_axis.truncate() - rest[h].w_axis.truncate()).length(),
+                _ => 1.0,
+            }
+        };
+        let scale = height(tgt_skel, tgt_rig).max(1e-4) / height(src_skel, src_rig).max(1e-4);
+        Self {
+            src_skel: src_skel.clone(),
+            tgt_skel: tgt_skel.clone(),
+            pairs,
+            src_rest,
+            tgt_rest,
+            src_hips: src_rig.hips,
+            tgt_hips: tgt_rig.hips,
+            scale,
+        }
+    }
+
+    /// The aligned role pairs this mapping carries: `(source joint, target
+    /// joint)` indices, in humanoid-role order.
+    pub fn pairs(&self) -> &[(usize, usize)] {
+        &self.pairs
+    }
+
+    /// How many roles the two skeletons share (0 = nothing to retarget).
+    pub fn mapped_count(&self) -> usize {
+        self.pairs.len()
+    }
+
+    /// Retarget a source local pose onto the target skeleton. `src_locals` is
+    /// the source skeleton's animated local transforms (e.g. from
+    /// [`AnimationClip::sample`]); the returned target locals are ready for
+    /// [`Skeleton::palette`].
+    pub fn apply(&self, src_locals: &[Mat4]) -> Vec<Mat4> {
+        let src_anim = self.src_skel.world_matrices(src_locals);
+        let mut tgt_glob_rot: Vec<Quat> = self.tgt_rest.iter().map(|m| m.to_scale_rotation_translation().1).collect();
+        for &(s, t) in &self.pairs {
+            let src_rest_rot = self.src_rest[s].to_scale_rotation_translation().1;
+            let src_anim_rot = src_anim[s].to_scale_rotation_translation().1;
+            let delta = (src_anim_rot * src_rest_rot.inverse()).normalize();
+            let tgt_rest_rot = self.tgt_rest[t].to_scale_rotation_translation().1;
+            tgt_glob_rot[t] = (tgt_rest_rot * delta).normalize();
+        }
+        (0..self.tgt_skel.joints.len())
+            .map(|t| {
+                let rot = match self.tgt_skel.joints[t].parent {
+                    Some(p) => (tgt_glob_rot[p].inverse() * tgt_glob_rot[t]).normalize(),
+                    None => tgt_glob_rot[t],
+                };
+                let mut trans = self.tgt_skel.joints[t].rest_translation;
+                // The hips (root) carries the locomotion translation, scaled to
+                // the target's proportions.
+                if Some(t) == self.tgt_hips
+                    && let Some(h) = self.src_hips
+                {
+                    trans += (src_anim[h].w_axis.truncate() - self.src_rest[h].w_axis.truncate()) * self.scale;
+                }
+                Mat4::from_scale_rotation_translation(self.tgt_skel.joints[t].rest_scale, rot, trans)
+            })
+            .collect()
+    }
+}
+
 /// Retarget a source humanoid's animated local pose onto a target humanoid by
 /// role: each mapped bone carries the source motion (its rotation relative to
 /// rest, in the source parent's rest frame), re-applied in the target parent's
 /// rest frame, so a clip authored for one skeleton plays on another with
-/// different names and proportions. The hips (root) translation is scaled by
-/// the target/source hip-to-head length; every other bone keeps its target rest
-/// translation and scale. Bones without a role mapping stay at the target rest
-/// pose.
-#[allow(dead_code)] // retargeting helpers, wired into the runtime in a follow-up.
+/// different names and proportions. One-shot convenience over
+/// [`HumanoidRetarget`]; build the struct directly to reuse the mapping across
+/// frames.
 pub fn retarget_locals(
     src_skel: &Skeleton,
     src_rig: &HumanoidRig,
@@ -209,55 +302,19 @@ pub fn retarget_locals(
     tgt_skel: &Skeleton,
     tgt_rig: &HumanoidRig,
 ) -> Vec<Mat4> {
-    let src_rest = src_skel.world_matrices(&src_skel.rest_locals());
-    let src_anim = src_skel.world_matrices(src_locals);
-    let tgt_rest = tgt_skel.world_matrices(&tgt_skel.rest_locals());
+    HumanoidRetarget::new(src_skel, src_rig, tgt_skel, tgt_rig).apply(src_locals)
+}
 
-    // Rotation retargeting happens in GLOBAL space: each mapped bone carries the
-    // source's global rotation offset from rest (which already includes its
-    // parents' motion), re-applied to the target's rest global rotation. Local
-    // rotations are then extracted down the hierarchy so the parent's motion
-    // propagates once, not per child.
-    let mut tgt_glob_rot: Vec<Quat> = tgt_rest.iter().map(|m| m.to_scale_rotation_translation().1).collect();
-    for (s, t) in role_pairs(src_rig, tgt_rig).into_iter().filter_map(|(s, t)| s.zip(t)) {
-        let src_rest_rot = src_rest[s].to_scale_rotation_translation().1;
-        let src_anim_rot = src_anim[s].to_scale_rotation_translation().1;
-        let delta = (src_anim_rot * src_rest_rot.inverse()).normalize();
-        let tgt_rest_rot = tgt_rest[t].to_scale_rotation_translation().1;
-        tgt_glob_rot[t] = (tgt_rest_rot * delta).normalize();
-    }
-
-    // Uniform translation scale: the target/source hip-to-head rest length.
-    let height = |skel: &Skeleton, rig: &HumanoidRig| -> f32 {
-        let rest = skel.world_matrices(&skel.rest_locals());
-        match (rig.hips, rig.head) {
-            (Some(h), Some(d)) => (rest[d].w_axis.truncate() - rest[h].w_axis.truncate()).length(),
-            _ => 1.0,
-        }
-    };
-    let src_height = height(src_skel, src_rig).max(1e-4);
-    let tgt_height = height(tgt_skel, tgt_rig).max(1e-4);
-    let scale = tgt_height / src_height;
-
-    // Build target locals: the retargeted local rotation, the target's rest
-    // local translation (hips excepted), and the target's rest scale.
-    (0..tgt_skel.joints.len())
-        .map(|t| {
-            let rot = match tgt_skel.joints[t].parent {
-                Some(p) => (tgt_glob_rot[p].inverse() * tgt_glob_rot[t]).normalize(),
-                None => tgt_glob_rot[t],
-            };
-            let mut trans = tgt_skel.joints[t].rest_translation;
-            // The hips (root) carries the locomotion translation, scaled to the
-            // target's proportions.
-            if Some(t) == tgt_rig.hips
-                && let Some(h) = src_rig.hips
-            {
-                trans += (src_anim[h].w_axis.truncate() - src_rest[h].w_axis.truncate()) * scale;
-            }
-            Mat4::from_scale_rotation_translation(tgt_skel.joints[t].rest_scale, rot, trans)
-        })
-        .collect()
+/// Sample a source clip at `time` and retarget it onto `tgt_skel` in one call.
+pub fn retarget_clip(
+    src_skel: &Skeleton,
+    src_rig: &HumanoidRig,
+    clip: &AnimationClip,
+    time: f32,
+    tgt_skel: &Skeleton,
+    tgt_rig: &HumanoidRig,
+) -> Vec<Mat4> {
+    retarget_locals(src_skel, src_rig, &clip.sample(src_skel, time), tgt_skel, tgt_rig)
 }
 
 fn world_matrices(skel: &Skeleton, locals: &[Mat4]) -> Vec<Mat4> {
@@ -1075,6 +1132,63 @@ mod tests {
         let want = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) * rest_off;
         let got = hand_anim - upper_anim;
         assert!((got - want).length() < 1e-3, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn retarget_map_reuses_and_scales_locomotion() {
+        let src = tpose();
+        let tgt = alt_tpose();
+        let src_rig = HumanoidRig::map(&src);
+        let tgt_rig = HumanoidRig::map(&tgt);
+        let map = HumanoidRetarget::new(&src, &src_rig, &tgt, &tgt_rig);
+
+        // Both rigs expose every role except the (absent) eye bones.
+        assert_eq!(map.mapped_count(), 18);
+        assert_eq!(map.pairs().len(), 18);
+
+        // Moving the source hips root is carried over, scaled to the target's
+        // proportions, and the precomputed map matches the one-shot helper.
+        let mut src_locals = src.rest_locals();
+        let hips = src.joints.iter().position(|j| j.name == "Hips").unwrap();
+        src_locals[hips] = Mat4::from_translation(Vec3::new(0.4, 0.0, 0.0)) * src_locals[hips];
+        let out = map.apply(&src_locals);
+        let one_shot = retarget_locals(&src, &src_rig, &src_locals, &tgt, &tgt_rig);
+        for (a, b) in out.iter().zip(&one_shot) {
+            let (ta, ra, sa) = a.to_scale_rotation_translation();
+            let (tb, rb, sb) = b.to_scale_rotation_translation();
+            assert!((ta - tb).length() < 1e-4, "translation mismatch");
+            assert!((ra - rb).length() < 1e-4, "rotation mismatch");
+            assert!((sa - sb).length() < 1e-4, "scale mismatch");
+        }
+
+        let src_world = src.world_matrices(&src_locals);
+        let src_rest = src.world_matrices(&src.rest_locals());
+        let tgt_world = tgt.world_matrices(&out);
+        let tgt_rest = tgt.world_matrices(&tgt.rest_locals());
+        let tgt_hips = tgt.joints.iter().position(|j| j.name == "Hips").unwrap();
+        let head = tgt.joints.iter().position(|j| j.name == "Head").unwrap();
+        let src_head = src.joints.iter().position(|j| j.name == "Head").unwrap();
+        let scale = (tgt_rest[head].w_axis.truncate() - tgt_rest[tgt_hips].w_axis.truncate()).length()
+            / (src_rest[src_head].w_axis.truncate() - src_rest[hips].w_axis.truncate()).length();
+        let want = tgt_rest[tgt_hips].w_axis.truncate()
+            + (src_world[hips].w_axis.truncate() - src_rest[hips].w_axis.truncate()) * scale;
+        assert!((tgt_world[tgt_hips].w_axis.truncate() - want).length() < 1e-3);
+    }
+
+    #[test]
+    fn retarget_clip_samples_then_retargets() {
+        let src = tpose();
+        let tgt = alt_tpose();
+        let clip = AnimationClip { name: "idle".into(), duration: 0.0, channels: vec![] };
+        let out = retarget_clip(&src, &HumanoidRig::map(&src), &clip, 0.0, &tgt, &HumanoidRig::map(&tgt));
+        let tgt_rest = tgt.rest_locals();
+        for (a, b) in out.iter().zip(&tgt_rest) {
+            let (ta, ra, sa) = a.to_scale_rotation_translation();
+            let (tb, rb, sb) = b.to_scale_rotation_translation();
+            assert!((ta - tb).length() < 1e-4, "translation mismatch");
+            assert!((ra - rb).length() < 1e-4, "rotation mismatch");
+            assert!((sa - sb).length() < 1e-4, "scale mismatch");
+        }
     }
 
     #[test]

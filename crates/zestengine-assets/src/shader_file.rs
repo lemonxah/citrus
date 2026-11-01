@@ -18,6 +18,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context as _, Result, bail};
 
 pub use crate::shader_props::*;
+use crate::shader_graph::SHADER_GRAPH_EXTENSION;
 
 pub const SHADER_EXTENSION: &str = "frag";
 pub const HLSL_SHADER_EXTENSION: &str = "hlsl";
@@ -26,7 +27,11 @@ pub const HLSL_SHADER_EXTENSION: &str = "hlsl";
 pub fn is_shader_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case(SHADER_EXTENSION) || e.eq_ignore_ascii_case(HLSL_SHADER_EXTENSION))
+        .is_some_and(|e| {
+            e.eq_ignore_ascii_case(SHADER_EXTENSION)
+                || e.eq_ignore_ascii_case(HLSL_SHADER_EXTENSION)
+                || e.eq_ignore_ascii_case(SHADER_GRAPH_EXTENSION)
+        })
 }
 
 pub fn shader_lang_for(path: &Path) -> ShaderLang {
@@ -1008,6 +1013,10 @@ fn read_if_fresh(path: &Path, sidecar: &Path) -> Option<Vec<u8>> {
 }
 
 fn read_source(path: &Path) -> Result<ShaderSource> {
+    if crate::shader_graph::is_shader_graph_path(path) {
+        return crate::shader_graph::load_shader_graph(path)
+            .with_context(|| format!("loading shader graph {}", path.display()));
+    }
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path
         .file_stem()
@@ -1184,6 +1193,20 @@ mod tests {
         assert!(is_spirv(&spirv));
         let frozen = compile_shader_variant(&source, "hlsl template", Some(&[1; MAX_SHADER_KEYWORDS])).unwrap();
         assert!(is_spirv(&frozen));
+    }
+
+    #[test]
+    fn shader_graph_file_compiles() {
+        let dir = std::env::temp_dir().join(format!("zestengine-graph-spv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("simple.shadergraph");
+        crate::shader_graph::save_shader_graph(&path, &crate::shader_graph::default_graph()).unwrap();
+        let (source, spirv) = load_shader_file(&path).unwrap();
+        assert_eq!(source.display_name, "simple");
+        assert!(is_spirv(&spirv));
+        let precompiled = precompile_shader_file(&path).unwrap();
+        assert!(std::fs::read(&precompiled).unwrap().len() > 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     pub(crate) fn spirv_words(b: &[u8]) -> Vec<u32> {

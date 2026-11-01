@@ -18,6 +18,14 @@ const uint MAX_VIEWS = 16;
 struct Draw {
     mat4 model;
     vec4 sphere; // object-space center xyz, radius w (<= 0: never culled)
+    vec4 color;  // per-instance base colour
+    vec4 param;  // per-instance material parameters
+};
+
+struct Instance {
+    mat4 model;
+    vec4 color;
+    vec4 param;
 };
 
 struct View {
@@ -36,13 +44,13 @@ layout(std430, set = 0, binding = 2) readonly buffer Batches { uvec4 batches[]; 
 layout(std430, set = 0, binding = 3) readonly buffer Views { View views[]; };
 // VkDrawIndexedIndirectCommand per batch (5 uints); instanceCount is the counter.
 layout(std430, set = 0, binding = 4) buffer Commands { uint commands[]; };
-layout(std430, set = 0, binding = 5) writeonly buffer Instances { mat4 instances[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer Instances { Instance instances[]; };
 // Per view: tested, visible, frustum/distance/size culled, occluded.
 layout(std430, set = 0, binding = 6) buffer Counters { uint counters[]; };
 layout(set = 0, binding = 7) uniform sampler2D hiz;
 // Late pass outputs, laid out like `commands` / `instances`.
 layout(std430, set = 0, binding = 8) buffer LateCommands { uint late_commands[]; };
-layout(std430, set = 0, binding = 9) writeonly buffer LateInstances { mat4 late_instances[]; };
+layout(std430, set = 0, binding = 9) writeonly buffer LateInstances { Instance late_instances[]; };
 // Per candidate of a Hi-Z view: 1 = the early pass rejected it as occluded.
 layout(std430, set = 0, binding = 10) buffer Occluded { uint occluded_flags[]; };
 
@@ -155,7 +163,11 @@ void main() {
             atomicAdd(s_counts[vi * 4u], 1u);
             if (result == 0u) {
                 uint slot = atomicAdd(commands[cand.y * 5u + 1u], 1u);
-                instances[batch.y + slot] = d.model;
+                Instance inst;
+                inst.model = d.model;
+                inst.color = d.color;
+                inst.param = d.param;
+                instances[batch.y + slot] = inst;
                 atomicAdd(s_counts[vi * 4u + 1u], 1u);
             } else {
                 atomicAdd(s_counts[vi * 4u + 1u + result], 1u);
@@ -169,7 +181,11 @@ void main() {
                 atomicAdd(s_counts[vi * 4u + 3u], 1u);
             } else {
                 uint slot = atomicAdd(late_commands[cand.y * 5u + 1u], 1u);
-                late_instances[batch.y + slot] = d.model;
+                Instance inst;
+                inst.model = d.model;
+                inst.color = d.color;
+                inst.param = d.param;
+                late_instances[batch.y + slot] = inst;
                 atomicAdd(s_counts[vi * 4u + 1u], 1u);
             }
         }

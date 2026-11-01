@@ -1048,6 +1048,7 @@ impl GameApp {
             ..self.scene.effective_postfx(cam_pos, &self.config.assets_root, self.water.time())
         };
         let planar = self.scene.planar_surfaces();
+        let decals = self.scene.gather_decals(&mut renderer, &self.config.assets_root);
         // Full light set (incl. baked) for the reflection cube capture, only
         // while one is queued or running (empty = use `lights`).
         let voxel_emitters = {
@@ -1085,6 +1086,7 @@ impl GameApp {
             water_time: self.water.time(),
             water: self.water.bodies(),
             draws: &self.scene.draws,
+            decals: &decals,
             lightmap_preview: false,
             gi_debug: view_mode(),
             render_viewport: true,

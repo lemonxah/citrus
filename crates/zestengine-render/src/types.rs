@@ -186,6 +186,12 @@ pub struct MaterialFeatures {
     /// Water surface shading (engine-generated water grids).
     #[serde(default)]
     pub water: bool,
+    /// Per-instance material properties (Unity per-instance colour + one
+    /// parameter vec4). When on, the forward pass takes the base colour and
+    /// the metallic/roughness/toon parameters from the instance stream so
+    /// material variants can share a batch. Off leaves the draw byte-identical.
+    #[serde(default)]
+    pub per_instance: bool,
 }
 
 /// Continuously editable material parameters; delivered to the shader as
@@ -649,6 +655,35 @@ pub struct DrawCmd {
     pub occluded: bool,
     /// Which passes draw it: shadow maps, cameras, or both.
     pub shadow_casting: ShadowCasting,
+    /// Per-instance base colour override (`None` = the material's base colour).
+    /// Only read by the forward pass when the material opts in
+    /// (`MaterialFeatures::per_instance`).
+    pub instance_color: Option<[f32; 4]>,
+    /// Per-instance material parameters override (metallic, roughness, toon
+    /// steps, toon/PBR blend; `None` = the material's values). Only read when
+    /// the material opts in.
+    pub instance_param: Option<[f32; 4]>,
+}
+
+/// A world-space box-projector decal. The renderer projects its texture onto
+/// opaque surfaces inside the box (see the deferred decal pass).
+#[derive(Clone, Copy, Debug)]
+pub struct Decal {
+    pub texture: TextureHandle,
+    /// World -> projector-local box transform (inverse of the object world).
+    pub world_to_local: Mat4,
+    /// World-space projector +Z direction (the direction the projector faces).
+    pub forward: Vec3,
+    /// Box width/height in projector-local units.
+    pub size: [f32; 2],
+    /// Projection depth along the projector's -Z.
+    pub depth: f32,
+    /// Fade-out fraction at the far end of the box.
+    pub fade: f32,
+    /// UV tiling over the box.
+    pub tiling: [f32; 2],
+    /// Linear RGBA tint multiplied with the decal texture.
+    pub tint: [f32; 4],
 }
 
 pub struct EguiDraw {
@@ -931,6 +966,8 @@ pub struct FrameInput<'a> {
     /// most `MAX_WATER_BODIES` are used).
     pub water: &'a [GpuWater],
     pub draws: &'a [DrawCmd],
+    /// World-space projected decals to composite over the opaque scene.
+    pub decals: &'a [Decal],
     /// Debug: render objects as a lightmap-UV checkerboard (cell size tracks
     /// each object's lightmap resolution) instead of their material.
     pub lightmap_preview: bool,

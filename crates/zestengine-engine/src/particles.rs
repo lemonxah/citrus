@@ -254,6 +254,8 @@ impl ParticleRenderer {
                 planar_index: -1,
                 occluded: false,
                 shadow_casting: zestengine_render::ShadowCasting::On,
+                instance_color: None,
+                instance_param: None,
             });
         }
         self.sims.retain(|id, _| alive.contains(id));

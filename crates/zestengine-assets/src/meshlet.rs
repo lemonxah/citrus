@@ -105,6 +105,21 @@ pub fn build_meshlets(mesh: &MeshData, max_vertices: usize, max_triangles: usize
     out
 }
 
+/// Decimate `mesh` to `keep` of its triangles with [`crate::simplify::simplify`]
+/// and partition the result into meshlet clusters. Returns the simplified mesh
+/// (the LOD to upload) alongside its clusters (the input a mesh-shader or
+/// cluster-culling pipeline consumes).
+pub fn build_lod_meshlets(
+    mesh: &MeshData,
+    keep: f32,
+    max_vertices: usize,
+    max_triangles: usize,
+) -> (MeshData, Vec<Meshlet>) {
+    let lod = crate::simplify::simplify(mesh, keep);
+    let meshlets = build_meshlets(&lod, max_vertices, max_triangles);
+    (lod, meshlets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +166,33 @@ mod tests {
             let p = mesh.vertices[i as usize].position;
             assert!(p[0] >= m.bounds_min[0] && p[0] <= m.bounds_max[0]);
             assert!(p[1] >= m.bounds_min[1] && p[1] <= m.bounds_max[1]);
+        }
+    }
+
+    #[test]
+    fn lod_meshlets_cover_the_simplified_mesh() {
+        let sphere = crate::procedural::primitive_mesh(crate::PrimitiveShape::Sphere);
+        let (lod, meshlets) = build_lod_meshlets(&sphere, 0.5, 64, 126);
+        assert!(lod.indices.len() / 3 < sphere.indices.len() / 3, "decimation reduced the mesh");
+        let total: usize = meshlets.iter().map(|m| m.indices.len() / 3).sum();
+        assert_eq!(total, lod.indices.len() / 3, "every simplified triangle lands in a meshlet");
+    }
+
+    #[test]
+    fn lod_meshlets_respect_budgets_and_bounds() {
+        let sphere = crate::procedural::primitive_mesh(crate::PrimitiveShape::Sphere);
+        let (lod, meshlets) = build_lod_meshlets(&sphere, 0.25, 64, 126);
+        assert!(!meshlets.is_empty());
+        for m in &meshlets {
+            assert!(m.vertices.len() <= 64);
+            assert!(m.indices.len() / 3 <= 126);
+            assert!(m.indices.iter().all(|&i| (i as usize) < m.vertices.len()));
+            for &v in &m.vertices {
+                let p = lod.vertices[v as usize].position;
+                assert!(p[0] >= m.bounds_min[0] && p[0] <= m.bounds_max[0]);
+                assert!(p[1] >= m.bounds_min[1] && p[1] <= m.bounds_max[1]);
+                assert!(p[2] >= m.bounds_min[2] && p[2] <= m.bounds_max[2]);
+            }
         }
     }
 }

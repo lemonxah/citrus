@@ -5869,6 +5869,8 @@ dependencies = [
  "ron",
  "serde",
  "tracing",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]

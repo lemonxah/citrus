@@ -169,6 +169,8 @@ impl WaterRenderer {
                 planar_index: -1,
                 occluded: false,
                 shadow_casting: zestengine_render::ShadowCasting::On,
+                instance_color: None,
+                instance_param: None,
             });
         }
         let gone: Vec<ObjectId> = self.surfaces.keys().filter(|id| !alive.contains(id)).copied().collect();

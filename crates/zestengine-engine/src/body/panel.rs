@@ -159,6 +159,8 @@ fn draw(mesh: zestengine_render::MeshHandle, material: zestengine_render::Materi
         planar_index: -1,
         occluded: false,
         shadow_casting: zestengine_render::ShadowCasting::Off,
+        instance_color: None,
+        instance_param: None,
     }
 }
 

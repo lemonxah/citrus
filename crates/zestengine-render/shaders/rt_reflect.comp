@@ -63,6 +63,7 @@ layout(set = 0, binding = 4) uniform samplerCube u_env;
 layout(set = 0, binding = 11) uniform samplerCube u_env_b; // second reflection probe
 layout(set = 0, binding = 12) uniform samplerCube u_env_c; // third reflection probe
 layout(set = 0, binding = 13) uniform samplerCube u_env_d; // fourth reflection probe
+layout(set = 0, binding = 14) uniform sampler2D u_shore[MAX_WATER_BODIES];
 layout(set = 0, binding = 5) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 6, scalar) readonly buffer Instances { Instance data[]; } instances;
 layout(set = 0, binding = 7, scalar) readonly buffer Lights { Light data[]; } lights;
@@ -221,12 +222,28 @@ vec3 ggx_half(vec3 N, float alpha, vec2 xi) {
     return normalize(T * (st * cos(phi)) + B * (st * sin(phi)) + N * ct);
 }
 
+// standard.vert's water_shore: share of the waves left at local `xz` (0..1),
+// calm over water shallower than the body's shore depth. Mirrors the
+// displaced-geometry path (water_displace.comp) so the RT shading normal
+// calms exactly where the rastered and displaced water do.
+float water_shore(int slot, vec2 xz) {
+    vec4 e = u.water_bodies[slot].extra;
+    if (e.y <= 0.0 || e.z <= 0.0) {
+        return 1.0;
+    }
+    vec2 uv = xz / (2.0 * e.zw) + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        return 1.0;
+    }
+    return smoothstep(0.0, e.y, textureLod(u_shore[nonuniformEXT(slot)], uv, 0.0).r);
+}
+
 // Water surface normal (object space) at the rest point `xz`: the Gerstner
 // sum of standard_common.glsl's water_waves plus the ripple field's slope
 // (texture `rip`, -1 = none). The BLAS holds the displaced surface
 // (rt_water.rs) but the instance's vertices stay the rest grid, so `xz` is the
 // rest point the raster evaluates its normal at too.
-vec3 water_normal(int slot, vec2 xz, float calm, int rip) {
+vec3 water_normal(int slot, vec2 xz, float calm, float shoal, int rip) {
     vec3 nrm = vec3(0.0, 1.0, 0.0);
     int n = min(int(u.water_bodies[slot].look1.z + 0.5), MAX_WATER_WAVES);
     for (int i = 0; i < n; ++i) {
@@ -240,7 +257,7 @@ vec3 water_normal(int slot, vec2 xz, float calm, int rip) {
         nrm.z -= a.y * wa * c;
         nrm.y -= b.z * s;
     }
-    nrm = mix(vec3(0.0, 1.0, 0.0), normalize(nrm), calm);
+    nrm = mix(vec3(0.0, 1.0, 0.0), normalize(nrm), calm * shoal);
     vec4 r = u.water_bodies[slot].ripple;
     if (rip >= 0 && r.z > 0.0) {
         vec2 ruv = (xz - r.xy) / r.z + 0.5;
@@ -316,7 +333,7 @@ vec3 trace_path(vec3 o, vec3 d, float t_min, float cone0, float spread, int boun
             float edge = v0.color.b * w + v1.color.b * bc.x + v2.color.b * bc.y;
             // The rest point in the body's local space (an ocean grid is drawn shifted).
             vec2 rest = (u.water_bodies[wslot].to_local * vec4(o2w * vec4(lp, 1.0), 1.0)).xz;
-            vec3 wn = normalize(m * water_normal(wslot, rest, 1.0 - edge * edge, inst.textures.x));
+            vec3 wn = normalize(m * water_normal(wslot, rest, 1.0 - edge * edge, water_shore(wslot, rest), inst.textures.x));
             hn = dot(wn, d) > 0.0 ? -wn : wn;
             albedo = mix(u.water_bodies[wslot].deep.rgb, u.water_bodies[wslot].shallow.rgb, 0.35);
             emission = vec3(0.0);

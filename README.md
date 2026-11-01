@@ -140,22 +140,29 @@ needs visual validation.
 
 ## Planned
 
-Tracked in **[Features.md](Features.md)** (with task breakdowns); the major
-goals:
+Tracked in **[Features.md](Features.md)** and
+**[OUTSTANDING_FEATURES.md](OUTSTANDING_FEATURES.md)** (with task breakdowns).
+Much of the old plan has landed: player controllers, the input binding system,
+the in-game API, the game UI system, physics joints/queries/triggers, VR
+(OpenXR on desktop), networking, and the content pipeline. What remains:
 
-- **Pawns & camera possession** — controllable entities that drive the active camera.
-- **Player controllers** — first-person, third-person, isometric/top-down, strategy.
-- **Input binding system** — device-independent actions + control schemes (KB/mouse, gamepad).
-- **In-game API** — a scripting surface so components read/affect the world (objects, transforms, physics, materials, audio, camera, scene).
-- **Editor-only vs gameplay components** — components that never ship in a built game.
-- **Game UI system** — developer's choice per project: immediate-mode egui *or* a retained
-  scene-graph UI (screen + world-space) for menus/HUD/inventory.
-- **3D physics** — rigid bodies + gravity already land (rapier3d); still to come: joints,
-  layer-collision matrix, queries (raycast/overlap), trigger events.
-- **Lighting** — bake GPU output still needs visual validation; HDR skybox + IBL.
-- **VR** — OpenXR stereo rendering, controller input, and in-headset world/avatar editing.
-- **Custom shaders phase 2** — Slang frontend with SPIR-V reflection.
-- **Milestones M3–M7** — VRM avatars, VR, full editor, networking, content pipeline.
+- **Hardware validation** — Android/Quest on-device run + `XR_FB_foveation`, and a
+  native Windows toolchain run. Both targets currently only cross-build.
+- **Terrain + foliage** — heightmap terrain with splat materials landed
+  (2026-11-01); foliage scatter, per-texel splat control, chunking/LOD remain.
+- **Projected decals** — deferred box-projector pass landed (2026-11-01);
+  normal-bent projection, emissive/alpha modes and transparent surfaces remain.
+- **Visual shader graph** — node editor + GLSL codegen landed (2026-11-01);
+  more node types, sub-graphs and a live material preview remain.
+- **Humanoid retargeting** — role-to-role bone mapping and clip retargeting landed
+  (2026-11-01); IK-aware constraints and the retarget UI remain.
+- **GPU instancing across materials** — per-instance colour/parameter lanes landed
+  (2026-11-01); cross-material batch merging and multi-parameter remain.
+- **Logic in UGC (WASM scripts)** — a sandboxed `Script` component (wasmtime, no
+  host I/O) landed (2026-11-01); package integration and a wider API surface remain.
+- **Cinematics / sequencer, AI behaviour trees + perception, vehicle / destruction,
+  virtual shadow maps / meshlets** — first increments in flight.
+- **Console platforms** — groundwork only: a bring-up plan, no SDK in the repo.
 
 ## Roadmap (milestones)
 
@@ -163,15 +170,16 @@ goals:
       resize/out-of-date handling
 - [x] **M2 — Meshes & materials**: depth, orbit camera, glTF/FBX import, zestengine
       standard shader phase 1, variant cache, egui material inspector with live edits
-- [ ] **M3 — Assets**: full glTF scenes, VRM avatar import (rig, blendshapes,
+- [x] **M3 — Assets**: full glTF scenes, VRM avatar import (rig, blendshapes,
       spring bones), skinned animation
-- [ ] **M4 — VR**: OpenXR session sharing the Vulkan device, stereo rendering
-      (multiview), head/controller tracking, locomotion + grab
-- [~] **M5 — Editor** (in progress): dockable editor, gizmos, hierarchy, materials,
-      components/plugins, code editor — much landed; avatar setup tooling still to come
-- [ ] **M6 — Networking**: world/avatar sync, voice, IK replication
-- [ ] **M7 — Content pipeline**: publishing format, mobile-tier shader validation,
-      content sandboxing (worlds are data, not code)
+- [~] **M4 — VR**: OpenXR session sharing the Vulkan device, stereo rendering
+      (multiview), head/controller tracking, locomotion + grab — landed on desktop;
+      Android/Quest on-device validation still pending
+- [x] **M5 — Editor**: dockable editor, gizmos, hierarchy, materials,
+      components/plugins, code editor
+- [x] **M6 — Networking**: world/avatar sync, voice, IK replication
+- [x] **M7 — Content pipeline**: publishing format, mobile-tier shader validation,
+      content sandboxing (the sandboxed WASM `Script` component)
 
 ## Running
 
