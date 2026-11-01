@@ -1,6 +1,6 @@
-# Citrus — Outstanding Features Backlog
+# ZestEngine — Outstanding Features Backlog
 
-Re-verified against the code on 2026-10-30. The detailed write-up, including the platform plan for Windows and Android, is in [ENGINE_REVIEW_2026-10-30.md](ENGINE_REVIEW_2026-10-30.md). Things Citrus already does are in [Features.md](Features.md).
+Re-verified against the code on 2026-10-30. The detailed write-up, including the platform plan for Windows and Android, is in [ENGINE_REVIEW_2026-10-30.md](ENGINE_REVIEW_2026-10-30.md). Things ZestEngine already does are in [Features.md](Features.md).
 
 The earlier P0/P1 gaps from the June audit are now **done**:
 - runtime UI (screen, world and VR, plus the UI Editor)
@@ -44,7 +44,7 @@ The earlier P0/P1 gaps from the June audit are now **done**:
 | Compressed bakes | ◑ | S | BC6H `.lightmap` v2 / `.reflprobe` v4 with a fallback for GPUs without BC (E5B9G9R9 / RGBA16F decoded at load): lightmaps 48 MB -> 3 MB, probe 96 MB -> 8 MB. Quest builds re-encode bakes as ASTC 4x4 HDR at cook time (2026-10-31); ASTC data also decodes on GPUs without it. The Baker tab shows the measured BC6H lightmap error against the raw bake. |
 | NAT relay / internet play | ◑ | S | Authenticated relay (cookies, owner-keyed rooms, join proofs, operator token, per-IP / pending / backoff limits), hole punching with relay fallback, room handover to a migration successor. Claims are limited to the best-ranked live successor of a silent host (2026-10-31). Client-to-client relay paths are not planned: sessions are a star. |
 | Client prediction / lag compensation | ◑ | S | Pawn, First / Third Person Controller, VR Player and any component implementing `Predictable` predicted, surviving host migration; adaptive interpolation; `ray_cast_at` / `ray_cast_rewound`. Listen-server hosts smooth remote predicted pawns. Left: lag-compensation history restarts on a new host. |
-| Net encryption / auth | ◑ | S | Argon2id passphrases, transcript-bound keys, authenticated REJECT / BYE / kick, Ed25519 player identities with allow / ban lists and host pinning, stateless cookies, half-open cap. A client tries other CHALLENGEs when its JOIN goes unanswered, so one raced forgery no longer stalls a join (2026-10-31). The relay join key is sealed to the relay (relay protocol 3). Account login (`CITRUS_ACCOUNT` / `CITRUS_PASSWORD`, host `CITRUS_ACCOUNTS`) landed 2026-10-31. |
+| Net encryption / auth | ◑ | S | Argon2id passphrases, transcript-bound keys, authenticated REJECT / BYE / kick, Ed25519 player identities with allow / ban lists and host pinning, stateless cookies, half-open cap. A client tries other CHALLENGEs when its JOIN goes unanswered, so one raced forgery no longer stalls a join (2026-10-31). The relay join key is sealed to the relay (relay protocol 3). Account login (`ZESTENGINE_ACCOUNT` / `ZESTENGINE_PASSWORD`, host `ZESTENGINE_ACCOUNTS`) landed 2026-10-31. |
 
 ## P2
 

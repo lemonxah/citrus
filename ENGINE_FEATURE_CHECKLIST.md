@@ -3,7 +3,7 @@
 What a game engine **must** have to be considered a usable, general-purpose engine —
 derived by auditing **Unreal Engine 5**, **Unity 6**, **Godot 4.x**, and **Bevy
 0.17/0.18** (editor *and* runtime). Each feature is tiered by how essential it is, and
-cross-referenced against **Citrus**.
+cross-referenced against **ZestEngine**.
 
 **Tiers**
 - **T0 — Table-stakes:** lacking it, the thing is "a rendering framework," not a usable
@@ -13,7 +13,7 @@ cross-referenced against **Citrus**.
   teams will hit the wall fast.
 - **T2 — Advanced / differentiating:** AAA polish; absence doesn't disqualify an engine.
 
-**Citrus status:** ✅ done · ◑ partial · ❌ missing. Citrus column reflects state at
+**ZestEngine status:** ✅ done · ◑ partial · ❌ missing. ZestEngine column reflects state at
 2026-06-18 (this includes the layer system, frustum culling, and reflection work landed
 this session).
 
@@ -30,7 +30,7 @@ Unreal (PBR, SSR, GTAO, TAA, DoF, volumetric fog, atmosphere, decals, DLSS, even
 experimental RT-GI and meshlets), yet it is widely described as "not yet usable as a
 general-purpose engine" — because it lacks the **editor/tooling tier**: no official editor,
 no inspector, no content browser, no undo, no play-in-editor, no built-in physics. That gap
-*is* the definition of T0. **For Citrus the lesson is direct: the editor + inspector +
+*is* the definition of T0. **For ZestEngine the lesson is direct: the editor + inspector +
 prefab + undo + play loop, plus built-in physics, are what separate an engine from a
 graphics demo — invest there, not only in the renderer.**
 
@@ -38,7 +38,7 @@ graphics demo — invest there, not only in the renderer.**
 
 ## T0 — Table-stakes (15)
 
-| # | Feature | Unreal | Unity | Godot | Bevy | **Citrus** |
+| # | Feature | Unreal | Unity | Godot | Bevy | **ZestEngine** |
 |---|---|---|---|---|---|---|
 | 1 | **Real-time PBR renderer** (forward/deferred) + dynamic shadows | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 2 | **Scene graph / composition model** (hierarchy, parent/child, transforms) | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -56,7 +56,7 @@ graphics demo — invest there, not only in the renderer.**
 | 14 | **Audio** — playback + 3D spatial + a **mixer/buses** | ✅ | ✅ | ✅ | ◑ | ◑ (playback + 3D ✅; **mixer/buses** `audio_mixer.rs` + Tools→Audio Mixer panel; rodio-sink wiring pending) |
 | 15 | **Build / export** to a distributable (≥ desktop), editor strip/cook | ✅ | ✅ | ✅ | ◑ | ◑ |
 
-**Citrus T0 gaps:** #7 Prefabs (only "duplicate"), #13 Runtime UI (**the single biggest
+**ZestEngine T0 gaps:** #7 Prefabs (only "duplicate"), #13 Runtime UI (**the single biggest
 hole**), plus the partials: #8 undo coverage, #12 physics queries/joints/triggers, #14 audio
 mixer, #15 cook/strip pipeline.
 
@@ -64,7 +64,7 @@ mixer, #15 cook/strip pipeline.
 
 ## T1 — Expected of a serious engine
 
-| # | Feature | UE | Unity | Godot | Bevy | **Citrus** |
+| # | Feature | UE | Unity | Godot | Bevy | **ZestEngine** |
 |---|---|---|---|---|---|---|
 | 16 | **Baked GI / lightmapping** | ✅ | ✅ | ✅ | ◑ | ✅ |
 | 17 | **Realtime GI** (SDFGI / Lumen / APV / probes) | ✅ Lumen | ✅ APV | ✅ SDFGI | ◑ | ✅ Flux |
@@ -91,7 +91,7 @@ mixer, #15 cook/strip pipeline.
 
 ## T2 — Advanced / differentiating (not disqualifying)
 
-| Feature | Who has it | **Citrus** |
+| Feature | Who has it | **ZestEngine** |
 |---|---|---|
 | **Virtualized geometry** (Nanite / meshlets) | UE ✅, Bevy ◑ exp | ❌ |
 | **Virtual shadow maps** | UE ✅ | ❌ |
@@ -106,17 +106,17 @@ mixer, #15 cook/strip pipeline.
 | **AI behavior trees + perception** | UE, Unity (ext) | ❌ |
 | **Vehicle / cloth / destruction physics** | UE Chaos, Unity | ❌ |
 | **Console platform support** | UE/Unity | ❌ |
-| **VR/XR** (OpenXR) | UE/Unity/Godot | ✅ (a Citrus strength) |
+| **VR/XR** (OpenXR) | UE/Unity/Godot | ✅ (a ZestEngine strength) |
 | **GPU-driven rendering / occlusion culling** | UE, Unity U6, Bevy | ❌ |
 
-Note two things the consensus explicitly rates **NOT** table-stakes, so Citrus shouldn't feel
+Note two things the consensus explicitly rates **NOT** table-stakes, so ZestEngine shouldn't feel
 behind for them: **visual scripting** (Godot *removed* it in 4.0 and is still universally
 "usable"; a text/Rust scripting layer is what's mandatory) and **networking** (engine-dev
-consensus: "very optional," game-dependent — Citrus already exceeds the floor here).
+consensus: "very optional," game-dependent — ZestEngine already exceeds the floor here).
 
 ---
 
-## Citrus scorecard
+## ZestEngine scorecard
 
 _Updated 2026-06-19 after the feature-foundations session — see the progress table below._
 
@@ -203,7 +203,7 @@ renderer passes), full node-EDITOR canvases for shader/anim graphs (today they'r
 the graph compiles live), and physics joints/triggers. T2 polish (decals, planar, bloom,
 Nanite-class) stays out of scope.
 
-**Bottom line:** Citrus is already past the "rendering framework" stage — it has the editor,
+**Bottom line:** ZestEngine is already past the "rendering framework" stage — it has the editor,
 inspector, content browser, gizmos, play-in-editor, scripting, input, physics foundation, GI,
 and VR that Bevy notably lacks. The two true T0 holes are **Runtime UI** and **Prefabs**; close
 those and complete the physics/animation/audio partials, and it crosses cleanly into

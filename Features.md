@@ -1,4 +1,4 @@
-# citrus — Features & Goals
+# zestengine — Features & Goals
 
 Tracks engine capabilities: **what we already support** vs **what we still want to
 build**. Working bug/backlog list lives in [TODO.md](TODO.md); high-level milestones
@@ -81,9 +81,9 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
     options without a custom shader.
 - [done] **Custom-shader pipeline exposes the full scene**: the preamble now declares the complete
   frame UBO (lights array, shadows `u_shadow`, probe SH `probes`, baked `u_lightmap`, post settings)
-  plus ready-to-call helpers (`citrus_gi(world_pos, n)` for probe-SH baked GI with ambient fallback,
-  `citrus_direct_diffuse(world_pos, n)` for all scene lights with attenuation/spot cones, and
-  `citrus_sh(...)`), so custom shaders integrate with lighting/GI the same way the built-ins do.
+  plus ready-to-call helpers (`zestengine_gi(world_pos, n)` for probe-SH baked GI with ambient fallback,
+  `zestengine_direct_diffuse(world_pos, n)` for all scene lights with attenuation/spot cones, and
+  `zestengine_sh(...)`), so custom shaders integrate with lighting/GI the same way the built-ins do.
 - [done] Lights: directional / point / spot (color, intensity, range, spot angle/blend,
   up to 16/frame, distance attenuation + spot cones)
 - [done] Shadow-casting lights (shadow-map array, PCF, per-light shadow bias).
@@ -112,7 +112,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   vanished, spheres showed their backs), placing reflections in the wrong spot. The capture now
   forces no-cull (`double_sided`) for all draws, matching the bake gbuffer pass.
 - [done] **Layer system (Unity-style)**: 32 named layers, a per-object `layer`, a per-camera
-  `culling_mask`, and a symmetric **layer collision matrix** (`LayerSettings` in citrus-core,
+  `culling_mask`, and a symmetric **layer collision matrix** (`LayerSettings` in zestengine-core,
   serialized with the scene). **Physics:** colliders get rapier `InteractionGroups` (membership
   = layer bit, filter = matrix row) so "layer A ignores B" is honored by the solver.
   **Rendering:** `LoadedScene::visible_layers` masks draws — the editor viewport's per-layer
@@ -142,7 +142,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] **Startup splash** (`splash.rs`): a borderless CPU-drawn window (softbuffer) shown
   before the Vulkan renderer exists, with a scaled background + bottom status line (ab_glyph).
   Shows the embedded `assets/splash.png` **instantly** as a placeholder while the animated
-  `splash.webp` (embedded `citrus-editor/assets/splash.webp`, or an override in the project
+  `zestengine.webp` (embedded `zestengine-editor/assets/zestengine.webp`, or an override in the project
   root) is **decoded on a worker thread** (streamed frame-by-frame to bound memory) and
   swapped in, looped by elapsed time. The Vulkan renderer build also runs on a worker thread
   (it's `Send`; the scene with non-`Send` `dyn Component`s can't be, so it stays on main) so
@@ -180,16 +180,16 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (abs path, srgb), so the main thread only installs handles — the heavy 4K EXR/PNG/JPG decode
   no longer freezes the splash. `LoadedScene::collect_material_texture_refs` gathers the refs
   (file + inline materials); single-queue GPUs fall back to a synchronous main-thread decode.
-- [done] **BC texture import cache** (`citrus-assets/tex_cache.rs`, `intel_tex_2`): each source
+- [done] **BC texture import cache** (`zestengine-assets/tex_cache.rs`, `intel_tex_2`): each source
   image is decoded, mip-chained, and block-compressed **once** (BC7 sRGB for colour, BC7 UNORM
-  for data maps, BC6H for HDR/EXR), persisted to a sibling `.citrus_texcache/` keyed by
+  for data maps, BC6H for HDR/EXR), persisted to a sibling `.zestengine_texcache/` keyed by
   (filename, srgb) and invalidated on source mtime/size change. Later loads skip decode +
   recompress entirely and upload the compressed mips straight from cache (`upload_compressed`),
   cutting load time and VRAM. Non-multiple-of-4 sources and GPUs without `textureCompressionBC`
   fall back to an uncompressed-but-cached path. The `textureCompressionBC` device feature is
   enabled when reported.
 - [done] `.scene` files: full save/load (objects, transforms, parents, components, materials)
-- [done] `project.citrus` (RON): project name, last scene, per-project settings
+- [done] `project.zestengine` (RON): project name, last scene, per-project settings
 - [done] `.lightmap` / `.lightdata` sidecars (baked GI + probe SH)
 - [done] Lightmap UVs (second UV set, generated atlas fallback)
 - [done] Audio clips: `.wav` / `.flac` / `.mp3` (rodio)
@@ -617,7 +617,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   the **Phosphor icon font** (`egui-phosphor`, registered via `install_icon_font`): globe
   (scene), sphere (material), cube (model), image, sparkle (shader), aperture (postfx), map
   (lightmap), database (lightdata), gear (config), file-text (markdown), orange-slice
-  (.citrus), folder, file (unknown); `.rs` keeps a monochrome Ferris silhouette. Known asset
+  (.zestengine), folder, file (unknown); `.rs` keeps a monochrome Ferris silhouette. Known asset
   extensions are hidden (the icon conveys the type) and names clip to one line. Folder clicks
   navigate only, with no Inspector selection.
 - [done] File browser image thumbnails: image tiles (png/jpg/jpeg/tga/bmp) show a real decoded
@@ -650,7 +650,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] Viewport widget filter (per-billboard visibility + size)
 - [done] Billboard widgets: lights, cameras (frustum), probe volumes (3 bulbs), audio (speaker)
 - [partial] **Editor redesign** (docs/design/editor-ui-spec.md, how-to + conversion plan in
-  docs/design/editor-ui-guide.md): `citrus-editor` `theme.rs` (spec tokens, runtime accent with faint/soft
+  docs/design/editor-ui-guide.md): `zestengine-editor` `theme.rs` (spec tokens, runtime accent with faint/soft
   variants, egui + egui_dock styles), `icons.rs` (spec SVG icon set drawn from path data, logo), `widgets.rs`
   (buttons, troughs/segments, icon toggles, badges, chips, type tile, axis vector fields, property rows,
   section headers, info notes, dashed add button, search field); IBM Plex Sans/Mono embedded. Converted: menu
@@ -767,13 +767,13 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   - **Floor fade:** probe coverage used to fade to ambient over the outer 20% of the volume, so a floor resting on the bottom face got about 2% of its GI and showed only probe dots. The outermost volume now has full coverage inside its box and fades over one probe cell outside it, as in DDGI. Both `sample_probes` and `sample_irradiance_smooth` do this.
   - **Backface step:** probes behind the shaded surface (such as the layer just under a floor) are dropped by a step across the surface plane.
   - **Linear weights:** the smooth sampler uses trilinear weights; smootherstep made each probe a plateau, which read as a grid.
-  - **Moving emitters per pixel:** moving emitters are no longer injected into the 0.5 m grid. They travel in the light array as kind 3 lights, and `standard.frag` (plus `citrus_gi` in custom shaders) evaluates the grid's own injection kernel per pixel as indirect light. Static emitters stay in the cached, propagated grid.
+  - **Moving emitters per pixel:** moving emitters are no longer injected into the 0.5 m grid. They travel in the light array as kind 3 lights, and `standard.frag` (plus `zestengine_gi` in custom shaders) evaluates the grid's own injection kernel per pixel as indirect light. Static emitters stay in the cached, propagated grid.
 - [done] **HUD preview on the Camera tab**: while editing, the game UI previews over the Scene view when the Game UI filter is on (where it can be edited), and otherwise over the Camera tab, which shows what the game will.
 - [done] **Per-pixel emitter light in Flux / FluxRT**:
   - **Problem:** the gathers used to add each emissive sphere's direct light at probe resolution, then the screen-space denoise blurred it. Its world-space footprint changed with camera angle and distance, so rotating the camera changed how the couch was lit.
   - **Fix:** the gathers now store only a per-probe emitter visibility bitmask (`ScreenProbe.c[4]`, 80-byte probes). `flux_integrate.comp` shades each emitter per pixel from the pixel's own position and normal, with visibility blended over the 3x3 nearest probes on the same surface.
   - **Result:** the light is identical from every view and has no temporal lag behind a moving emitter.
-  - **Test view:** `CITRUS_VIEW_MODE=2` (indirect) / `6` (realtime Flux GI only) on the game runtime, for test captures.
+  - **Test view:** `ZESTENGINE_VIEW_MODE=2` (indirect) / `6` (realtime Flux GI only) on the game runtime, for test captures.
 - [done] Multiple reflection probes with two-probe blending:
   - **Selection:** `LoadedScene::active_reflection_probes` ranks every probe for the camera (contains the camera, importance, smaller box, nearer). The best two go to renderer slots 0 (binding 7) and 1 (binding 9, its own env cube). Their boxes are in the frame UBO (`refl2_*`, `refl_blend`).
   - **Blending in `standard.frag`:** per pixel, each probe's influence ramps across its blend-distance shell inside its box. Where both boxes overlap, the higher importance, then smaller, probe wins; outside both, slot 0 is used. With a single probe the shader path is unchanged.
@@ -785,16 +785,16 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   - **Baking:** Bake Reflections bakes every probe in turn; Bake This Probe updates that probe's entry.
   - **Tests:** v3 round-trip and the legacy fallback. On the GPU, a second 4x-intensity probe over part of the room brightens reflections there with a ramp across its 1 m blend shell; a single-probe scene renders identically to before.
   - **SSR / RT:** the SSR resolve (binding 5) and RT reflections (binding 11) apply the same two-probe blend (`shaders/probe_blend.glsl`), so they replace exactly the environment the forward pass added; verified on the GPU in both modes.
-  - **Custom shaders:** the GLSL / HLSL preamble's `citrus_env` blends both probes the same way.
+  - **Custom shaders:** the GLSL / HLSL preamble's `zestengine_env` blends both probes the same way.
 - [done] HDR verified end to end (2026-10-30): with 8x emissive orbs and bloom off, lowering exposure by 3 EV darkens the couch region from 106 to 20.5 (green, sRGB), while the orbs keep their colour (core 140/205/147 to 39/91/37: blown-out cyan at 0 EV, true green at -3 EV). Radiance above 1 survives to the tonemapper. Note: a Volume profile overrides tonemap / exposure only with `tonemap.enabled: true`.
 - [done] Flux trace GPU zones: gather / denoise / integrate timestamps (`RenderStats::gpu_gi_*_ms`, profiler,
-  `CITRUS_FRAME_STATS` log). Flux software gather 1.34 -> 0.87 ms: lights below 1e-3 unshadowed contribution skip
+  `ZESTENGINE_FRAME_STATS` log). Flux software gather 1.34 -> 0.87 ms: lights below 1e-3 unshadowed contribution skip
   their shadow march, 4-tap tetrahedral hit normal, shadow rays clipped to the GDF box (directional lights).
   FluxRT gather skips negligible lights too (0.29 -> 0.27 ms).
 - [done] FluxVoxel static rebuild 68 -> 5 ms (DDGI moment rays stop at their 8 m clamp instead of the scene
   diagonal; probes split across threads) and asynchronous after the first build (worker thread, the previous
   base renders until the new one lands), so camera-clipmap steps and static-light edits no longer hitch.
-- [done] Frame timing in game builds: `CITRUS_FRAME_STATS=1` turns vsync off, records the GPU timestamp zones
+- [done] Frame timing in game builds: `ZESTENGINE_FRAME_STATS=1` turns vsync off, records the GPU timestamp zones
   without the profiler window, and logs the mean frame interval, GPU zones and draw calls every 240 frames.
   Before / after numbers for this pass are in ENGINE_REVIEW_2026-10-30.md §1.3a.
 - [done] Mixed lighting: Flux / FluxRT run with a bake loaded and ADD to it. The gather then carries only what
@@ -871,12 +871,12 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   spinner, and compile/result messages ("Compiling components…", shader reloads). Global
   minimum text size (folder-explorer 13px) so nothing renders unreadably small
 - [done] Log console tab (tracing ring buffer, level filter + search, follow, wrap, timestamps)
-- [done] Code editor tabs with a custom **Citrus Purple** syntect theme (solid-black
+- [done] Code editor tabs with a custom **ZestEngine Purple** syntect theme (solid-black
   background, purple-leaning palette, borderless text box); line-number gutter; fills the
   dock; debounced auto-save; bottom status line (mode / file / language / line:col /
   unsaved, folds in the vim `:` command line); caret stays solid while moving. Minimal
   header (problem counts + hint); the tab name carries the filename
-- [done] Vim mode (toggle in **Edit menu**, persisted in `project.citrus`; per-file
+- [done] Vim mode (toggle in **Edit menu**, persisted in `project.zestengine`; per-file
   mode): Normal / Insert /
   Visual / Visual-line / Command. Motions h j k l w b e 0 ^ $ gg {n}gg G {n}G (counts);
   i a I A o O; x D C dd cc yy dw cw yw d$/c$/y$ p P; visual d y c p; `u` undo / Ctrl+R
@@ -888,7 +888,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 - [done] rust-analyzer LSP (diagnostics, completion, hover, go-to-definition,
   find-references on `.rs`); file browser badges files (and aggregates onto folders)
   with red/yellow problem dots, and live-updates as files change on disk
-- [done] App icon (procedural citrus slice; X11 window icon + desktop entry install)
+- [done] App icon (procedural zestengine slice; X11 window icon + desktop entry install)
 - [done] Crash handler (symbolized backtrace on SIGSEGV/SIGBUS/SIGILL/SIGABRT)
 
 ### Components
@@ -909,7 +909,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   objects spawned during play, and reloads the scene from disk if play destroyed objects.
   Headless tests in `play.rs` cover the loop end to end.
 - [done] Rust component plugins (`plugins/*` workspace crates, cargo-built + dylib-loaded,
-  `citrus_register`, hot reload)
+  `zestengine_register`, hot reload)
 - [done] Runtime scene switching: `ComponentCtx::load_scene(path)` lets gameplay
   components change levels / go menu -> game during Play (first slice of the in-game API,
   2D); editor Open/New/Save Scene already covers authoring
@@ -936,7 +936,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   Steam Audio static mesh, rebuilt only when the static set changes) against every occluding voice every
   ~33 ms; results feed each voice's direct effect.
 - [done] libphonon is downloaded at build time (`auto-install`), copied next to the editor binary with an
-  `$ORIGIN` rpath (`crates/citrus/build.rs`), and shipped next to built games (`bundle.rs`). Feature off /
+  `$ORIGIN` rpath (`crates/zestengine/build.rs`), and shipped next to built games (`bundle.rs`). Feature off /
   init failure: the old distance-volume path.
 - [done] **Steam Audio, full interface** (`steam_audio.rs`, audionimbus FFI to Valve's libphonon 4.8.1):
   real-time reflections (Convolution / Parametric / Hybrid) per source or as listener-centric reverb,
@@ -947,7 +947,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   rotation + binaural / speaker decode) and ambisonic encode for sources; SOFA HRTFs (fallback to
   default); output layouts Headphones / Stereo / Quad / 5.1 / 7.1 with virtual surround for beds; ray
   tracer Default / Embree / Radeon Rays with fallback. Project Settings > Spatial Audio
-  (`SpatialAudioSettings` in project.citrus). Game builds ship STEAM_AUDIO_LICENSE.txt + third-party notices.
+  (`SpatialAudioSettings` in project.zestengine). Game builds ship STEAM_AUDIO_LICENSE.txt + third-party notices.
 - [todo] TrueAudioNext (AMD GPU convolution); per-volume bake flags (one probe batch today); shared
   reverb bus (listener reverb is convolved per voice); reflections for one-shots. First build after
   `cargo clean` needs a second build to place libphonon next to the editor.
@@ -991,17 +991,17 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (`on_animation_event` + `AnimationEvent`), root motion (through the Character Controller),
   **GPU skinning** (compute pass writing the vertex buffer; CPU fallback per Animator).
 - [done] **Animator Controllers + clip authoring** (2026-10-30): `.animctrl` assets
-  (`citrus_assets::AnimatorController`: Float / Int / Bool / Trigger parameters; layers with
+  (`zestengine_assets::AnimatorController`: Float / Int / Bool / Trigger parameters; layers with
   weight, Override / Additive blending and bone / path masks; per-layer state machines with
   clip, `.anim` or blend-tree states, speed parameters, on-enter / on-exit events, Any State,
   default state, transitions with conditions, exit time, duration, offset, interruptible).
-  Runtime in `citrus-engine/src/anim_graph.rs` (rig + masked TRS poses, trigger consumption,
+  Runtime in `zestengine-engine/src/anim_graph.rs` (rig + masked TRS poses, trigger consumption,
   Any State priority, cross-fades, layer composition, root motion on the base layer) hooked
   into `update_skinning` for skinned models and `PlaySession::animate_objects` for plain object
   hierarchies. `Animator.controller` (empty = old clip path), `Animator.drivers` (parameters
   fed from movement / ground check / another Animator), `AnimatorStateChanged` events, code API
   (`set_animator_int/bool/trigger`, `play_animator_state`, `animator_state`, ...). `.anim`
-  clips (`citrus_assets::AnimClip`: tracks by relative object path or bone name, Position /
+  clips (`zestengine_assets::AnimClip`: tracks by relative object path or bone name, Position /
   Rotation / Scale / Light Intensity, Step / Linear / Cubic keys, clip events). Editor:
   **Animator Controller** tab (graph canvas with pan / zoom, drag states, Shift-drag or
   Make Transition, right-click create / default / duplicate / delete, Layers + Parameters
@@ -1041,8 +1041,8 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   (no frames until it's in; a failed boot load still exits with the error).
 - [done] **Material texture means off the main thread**: `apply_material`'s albedo / emission /
   mask / ORM averages (GI emitter scale, bake albedo/metalness) used to decode every texture
-  synchronously per material. Now `citrus_assets::texture_mean` caches them on disk
-  (`.citrus_texcache/<file>.<srgb>.mean`, invalidated by mtime/size) and the loader worker
+  synchronously per material. Now `zestengine_assets::texture_mean` caches them on disk
+  (`.zestengine_texcache/<file>.<srgb>.mean`, invalidated by mtime/size) and the loader worker
   warms the cache in parallel (`collect_material_mean_refs`).
 - [todo] Remaining main-thread work during loads: the scene install itself (pipelines,
   materials; one step), post-load skybox upload / baked-lighting upload / reflection capture
@@ -1050,7 +1050,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
   renderer build (must be created against the OpenXR instance), the runtime `Renderer::new`,
   and the in-editor plugin rebuild / Open Project cargo builds.
 - [done] June modules resolved: savegame (`ctx.save_value` / `write_save` / `load_save`),
-  localization (`ctx.tr`, `localization/*.loc`), audio mixer (saved in `project.citrus`, applied
+  localization (`ctx.tr`, `localization/*.loc`), audio mixer (saved in `project.zestengine`, applied
   to Audio Source buses, `ctx.set_bus_volume`), LOD Group (model swap by distance, hysteresis,
   culling). Superseded modules (`events`, `anim_graph`, `asset_handle`, `streaming`,
   `shader_graph`, `ui_canvas`, engine copies of `savegame` / `localization` / `lod`) deleted.
@@ -1063,7 +1063,7 @@ Legend: `[done]` implemented · `[partial]` partial / needs validation · `[todo
 A **Pawn** is a controllable entity that a controller can "possess". It owns movement
 state and can drive which scene camera is active.
 
-**Implemented** (`Pawn` component in `citrus-core`, FP/TP/TopDown/Strategy modes): a possessed
+**Implemented** (`Pawn` component in `zestengine-core`, FP/TP/TopDown/Strategy modes): a possessed
 pawn reads the action snapshot, moves itself (through a Character Controller when present, else
 on a flat floor), yaws the body + pitches a child camera, and **activates its camera**
 via `ComponentCommand::SetActiveCamera` (a `LoadedScene::active_camera_override` honored by
@@ -1121,11 +1121,11 @@ with a matching `spawn_tag` teleports there on Play start, and game code queries
 Control schemes that are **independent of the controller** but share one interface, so
 each game can mix keyboard+mouse and/or gamepad freely.
 
-**Implemented** (`citrus-core::input` + `citrus-engine::input_engine`): named **actions**
+**Implemented** (`zestengine-core::input` + `zestengine-engine::input_engine`): named **actions**
 (Button / Axis1 / Axis2), **bindings** (composite WASD→2D axis, analog sticks, deadzone/scale),
 **control schemes** (default KB+Mouse and Gamepad), gamepad via **gilrs**, the per-frame
 `InputState` snapshot read through `ComponentCtx` (`ctx.input.axis2("Move")`,
-`ctx.input.pressed("Jump")`). Schemes **serialize to `project.citrus`** (`ProjectFile.bindings`)
+`ctx.input.pressed("Jump")`). Schemes **serialize to `project.zestengine`** (`ProjectFile.bindings`)
 and are editable in the editor **Tools → Input Bindings** window (rebind by capturing the next
 key/mouse press). Tested in `input.rs`.
 
@@ -1203,7 +1203,7 @@ control. Items below are marked individually.
   - [done] **Events / messaging**: typed broadcast bus, `ctx.emit(event)` /
     `ctx.events::<T>()` (readable the following frame)
 - [done] Stable surface usable from plugin components without reaching into editor
-  internals: everything lives in `citrus-core` (`ComponentCtx`, `PhysicsQuery`,
+  internals: everything lives in `zestengine-core` (`ComponentCtx`, `PhysicsQuery`,
   `ComponentLookup`), implemented by the engine
 
 ### 2E. Editor-only vs gameplay components [partial]
@@ -1222,7 +1222,7 @@ shipped game.
 ### 2F. Game UI system (runtime UI) [partial]
 
 Status 2026-10-29: the retained screen-space system (A) is working in editor Play and in a
-built game (`game_ui.rs`, components in `citrus-core/src/ui.rs`, reference in
+built game (`game_ui.rs`, components in `zestengine-core/src/ui.rs`, reference in
 docs/components.md "UI"):
 - [done] Components: `UI Canvas` (constant-pixel / scale-with-screen + match width/height,
   sort order), `UI Rect` (anchors / pivot / position / size, y-down, anchor presets in the
@@ -1248,7 +1248,7 @@ docs/components.md "UI"):
 In-game menus / inventory / HUD. **The developer picks the approach per project**;
 both are first-class and can coexist (e.g. egui debug overlay on top of a retained HUD):
 
-- **A. Retained scene-graph UI** (the citrus-native system, below), Unity uGUI-style:
+- **A. Retained scene-graph UI** (the zestengine-native system, below), Unity uGUI-style:
   widgets are scene objects under a `UICanvas`, **visually authored** in the editor and
   serialized into `.scene`, **screen-space + world-space** (world-space for VR
   controller-ray interaction). Best for polished, designer-authored, VR, and
@@ -1259,7 +1259,7 @@ both are first-class and can coexist (e.g. egui debug overlay on top of a retain
   scene wiring), but not visually authored and weaker for world-space/VR.
 
 How the choice works in a build:
-- [todo] egui (option B) is always **available**: `citrus-render` keeps the egui pass in
+- [todo] egui (option B) is always **available**: `zestengine-render` keeps the egui pass in
   every build (~1.5M; not worth gating out). To use it a game opts in at the API
   level: `run_game` hands each frame's egui `Context` to a game callback, and
   `FrameInput.egui` carries the tessellated output exactly as the editor's path does (the
@@ -1292,20 +1292,20 @@ Built-in networking so games can be multiplayer, supporting **both** topologies:
 **client-server** (an authoritative server, dedicated or player-hosted) and
 **peer-to-peer**. One replication/API surface; the topology is a choice per game.
 
-**Implemented** (`citrus-engine::net`): a UDP **star-relay** session (`NetSession::host`/`join`).
+**Implemented** (`zestengine-engine::net`): a UDP **star-relay** session (`NetSession::host`/`join`).
 One peer hosts (dedicated server or player-host), others join, all traffic relayed through the
 host, so one path serves client-server and P2P on a LAN. **Ownership-based replication**: the
 `Sync` component marks an object networked; whoever **grabs** it (presses the grab action) claims
 authority (host-arbitrated, last-claim-wins), broadcasts its transform to everyone else (who apply
 it snapped/smoothed), and releases it for others, exactly the "move it, let go, someone else takes
 it" model. Exposed through `ComponentCtx` (`net.owns`, `request_ownership`, `release_ownership`) +
-`NetView`. Driven from the editor **Tools → Network** panel or a game's `CITRUS_HOST`/`CITRUS_JOIN`
+`NetView`. Driven from the editor **Tools → Network** panel or a game's `ZESTENGINE_HOST`/`ZESTENGINE_JOIN`
 env vars. Wire format is a compact hand-rolled binary (no extra deps).
 
 **Messaging** (public/private): `ctx.broadcast(text)` and `ctx.send_to(peer, text)`; received
 messages arrive via `ctx.messages()` (`(from_peer, is_private, text)` each frame), host-routed.
 
-**Spatial voice comms** (`citrus-engine::voice`, push-to-talk on the `Voice` action): mic captured
+**Spatial voice comms** (`zestengine-engine::voice`, push-to-talk on the `Voice` action): mic captured
 via **cpal**, downmixed to mono 16 kHz, sent as PCM frames over the transport, and played back per
 peer through a **jitter buffer** (≈120 ms pre-buffer + seq reordering) so it never sounds laggy:
 late/lost packets become brief silence, not time-stretched "lag." Playback is **spatial**: each
@@ -1352,7 +1352,7 @@ monitor, a TV showing a moveable camera, a mirror, a portal, a minimap, or
 picture-in-picture. The camera is an ordinary scene object, so moving it (or
 possessing it, 2A) updates the screen live.
 
-Foundation already in place: the renderer's `CameraPreview` (`citrus-render`) is
+Foundation already in place: the renderer's `CameraPreview` (`zestengine-render`) is
 already a render-to-texture pass, an offscreen color+depth target with per-frame
 camera UBOs, rendered by the scene pass and exposed to egui as a user texture. This
 feature generalizes that single editor-only target into a reusable, material-sampled
@@ -1375,7 +1375,7 @@ existing tonemap/bloom path.
 
 - [done] **Build targets (2026-10-30)**: `BuildTarget::{Host, Windows}`. Project Settings has a
   Target dropdown, the File menu has **Build Game for Windows**, and the CLI takes
-  `citrus --build <dir> --target windows`. From Linux / macOS it cross-compiles with
+  `zestengine --build <dir> --target windows`. From Linux / macOS it cross-compiles with
   `cargo xwin rustc --target x86_64-pc-windows-msvc`, after checking for cargo-xwin and the
   rustup target. Output goes to `build-windows/` (exe, `phonon.dll` plus Steam Audio licence
   files, assets). Verified: the FPS template builds and runs under Wine (RTX 4080, Steam Audio,
@@ -1383,12 +1383,12 @@ existing tonemap/bloom path.
   whitelist).
 - [partial] **Android build (2026-10-30)**: the engine and a game build and link for
   `aarch64-linux-android` (NDK r29; winit `android-native-activity` on Android; plugin `.so`
-  on Android). `citrus_engine::run_game_android(app, config, register)` is the `android_main`
+  on Android). `zestengine_engine::run_game_android(app, config, register)` is the `android_main`
   entry. **APK packaging:** `tools/android/build_apk.sh <game-crate> <assets> <out.apk> [package]`
   builds the cdylib (`examples/android-game` shows `android_main`), bundles the assets with a
-  `citrus_assets.txt` list, writes a NativeActivity manifest (Vulkan 1.3 required, arm64-v8a),
+  `zestengine_assets.txt` list, writes a NativeActivity manifest (Vulkan 1.3 required, arm64-v8a),
   then `aapt2` / `zipalign` / `apksigner` with a debug key kept next to the APK. On first run
-  `citrus_engine::android_assets_root(&app)` extracts the assets to internal storage (again only
+  `zestengine_engine::android_assets_root(&app)` extracts the assets to internal storage (again only
   when the list changes). Verified: the FPS template packs into a 6.7 MB APK that `aapt2 dump
   badging` and `apksigner verify` accept, exporting `ANativeActivity_onCreate` + `android_main`.
   **Not yet:** a Vulkan 1.1 fallback (Quest 2), ASTC textures. **Never run on a device:** the
@@ -1401,12 +1401,12 @@ components linked in, collect every asset the game needs, and emit a `build/` fo
 an executable a player can double-click. No editor, no toolchain assumptions on the
 target machine.
 
-citrus is a **Rust-native** engine, so its build model matches Bevy, not Unity/Godot:
+zestengine is a **Rust-native** engine, so its build model matches Bevy, not Unity/Godot:
 the components *are* Rust code compiled into the binary, so a build is fundamentally a
 `cargo build --release` of a thin runtime binary + an assets folder resolved relative to
 the executable. Unity (player exe + `_Data/` with managed DLLs) and Godot (export-template
 binary + a `.pck` data pack) ship scripts *as data* because they're interpreted/managed;
-citrus does not. An optional packed-archive step (Godot-style `.pck`) is a later add; v1
+zestengine does not. An optional packed-archive step (Godot-style `.pck`) is a later add; v1
 emits a folder.
 
 **Boot-scene decision:** both a project setting *and* an editable entry file. The
@@ -1416,44 +1416,44 @@ convention), advanced users edit it for custom startup (splash, save-driven scen
 Bevy "main.rs is code"). The setting is the default; `main.rs` is the override.
 
 Landed so far:
-- [done] **Runtime game loop**: `citrus_engine::run_game(GameConfig, register)` (in
-  `citrus-engine/src/runtime.rs`): opens a window, creates the renderer, loads the boot
+- [done] **Runtime game loop**: `zestengine_engine::run_game(GameConfig, register)` (in
+  `zestengine-engine/src/runtime.rs`): opens a window, creates the renderer, loads the boot
   scene, fires `start`, then runs `update`/`late_update` + render each frame with
   `FrameInput.egui = None` and `camera_preview = None` (no editor code on the path). Drains
   `ComponentCommand::LoadScene` to switch scenes. Uses the scene's `Camera` component for
   view/proj (fixed fallback if none). `GameConfig::from_project_dir` reads `boot_scene` +
-  title from `project.citrus`.
+  title from `project.zestengine`.
 - [done] **Static component linking**: the project's component crate builds as both
   `cdylib` (editor hot-load) and `rlib` (`crate-type = ["cdylib", "rlib"]`); a game binary
-  depends on it as a normal crate (editor feature off) and calls `citrus_register`
+  depends on it as a normal crate (editor feature off) and calls `zestengine_register`
   directly, with no shipped dylib and no `libloading`.
-- [done] **`New Project`** (File menu + `citrus --new-project <parent> <name>`):
+- [done] **`New Project`** (File menu + `zestengine --new-project <parent> <name>`):
   `bundle::scaffold_project` writes a standalone cargo workspace: root `Cargo.toml` (game
-  bin + `[workspace.dependencies]` path-pointing at the citrus checkout, found via
-  `bundle::citrus_root`), editable `src/main.rs`, `plugins/components` (cdylib+rlib),
+  bin + `[workspace.dependencies]` path-pointing at the zestengine checkout, found via
+  `bundle::zestengine_root`), editable `src/main.rs`, `plugins/components` (cdylib+rlib),
   `scenes/ materials/ shaders/ textures/`, a starter scene (camera + lit cube on a plane),
-  and `project.citrus` with `boot_scene`. The editor then switches to the new project
+  and `project.zestengine` with `boot_scene`. The editor then switches to the new project
   (reloads project file, file browser, plugins, boot scene).
-- [done] **Project Settings UI** (File -> Project Settings…): edits `project.citrus`:
+- [done] **Project Settings UI** (File -> Project Settings…): edits `project.zestengine`:
   name + a **Starting scene** picker (boot scene), with a Build Game button. Saves on
   change.
-- [done] **Build Game** (File menu + `citrus --build [dir]`): `bundle::build_game` runs
+- [done] **Build Game** (File menu + `zestengine --build [dir]`): `bundle::build_game` runs
   `cargo build --release --bin <game>`, then assembles `build/<game>` + `build/assets/`
-  (the asset dirs + `project.citrus`, copied so paths resolve exe-relative). Verified
+  (the asset dirs + `project.zestengine`, copied so paths resolve exe-relative). Verified
   end-to-end: a scaffolded project builds and the bundled executable runs standalone
   (window + Vulkan + scene render confirmed).
 - [done] **Editor-free runtime path proven**: `examples/sample-game` (detached package)
-  links `citrus-engine` + a components crate and runs a scene.
+  links `zestengine-engine` + a components crate and runs a scene.
 
-- [done] **Editor stripped from a build**: `citrus-engine` now has a default-on `editor`
-  cargo feature. The `EngineApp` moved into a gated `editor_app` module; `citrus-editor`,
+- [done] **Editor stripped from a build**: `zestengine-engine` now has a default-on `editor`
+  cargo feature. The `EngineApp` moved into a gated `editor_app` module; `zestengine-editor`,
   `egui`, `egui_dock`, `egui-winit`, `transform-gizmo-egui`, `hecs`, `image`, `serde_json`,
   `libc` and the editor-only modules (gizmo/lsp/undo/camera/icon/crash) are optional, and
   the `plugins.rs` editor/clippy paths are gated. The egui-free **data models**
   (`MaterialModel`, `AlphaModeModel`, `ShaderUiInfo`, `ShaderPropUi`, `ShaderPropKindUi`)
-  moved to `citrus-core`, so the always-on scene/shader path no longer touches the editor.
-  A game depends on `citrus-engine` with `default-features = false`: verified that
-  `citrus-editor`, `egui_dock`, `transform-gizmo`, and `syntect` are **absent** from a
+  moved to `zestengine-core`, so the always-on scene/shader path no longer touches the editor.
+  A game depends on `zestengine-engine` with `default-features = false`: verified that
+  `zestengine-editor`, `egui_dock`, `transform-gizmo`, and `syntect` are **absent** from a
   built game's dependency tree (egui itself stays, shared via the renderer). Editor and
   game both build; the game still runs.
 
@@ -1464,7 +1464,7 @@ Also landed:
   unaffected (the profile lives in the generated project).
 
 Still to do:
-- **egui stays in the render path** (decided): `citrus-render` always links
+- **egui stays in the render path** (decided): `zestengine-render` always links
   `egui`/`egui-ash-renderer` for its overlay. That adds ~1.5M to a game binary, which is
   acceptable, so it is *not* gated out. Upside: **immediate-mode egui game UI** (2F option
   B) needs no feature flag; it's a matter of `run_game` handing the per-frame egui
@@ -1550,7 +1550,7 @@ physics engine (#26) --+                              |
 - [done] HDR skybox (EXR / `.hdr` into a float env cube) + IBL (roughness-mipped env /
   reflection-probe cubes, split-sum env BRDF)
 - [done] **Full-body IK + VR locomotion** — analytic two-bone + FABRIK solvers
-  (`citrus_core::ik`); `humanoid::HumanoidRig` maps Mixamo/VRM/Unity bones and
+  (`zestengine_core::ik`); `humanoid::HumanoidRig` maps Mixamo/VRM/Unity bones and
   `pose_from_trackers` drives any humanoid from head/hands/hips/feet targets.
   Added: **terrain foot IK** (`apply_foot_ik` — hips drop + per-leg two-bone solve
   onto the ground + foot-to-normal roll, pluggable ground sampler;
@@ -1558,7 +1558,7 @@ physics engine (#26) --+                              |
   (`TrackerCalibration` + `humanoid::{calibrate_tpose, targets_from_calibrated}` +
   `LoadedScene::calibrate_vr_tpose`/`vr_apply_calibration` — capture each tracker's
   offset to its bone, then drive naturally), and **VR play-space locomotion**
-  (`citrus_core::VrRig`: fly, turn, scale-self, grab-drag the world, pointer ray).
+  (`zestengine_core::VrRig`: fly, turn, scale-self, grab-drag the world, pointer ray).
   All unit-tested.
 - [wip] **Editor VR** (VR-only; desktop editor untouched) — stereo rendering into
   the HMD (`Renderer::render_xr_eye` per eye + an editor `setup_stereo`/`begin_
@@ -1594,7 +1594,7 @@ physics engine (#26) --+                              |
 ## Gameplay / engine subsystems (ENGINE_FEATURE_CHECKLIST, 2026-06-19)
 
 Foundations added to close the T0/T1 gap list. Each is a tested module under
-`crates/citrus-engine/src/`; authoring/inspect UI is in **Tools → Systems** (and
+`crates/zestengine-engine/src/`; authoring/inspect UI is in **Tools → Systems** (and
 **Tools → Audio Mixer**) unless noted. See `ENGINE_FEATURE_CHECKLIST.md` for the
 per-feature "what's done / what's left" table.
 
@@ -1651,7 +1651,7 @@ per-feature "what's done / what's left" table.
   matrix all use `LayerSettings::shown_count()` (highest named + 2, clamped [8,32]) instead of
   32 / 8 / 4. The Layers-window names list shows all 32 (naming a higher layer reveals it
   everywhere). Camera mask now shows real layer names via `InspectCtx.layer_names`.
-- [done] **LOD is now a component** — `LodComponent` (citrus-core) with an Inspector editor
+- [done] **LOD is now a component** — `LodComponent` (zestengine-core) with an Inspector editor
   (Add Component → "LOD Group": per-level distance + model path, cull distance). Replaces the
   incorrect Tools-menu placement. See `FEATURE_UI_GUIDE.md` for where every feature's UI belongs.
 - [done] **Removed the "Tools → Systems" dump** — it wrongly mixed components, settings, and
@@ -1662,12 +1662,12 @@ per-feature "what's done / what's left" table.
   the voxel volume (`EMISSIVE_GI_GAIN`) with an 8 m reach, so floor/couch/props get a visible
   VIEW-INDEPENDENT colored pool (chrome/mirror specular deferred per request).
 
-## User-generated content packages (.citruspak, 2026-10-30)
+## User-generated content packages (.zestenginepak, 2026-10-30)
 
 Worlds, avatars and props built in the editor load into a running game without
 recompiling it (VRChat-style). Full design + safety model: [docs/user-content.md](docs/user-content.md).
 
-- [done] **`.citruspak` format** (`citrus-assets/src/package.rs`) — zip with `manifest.ron`
+- [done] **`.zestenginepak` format** (`zestengine-assets/src/package.rs`) — zip with `manifest.ron`
   (kind World/Avatar/Prop, name/author/version, engine format version, SHA-256 content hash
   over the file table, required components, stats, thumbnail), `files/` (entry `.scene` + every
   referenced asset, baked sidecars), `texcache/` (BC import-cache blobs re-bound on extract).
@@ -1677,7 +1677,7 @@ recompiling it (VRChat-style). Full design + safety model: [docs/user-content.md
   component validation; limits; Analyse / Build report.
 - [done] **Avatar Descriptor** component — eye point (camera placement), humanoid bone-map
   overrides (`HumanoidRig::map_with_overrides`), body capsule for the Character Controller.
-- [done] **ContentManager** (`citrus-engine/src/content.rs`) in the runtime + editor Play mode:
+- [done] **ContentManager** (`zestengine-engine/src/content.rs`) in the runtime + editor Play mode:
   path / content id / `http://` (pluggable `ContentFetcher` for HTTPS) on a worker thread,
   validate → extract into a hash-keyed cache (`ContentCache`, source index, LRU prune) →
   decode + transfer-queue upload; worlds switch through `SceneFlow::switch_to_loaded`, props /
@@ -1690,14 +1690,14 @@ recompiling it (VRChat-style). Full design + safety model: [docs/user-content.md
   confined), per-kind resource limits checked on claims, entry sizes and measured data
   (triangles / texture memory before upload), BC blob validation, unknown components dropped.
 - [done] **F8 developer overlay** in built games (`GameConfig::content_overlay` /
-  `CITRUS_CONTENT_OVERLAY=1`): inbox folders → Spawn / Wear / Enter, loaded list → Unload.
+  `ZESTENGINE_CONTENT_OVERLAY=1`): inbox folders → Spawn / Wear / Enter, loaded list → Unload.
 - [todo] Free GPU meshes/textures per package on unload (today: at the next world switch);
   sandboxed WASM scripting for content logic. (Avatar content ids replicate: see Networked UGC
   avatars.)
 
-## Custom shader system v2 + Citrus Toon (2026-10-30)
+## Custom shader system v2 + ZestEngine Toon (2026-10-30)
 
-- [done] **Property declarations v2** (`citrus-assets/src/shader_props.rs`): `// @property name
+- [done] **Property declarations v2** (`zestengine-assets/src/shader_props.rs`): `// @property name
   "Label" Type = default` with Range, Float, Int, IntRange, Toggle, Enum, Color(HDR), Color3,
   Vector2/3/4, Texture2D (white/black/normal/gray, `@linear`); `@feature` / `@foldout` / `@header`
   groups, `@show_if(expr)` conditions, `@tooltip`, `@preset`. v1 `//! prop` pragmas still work.
@@ -1707,13 +1707,13 @@ recompiling it (VRChat-style). Full design + safety model: [docs/user-content.md
 - [done] **Inspector**: presets, foldouts with feature checkboxes, conditional visibility,
   sliders / drags / enum combos / HDR colour pickers / vectors / texture slots with drop +
   tiling/offset, property filter, variant badge, fixed material texture slots, compile errors.
-- [done] **HLSL custom shaders** (`.hlsl`, `citrus_frag(CitrusInput)`, auto-combined samplers,
+- [done] **HLSL custom shaders** (`.hlsl`, `zestengine_frag(ZestEngineInput)`, auto-combined samplers,
   `packoffset` cbuffer) and shaders from any project folder; hot reload remaps values by name.
 - [done] **Keyword variants** (shader_feature model): `@keyword` properties are specialization
   constants; the pipeline key includes the material's keyword set (lazy, cached pipelines).
   Game builds bake the keyword sets their materials use into frozen-constant SPIR-V sidecars.
 - [done] **Per-material inverted-hull outline** (`OUTLINE` + `outline_color` + `outline_width`).
-- [done] **Citrus Toon** (`shaders/citrus_toon.frag`): Poiyomi-style lighting modes, shadow
+- [done] **ZestEngine Toon** (`shaders/zestengine_toon.frag`): Poiyomi-style lighting modes, shadow
   layers, rim, 2 matcaps, toon / anisotropic / GGX specular, reflections, 2 emission slots,
   dissolve, glitter, decal, detail maps, UV tile discard, vertex colour, alpha options,
   parallax; Simple / Medium / Heavy presets. Out of scope list in `docs/shaders.md`.
@@ -1731,7 +1731,7 @@ Extends 2G. API and model: `docs/networking.md`.
 - [done] **Sessions**: host / join by address, LAN discovery (`LanBrowser`, UDP 47777), player
   list with names / ids / ping, `PeerJoined` / `PeerLeft` / `Connected` / `Disconnected` events,
   `ctx.net_host` / `net_join` / `net_disconnect`, `Network Manager` component (limits, player
-  prefab per peer at Spawn Points, dedicated host, auto start), `CITRUS_NAME`.
+  prefab per peer at Spawn Points, dedicated host, auto start), `ZESTENGINE_NAME`.
 - [done] **Editor Network window** rebuilt on the widget kit: name / address, Host / Join, LAN
   list, status chip, players with ping, traffic, networked objects with who simulates them;
   connections stay alive while editing; Stop clears replicated state.
@@ -1767,14 +1767,14 @@ Extends 2G. API and model: `docs/networking.md`.
 ## Project templates + gameplay kit (2026-10-30)
 
 New Project offers starter games; each is built from reusable built-in components and plays in
-the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src/templates/`,
-`crates/citrus-core/src/kit/`, inspectors in `crates/citrus-editor/src/kit_ui.rs`.
+the editor's Play mode as soon as it is created. Code: `crates/zestengine-engine/src/templates/`,
+`crates/zestengine-core/src/kit/`, inspectors in `crates/zestengine-editor/src/kit_ui.rs`.
 
 - [done] **Template registry** (`templates::TEMPLATES`: id, name, description, Desktop / VR
   category, card icon, feature list). `scaffold_project(parent, name, template)` writes the
   cargo workspace as before plus the template's scenes, material palette, prefabs, input
-  bindings (project.citrus) and sample assets copied from the checkout (sky texture, the helmet
-  model); a missing asset is skipped. CLI: `citrus --new-project <parent> <name> [template]`.
+  bindings (project.zestengine) and sample assets copied from the checkout (sky texture, the helmet
+  model); a missing asset is skipped. CLI: `zestengine --new-project <parent> <name> [template]`.
 - [done] **Empty**: the previous starter scene (default).
 - [done] **First Person Shooter**: walled arena with cover, ramp and platform, physics crates,
   target range; FPS controller (mouse look, WASD, jump, sprint, crouch), hitscan rifle with
@@ -1825,10 +1825,10 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   poses, VR or desktop fallback) and **Hidden For Owner** (its own visuals are disabled locally),
   so peers see head, hands and torso without the owner seeing a double. Test:
   `vr_social_avatar_prefab_mirrors_the_local_player_for_others`.
-- [todo] VR left trigger is not read by citrus-xr yet.
+- [todo] VR left trigger is not read by zestengine-xr yet.
 
 ## Bone cloth + cloth colliders (2026-10-30)
-- [done] **Bone Cloth** (`citrus_core::cloth`): position-based secondary motion for joint chains
+- [done] **Bone Cloth** (`zestengine_core::cloth`): position-based secondary motion for joint chains
   (hair, tails, ears, bone-rigged skirts). Pick root joints; every joint below simulates, with an
   optional virtual tail so the last bone swings. Connection modes: independent chains, or
   neighbouring chains linked as a loop / open strip (a root with several children is sorted
@@ -1849,13 +1849,13 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   auto-fitted colliders; editing one by hand keeps it.
 - [done] **Gizmos**: collider wireframes (selected one highlighted, with start / end handles and
   radius handles), and the live simulated chains, chain links and particle radii.
-- Tests: `citrus-core` cloth (hanging, stiffness, sphere / edge collision, teleport, inertia,
-  ring links, capsule fit, collider frames), `citrus-engine`
+- Tests: `zestengine-core` cloth (hanging, stiffness, sphere / edge collision, teleport, inertia,
+  ring links, capsule fit, collider frames), `zestengine-engine`
   `auto_fit_wraps_the_thigh_and_cloth_slides_off_it`.
 - [done] **Wind Zones** (`Wind Zone`: global / sphere / box, strength, turbulence, gust
   frequency, gizmo) push Bone Cloth and Mesh Cloth (`wind` scale on each) and raise wind seas on
   Water.
-- [done] **Mesh Cloth** (`citrus_core::cloth_mesh`): a skinned submesh simulated from its own
+- [done] **Mesh Cloth** (`zestengine_core::cloth_mesh`): a skinned submesh simulated from its own
   triangles: seam welding, optional particle spacing (reduction), stretch / bending /
   keep-shape / tether constraints, pins from a vertex colour channel, bones or the top of the
   mesh, collision with Cloth Colliders, self-collision (spatial hash), inertia and teleport like
@@ -1877,7 +1877,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 
 ## Full-body tracking, remote IK, networked avatars (2026-10-30)
 - [done] **Tracker roles**: `TrackerTargets` covers head, hands, hips, feet, chest, elbows and
-  knees (`TRACKER_SLOTS` = 11, `slots` / `from_slots` / `transformed`); citrus-xr binds the Vive
+  knees (`TRACKER_SLOTS` = 11, `slots` / `from_slots` / `transformed`); zestengine-xr binds the Vive
   tracker chest / elbow / knee roles next to waist and feet.
 - [done] **Full-body solver** (`humanoid::solve_body`, VR-avatar style): pelvis from the hip
   tracker or estimated under the head (turned by its yaw), spine bent toward the chest and head
@@ -1897,7 +1897,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 - [done] **Remote humanoid IK**: the avatar packet carries all 11 roles (protocol 3); owners send
   their calibrated targets; remote copies pose their Humanoid IK from them.
 - [done] **Networked UGC avatars**: wearing a package sets the player's Network Avatar `wearing`
-  (content id + URL), replicated as the `citrus.avatar` synced variable with late-join catch-up;
+  (content id + URL), replicated as the `zestengine.avatar` synced variable with late-join catch-up;
   peers load and wear it. Worn avatars get Humanoid IK on their skinned parts automatically.
 - Tests: `three_point_tracking_reaches_head_and_hands_and_crouches_on_planted_feet`,
   `foot_and_hip_trackers_drive_the_legs_and_knee_trackers_aim_them`,
@@ -1906,16 +1906,16 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   `worn_avatar_package_reaches_peers_and_late_joiners`, `remote_players_announced_avatar_is_requested_once`,
   plus chest / knee replication in the network convergence test.
 - [done] Command palette: the list no longer stays at the height of an earlier search.
-- [done] Project Hub (`citrus-hub`, a separate executable): recent projects (search, sort, pin, show in
+- [done] Project Hub (`zestengine-hub`, a separate executable): recent projects (search, sort, pin, show in
   file manager, locate / prune missing folders, thumbnails from a project's `thumbnail.png`), New
-  Project from the templates (runs `citrus --new-project`, so the hub and editor share the template
+  Project from the templates (runs `zestengine --new-project`, so the hub and editor share the template
   code), Open folder (an in-theme folder browser; offers to initialise a folder without a
-  project.citrus), Settings (editor path or `CITRUS_EDITOR`, minimise or close the hub after
-  opening, default location). Opens a project by starting the editor as `citrus <dir>`. Recent
-  projects are shared with the editor in `<config>/Citrus/projects.ron` (the editor records every
-  project it opens, CLI included); hub settings and window size in `<config>/Citrus/hub.ron`.
-- [done] CLI: `citrus <project-dir>` opens that project; `citrus <scene|model>` finds its project;
-  `citrus --hub` starts the hub; bare `citrus` opens the project in the current folder, else the
+  project.zestengine), Settings (editor path or `ZESTENGINE_EDITOR`, minimise or close the hub after
+  opening, default location). Opens a project by starting the editor as `zestengine <dir>`. Recent
+  projects are shared with the editor in `<config>/ZestEngine/projects.ron` (the editor records every
+  project it opens, CLI included); hub settings and window size in `<config>/ZestEngine/hub.ron`.
+- [done] CLI: `zestengine <project-dir>` opens that project; `zestengine <scene|model>` finds its project;
+  `zestengine --hub` starts the hub; bare `zestengine` opens the project in the current folder, else the
   hub, else the last project. Editor: File > Project Hub..., command-palette project entries, and
   a Save / Discard / Cancel prompt before switching projects with unsaved changes.
 - [done] Editor splash (editor only, never in games): Plex type, project name + version, a six-step
@@ -1940,7 +1940,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   locked while Play runs.
 - [done] Avatar scaling to the player's height: standing eye height measured in the headset (a 1 s
   stand-straight capture, outlier rejection, movement check), arm span from the T-pose, manual
-  height (cm) override and reset, saved per user in `Citrus/body.ron` (shared by every game and the
+  height (cm) override and reset, saved per user in `ZestEngine/body.ron` (shared by every game and the
   editor). VR Player `avatar_scaling`: Scale avatar (default), Scale player (scales the tracking
   space; a child avatar keeps its size), Off; optional arm-span reach compensation. Replicated so
   remote avatars scale to match. API: `ctx.player_height()`, `ctx.avatar_scale()`, `ctx.body()`,
@@ -1958,9 +1958,9 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 - [done] **Blendshapes**: glTF morph targets (names from `extras.targetNames`) and FBX blend
   shapes (ufbx channels remapped onto triangle corners) import as sparse offsets; skinned
   objects with Face Tracking / Blend Shapes / Lip Sync apply them before CPU skinning.
-- [done] **Face tracking** (`citrus_core::face`): Unified Expressions frame (102 base shapes,
+- [done] **Face tracking** (`zestengine_core::face`): Unified Expressions frame (102 base shapes,
   blended shapes, ARKit and VRM aliases, gaze), `XR_FB_face_tracking2` mapping, OSC parameter
-  decoding (v2 / FT/v2 / combined signed parameters). Headset read directly in citrus-xr
+  decoding (v2 / FT/v2 / combined signed parameters). Headset read directly in zestengine-xr
   (`face_weights`, `eye_gaze`); opt-in OSC receiver (`face_input.rs`). `Face Tracking`
   component (source Auto / Local / Network, smoothing, eye bones, mappings, live matched list),
   `Blend Shapes` (sliders). Faces replicate (P_FACE). Worn avatars get Face Tracking and Lip Sync.
@@ -1995,7 +1995,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   (`model.removed`), edited parts stay as entries tagged `model_part`. Older scenes load as before
   and shrink on their next save. Geometry was never stored in `.scene` files; the large files
   next to a scene are the bakes (see BC6H in OUTSTANDING_FEATURES).
-- [done] **Generated LODs**: `citrus_assets::simplify` (quadric-error edge collapse, borders and
+- [done] **Generated LODs**: `zestengine_assets::simplify` (quadric-error edge collapse, borders and
   UV seams locked, flip-safe, attributes and skin weights kept). A LOD Group level with no model
   and a Keep percentage builds its meshes from the object's own model at load.
 - Tests: `pristine_parts_drop_out_and_come_back`, `edited_materials_and_components_keep_a_part_stored`,
@@ -2124,7 +2124,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 - [done] Buoyancy stability: lift capped at 6x a body's weight plus extra heave damping for very
   light floats (a 1 kg couch-sized body bobs instead of launching); Rigid Body mass defaults to 0
   = Auto (collider volume x physics material density, 500 kg/m3 without one), shown as "Auto".
-- [done] **Asset references by id** (`citrus_core::asset_ref`): slots store `@<id>` from the
+- [done] **Asset references by id** (`zestengine_core::asset_ref`): slots store `@<id>` from the
   asset's `.meta` sidecar (created on first assignment), resolved through a per-project index of
   the sidecars (rescanned on a miss), so renames and moves keep every reference. The file browser
   hides `.meta` files and carries them along on rename / move / delete; copies get fresh ids.
@@ -2137,8 +2137,8 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   highlights the file in the file browser, double-click opens it in the inspector; drop, browse
   and [+] new still assign.
 - [todo] Skybox image slots in Environment still show paths (browse works; not chips yet).
-- [done] **GPU shallow-water simulation** (`water_sim.comp`, `citrus-render/src/water_sim.rs`,
-  CPU reference `citrus-core/src/water_pipe.rs`): virtual-pipe model per interactive Water (up to
+- [done] **GPU shallow-water simulation** (`water_sim.comp`, `zestengine-render/src/water_sim.rs`,
+  CPU reference `zestengine-core/src/water_pipe.rs`): virtual-pipe model per interactive Water (up to
   4), 256^2 default, fp32 state (column height, 4 outflow pipes, velocity, per-cell rest depth /
   base flow / water-shore-obstacle). Window covers small bodies whole (shores reflect, pools
   slosh) or follows the camera with an absorbing border (toroidal storage, only new cells reset).
@@ -2263,7 +2263,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
 - [done] Vulkan 1.1 fallback: core 1.3 when available, else 1.1 / 1.2 with KHR dynamic rendering +
   synchronization2 (+ depth_stencil_resolve / create_renderpass2) through a KHR-aliased device
   table, failing clearly when an extension is missing; Android shaders are SPIR-V 1.3.
-- [done] ASTC LDR textures (4x4..8x8; 6x6 colour, 4x4 data by default, `CITRUS_ASTC_BLOCKS`) for
+- [done] ASTC LDR textures (4x4..8x8; 6x6 colour, 4x4 data by default, `ZESTENGINE_ASTC_BLOCKS`) for
   devices without BC, in a separate `.castc` cache; Android / Quest builds cook ASTC into the APK
   (no BC data) and seed it on first run, and cook custom shaders to SPIR-V 1.3. ASTC HDR bake
   format plumbing (`AstcHdr4x4`, devices with ASTC HDR only; no encoder yet, so Quest bakes decode
@@ -2274,9 +2274,9 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   per-eye post, XR swapchain format negotiation; the per-eye path stays for desktop PCVR and the
   VR overlay.
 - [done] Render tiers: `RenderTier::Mobile` on Android (1024 shadows / 2 cascades, no RT / SSR /
-  realtime GI, quarter-res bloom, MSAA 4x + multiview for the eyes; `CITRUS_RENDER_TIER`), XR
-  refresh-rate selection (`XR_FB_display_refresh_rate`, `CITRUS_XR_REFRESH_HZ`). The editor ends its
-  XR session before the renderer; the game build of citrus-engine is warning-free.
+  realtime GI, quarter-res bloom, MSAA 4x + multiview for the eyes; `ZESTENGINE_RENDER_TIER`), XR
+  refresh-rate selection (`XR_FB_display_refresh_rate`, `ZESTENGINE_XR_REFRESH_HZ`). The editor ends its
+  XR session before the renderer; the game build of zestengine-engine is warning-free.
 - [todo] Quest: on-device validation; `XR_FB_foveation` (needs a fragment density map on the scene
   pass); an ASTC HDR encoder for bakes; cooking code-only and model-embedded textures; MSAA on
   the per-eye fallback path.
@@ -2289,19 +2289,19 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   reflection probe 96 MB -> 8 MB on disk. Baker's Man > Storage: Compress lightmaps / probes
   (default on), size lines (disk vs uncompressed vs VRAM), "Compress existing bake".
 - [done] Android / Meta Quest builds: Build Game targets "Android (arm64)" and "Meta Quest 3 / 3S /
-  Pro" (also `citrus --build --target android|quest`) produce a signed APK through
+  Pro" (also `zestengine --build --target android|quest`) produce a signed APK through
   tools/android/build_apk.sh with a generated `android_main` crate that links the project's
   components; clear errors for a missing SDK, NDK, build-tools, rust target or loader.
 - [done] Quest packaging (`--quest`): VR launcher category, head tracking required, supported devices
   quest3 / quest3s / questpro (quest2 opt-in), optional hand / eye / face tracking, focus-aware,
   the Khronos OpenXR loader 1.1.63 bundled (`OPENXR_LOADER_SO` or a pinned, SHA-256-checked
-  fetch), minSdk 29 / targetSdk 32, release signing from `CITRUS_KEYSTORE`.
+  fetch), minSdk 29 / targetSdk 32, release signing from `ZESTENGINE_KEYSTORE`.
 - [done] OpenXR on Android (loader init + `XR_KHR_android_create_instance`; session state machine
   for pause / resume, focus loss and exit; STAGE falls back to LOCAL). Game runtime VR: XR starts
   before the renderer, the game renders stereo eyes from the VR Player rig or the main camera,
   `GameConfig.xr` (Auto / Required / Off), Quest Touch inputs reach `ctx.screen.vr` (released while
   unfocused). Android lifecycle: surface dropped on suspend and rebuilt on resume, idle loop while
-  paused, logcat (tag `citrus`), Quest Pro eye / face permissions requested at runtime. Builds and
+  paused, logcat (tag `zestengine`), Quest Pro eye / face permissions requested at runtime. Builds and
   packages; never run on a device.
 - [done] Input: VR controller sources in bindings (sticks, triggers and grips as axes and buttons,
   A/B/X/Y, stick clicks, menu, stick directions) and a default "VR Controllers" scheme; the VR
@@ -2313,16 +2313,16 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   window opens the same editor.
 - [done] Runtime remap API: `ctx.rebind` / `rebind_with` (Allow / Steal / Swap), `capture_next_input`,
   `reset_bindings`, `set_control_scheme`, `binding_conflicts`, `tune_action`; player overrides
-  saved to `input.ron` in the user config folder (Play mode: `.citrus/input_overrides.ron`), kept
+  saved to `input.ron` in the user config folder (Play mode: `.zestengine/input_overrides.ron`), kept
   apart from the project defaults. Controls Menu kit component + Controls UI template (scheme
   switch, two bindings per action, paging, reset), linked from the Settings, Main Menu and Pause
   Menu pages.
-- [done] Internet play without port forwarding: `citrus-relay` rendezvous + relay server (std-only
+- [done] Internet play without port forwarding: `zestengine-relay` rendezvous + relay server (std-only
   UDP; rooms by 6-character code; per-member rate limits; star forwarding of ciphertext). Hosting
   with a relay also opens a room (LAN clients still connect directly); joining takes `ABC123`,
   `ABC123@relay:port` or `host:port`. UDP hole punching from the relay's introduction (public +
   LAN endpoints, punch tokens), falling back to relaying and re-punching after 20 s; peers show
-  as LAN / direct / relayed. Run: `cargo run --release -p citrus-relay -- --bind 0.0.0.0:47800`.
+  as LAN / direct / relayed. Run: `cargo run --release -p zestengine-relay -- --bind 0.0.0.0:47800`.
 - [done] Session security (protocol 5): HELLO / CHALLENGE / sealed JOIN handshake, per-connection
   keys (HKDF-SHA256 from the join secret, session salt and client nonce), every packet
   ChaCha20-Poly1305 with a replay window; wrong secrets rejected, forged packets dropped and
@@ -2389,7 +2389,7 @@ the editor's Play mode as soon as it is created. Code: `crates/citrus-engine/src
   custom-shader, outlined, water and error draws and the secondary cameras stay on the CPU path.
   Grow-only per-frame / per-eye buffers, counts read back without stalling (profiler "GPU
   culling"). View > GPU culling / Hi-Z occlusion (`Renderer::set_gpu_cull_settings`; env
-  `CITRUS_GPU_CULL=0`, `CITRUS_HIZ=1`); default GPU culling on, Hi-Z off. The CPU shadow fallback
+  `ZESTENGINE_GPU_CULL=0`, `ZESTENGINE_HIZ=1`); default GPU culling on, Hi-Z off. The CPU shadow fallback
   now draws casters instanced per mesh. Not yet run on a GPU.
 - [done] Cast Shadows per object (Inspector > Mesh & Material > Mesh): On / Off / Two Sided /
   Shadows Only; saved in scenes and prefabs (omitted when On), undoable, multi-select. Off: never in

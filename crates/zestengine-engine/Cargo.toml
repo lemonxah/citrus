@@ -1,0 +1,84 @@
+[package]
+name = "zestengine-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# `editor` (on by default) pulls in the egui editor shell. A built game depends
+# on zestengine-engine with `default-features = false`, so it links the runtime only
+# — no zestengine-editor, egui_dock, gizmos, or LSP.
+default = ["editor", "steam-audio"]
+# Steam Audio spatialization (HRTF, air absorption, directivity, occlusion).
+# Off: spatial sources fall back to distance-attenuated volume.
+steam-audio = ["dep:audionimbus"]
+editor = [
+    "dep:zestengine-editor",
+    "dep:egui-winit",
+    "dep:transform-gizmo-egui",
+    "dep:egui_dock",
+    "dep:hecs",
+    "dep:image",
+    "dep:serde_json",
+    "dep:libc",
+    "dep:softbuffer",
+    "dep:ab_glyph",
+]
+
+[dependencies]
+zestengine-core.workspace = true
+zestengine-render.workspace = true
+zestengine-assets.workspace = true
+zestengine-xr.workspace = true
+winit.workspace = true
+# Always-on (runtime needs them): plugin loading, audio, logging.
+libloading.workspace = true
+rodio.workspace = true
+audionimbus = { workspace = true, optional = true }
+glam.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+ron.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Editor-only (optional; enabled by the `editor` feature).
+zestengine-editor = { workspace = true, optional = true }
+# Always on: game UI draws through the renderer's egui pass (egui links via
+# zestengine-render in every build anyway).
+egui = { workspace = true }
+egui-winit = { workspace = true, optional = true }
+transform-gizmo-egui = { workspace = true, optional = true }
+egui_dock = { workspace = true, optional = true }
+hecs = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+# CPU-drawn splash window (shown before the Vulkan renderer exists).
+softbuffer = { version = "0.4", optional = true }
+ab_glyph = { version = "0.2", optional = true }
+serde_json = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+rapier3d = "0.33.0"
+# Internet play: the relay wire protocol, and session encryption.
+zestengine-relay.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+# Gamepad input for the binding system (2C). Networking (2G) uses std::net.
+gilrs = "0.11"
+# Microphone capture for voice comms (matches rodio's cpal).
+cpal = "0.15"
+
+# Android: JNI calls on the activity (runtime permission requests for the
+# Quest Pro eye / face tracking features).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+
+# Writes PNGs through `image`, which only the editor feature links.
+[[example]]
+name = "gi_preview"
+required-features = ["editor"]

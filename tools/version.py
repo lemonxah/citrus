@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read/bump Citrus's inherited workspace version, preserving manifest formatting."""
+"""Read/bump ZestEngine's inherited workspace version, preserving manifest formatting."""
 
 import re
 import subprocess

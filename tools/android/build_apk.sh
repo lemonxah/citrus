@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Package a citrus game for Android (arm64-v8a, NativeActivity, Vulkan).
+# Package a zestengine game for Android (arm64-v8a, NativeActivity, Vulkan).
 #
 #   tools/android/build_apk.sh [--quest] [--manifest-only] <game-crate-dir> <assets-dir> <out.apk> [package-id]
 #
 # <game-crate-dir> builds a cdylib exporting `android_main` (see
-# examples/android-game); <assets-dir> holds project.citrus plus the content
+# examples/android-game); <assets-dir> holds project.zestengine plus the content
 # folders (a Build Game `build/assets` works). Needs the NDK and build-tools:
 # ANDROID_HOME (default /opt/android-sdk), ANDROID_NDK_HOME (default: newest
 # under $ANDROID_HOME/ndk), and `rustup target add aarch64-linux-android`.
@@ -18,15 +18,15 @@
 # Environment:
 #   OPENXR_LOADER_SO       arm64-v8a libopenxr_loader.so to bundle (--quest).
 #                          Unset: the pinned Khronos release below is fetched
-#                          once into $CITRUS_ANDROID_CACHE and its checksum
-#                          verified. CITRUS_OPENXR_FETCH=0 disables the fetch.
-#   CITRUS_ANDROID_CACHE   download cache (default ~/.cache/citrus/android).
-#   CITRUS_QUEST2=1        also list Quest 2 as a supported device.
-#   CITRUS_APP_LABEL       launcher label (default: the lib name).
-#   CITRUS_VERSION_CODE / CITRUS_VERSION_NAME   (default 1 / 0.1).
-#   CITRUS_KEYSTORE        release keystore; with CITRUS_KEYSTORE_PASS,
-#                          CITRUS_KEY_ALIAS (default: the first alias) and
-#                          CITRUS_KEY_PASS (default: the store password).
+#                          once into $ZESTENGINE_ANDROID_CACHE and its checksum
+#                          verified. ZESTENGINE_OPENXR_FETCH=0 disables the fetch.
+#   ZESTENGINE_ANDROID_CACHE   download cache (default ~/.cache/zestengine/android).
+#   ZESTENGINE_QUEST2=1        also list Quest 2 as a supported device.
+#   ZESTENGINE_APP_LABEL       launcher label (default: the lib name).
+#   ZESTENGINE_VERSION_CODE / ZESTENGINE_VERSION_NAME   (default 1 / 0.1).
+#   ZESTENGINE_KEYSTORE        release keystore; with ZESTENGINE_KEYSTORE_PASS,
+#                          ZESTENGINE_KEY_ALIAS (default: the first alias) and
+#                          ZESTENGINE_KEY_PASS (default: the store password).
 #                          Unset: a debug key kept next to the APK (never
 #                          ~/.android).
 set -euo pipefail
@@ -53,12 +53,12 @@ die() { echo "error: $*" >&2; exit 1; }
 
 CRATE=$(realpath "$1")
 OUT=$(realpath -m "$3")
-PACKAGE=${4:-com.citrus.game}
+PACKAGE=${4:-com.zestengine.game}
 LIB=$(sed -n '/^\[lib\]/,/^\[/s/^name *= *"\(.*\)"/\1/p' "$CRATE/Cargo.toml" | head -1)
 [ -n "$LIB" ] || die "no [lib] name in $CRATE/Cargo.toml"
-LABEL=${CITRUS_APP_LABEL:-$LIB}
-VERSION_CODE=${CITRUS_VERSION_CODE:-1}
-VERSION_NAME=${CITRUS_VERSION_NAME:-0.1}
+LABEL=${ZESTENGINE_APP_LABEL:-$LIB}
+VERSION_CODE=${ZESTENGINE_VERSION_CODE:-1}
+VERSION_NAME=${ZESTENGINE_VERSION_NAME:-0.1}
 
 # Meta's store guidance for Horizon OS: minSdk 29 (Android 10), targetSdk 32
 # (Android 12L). Phones keep the API 30 floor.
@@ -77,7 +77,7 @@ manifest() {
 XML
     if [ $QUEST = 1 ]; then
         devices="quest3|quest3s|questpro"
-        [ "${CITRUS_QUEST2:-0}" = 1 ] && devices="quest2|$devices"
+        [ "${ZESTENGINE_QUEST2:-0}" = 1 ] && devices="quest2|$devices"
         cat <<XML
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="true" />
@@ -145,7 +145,7 @@ if [ $MANIFEST_ONLY = 1 ]; then
 fi
 
 ASSETS=$(realpath "$2")
-[ -f "$ASSETS/project.citrus" ] || die "$ASSETS has no project.citrus (build the game's assets first)"
+[ -f "$ASSETS/project.zestengine" ] || die "$ASSETS has no project.zestengine (build the game's assets first)"
 SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/opt/android-sdk}}
 [ -d "$SDK" ] || die "Android SDK not found at $SDK (set ANDROID_HOME)"
 newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1; }
@@ -168,10 +168,10 @@ openxr_loader() {
         echo "$OPENXR_LOADER_SO"
         return
     fi
-    local cache=${CITRUS_ANDROID_CACHE:-$HOME/.cache/citrus/android}/openxr_loader-$OPENXR_LOADER_VERSION
+    local cache=${ZESTENGINE_ANDROID_CACHE:-$HOME/.cache/zestengine/android}/openxr_loader-$OPENXR_LOADER_VERSION
     local so=$cache/arm64-v8a/libopenxr_loader.so
     if [ ! -f "$so" ]; then
-        [ "${CITRUS_OPENXR_FETCH:-1}" != 0 ] \
+        [ "${ZESTENGINE_OPENXR_FETCH:-1}" != 0 ] \
             || die "no OpenXR loader: set OPENXR_LOADER_SO to an arm64-v8a libopenxr_loader.so (or allow the fetch)"
         command -v curl >/dev/null || die "curl is needed to fetch the OpenXR loader (or set OPENXR_LOADER_SO)"
         echo "== fetching Khronos OpenXR loader $OPENXR_LOADER_VERSION" >&2
@@ -206,8 +206,8 @@ mkdir -p "$STAGE/lib/arm64-v8a" "$STAGE/assets"
 cp "$TARGET_DIR/aarch64-linux-android/release/lib$LIB.so" "$STAGE/lib/arm64-v8a/"
 [ -n "$LOADER" ] && cp "$LOADER" "$STAGE/lib/arm64-v8a/libopenxr_loader.so"
 cp -r "$ASSETS"/. "$STAGE/assets/"
-# Extraction list read by citrus_engine::android_assets_root.
-(cd "$STAGE/assets" && find . -type f ! -name citrus_assets.txt | sed 's|^\./||' | sort > citrus_assets.txt)
+# Extraction list read by zestengine_engine::android_assets_root.
+(cd "$STAGE/assets" && find . -type f ! -name zestengine_assets.txt | sed 's|^\./||' | sort > zestengine_assets.txt)
 
 manifest > "$STAGE/AndroidManifest.xml"
 
@@ -217,18 +217,18 @@ echo "== linking APK"
 "$BT/zipalign" -p -f 4 "$STAGE/base.apk" "$STAGE/aligned.apk"
 
 mkdir -p "$(dirname "$OUT")"
-if [ -n "${CITRUS_KEYSTORE:-}" ]; then
-    [ -f "$CITRUS_KEYSTORE" ] || die "CITRUS_KEYSTORE=$CITRUS_KEYSTORE does not exist"
-    [ -n "${CITRUS_KEYSTORE_PASS:-}" ] || die "CITRUS_KEYSTORE is set but CITRUS_KEYSTORE_PASS is not"
-    echo "== signing with $CITRUS_KEYSTORE"
-    SIGN=(--ks "$CITRUS_KEYSTORE" --ks-pass env:CITRUS_KEYSTORE_PASS)
-    [ -n "${CITRUS_KEY_ALIAS:-}" ] && SIGN+=(--ks-key-alias "$CITRUS_KEY_ALIAS")
-    if [ -n "${CITRUS_KEY_PASS:-}" ]; then SIGN+=(--key-pass env:CITRUS_KEY_PASS); else SIGN+=(--key-pass env:CITRUS_KEYSTORE_PASS); fi
+if [ -n "${ZESTENGINE_KEYSTORE:-}" ]; then
+    [ -f "$ZESTENGINE_KEYSTORE" ] || die "ZESTENGINE_KEYSTORE=$ZESTENGINE_KEYSTORE does not exist"
+    [ -n "${ZESTENGINE_KEYSTORE_PASS:-}" ] || die "ZESTENGINE_KEYSTORE is set but ZESTENGINE_KEYSTORE_PASS is not"
+    echo "== signing with $ZESTENGINE_KEYSTORE"
+    SIGN=(--ks "$ZESTENGINE_KEYSTORE" --ks-pass env:ZESTENGINE_KEYSTORE_PASS)
+    [ -n "${ZESTENGINE_KEY_ALIAS:-}" ] && SIGN+=(--ks-key-alias "$ZESTENGINE_KEY_ALIAS")
+    if [ -n "${ZESTENGINE_KEY_PASS:-}" ]; then SIGN+=(--key-pass env:ZESTENGINE_KEY_PASS); else SIGN+=(--key-pass env:ZESTENGINE_KEYSTORE_PASS); fi
 else
-    KEY=$(dirname "$OUT")/citrus-debug.keystore
+    KEY=$(dirname "$OUT")/zestengine-debug.keystore
     if [ ! -f "$KEY" ]; then
-        keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias citrus \
-            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Citrus Debug" >/dev/null
+        keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias zestengine \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=ZestEngine Debug" >/dev/null
     fi
     SIGN=(--ks "$KEY" --ks-pass pass:android --key-pass pass:android)
 fi

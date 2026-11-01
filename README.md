@@ -1,6 +1,6 @@
-# citrus
+# zestengine
 
-Citrus is a standalone 3D game engine in Rust + Vulkan with a dockable in-engine
+ZestEngine is a standalone 3D game engine in Rust + Vulkan with a dockable in-engine
 editor. It's a general-purpose desktop engine: scenes, materials, FBX/glTF
 import, a component + hot-reloadable Rust-plugin system, custom shaders, realtime
 global illumination (**Flux** — see below), a lighting bake, audio, physics
@@ -9,7 +9,7 @@ is on the roadmap, not a prerequisite.
 
 ## Flux — realtime global illumination
 
-Flux is Citrus's built-in realtime GI: a Lumen-style screen-space technique that
+Flux is ZestEngine's built-in realtime GI: a Lumen-style screen-space technique that
 needs no bake and no RT cores. Each frame it places sparse screen-space probes
 (one per 4x4 pixel block), reconstructs world position + normal from a depth
 prepass, and cosine-traces them against a cached **Global Distance Field** — a
@@ -36,7 +36,7 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 - **[BUGS.md](BUGS.md)** — open bugs, verify-after-rebuild items, crash/stability.
 - **[docs/components.md](docs/components.md)** — the component model, the in-game
   API (`ComponentCtx`), object references, and writing a Rust plugin.
-- **[docs/shaders.md](docs/shaders.md)** — the citrus standard shader.
+- **[docs/shaders.md](docs/shaders.md)** — the zestengine standard shader.
 
 ## Stack
 
@@ -50,25 +50,25 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 | Worlds/props | glTF 2.0, FBX (ufbx) |
 | Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones (planned); Bone Cloth for hair / skirts with auto-fitted body colliders |
 | Audio | [rodio](https://crates.io/crates/rodio) (.wav/.flac/.mp3) |
-| Default shader | citrus standard uber-shader, Poiyomi-inspired — see [docs/shaders.md](docs/shaders.md) |
+| Default shader | zestengine standard uber-shader, Poiyomi-inspired — see [docs/shaders.md](docs/shaders.md) |
 | Windowing | winit |
 
 ## Workspace layout
 
 ```
 crates/
-  citrus          binary entry point (desktop now, +VR at M4)
-  citrus-core     egui-free runtime API: components, ComponentCtx, ObjectId/Ref
-  citrus-engine   app loop, scene, timing, input, editor host
-  citrus-render   ash Vulkan renderer (context, swapchain, frames, bake)
-  citrus-xr       OpenXR session/swapchains/input          (stub)
-  citrus-assets   glTF/FBX, .material/.scene/project files, bake sidecars
-  citrus-editor   egui editor panels (inspector, files, code editor, components)
+  zestengine          binary entry point (desktop now, +VR at M4)
+  zestengine-core     egui-free runtime API: components, ComponentCtx, ObjectId/Ref
+  zestengine-engine   app loop, scene, timing, input, editor host
+  zestengine-render   ash Vulkan renderer (context, swapchain, frames, bake)
+  zestengine-xr       OpenXR session/swapchains/input          (stub)
+  zestengine-assets   glTF/FBX, .material/.scene/project files, bake sidecars
+  zestengine-editor   egui editor panels (inspector, files, code editor, components)
 plugins/
   components      example Rust component plugin (Orbit)
 ```
 
-A shipped game links `citrus-core` (through the engine) and never the editor:
+A shipped game links `zestengine-core` (through the engine) and never the editor:
 behaviour lives in core, inspector/gizmo code is gated behind an `editor` cargo
 feature. See [docs/components.md](docs/components.md).
 
@@ -82,7 +82,7 @@ what's already in:
 selection outline; camera preview tab; stats overlay; vsync toggle.
 
 **Assets & formats** — glTF and FBX import; built-in primitives; `.material`,
-`.scene`, and `project.citrus` files; `.wav`/`.flac`/`.mp3` audio.
+`.scene`, and `project.zestengine` files; `.wav`/`.flac`/`.mp3` audio.
 
 **Editor** — dockable panels (egui_dock); transform gizmos (move **W** / rotate
 **R** / scale **E**) with snapping, pivot/orientation modes, camera-relative
@@ -97,7 +97,7 @@ go-to-definition, references); a **vim mode** (motions, operators, visual,
 
 **Components & scripting** — `TypedComponent` system with built-ins
 (Light, Camera, Audio, Colliders, Spin, Bob, Light Probe Volume); cargo-built,
-hot-reloadable **Rust plugins** (runtime behaviour in `citrus-core`, editor
+hot-reloadable **Rust plugins** (runtime behaviour in `zestengine-core`, editor
 inspector/gizmo behind an `editor` feature); stable **object identity**
 (`ObjectId` UUID) with `ObjectRef` cross-object references set by dragging from
 the Scene tree; an in-game API (`ComponentCtx`) for transforms (incl.
@@ -106,14 +106,14 @@ custom **GLSL shaders**. Full reference in [docs/components.md](docs/components.
 
 **Projects & game builds** — **File → New Project** scaffolds a standalone cargo
 project (`scenes/ materials/ shaders/ textures/ src/main.rs` + a `plugins/components`
-crate + `project.citrus`) that builds and runs immediately; **File → Project Settings**
-sets the starting (boot) scene; **File → Build Game** (or `citrus --build`) compiles a
+crate + `project.zestengine`) that builds and runs immediately; **File → Project Settings**
+sets the starting (boot) scene; **File → Build Game** (or `zestengine --build`) compiles a
 **standalone executable + bundled `assets/`** under `build/`. **File → Build Game for
-Windows** (or `citrus --build <dir> --target windows`) cross-compiles from Linux with
+Windows** (or `zestengine --build <dir> --target windows`) cross-compiles from Linux with
 `cargo xwin` into `build-windows/` (needs `cargo install cargo-xwin` and
 `rustup target add x86_64-pc-windows-msvc`). A shipped game links the
-runtime only (`citrus-engine` with the editor cargo feature off), so no editor/egui_dock
-in the binary; the boot scene comes from `project.citrus` and is overridable in the
+runtime only (`zestengine-engine` with the editor cargo feature off), so no editor/egui_dock
+in the binary; the boot scene comes from `project.zestengine` and is overridable in the
 editable `src/main.rs`. Unsaved-changes prompt on exit.
 
 **Audio** — spatial / non-spatial `AudioSource` + `AudioListener` with distance
@@ -159,7 +159,7 @@ goals:
 
 - [x] **M1 — Foundation**: window + Vulkan device + swapchain, frames in flight,
       resize/out-of-date handling
-- [x] **M2 — Meshes & materials**: depth, orbit camera, glTF/FBX import, citrus
+- [x] **M2 — Meshes & materials**: depth, orbit camera, glTF/FBX import, zestengine
       standard shader phase 1, variant cache, egui material inspector with live edits
 - [ ] **M3 — Assets**: full glTF scenes, VRM avatar import (rig, blendshapes,
       spring bones), skinned animation
@@ -198,7 +198,7 @@ just release 0.2.0 "changes"   # bump, commit, tag, push, GitHub release
 ```
 
 Installation puts the editor, hub, relay and `libphonon.so` together under
-`<prefix>/lib/citrus`, adds links in `<prefix>/bin`, and installs a desktop
+`<prefix>/lib/zestengine`, adds links in `<prefix>/bin`, and installs a desktop
 launcher that opens the Project Hub. For a user install, put `$HOME/.local/bin`
 on `PATH`. Keep this source checkout available: generated game projects use
 local engine crate paths. The install is a local developer install.
@@ -211,24 +211,24 @@ files, creates `v<version>`, pushes the branch and that tag to `origin`, then
 creates a GitHub release with generated notes. It does not upload build artifacts.
 
 ```sh
-cargo run --bin citrus                      # the project in the current folder, else the Project Hub
-cargo run --bin citrus -- <project-dir>     # open a project directly
-cargo run --bin citrus-hub                  # the Project Hub
+cargo run --bin zestengine                      # the project in the current folder, else the Project Hub
+cargo run --bin zestengine -- <project-dir>     # open a project directly
+cargo run --bin zestengine-hub                  # the Project Hub
 ```
 
 Open a model or scene directly: `cargo run -- world.glb` / `model.fbx` /
-`scenes/world.scene` (the project is the folder above it holding `project.citrus`).
+`scenes/world.scene` (the project is the folder above it holding `project.zestengine`).
 
 ### Project Hub
 
-`citrus-hub` (or `citrus --hub`, or **File → Project Hub** in the editor) lists recent
+`zestengine-hub` (or `zestengine --hub`, or **File → Project Hub** in the editor) lists recent
 projects (pin, search, sort, show in file manager, locate moved ones), creates new
 projects from the templates and opens projects in the editor, which runs as its own
-process (`citrus <project-dir>`). The editor is found next to the hub executable; set
-`CITRUS_EDITOR` or the path in the hub's Settings otherwise. The recent list lives in
-`<config>/Citrus/projects.ron` (the editor records every project it opens there too),
-hub preferences in `<config>/Citrus/hub.ron`. A `thumbnail.png` in a project's root (or
-its `.citrus/` folder) is shown as its picture.
+process (`zestengine <project-dir>`). The editor is found next to the hub executable; set
+`ZESTENGINE_EDITOR` or the path in the hub's Settings otherwise. The recent list lives in
+`<config>/ZestEngine/projects.ron` (the editor records every project it opens there too),
+hub preferences in `<config>/ZestEngine/hub.ron`. A `thumbnail.png` in a project's root (or
+its `.zestengine/` folder) is shown as its picture.
 
 ### Editor
 
@@ -264,8 +264,8 @@ to pick the boot scene, **File → Build Game** to produce `build/<game>` + `bui
 The same is available headless:
 
 ```sh
-citrus --new-project <parent-dir> <name>   # scaffold a project
-citrus --build [project-dir]                # cargo build --release + bundle assets
+zestengine --new-project <parent-dir> <name>   # scaffold a project
+zestengine --build [project-dir]                # cargo build --release + bundle assets
 ```
 
 The output `build/` folder is self-contained and relocatable; run the executable

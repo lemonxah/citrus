@@ -1,18 +1,18 @@
 # VR avatars: height, scaling and full-body calibration
 
 A VR player's avatar should stand at the player's height, put its eyes where
-the headset is, and have each tracker drive the right body part. Citrus
+the headset is, and have each tracker drive the right body part. ZestEngine
 measures the player once, keeps the measurements per user, and fits whatever
-avatar they wear to them. The code is in `crates/citrus-core/src/body.rs` (data
-and math) and `crates/citrus-engine/src/body.rs` (devices, the calibration
+avatar they wear to them. The code is in `crates/zestengine-core/src/body.rs` (data
+and math) and `crates/zestengine-engine/src/body.rs` (devices, the calibration
 flow, the fit and the body panel).
 
 ## The player's body
 
-The engine keeps one `BodyProfile` per user in `Citrus/body.ron` in the user's
+The engine keeps one `BodyProfile` per user in `ZestEngine/body.ron` in the user's
 config folder (`%APPDATA%`, `~/Library/Application Support`,
-`$XDG_CONFIG_HOME` or `~/.config`; `CITRUS_CONFIG_DIR` overrides it; on Android
-the app's internal storage). Every Citrus game and the editor share it, so a
+`$XDG_CONFIG_HOME` or `~/.config`; `ZESTENGINE_CONFIG_DIR` overrides it; on Android
+the app's internal storage). Every ZestEngine game and the editor share it, so a
 player measures once. It holds:
 
 - `measured_eye_height`: the headset's height above the floor while standing
@@ -38,7 +38,7 @@ come from two places:
 
 - The OpenXR runtime's trackers (`XR_HTCX_vive_tracker_interaction`), one
   device per role path: `xr:waist`, `xr:left_foot`, ... The runtime decides
-  which tracker sits on which path (SteamVR's tracker roles); Citrus can move a
+  which tracker sits on which path (SteamVR's tracker roles); ZestEngine can move a
   path to another body role or ignore it.
 - SlimeVR, through the server's driver bridge (`slimevr.rs`), one device per
   server tracker keyed by its serial: `slimevr:<serial>`.
@@ -110,7 +110,7 @@ headset is running.
 
 The owner's Network Avatar (Drive From VR or Follow Local Player) sends the
 fitted avatar scale and the measured eye height as the synced variables
-`citrus.avatar_scale` and `citrus.eye_height` (reliable, late joiners catch
+`zestengine.avatar_scale` and `zestengine.eye_height` (reliable, late joiners catch
 up). Remote copies expose them as `avatar_scale` / `player_eye_height` and the
 avatar under a remote Network Avatar is scaled by `avatar_scale`, so everyone
 sees the same size. The replicated tracker targets are already calibrated
@@ -154,5 +154,5 @@ ctx.calibrate_trackers();           // capture the T-pose now
 - Runtime trackers are identified by their OpenXR role path, not their
   serial: `XR_HTCX_vive_tracker_interaction` binds actions per role path, and
   `XR_MNDX_xdev_space` is not used yet. Moving a physical tracker to another
-  SteamVR role moves its saved Citrus role with it.
+  SteamVR role moves its saved ZestEngine role with it.
 - Fingers are not tracked yet.

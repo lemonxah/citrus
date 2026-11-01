@@ -1,7 +1,7 @@
-"""Decode BlenderKit exports and normalize starter weapons for Citrus.
+"""Decode BlenderKit exports and normalize starter weapons for ZestEngine.
 
 blender --background --factory-startup --disable-autoexec --python tools/prepare_template_weapons.py
-Outputs plain glTF (no Draco requirement), metres, -Z forward in Citrus.
+Outputs plain glTF (no Draco requirement), metres, -Z forward in ZestEngine.
 """
 from pathlib import Path
 import json
@@ -16,7 +16,7 @@ manifest = {}
 for name in ('rifle', 'pistol', 'blaster'):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.import_scene.gltf(filepath=str(ROOT / f'models/weapons/blenderkit/{name}/{name}.glb'))
-    # Source textures are embedded as WebP. Citrus uses gltf::import, which
+    # Source textures are embedded as WebP. ZestEngine uses gltf::import, which
     # does not understand EXT_texture_webp (a required extension would make
     # the whole import fail). Force Blender to re-encode every image as PNG
     # before export so the exporter drops the WebP extension entirely.

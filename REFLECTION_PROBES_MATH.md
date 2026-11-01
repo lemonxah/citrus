@@ -1,12 +1,12 @@
 # Reflection-Probe Cubemapping: Mathematics & Implementation Reference
 
-A self-contained reference for Citrus's reflection-probe + IBL pipeline (Rust + Vulkan).
+A self-contained reference for ZestEngine's reflection-probe + IBL pipeline (Rust + Vulkan).
 Equations/code are quoted from primary sources where possible. Sources at the end.
 
 > **Authorship correction:** The parallax-corrected cubemap work is by **Sébastien Lagarde
 > & Antoine Zanuttini** (SIGGRAPH 2012), not "Zucconi."
 
-> **Citrus status callouts** are flagged inline as `> CITRUS:` — they map each piece of the
+> **ZestEngine status callouts** are flagged inline as `> ZESTENGINE:` — they map each piece of the
 > math to where it lives in our code, and whether we match the reference.
 
 ---
@@ -39,7 +39,7 @@ t = ( tc/|ma| + 1 ) / 2
 ```
 The divisor is `|ma|`, the **absolute** major-axis magnitude.
 
-> CITRUS: `citrus-render/src/lib.rs::ReflProbeJob::face_dir(face, fx, fy)` is the inverse of
+> ZESTENGINE: `zestengine-render/src/lib.rs::ReflProbeJob::face_dir(face, fx, fy)` is the inverse of
 > this table and is used by `build_face_mip0` to build the skybox cube from the equirect map.
 > Verified to match the spec exactly:
 > `+X → [1,-fy,-fx]`, `-X → [-1,-fy,fx]`, `+Y → [fx,1,fy]`, `-Y → [fx,-1,-fy]`,
@@ -74,7 +74,7 @@ canonical capture up-vectors are mostly `(0,-1,0)`.
 **Vulkan caveat (§5):** NDC/framebuffer Y points *down*, so the up vectors (esp. ±Y) must be
 retuned per engine, or top/bottom faces flip. The **dir** vectors stay the same.
 
-> CITRUS: `step_refl_capture` uses exactly these dir/up pairs with `Mat4::look_at_rh` + a
+> ZESTENGINE: `step_refl_capture` uses exactly these dir/up pairs with `Mat4::look_at_rh` + a
 > **positive-height** viewport. Traced per-face: pixel `(fx,fy)` on +X → world dir `[1,-fy,-fx]`,
 > on +Z → `[fx,-fy,1]`, on +Y → `[fx,1,fy]` — i.e. it reproduces `face_dir` (§1.2) exactly.
 > So the captured probe cube and the skybox cube share one convention. (See §5.2 on why the
@@ -110,7 +110,7 @@ R = reflect(-V, N) = 2·(N·V)·N − V        // "mirror the view vector about 
 Passing `+V` flips R and samples the opposite hemisphere — the classic "reflection on the
 wrong side / slides the wrong way" bug.
 
-> CITRUS: `standard.frag:784` is `vec3 R = reflect(-V, N);` with
+> ZESTENGINE: `standard.frag:784` is `vec3 R = reflect(-V, N);` with
 > `V = normalize(frame.camera_pos.xyz - v_world_pos)` (`:661`). **Correct** per the reference.
 
 ### 2.3 Mirror-sphere empirical validation (use this to judge correctness)
@@ -124,7 +124,7 @@ From `R = 2(N·V)N − V`:
   the camera; the scene wraps around the rim.
 - **Transition:** moving center→rim, R sweeps continuously from `V` (behind) to `−V` (front).
 
-> CITRUS takeaway: a chrome sphere catching the **sun near its silhouette** while the sun is in
+> ZESTENGINE takeaway: a chrome sphere catching the **sun near its silhouette** while the sun is in
 > front of you is **CORRECT**, not a bug. The sun only belongs at the *center* if it's behind
 > the camera. Judge orientation with the in-engine debug views (§6.9), which we added as render
 > modes 4 (mirror) and 5 (reflection-vector-as-RGB).
@@ -173,7 +173,7 @@ Re-vectoring with the **box center** `B` instead of `C` asks the cube for "what'
 C along `P−B`" — the wrong texel whenever `B ≠ C`. Result: reflections **spatially shifted off
 the surfaces they belong to**.
 
-> CITRUS — RESOLVED: verified that Citrus captures the cube AT the box center
+> ZESTENGINE — RESOLVED: verified that ZestEngine captures the cube AT the box center
 > (`active_reflection_probe` returns the probe's world position as `center`, which feeds BOTH
 > `request_reflection_capture(center)` and `ubo.refl_center`). So capture position == box
 > center, and `R = hit - refl_center` IS the correct Lagarde re-vector — no separate capture
@@ -219,7 +219,7 @@ Karis: assuming `n=v=r` is the **largest** error source — it loses the elongat
 stretch. **Mip↔roughness is an implementation choice** (no closed form in Karis):
 LearnOpenGL uses `sample = textureLod(prefilter, R, roughness*MAX_LOD)` (`MAX_LOD=4`).
 
-> CITRUS — FIXED (2026-06-18): `ENV_MAX_LOD` was a hardcoded `6.0` (= `cube_mip_count(64)-1`,
+> ZESTENGINE — FIXED (2026-06-18): `ENV_MAX_LOD` was a hardcoded `6.0` (= `cube_mip_count(64)-1`,
 > right for the 64px skybox cube) but a CAPTURED probe cube is 256px (9 mips), so `roughness=1`
 > sampled mip 6 of 9 → reflections **too sharp** on rough surfaces (a defined blob on a rough
 > floor instead of a smooth wash). Now `#define ENV_MAX_LOD (float(textureQueryLevels(u_env)-1))`
@@ -242,7 +242,7 @@ half3 EnvBRDFApprox(half3 SpecularColor, half Roughness, half NoV){
     return SpecularColor*AB.x+AB.y;
 }
 ```
-> CITRUS: `standard.frag::env_brdf_approx(roughness, NdotV)` is this function — used at `:819`.
+> ZESTENGINE: `standard.frag::env_brdf_approx(roughness, NdotV)` is this function — used at `:819`.
 > Matches the reference. (Lazarov's `a004` dielectric fit is the same curve reparameterized.)
 
 ---
@@ -264,13 +264,13 @@ flip is for the **swapchain pass only**; offscreen cube faces stay logically un-
 **Failure mode:** reusing the main-pass negative-height flip for cube faces **double-flips** →
 faces vertically inverted vs the sampling convention.
 
-> CITRUS: we already do this — capture uses a positive-height viewport with no-cull
+> ZESTENGINE: we already do this — capture uses a positive-height viewport with no-cull
 > (`capturing_refl`); the main pass uses negative-height. Confirmed consistent with `face_dir`.
 
 ### 5.3 Winding / culling
 Front/back = signed polygon area in **framebuffer** coords (post-viewport). A negative-height
 viewport flips area sign → reverses apparent winding. The Y-flip and frontFace/cull are
-**independent levers to keep consistent per render target**. Citrus sidesteps this in capture
+**independent levers to keep consistent per render target**. ZestEngine sidesteps this in capture
 by forcing **no-cull** (`force_no_cull = capturing_refl`).
 
 ### 5.4 Vertical flip vs handedness/horizontal mirror — distinguishing symptoms
@@ -297,7 +297,7 @@ backwards text); **even** (det +1) = rotation (orientation preserved, readable t
 | 6.7 | **No seamless filtering / face-by-face prefilter** | Hard **seams along cube-face edges**, worst on blurry mips. |
 | 6.8 | **Skybox inside-out / wrong face order** | Skybox disappears/black, or environment scrambled/rotated. |
 
-> CITRUS — status (2026-06-18): the reflection pipeline is now fixed end-to-end:
+> ZESTENGINE — status (2026-06-18): the reflection pipeline is now fixed end-to-end:
 > - **6.1/6.2/6.3 (orientation / handedness / reflect sign):** PROVEN CORRECT by an executable
 >   round-trip test (`refl_capture_tests::cube_capture_matches_sampling`) that simulates the GPU
 >   capture (look_at_rh + perspective_rh + positive viewport) for all 6 faces × 7 sample points
@@ -320,7 +320,7 @@ backwards text); **even** (det +1) = rotation (orientation preserved, readable t
 - **C. Sampled cube direction as RGB** — output `normalize(dir)*0.5+0.5`; +Z→blue, up→green.
   Tells whether a misorientation is in **direction math** (this) vs **face arrangement** (A).
 
-> CITRUS: render modes **4** (perfect mirror of the cube — variant of C/A) and **5**
+> ZESTENGINE: render modes **4** (perfect mirror of the cube — variant of C/A) and **5**
 > (reflection vector as RGB — view B) are wired in (`standard.frag` gi_dbg 4/5, editor render-
 > mode dropdown → "Reflection debug"). Use mode 5 on a sphere: if the center is **not** the
 > color of the behind-camera direction, it's a §6.3 sign bug; if every face mirrors, §6.1.

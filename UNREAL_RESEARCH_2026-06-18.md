@@ -1,7 +1,7 @@
 # Unreal Engine 5.8 Research — Baked Lighting, Reflections, Async Loading
 
 Source read: `/home/lemonxah/git/UnrealEngine-5.8.0-preview-1`. Findings drive the
-Citrus changes in this pass. File paths + symbols cited so they're re-checkable.
+ZestEngine changes in this pass. File paths + symbols cited so they're re-checkable.
 
 ---
 
@@ -101,7 +101,7 @@ Citrus changes in this pass. File paths + symbols cited so they're re-checkable.
    transfer-queue staging → create a new `VkImage` of the new mip count → copy the shared
    smaller mips → swap the handle. Spread over N frames, capped per frame.
 
-**Citrus status:** we already do worker-decode + main-thread GPU-apply + chunked bake + BC
+**ZestEngine status:** we already do worker-decode + main-thread GPU-apply + chunked bake + BC
 import cache. The new ideas to adopt are the **RAII per-frame time budget**, the
 **handle-as-refcount** async API, the **fence-depth frame lag** for egui smoothness, and
 **projected-size mip streaming**. (Documented as follow-ups; not all built this pass.)
@@ -144,7 +144,7 @@ import cache. The new ideas to adopt are the **RAII per-frame time budget**, the
    fix lets the non-metallic painted regions receive baked light, and the reflection fixes above
    give the metallic regions their reflections.)*
 
-7. **Box-projection math is now unit-tested** (`box_project_reflection` in citrus-core, the
+7. **Box-projection math is now unit-tested** (`box_project_reflection` in zestengine-core, the
    reference the shader must match): centre = identity, off-centre = parallax-corrected, hits the
    facing wall. Confirms the bug was orientation/stale-bake, not the projection math.
 
@@ -157,6 +157,6 @@ import cache. The new ideas to adopt are the **RAII per-frame time budget**, the
   **priority *selection*** (best single probe) + the correct blend/priority **algorithm documented**
   (§B.2) to implement next. The per-texel bake (sampling albedo/ORM in the bake gbuffer instead of
   the CPU mean) and **directional lightmaps** (§A.5) are the other two GPU-side follow-ups.
-- **Planar reflections** — the one reflection model UE has that Citrus lacks (mirror/water). Worth
+- **Planar reflections** — the one reflection model UE has that ZestEngine lacks (mirror/water). Worth
   adding after multi-probe; needs a per-planar-reflector scene re-render across a mirror plane.
 </content>

@@ -1,0 +1,459 @@
+//! glTF 2.0 import into a [`Scene`].
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context as _, Result, bail};
+use zestengine_render::{AlphaMode, MaterialFeatures, MaterialParams, MeshData, Vertex};
+use glam::{Mat4, Quat, Vec3};
+
+use crate::skeleton::{AnimChannel, AnimationClip, ChannelPath, Joint, Skeleton};
+use crate::{Instance, MeshSlot, Scene, SceneMaterial};
+
+pub fn load_gltf(path: impl AsRef<Path>) -> Result<Scene> {
+    let path = path.as_ref();
+    let (doc, buffers, images) =
+        gltf::import(path).with_context(|| format!("importing glTF file {}", path.display()))?;
+
+    let mut scene = Scene {
+        meshes: Vec::new(),
+        textures: Vec::new(),
+        materials: Vec::new(),
+        instances: Vec::new(),
+        skeletons: Vec::new(),
+        morphs: Vec::new(),
+        springs: Default::default(),
+        animations: Vec::new(),
+        collision: Vec::new(),
+    };
+    // (image index, srgb) -> scene texture index. The same image can be
+    // legally referenced as both color and data; cache per usage.
+    let mut texture_cache: HashMap<(usize, bool), usize> = HashMap::new();
+
+    let mut get_texture = |scene: &mut Scene, image_index: usize, srgb: bool| -> Result<usize> {
+        if let Some(&index) = texture_cache.get(&(image_index, srgb)) {
+            return Ok(index);
+        }
+        let data = rgba8_from_gltf(&images[image_index], srgb)?;
+        scene.textures.push(data);
+        let index = scene.textures.len() - 1;
+        texture_cache.insert((image_index, srgb), index);
+        Ok(index)
+    };
+
+    // Materials. Index i = glTF material i; one extra default at the end.
+    for material in doc.materials() {
+        let pbr = material.pbr_metallic_roughness();
+
+        let albedo = pbr
+            .base_color_texture()
+            .map(|t| get_texture(&mut scene, t.texture().source().index(), true))
+            .transpose()?;
+        let orm_info = pbr.metallic_roughness_texture();
+        let orm = orm_info
+            .as_ref()
+            .map(|t| get_texture(&mut scene, t.texture().source().index(), false))
+            .transpose()?;
+        let normal_info = material.normal_texture();
+        let normal = normal_info
+            .as_ref()
+            .map(|t| get_texture(&mut scene, t.texture().source().index(), false))
+            .transpose()?;
+        let emission_tex = material
+            .emissive_texture()
+            .map(|t| get_texture(&mut scene, t.texture().source().index(), true))
+            .transpose()?;
+
+        // Occlusion is only honored when packed into the same image as
+        // metallic-roughness (the common ORM layout); a separate occlusion
+        // texture would need its own slot.
+        let occlusion_strength = match (material.occlusion_texture(), &orm_info) {
+            (Some(occ), Some(mr))
+                if occ.texture().source().index() == mr.texture().source().index() =>
+            {
+                occ.strength()
+            }
+            _ => 0.0,
+        };
+
+        let emissive_factor = material.emissive_factor();
+        let emissive_strength = material.emissive_strength().unwrap_or(1.0);
+        let has_emission = emission_tex.is_some() || emissive_factor.iter().any(|&c| c > 0.0);
+
+        let (alpha_mode, alpha_cutoff) = match material.alpha_mode() {
+            gltf::material::AlphaMode::Opaque => (AlphaMode::Opaque, 0.5),
+            gltf::material::AlphaMode::Mask => {
+                (AlphaMode::Cutout, material.alpha_cutoff().unwrap_or(0.5))
+            }
+            gltf::material::AlphaMode::Blend => (AlphaMode::Blend, 0.5),
+        };
+
+        scene.materials.push(SceneMaterial {
+            name: material
+                .name()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("material {}", material.index().unwrap_or(0))),
+            params: MaterialParams {
+                base_color: pbr.base_color_factor(),
+                emission_color: emissive_factor,
+                emission_intensity: emissive_strength,
+                metallic: pbr.metallic_factor(),
+                roughness: pbr.roughness_factor(),
+                alpha_cutoff,
+                normal_strength: normal_info.as_ref().map_or(1.0, |n| n.scale()),
+                occlusion_strength,
+                pbr_toon_blend: 0.0, // glTF imports as pure PBR; toon is opt-in
+                ..MaterialParams::default()
+            },
+            features: MaterialFeatures {
+                toon: false,
+                normal_map: normal.is_some(),
+                emission: has_emission,
+                alpha_mode,
+                double_sided: material.double_sided(),
+                water: false,
+            },
+            albedo,
+            normal,
+            orm,
+            emission: emission_tex,
+        });
+    }
+    // Fallback for primitives without a material.
+    scene.materials.push(SceneMaterial {
+        name: "default".into(),
+        params: MaterialParams::default(),
+        features: MaterialFeatures::default(),
+        albedo: None,
+        normal: None,
+        orm: None,
+        emission: None,
+    });
+    let default_material = scene.materials.len() - 1;
+
+    // Meshes: each glTF primitive becomes one MeshData.
+    // (gltf mesh index, primitive index) -> (scene mesh, scene material)
+    let mut primitive_map: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    for mesh in doc.meshes() {
+        for primitive in mesh.primitives() {
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                tracing::warn!(
+                    mesh = mesh.name().unwrap_or("?"),
+                    "skipping non-triangle primitive"
+                );
+                continue;
+            }
+            let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+            let Some(positions) = reader.read_positions() else {
+                continue;
+            };
+            let positions: Vec<[f32; 3]> = positions.collect();
+            let normals: Vec<[f32; 3]> = reader
+                .read_normals()
+                .map(|n| n.collect())
+                .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
+            let uvs: Vec<[f32; 2]> = reader
+                .read_tex_coords(0)
+                .map(|t| t.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+            // Second UV set = lightmap UVs; fall back to the primary set when
+            // the model has no TEXCOORD_1. `real_uv1` distinguishes a genuine
+            // non-overlapping lightmap UV from the uv0 fallback (not bakeable).
+            let real_uv1 = reader.read_tex_coords(1).is_some();
+            let uvs1: Vec<[f32; 2]> = reader
+                .read_tex_coords(1)
+                .map(|t| t.into_f32().collect())
+                .unwrap_or_else(|| uvs.clone());
+            let colors: Vec<[f32; 4]> = reader
+                .read_colors(0)
+                .map(|c| c.into_rgba_f32().collect())
+                .unwrap_or_else(|| vec![[1.0; 4]; positions.len()]);
+            let tangents: Vec<[f32; 4]> = reader
+                .read_tangents()
+                .map(|t| t.collect())
+                .unwrap_or_else(|| vec![[1.0, 0.0, 0.0, 1.0]; positions.len()]);
+            // Skinning: joint indices (skin-local) + weights. Absent on static
+            // meshes → zero (the skinned pipeline variant is unused for them).
+            let joints: Vec<[u32; 4]> = reader
+                .read_joints(0)
+                .map(|j| {
+                    j.into_u16()
+                        .map(|[a, b, c, d]| [a as u32, b as u32, c as u32, d as u32])
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![[0u32; 4]; positions.len()]);
+            let weights: Vec<[f32; 4]> = reader
+                .read_weights(0)
+                .map(|w| w.into_f32().collect())
+                .unwrap_or_else(|| vec![[0.0f32; 4]; positions.len()]);
+
+            let vertices: Vec<Vertex> = (0..positions.len())
+                .map(|i| Vertex {
+                    position: positions[i],
+                    normal: normals[i],
+                    uv: uvs[i],
+                    color: colors[i],
+                    tangent: tangents[i],
+                    uv1: uvs1[i],
+                    joints: joints[i],
+                    weights: weights[i],
+                })
+                .collect();
+            let indices: Vec<u32> = reader
+                .read_indices()
+                .map(|i| i.into_u32().collect())
+                .unwrap_or_else(|| (0..vertices.len() as u32).collect());
+
+            // A real TEXCOORD_1 is a lightmap UV; otherwise uv1 falls back to uv0,
+            // which is still bakeable IF uv0 is a non-overlapping atlas (most
+            // models). Only genuinely overlapping/tiled uv0 needs a generated set.
+            // A real TEXCOORD_1 is a lightmap UV; otherwise uv1 falls back to uv0,
+            // which is still bakeable IF uv0 is a non-overlapping atlas (most
+            // models). Only genuinely overlapping/tiled uv0 needs a generated set.
+            let has_lightmap_uv =
+                real_uv1 || crate::lightmap_uv::uv0_is_lightmappable(&vertices, &indices);
+            let morphs = read_morphs(&reader, &mesh, &primitive, vertices.len());
+            if !morphs.is_empty() {
+                scene.morphs.resize(scene.meshes.len(), Vec::new());
+                scene.morphs.push(morphs);
+            }
+            scene.meshes.push(MeshData { vertices, indices, has_lightmap_uv });
+            let material = primitive.material().index().unwrap_or(default_material);
+            primitive_map.insert(
+                (mesh.index(), primitive.index()),
+                (scene.meshes.len() - 1, material),
+            );
+        }
+    }
+
+    // Skeletons (armatures) — one per glTF skin. Joints stay in skin order so
+    // the skin-local vertex joint indices line up. Parent links come from the
+    // node hierarchy (node -> parent node, mapped back to joint index).
+    let mut node_parent: HashMap<usize, usize> = HashMap::new();
+    for node in doc.nodes() {
+        for child in node.children() {
+            node_parent.insert(child.index(), node.index());
+        }
+    }
+    for skin in doc.skins() {
+        let reader = skin.reader(|b| Some(&buffers[b.index()]));
+        let ibms: Vec<Mat4> = reader
+            .read_inverse_bind_matrices()
+            .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+            .unwrap_or_default();
+        let joint_nodes: Vec<usize> = skin.joints().map(|j| j.index()).collect();
+        let node_to_joint: HashMap<usize, usize> =
+            joint_nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+        let mut joints = Vec::with_capacity(joint_nodes.len());
+        for (i, node) in skin.joints().enumerate() {
+            let (t, r, s) = node.transform().decomposed();
+            let parent = node_parent
+                .get(&node.index())
+                .and_then(|p| node_to_joint.get(p))
+                .copied();
+            joints.push(Joint {
+                name: node.name().unwrap_or("joint").to_string(),
+                parent,
+                inverse_bind: ibms.get(i).copied().unwrap_or(Mat4::IDENTITY),
+                rest_translation: Vec3::from(t),
+                rest_rotation: Quat::from_array(r),
+                rest_scale: Vec3::from(s),
+            });
+        }
+        scene.skeletons.push(Skeleton { joints });
+    }
+
+    // Animations: per-joint TRS channels. Joint indices are resolved against the
+    // first skin (the common single-armature case); channels targeting nodes not
+    // in that skin are skipped.
+    if let Some(skin) = doc.skins().next() {
+        let node_to_joint: HashMap<usize, usize> = skin
+            .joints()
+            .enumerate()
+            .map(|(i, j)| (j.index(), i))
+            .collect();
+        for anim in doc.animations() {
+            let mut channels = Vec::new();
+            let mut duration = 0.0f32;
+            for ch in anim.channels() {
+                let Some(&joint) = node_to_joint.get(&ch.target().node().index()) else {
+                    continue;
+                };
+                let reader = ch.reader(|b| Some(&buffers[b.index()]));
+                let times: Vec<f32> = match reader.read_inputs() {
+                    Some(it) => it.collect(),
+                    None => continue,
+                };
+                if let Some(last) = times.last() {
+                    duration = duration.max(*last);
+                }
+                use gltf::animation::util::ReadOutputs;
+                let (path, vecs, quats) = match reader.read_outputs() {
+                    Some(ReadOutputs::Translations(it)) => {
+                        (ChannelPath::Translation, it.map(Vec3::from).collect(), Vec::new())
+                    }
+                    Some(ReadOutputs::Scales(it)) => {
+                        (ChannelPath::Scale, it.map(Vec3::from).collect(), Vec::new())
+                    }
+                    Some(ReadOutputs::Rotations(it)) => (
+                        ChannelPath::Rotation,
+                        Vec::new(),
+                        it.into_f32().map(Quat::from_array).collect(),
+                    ),
+                    _ => continue, // morph-target weights unsupported
+                };
+                channels.push(AnimChannel {
+                    joint,
+                    path,
+                    times,
+                    vec_values: vecs,
+                    quat_values: quats,
+                });
+            }
+            if !channels.is_empty() {
+                scene.animations.push(AnimationClip {
+                    name: anim.name().unwrap_or("clip").to_string(),
+                    duration,
+                    channels,
+                });
+            }
+        }
+    }
+
+    // Instances from the node hierarchy.
+    let gltf_scene = doc
+        .default_scene()
+        .or_else(|| doc.scenes().next())
+        .context("glTF file contains no scenes")?;
+    for node in gltf_scene.nodes() {
+        visit_node(&node, Mat4::IDENTITY, &primitive_map, &mut scene.instances);
+    }
+
+    if scene.instances.is_empty() {
+        bail!("glTF scene produced no renderable instances");
+    }
+    scene.springs = crate::vrm::read_springs(path);
+    tracing::info!(
+        meshes = scene.meshes.len(),
+        materials = scene.materials.len(),
+        textures = scene.textures.len(),
+        instances = scene.instances.len(),
+        "glTF scene loaded"
+    );
+    Ok(scene)
+}
+
+fn visit_node(
+    node: &gltf::Node<'_>,
+    parent: Mat4,
+    primitive_map: &HashMap<(usize, usize), (usize, usize)>,
+    instances: &mut Vec<Instance>,
+) {
+    let transform = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+    if let Some(mesh) = node.mesh() {
+        let base_name = node
+            .name()
+            .or_else(|| mesh.name())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("node {}", node.index()));
+        // All of the mesh's primitives become material slots on one instance.
+        let slots: Vec<MeshSlot> = mesh
+            .primitives()
+            .filter_map(|primitive| {
+                primitive_map
+                    .get(&(mesh.index(), primitive.index()))
+                    .map(|&(mesh, material)| MeshSlot { mesh, material })
+            })
+            .collect();
+        if !slots.is_empty() {
+            instances.push(Instance {
+                name: base_name,
+                transform,
+                slots,
+            });
+        }
+    }
+    for child in node.children() {
+        visit_node(&child, transform, primitive_map, instances);
+    }
+}
+
+fn rgba8_from_gltf(data: &gltf::image::Data, srgb: bool) -> Result<zestengine_render::TextureData> {
+    use gltf::image::Format;
+    let pixel_count = (data.width * data.height) as usize;
+    let pixels = match data.format {
+        Format::R8G8B8A8 => data.pixels.clone(),
+        Format::R8G8B8 => {
+            let mut out = Vec::with_capacity(pixel_count * 4);
+            for chunk in data.pixels.as_chunks::<3>().0 {
+                out.extend_from_slice(chunk);
+                out.push(255);
+            }
+            out
+        }
+        Format::R8 => {
+            let mut out = Vec::with_capacity(pixel_count * 4);
+            for &v in &data.pixels {
+                out.extend_from_slice(&[v, v, v, 255]);
+            }
+            out
+        }
+        Format::R8G8 => {
+            let mut out = Vec::with_capacity(pixel_count * 4);
+            for chunk in data.pixels.as_chunks::<2>().0 {
+                out.extend_from_slice(&[chunk[0], chunk[1], 0, 255]);
+            }
+            out
+        }
+        other => bail!("unsupported glTF image format {other:?} (16-bit formats land in M3)"),
+    };
+    Ok(zestengine_render::TextureData {
+        width: data.width,
+        height: data.height,
+        pixels,
+        srgb,
+        hdr: false,
+    })
+}
+
+/// Blendshape names from `extras.targetNames` (on the primitive, else the mesh,
+/// as exporters write them).
+fn target_names(mesh: &gltf::Mesh, primitive: &gltf::Primitive) -> Vec<String> {
+    let parse = |extras: &gltf::json::Extras| -> Option<Vec<String>> {
+        let raw = extras.as_ref()?;
+        let v: serde_json::Value = serde_json::from_str(raw.get()).ok()?;
+        let names = v.get("targetNames")?.as_array()?;
+        Some(names.iter().map(|n| n.as_str().unwrap_or_default().to_owned()).collect())
+    };
+    parse(primitive.extras()).or_else(|| parse(mesh.extras())).unwrap_or_default()
+}
+
+/// A primitive's morph targets, keeping only the vertices each one moves.
+fn read_morphs<'a, 's, F>(
+    reader: &gltf::mesh::Reader<'a, 's, F>,
+    mesh: &gltf::Mesh,
+    primitive: &gltf::Primitive,
+    vertex_count: usize,
+) -> Vec<crate::MorphTarget>
+where
+    F: Clone + Fn(gltf::Buffer<'a>) -> Option<&'s [u8]>,
+{
+    let names = target_names(mesh, primitive);
+    let mut out = Vec::new();
+    for (k, (positions, normals, _)) in reader.read_morph_targets().enumerate() {
+        let p: Vec<[f32; 3]> = positions.map(|it| it.collect()).unwrap_or_default();
+        let n: Vec<[f32; 3]> = normals.map(|it| it.collect()).unwrap_or_default();
+        let mut deltas = Vec::new();
+        for v in 0..vertex_count {
+            let dp = p.get(v).copied().unwrap_or_default();
+            let dn = n.get(v).copied().unwrap_or_default();
+            if dp.iter().chain(&dn).any(|x| x.abs() > 1e-7) {
+                deltas.push((v as u32, dp, dn));
+            }
+        }
+        let name = names.get(k).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| format!("Shape {k}"));
+        out.push(crate::MorphTarget { name, deltas });
+    }
+    out
+}
+

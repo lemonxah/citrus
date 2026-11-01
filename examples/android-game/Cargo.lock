@@ -107,7 +107,7 @@ dependencies = [
 name = "android-game"
 version = "0.1.0"
 dependencies = [
- "citrus-engine",
+ "zestengine-engine",
  "tracing",
 ]
 
@@ -455,14 +455,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-assets"
+name = "zestengine-assets"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bcdec_rs",
  "bytemuck",
- "citrus-core",
- "citrus-render",
+ "zestengine-core",
+ "zestengine-render",
  "glam 0.30.10",
  "gltf",
  "half",
@@ -477,7 +477,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-core"
+name = "zestengine-core"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
@@ -488,18 +488,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-engine"
+name = "zestengine-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
  "chacha20poly1305",
  "chrono",
- "citrus-assets",
- "citrus-core",
- "citrus-relay",
- "citrus-render",
- "citrus-xr",
+ "zestengine-assets",
+ "zestengine-core",
+ "zestengine-relay",
+ "zestengine-render",
+ "zestengine-xr",
  "cpal",
  "ed25519-dalek",
  "egui",
@@ -522,7 +522,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-relay"
+name = "zestengine-relay"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
@@ -532,7 +532,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-render"
+name = "zestengine-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -552,7 +552,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-xr"
+name = "zestengine-xr"
 version = "0.1.0"
 dependencies = [
  "anyhow",

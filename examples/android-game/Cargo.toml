@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-citrus-engine = { path = "../../crates/citrus-engine", default-features = false }
+zestengine-engine = { path = "../../crates/zestengine-engine", default-features = false }
 tracing = "0.1"
 
 [profile.release]

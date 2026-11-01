@@ -1,14 +1,14 @@
-# Citrus Engine — Editor UI Design Spec
+# ZestEngine Engine — Editor UI Design Spec
 
 Status: design approved for implementation · Owner: Ryno · Reference mockup:
-"Citrus Engine editor redesign" Design canvas (artboard `Main.dc.html`, interactive)
+"ZestEngine Engine editor redesign" Design canvas (artboard `Main.dc.html`, interactive)
 
-This document describes the redesigned Citrus Engine editor shell: layout, visual
+This document describes the redesigned ZestEngine Engine editor shell: layout, visual
 tokens, every panel, and the interaction states. It is framework-agnostic. Map the
 tokens and components onto whatever UI layer the editor uses; do not change the
 values without checking with Ryno.
 
-Citrus is part of a suite with ZestPaint and ZestBay. It must read as the same
+ZestEngine is part of a suite with ZestPaint and ZestBay. It must read as the same
 family: same graphite surfaces, same IBM Plex type, same yellow accent. When in
 doubt, match ZestPaint.
 
@@ -152,8 +152,8 @@ Reference frame 1600×960. Fixed regions, fluid centre.
 Three zones: left and right are flex 1, centre is fixed so the transport is always
 centred.
 
-Left: logo mark (20 px citrus slice: yellow disc, dark ring and 6 segment lines, dark
-centre dot) + "Citrus" (13 px/600). Then menu buttons: File, Edit, Object, Tools,
+Left: logo mark (20 px zestengine slice: yellow disc, dark ring and 6 segment lines, dark
+centre dot) + "ZestEngine" (13 px/600). Then menu buttons: File, Edit, Object, Tools,
 View, Windows, Help (28 px tall, 9 px horizontal padding, transparent,
 text.secondary, 5 px radius).
 
@@ -164,7 +164,7 @@ containing:
   While playing it becomes a stop-square + "Stop" (still yellow).
 - Pause and Step — icon-only, 28×26. text.dim when stopped, text.body while playing.
 
-Right: breadcrumb "citrus / main.scene" (project dim, slash darker, scene
+Right: breadcrumb "zestengine / main.scene" (project dim, slash darker, scene
 text.secondary, ellipsis on overflow) · command search button (220 px, "Search
 commands" + Ctrl K in mono) · preferences gear (icon button).
 
@@ -404,7 +404,7 @@ dot r=1.6 in bg.chrome.
 
 ## 12. Out of scope / follow-ups
 
-- Light theme: ZestBay ships dark and light; Citrus should too. Not designed yet. Keep
+- Light theme: ZestBay ships dark and light; ZestEngine should too. Not designed yet. Keep
   every colour behind a token so a light palette can be swapped in.
 - Camera (game view) tab content.
 - Panel docking, undocking and saved layouts.

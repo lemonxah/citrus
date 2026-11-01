@@ -77,7 +77,7 @@ UE files worth re-reading per pillar:
 
 ## Where Flux fails today (mapped to our code)
 
-| Lumen | Flux (`crates/citrus-engine/src/sw_gi.rs`, `shaders/screen_gi.comp`, `shaders/standard.frag::screen_gi_upsample`) | Consequence |
+| Lumen | Flux (`crates/zestengine-engine/src/sw_gi.rs`, `shaders/screen_gi.comp`, `shaders/standard.frag::screen_gi_upsample`) | Consequence |
 |---|---|---|
 | 1 probe / 256 px, 64 rays/probe | **1 trace per pixel**, 6–24 cosine rays (`screen_gi.comp`) | ~256× more trace work → too few rays → variance |
 | Hit = read cached FinalLighting | Hit = re-shade (`direct_light` + `emitter_light` NEE) every ray | per-ray variance, no surface reuse |

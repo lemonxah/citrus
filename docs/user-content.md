@@ -1,13 +1,13 @@
-# User-generated content (`.citruspak`)
+# User-generated content (`.zestenginepak`)
 
-Players and creators can bring worlds, avatars and props into a running citrus
+Players and creators can bring worlds, avatars and props into a running zestengine
 game without recompiling it, the way VRChat loads worlds and avatars built in
 Unity. A creator builds a package in the editor (Tools > Build Content
 Package); the game loads it from a file or URL at runtime.
 
 ## Why this works without recompiling
 
-A citrus game is already split into data and code:
+A zestengine game is already split into data and code:
 
 - Scenes, materials, models, textures, audio, animation clips/controllers,
   baked lighting and custom shader *sources* are all data files.
@@ -26,7 +26,7 @@ Custom logic shipped inside content is future work (see the end).
 
 ## Package format
 
-A `.citruspak` is a zip archive (the `zip` crate was already in the dependency
+A `.zestenginepak` is a zip archive (the `zip` crate was already in the dependency
 tree; entries are deflated except already-compressed images/audio):
 
 ```text
@@ -74,10 +74,10 @@ Tools > Build Content Package opens the build window:
   moved to the origin.
 
 Analyse shows what would be written (files, size, triangles, texture memory,
-components, warnings, errors); Build writes `build/content/<name>.citruspak`
+components, warnings, errors); Build writes `build/content/<name>.zestenginepak`
 (or the chosen output path).
 
-The builder (`citrus_assets::package::plan_package`):
+The builder (`zestengine_assets::package::plan_package`):
 
 1. Classifies each component: engine built-in (kept), plugin (kept with a
    warning, or stripped by option), unknown (stripped).
@@ -115,15 +115,15 @@ work with no setup.
 
 ## Loading at runtime
 
-`ContentManager` (`crates/citrus-engine/src/content.rs`) lives in the game
+`ContentManager` (`crates/zestengine-engine/src/content.rs`) lives in the game
 runtime and in the editor's Play mode. Gameplay drives it through `ctx`:
 
 ```rust
 // Load only (validate + upload); result arrives as ContentEvent::Loaded.
-let req = ctx.load_content("https://example.com/forest.citruspak");
+let req = ctx.load_content("https://example.com/forest.zestenginepak");
 
 // Spawn a prop in front of the player.
-let (req, root) = ctx.spawn_content("/home/me/chair.citruspak", pos, rot);
+let (req, root) = ctx.spawn_content("/home/me/chair.zestenginepak", pos, rot);
 
 // Make an avatar package the player's body.
 ctx.spawn_avatar(self.player, avatar_id_or_path);
@@ -182,7 +182,7 @@ For HTTPS, a CDN or authentication, install a fetcher:
 
 ```rust
 struct MyFetcher;
-impl citrus_engine::content::ContentFetcher for MyFetcher {
+impl zestengine_engine::content::ContentFetcher for MyFetcher {
     fn fetch(&self, url: &str, dest: &Path, max_bytes: u64, progress: &dyn Fn(u64, Option<u64>)) -> Result<(), String> {
         // ureq / reqwest / platform HTTP here
     }
@@ -194,16 +194,16 @@ content_manager.set_fetcher(Arc::new(MyFetcher));
 
 The per-user cache defaults to `<cache dir>/<game title>/content`
 (`GameConfig::content_cache` overrides it; the editor uses
-`<project>/.citrus_content`). It holds one directory per content hash,
+`<project>/.zestengine_content`). It holds one directory per content hash,
 `sources.ron` (URL -> hash, so a URL isn't downloaded twice) and `downloads/`.
 `ContentCache::prune(max_bytes, keep)` evicts least-recently-used packages;
 `evict(hash)` removes one.
 
 ### Developer overlay
 
-Set `GameConfig::content_overlay` (or `CITRUS_CONTENT_OVERLAY=1`) and press F8
-in a built game: it lists `.citruspak` files in `<cache>/inbox`,
-`<assets>/content` and `CITRUS_CONTENT_DIR`, with Spawn / Wear / Enter buttons,
+Set `GameConfig::content_overlay` (or `ZESTENGINE_CONTENT_OVERLAY=1`) and press F8
+in a built game: it lists `.zestenginepak` files in `<cache>/inbox`,
+`<assets>/content` and `ZESTENGINE_CONTENT_DIR`, with Spawn / Wear / Enter buttons,
 the loaded packages with Unload, and a log of content events and warnings.
 
 ## Safety model (untrusted content)
@@ -284,14 +284,14 @@ untrusted content.
 
 ## Code map
 
-- `crates/citrus-assets/src/package.rs`: format, builder (`plan_package`,
+- `crates/zestengine-assets/src/package.rs`: format, builder (`plan_package`,
   `write_package`), reader (`PackageReader`), validation, `ContentCache`,
   extraction / sanitizing, SHA-256.
-- `crates/citrus-assets/src/tex_cache.rs`: `texture_cache_blob`,
+- `crates/zestengine-assets/src/tex_cache.rs`: `texture_cache_blob`,
   `seed_texture_cache`, `validate_compressed`.
-- `crates/citrus-core/src/content.rs`: `ContentKind`, `ContentEvent`,
+- `crates/zestengine-core/src/content.rs`: `ContentKind`, `ContentEvent`,
   `ContentCommand`, `AvatarDescriptor`, the `ctx` methods.
-- `crates/citrus-engine/src/content.rs`: `ContentManager`, worker
+- `crates/zestengine-engine/src/content.rs`: `ContentManager`, worker
   (`load_package_on_worker`), `HttpFetcher`, F8 overlay, editor build window.
-- `crates/citrus-engine/src/scene_loader.rs`: `load_on_worker_checked`,
+- `crates/zestengine-engine/src/scene_loader.rs`: `load_on_worker_checked`,
   `SceneFlow::switch_to_loaded`.

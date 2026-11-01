@@ -360,13 +360,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-assets"
+name = "zestengine-assets"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
- "citrus-core",
- "citrus-render",
+ "zestengine-core",
+ "zestengine-render",
  "glam 0.30.10",
  "gltf",
  "half",
@@ -380,7 +380,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-core"
+name = "zestengine-core"
 version = "0.1.0"
 dependencies = [
  "getrandom",
@@ -391,15 +391,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-engine"
+name = "zestengine-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "citrus-assets",
- "citrus-core",
- "citrus-render",
- "citrus-xr",
+ "zestengine-assets",
+ "zestengine-core",
+ "zestengine-render",
+ "zestengine-xr",
  "cpal",
  "egui",
  "gilrs",
@@ -415,16 +415,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-project-components"
+name = "zestengine-project-components"
 version = "0.1.0"
 dependencies = [
- "citrus-core",
+ "zestengine-core",
  "glam 0.30.10",
  "serde",
 ]
 
 [[package]]
-name = "citrus-render"
+name = "zestengine-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -444,7 +444,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus-xr"
+name = "zestengine-xr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2549,8 +2549,8 @@ name = "sample-game"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "citrus-engine",
- "citrus-project-components",
+ "zestengine-engine",
+ "zestengine-project-components",
 ]
 
 [[package]]

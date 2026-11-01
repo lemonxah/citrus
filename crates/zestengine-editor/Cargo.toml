@@ -1,0 +1,19 @@
+[package]
+name = "zestengine-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zestengine-core.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+glam.workspace = true
+image.workspace = true
+regex.workspace = true
+serde.workspace = true
+syntect.workspace = true
+ron.workspace = true
+tracing.workspace = true
+egui_dock.workspace = true
+egui-phosphor = "0.11" # icon font; 0.11 = egui 0.33 (0.12 needs egui 0.34)

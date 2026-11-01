@@ -1,15 +1,15 @@
 # Default template assets
 
 Working inventory and replacement checklist, checked 2026-10-31 against
-`crates/citrus-engine/src/templates/`. BlenderKit catalogue candidates below
+`crates/zestengine-engine/src/templates/`. BlenderKit catalogue candidates below
 have not yet passed visual, deformation or in-engine material validation.
 
 **Status update (2026-10-31, later same day):** mannequins and weapons are now
-integrated in code (see sections below) and pass `cargo test -p citrus-engine
+integrated in code (see sections below) and pass `cargo test -p zestengine-engine
 templates::tests`. Prepared weapon GLBs were re-exported with PNG textures
 instead of embedded WebP, which `EXT_texture_webp` made `gltf::import` (used by
-Citrus) refuse to load; a `weapon_models_import_in_citrus` test now imports all
-three through the real Citrus loader. Muzzle position and forward sign were
+ZestEngine) refuse to load; a `weapon_models_import_in_zestengine` test now imports all
+three through the real ZestEngine loader. Muzzle position and forward sign were
 visually confirmed with an offline Blender render (all three weapons' barrels
 point in the engine's -Z forward convention). Hand-to-grip attachment is still
 not implemented: weapons are positioned near the body/camera but are not
@@ -125,7 +125,7 @@ KayKit 1.1 is downloaded to `animations/kaykit/` (provenance in its
 clips: `Running_Strafe_Left`, `Running_Strafe_Right`, `Walking_Backwards`,
 `Dodge_Left/Right/Forward/Backward`, `Crouching`, `Sneaking`; `MovementBasic` has
 `Walking_A/B/C`, `Running_A/B`, `Jump_*`, `T-Pose`. There is **no** dedicated
-turn-in-place clip. KayKit uses a Mixamo-style rig, unlike the VRM-style Citrus
+turn-in-place clip. KayKit uses a Mixamo-style rig, unlike the VRM-style ZestEngine
 mannequins; the retarget bone map is `hips→pelvis, spine→spine_01, chest→spine_02,
 head→Head, upperarm.*→upperarm_*, lowerarm.*→lowerarm_*, wrist/hand.*→hand_*,
 upperleg.*→thigh_*, lowerleg.*→calf_*, foot.*→foot_*, toes.*→ball_*` (adapt
@@ -137,8 +137,8 @@ Review editable-asset redistribution separately before bundling Mixamo downloads
 **Decision (2026-10-31): kept the free Standard pack, did not acquire a new
 animation source this pass.** `TemplateAvatar` already computes and exposes
 `Forward`/`Right`/`Turn` Animator parameters from actual root motion
-(`crates/citrus-core/src/kit/avatar.rs`). The default `.animctrl`
-(`crates/citrus-engine/src/templates/avatar.rs::controller`) now blends the
+(`crates/zestengine-core/src/kit/avatar.rs`). The default `.animctrl`
+(`crates/zestengine-engine/src/templates/avatar.rs::controller`) now blends the
 Locomotion and Crouch states on a genuine 2D blend tree keyed on `Right`
 (x) and `Forward` (y) instead of raw planar speed, using the Animator's
 existing 2D blend-tree support (`BlendTree::parameter_y`, previously unused).
@@ -179,7 +179,7 @@ left/right commands. Animation availability alone does not prove integration.
       offsets or real two-bone arm IK onto the weapon grip, not done this pass.
 - [ ] Add shared locomotion/turning animation setup for TPS, top-down and RTS (Forward/Right directional blend done; dedicated turning/strafe clips not sourced, see Animation sources above).
 - [ ] Replace current scenery in small groups, retaining colliders and interactions. (Done so far: FPS/TPS wooden + metal crates, CC0; RTS tree + town hall; top-down lamp post + treasure chest; VR Social table + throwable ball. Converted but not wired: wall sconce. Unreachable with current Free-tier credential: concrete cover, lever, gate, rock. All in `models/props/`, provenance in `models/props/blenderkit/<name>/source.json`.)
-- [x] Verify each template scaffolds, loads and runs (`cargo test -p citrus-engine templates::tests`); desktop/VR fallback and multiplayer avatar selection still need manual/headset verification.
+- [x] Verify each template scaffolds, loads and runs (`cargo test -p zestengine-engine templates::tests`); desktop/VR fallback and multiplayer avatar selection still need manual/headset verification.
 - [ ] Visually check both genders, foot sliding, reversals, weapon grips, mirrors and VR body fit (muzzle position/forward sign checked by offline render; hand-grip attachment, in-headset VR fit and live reversal/sliding checks are not done). A real first-person bug was found and fixed by code review: FPS and VR Shooter's head cameras sat inside the avatar's own head model with no layer exclusion, so the player would see the inside of their own head mesh; both cameras now exclude `CHARACTER_LAYER` via a new `Scene::hide_own_body_from_camera`, covered by `first_person_cameras_exclude_the_avatar_body_layer`. TPS intentionally keeps the body layer visible (third person). This is a headless-test-verified fix, not an in-headset/GPU visual confirmation.
 
 Keep stable gameplay roots and put replaceable visuals under them: changing a

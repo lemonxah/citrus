@@ -12,10 +12,10 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-# citrus-core: engine-runtime API shared by the engine, editor, and plugins
+# zestengine-core: engine-runtime API shared by the engine, editor, and plugins
 # (component/behaviour traits, ComponentCtx, Transform). Deliberately egui-free
 # so a shipped game links it without any editor code.
-citrus-core = { path = "crates/citrus-core" }
+zestengine-core = { path = "crates/zestengine-core" }
 # graphics
 ash = "0.38"
 ash-window = "0.13"
@@ -78,12 +78,12 @@ hmac = "0.12"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 
 # internal crates
-citrus-engine = { path = "crates/citrus-engine" }
-citrus-render = { path = "crates/citrus-render" }
-citrus-assets = { path = "crates/citrus-assets" }
-citrus-editor = { path = "crates/citrus-editor" }
-citrus-xr = { path = "crates/citrus-xr" }
-citrus-relay = { path = "crates/citrus-relay" }
+zestengine-engine = { path = "crates/zestengine-engine" }
+zestengine-render = { path = "crates/zestengine-render" }
+zestengine-assets = { path = "crates/zestengine-assets" }
+zestengine-editor = { path = "crates/zestengine-editor" }
+zestengine-xr = { path = "crates/zestengine-xr" }
+zestengine-relay = { path = "crates/zestengine-relay" }
 
 [profile.dev]
 # Vulkan bootstrap is slow in pure debug; optimize deps but keep our code debuggable.
@@ -91,3 +91,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# cpal 0.15.3 backport: route the ALSA POLLERR (a stuck xrun) to the XRun
+# recovery path instead of erroring forever in a poll loop. Upstream fixed this
+# in cpal 0.18, but rodio 0.19 pins cpal 0.15, so we vendor + patch. See
+# vendor/cpal/src/host/alsa/mod.rs for the one-line change.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

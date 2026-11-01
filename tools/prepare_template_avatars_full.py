@@ -101,8 +101,8 @@ def prepare(variant):
         else:
             heads[bone.name] = bone.head_local * ratio
 
-    armature = bpy.data.armatures.new("Citrus Humanoid")
-    target = bpy.data.objects.new("Citrus Humanoid", armature)
+    armature = bpy.data.armatures.new("ZestEngine Humanoid")
+    target = bpy.data.objects.new("ZestEngine Humanoid", armature)
     bpy.context.collection.objects.link(target)
     bpy.context.view_layer.objects.active = target
     target.select_set(True)
@@ -136,7 +136,7 @@ def prepare(variant):
     modifier = mesh.modifiers.new("Humanoid Skin", "ARMATURE")
     modifier.object = target
     mesh.parent = target
-    mesh.name = f"Citrus {variant.title()}"
+    mesh.name = f"ZestEngine {variant.title()}"
     mesh.data.name = mesh.name
     target.animation_data_create()
     source.animation_data_create()
@@ -146,7 +146,7 @@ def prepare(variant):
         source.animation_data.action = action
         if action.slots:
             source.animation_data.action_slot = action.slots[0]
-        baked = bpy.data.actions.new(action.name + "_Citrus")
+        baked = bpy.data.actions.new(action.name + "_ZestEngine")
         target.animation_data.action = baked
         start, end = action.frame_range
         length = max(1, math.ceil(end - start))
@@ -184,7 +184,7 @@ def prepare(variant):
         kay_source.animation_data.action = action
         if action.slots:
             kay_source.animation_data.action_slot = action.slots[0]
-        baked = bpy.data.actions.new(action.name + "_Citrus")
+        baked = bpy.data.actions.new(action.name + "_ZestEngine")
         target.animation_data.action = baked
         start, end = action.frame_range
         length = max(1, math.ceil(end - start))

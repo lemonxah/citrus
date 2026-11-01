@@ -1,0 +1,14 @@
+[package]
+name = "zestengine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zestengine"
+path = "src/main.rs"
+
+[dependencies]
+zestengine-engine.workspace = true
+zestengine-assets.workspace = true
+anyhow.workspace = true

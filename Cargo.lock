@@ -310,6 +310,26 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.13.0",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex 1.3.0",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
@@ -323,7 +343,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "shlex 1.3.0",
  "syn 2.0.117",
 ]
@@ -341,7 +361,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "shlex 1.3.0",
  "syn 2.0.117",
 ]
@@ -574,195 +594,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "citrus"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "citrus-assets",
- "citrus-engine",
-]
-
-[[package]]
-name = "citrus-assets"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bcdec_rs",
- "bytemuck",
- "cc",
- "citrus-core",
- "citrus-render",
- "glam 0.30.10",
- "gltf",
- "half",
- "image",
- "intel_tex_2",
- "ron",
- "serde",
- "serde_json",
- "texture2ddecoder",
- "tracing",
- "ufbx",
- "zip",
-]
-
-[[package]]
-name = "citrus-core"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "glam 0.30.10",
- "ron",
- "serde",
- "tracing",
-]
-
-[[package]]
-name = "citrus-editor"
-version = "0.1.0"
-dependencies = [
- "citrus-core",
- "egui",
- "egui-phosphor",
- "egui_dock",
- "egui_extras",
- "glam 0.30.10",
- "image",
- "regex",
- "ron",
- "serde",
- "syntect",
- "tracing",
-]
-
-[[package]]
-name = "citrus-engine"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "anyhow",
- "argon2",
- "audionimbus",
- "chacha20poly1305",
- "chrono",
- "citrus-assets",
- "citrus-core",
- "citrus-editor",
- "citrus-relay",
- "citrus-render",
- "citrus-xr",
- "cpal",
- "ed25519-dalek",
- "egui",
- "egui-winit",
- "egui_dock",
- "getrandom 0.3.4",
- "gilrs",
- "glam 0.30.10",
- "hecs",
- "hkdf",
- "hmac",
- "image",
- "jni 0.21.1",
- "libc",
- "libloading 0.8.9",
- "ndk-context",
- "rapier3d",
- "rodio",
- "ron",
- "serde",
- "serde_json",
- "sha2",
- "softbuffer",
- "tracing",
- "tracing-subscriber",
- "transform-gizmo-egui",
- "winit",
-]
-
-[[package]]
-name = "citrus-hub"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "citrus-assets",
- "citrus-editor",
- "citrus-render",
- "egui",
- "egui-winit",
- "image",
- "ksni",
- "ron",
- "serde",
- "tracing",
- "tracing-subscriber",
- "winit",
-]
-
-[[package]]
-name = "citrus-project-components"
-version = "0.1.0"
-dependencies = [
- "citrus-core",
- "citrus-editor",
- "egui",
- "glam 0.30.10",
- "serde",
-]
-
-[[package]]
-name = "citrus-relay"
-version = "0.1.0"
-dependencies = [
- "chacha20poly1305",
- "curve25519-dalek",
- "ed25519-dalek",
- "getrandom 0.3.4",
- "hkdf",
- "hmac",
- "sha2",
-]
-
-[[package]]
-name = "citrus-render"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "ash-window",
- "bytemuck",
- "egui",
- "egui-ash-renderer",
- "glam 0.30.10",
- "gpu-allocator",
- "half",
- "openxr",
- "raw-window-handle",
- "serde",
- "tracing",
- "winit",
-]
-
-[[package]]
-name = "citrus-scripting"
-version = "0.1.0"
-dependencies = [
- "wasmtime",
- "wat",
-]
-
-[[package]]
-name = "citrus-xr"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "glam 0.30.10",
- "openxr",
- "tracing",
-]
-
-[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -912,8 +743,6 @@ dependencies = [
 [[package]]
 name = "cpal"
 version = "0.15.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "873dab07c8f743075e57f524c583985fbaf745602acbe916a01539364369a779"
 dependencies = [
  "alsa",
  "core-foundation-sys",
@@ -1011,7 +840,7 @@ dependencies = [
  "postcard",
  "pulley-interpreter",
  "regalloc2",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_derive",
  "sha2",
@@ -1897,7 +1726,7 @@ checksum = "25234f20a3ec0a962a61770cfe39ecf03cb529a6e474ad8cff025ed497eda557"
 dependencies = [
  "bitflags 2.13.0",
  "debugid",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_derive",
  "serde_json",
@@ -3840,7 +3669,7 @@ dependencies = [
  "bumpalo",
  "hashbrown 0.17.1",
  "log",
- "rustc-hash",
+ "rustc-hash 2.1.2",
  "serde",
  "smallvec",
 ]
@@ -3923,6 +3752,12 @@ name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
+name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"
@@ -5991,6 +5826,196 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+
+[[package]]
+name = "zestengine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "zestengine-assets",
+ "zestengine-engine",
+]
+
+[[package]]
+name = "zestengine-assets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bcdec_rs",
+ "bytemuck",
+ "cc",
+ "glam 0.30.10",
+ "gltf",
+ "half",
+ "image",
+ "intel_tex_2",
+ "ron",
+ "serde",
+ "serde_json",
+ "texture2ddecoder",
+ "tracing",
+ "ufbx",
+ "zestengine-core",
+ "zestengine-render",
+ "zip",
+]
+
+[[package]]
+name = "zestengine-core"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "glam 0.30.10",
+ "ron",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "zestengine-editor"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-phosphor",
+ "egui_dock",
+ "egui_extras",
+ "glam 0.30.10",
+ "image",
+ "regex",
+ "ron",
+ "serde",
+ "syntect",
+ "tracing",
+ "zestengine-core",
+]
+
+[[package]]
+name = "zestengine-engine"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "anyhow",
+ "argon2",
+ "audionimbus",
+ "chacha20poly1305",
+ "chrono",
+ "cpal",
+ "ed25519-dalek",
+ "egui",
+ "egui-winit",
+ "egui_dock",
+ "getrandom 0.3.4",
+ "gilrs",
+ "glam 0.30.10",
+ "hecs",
+ "hkdf",
+ "hmac",
+ "image",
+ "jni 0.21.1",
+ "libc",
+ "libloading 0.8.9",
+ "ndk-context",
+ "rapier3d",
+ "rodio",
+ "ron",
+ "serde",
+ "serde_json",
+ "sha2",
+ "softbuffer",
+ "tracing",
+ "tracing-subscriber",
+ "transform-gizmo-egui",
+ "winit",
+ "zestengine-assets",
+ "zestengine-core",
+ "zestengine-editor",
+ "zestengine-relay",
+ "zestengine-render",
+ "zestengine-xr",
+]
+
+[[package]]
+name = "zestengine-hub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "egui",
+ "egui-winit",
+ "image",
+ "ksni",
+ "ron",
+ "serde",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+ "zestengine-assets",
+ "zestengine-editor",
+ "zestengine-render",
+]
+
+[[package]]
+name = "zestengine-project-components"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "glam 0.30.10",
+ "serde",
+ "zestengine-core",
+ "zestengine-editor",
+]
+
+[[package]]
+name = "zestengine-relay"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "hkdf",
+ "hmac",
+ "sha2",
+]
+
+[[package]]
+name = "zestengine-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "ash-window",
+ "bindgen 0.70.1",
+ "bytemuck",
+ "egui",
+ "egui-ash-renderer",
+ "glam 0.30.10",
+ "gpu-allocator",
+ "half",
+ "openxr",
+ "raw-window-handle",
+ "serde",
+ "tracing",
+ "winit",
+]
+
+[[package]]
+name = "zestengine-scripting"
+version = "0.1.0"
+dependencies = [
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
+name = "zestengine-xr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "glam 0.30.10",
+ "openxr",
+ "tracing",
+]
 
 [[package]]
 name = "zip"

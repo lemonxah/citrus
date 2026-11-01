@@ -1,9 +1,9 @@
-# Citrus Engine — Review & Outstanding Work (2026-10-30)
+# ZestEngine Engine — Review & Outstanding Work (2026-10-30)
 
 This pass covered three things:
 - Flux / FluxRT / FluxVoxel correctness and performance.
 - A full render-pipeline review: HDR end to end, CPU stalls, wasted passes.
-- A large feature batch: physics and navigation gizmos, animation controllers, the shader system v2 with Citrus Toon, project templates, built-in networking, user-generated content, and Windows builds.
+- A large feature batch: physics and navigation gizmos, animation controllers, the shader system v2 with ZestEngine Toon, project templates, built-in networking, user-generated content, and Windows builds.
 
 The second half of this document is the honest list of what is still missing, including the platform picture: Linux, Windows and Android.
 
@@ -87,7 +87,7 @@ Method:
 - **After:** the working tree.
 - **Both:** run as the sample game on HEAD's own `world.scene`, with no bake, the orbs animating, and vsync off.
 - **Timings:** GPU time comes from the renderer's timestamp zones. Frame time is the mean wall-clock interval over 240 frames.
-- **Reproduce:** `CITRUS_FRAME_STATS=1` turns this logging on in any game build. It also records the GPU timestamp zones without the profiler window, and logs draw calls.
+- **Reproduce:** `ZESTENGINE_FRAME_STATS=1` turns this logging on in any game build. It also records the GPU timestamp zones without the profiler window, and logs draw calls.
 
 | GI mode | Frame (ms) before → after | GPU (ms) before → after | GI pass (ms) before → after | Shadows (ms) before → after |
 | --- | --- | --- | --- | --- |
@@ -101,7 +101,7 @@ What the table shows:
 - **The "after" column includes added work:** HDR bloom and the per-object depth prepass, which HEAD didn't have.
 - **A still scene costs less:** once the GI converges and nothing moves, the trace is skipped (GI pass 0 ms). Your scene with its bake, frozen orbs and FluxRT runs at 0.26 ms per frame (0.24 ms GPU).
 
-Later passes the same night, profiled with new GPU zones inside the Flux trace (gather / denoise / integrate, also in the profiler and the `CITRUS_FRAME_STATS` log):
+Later passes the same night, profiled with new GPU zones inside the Flux trace (gather / denoise / integrate, also in the profiler and the `ZESTENGINE_FRAME_STATS` log):
 - **Flux (software) gather: 1.34 → 0.87 ms (-35%).** Hits no longer march a shadow ray for lights whose unshadowed contribution there is below 1e-3, and the hit normal uses a 4-tap tetrahedral gradient instead of 6 taps. Shadow rays also stop where they leave the GDF box, so a directional light's ray no longer runs all 96 steps. Image difference against the previous build: mean 0.47/255 (temporal noise).
   - The whole Flux GI pass is now 1.00 ms (was 1.90 in HEAD), and the frame is 1.27 ms (was 3.22).
 - **FluxRT gather: 0.29 → 0.27 ms** from the same light threshold on its ray-query shadow rays.
@@ -139,10 +139,10 @@ The underlying primitive is `GizmoSpec::Lines`.
 - **Authored `.anim` clips.**
 - **Editor tabs:** Animator Controller and Animation.
 
-### 1.6 Shader system v2 and Citrus Toon
+### 1.6 Shader system v2 and ZestEngine Toon
 - **External shaders:** GLSL or HLSL files declare their properties (`@property`, `@feature`, `@preset`), and those properties appear in the inspector.
 - **Variants:** feature toggles compile to specialization-constant keyword variants, so a material's pipeline contains only the features it uses. The game bundle bakes these variants.
-- **Citrus Toon** is a single Poiyomi-style uber shader with Simple, Medium and Heavy presets. It covers:
+- **ZestEngine Toon** is a single Poiyomi-style uber shader with Simple, Medium and Heavy presets. It covers:
   - toon ramps, rim, matcaps, specular modes
   - emission, detail and decal layers
   - dissolve, glitter, UV discard, parallax
@@ -150,18 +150,18 @@ The underlying primitive is `GizmoSpec::Lines`.
 - **GPU check:** toon shading, rim and outline all render. A red outline test is in the sample game.
 
 ### 1.7 Templates, networking, user content
-- **Templates:** FPS, TPS, top-down click-to-move, strategy, VR shooter and VR social, plus a gameplay kit. Each template plays immediately; there is a New Project dialog and `citrus --new-project`.
+- **Templates:** FPS, TPS, top-down click-to-move, strategy, VR shooter and VR social, plus a gameplay kit. Each template plays immediately; there is a New Project dialog and `zestengine --new-project`.
 - **Networking:**
   - `NetworkObject` with ownership, interpolation and active/parent sync
   - `NetworkVariables`, RPCs, `NetworkAnimator`, `NetworkAvatar`
   - a Network Manager with a player prefab, spawn points and auto-start
   - LAN discovery and a Network window
-- **User content:** `.citruspak` packages (avatars, worlds, props) load into a running game without recompiling. They are hashed, sanitised, size-limited and cached.
+- **User content:** `.zestenginepak` packages (avatars, worlds, props) load into a running game without recompiling. They are hashed, sanitised, size-limited and cached.
 
 ### 1.8 Follow-ups finished in this pass
 - **Windows game builds from Linux.**
   - Build targets: `BuildTarget::{Host, Windows}`.
-  - Project Settings has a Target dropdown, and the File menu has **Build Game for Windows**. From the CLI: `citrus --build <dir> --target windows`.
+  - Project Settings has a Target dropdown, and the File menu has **Build Game for Windows**. From the CLI: `zestengine --build <dir> --target windows`.
   - The build cross-compiles with `cargo xwin` and the MSVC toolchain, then ships `phonon.dll` (Steam Audio) and its licence files in `build-windows/`.
   - Verified: the FPS template built in 92 s using the shared target dir. Under Wine the exe found the RTX 4080, started Steam Audio and rendered the HUD, sky and shadows.
 - **Game builds run in the background.** They used to block the editor UI; they now run as a background task with progress shown in the status bar.
@@ -206,7 +206,7 @@ This is the primary development platform. The editor, game builds, VR (OpenXR) a
   - The engine and the sample game build for `aarch64-linux-android` with the installed NDK r29 (`/opt/android-sdk`), producing an ARM64 Android ELF.
   - winit uses `android-native-activity` on Android.
   - The plugin loader knows `.so` on Android.
-  - `citrus_engine::run_game_android(app, config, register)` (with `AndroidApp` re-exported) is the entry point for a game's `android_main`.
+  - `zestengine_engine::run_game_android(app, config, register)` (with `AndroidApp` re-exported) is the entry point for a game's `android_main`.
   - Build command: `CC/CXX/AR/linker = $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-*`, `cargo build --target aarch64-linux-android`, with `CARGO_TARGET_DIR=target-android`.
 - **APK packaging works:** `tools/android/build_apk.sh` produced a signed, verified 6.7 MB APK of the FPS template (NativeActivity, arm64-v8a, Vulkan 1.3). Assets are extracted on first run by `android_assets_root`.
 - **Not done: running it.** No device is attached, and the SDK has no emulator system image (installing one means a multi-GB download into the root-owned `/opt` plus KVM / Vulkan passthrough). The blockers below are what a first run will hit, roughly in order:
@@ -248,7 +248,7 @@ These are things that are actually missing or partial. Everything else that olde
 - **Reflection probes beyond two at once.** Multiple probes with per-pixel two-probe blending landed (Features.md). What remains:
   - more than two probes blending at the same pixel
   - (SSR, RT and custom shaders now blend both probes as well)
-- **Projected decals.** The Citrus Toon decal is a texture layer, not a world-space decal projector.
+- **Projected decals.** The ZestEngine Toon decal is a texture layer, not a world-space decal projector.
 - **Terrain.** There is no heightmap terrain, splat painting, or foliage scatter.
 - **Remote humanoid IK.** `NetworkAvatar::targets` replicates the poses, but the skinning IK path only uses the global (local-player) targets. Remote players need per-avatar IK targets.
 

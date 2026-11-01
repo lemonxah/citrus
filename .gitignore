@@ -3,7 +3,7 @@ example-game
 *.lightmap
 target
 **/*.spv
-.citrus_texcache
-**/.citrus_texcache
+.zestengine_texcache
+**/.zestengine_texcache
 target-win
 target-android

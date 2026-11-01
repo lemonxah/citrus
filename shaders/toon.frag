@@ -9,7 +9,7 @@
 //! prop spec_size float range(0, 1) default(0.1)
 //! prop emission_strength float range(0, 8) default(0)
 //
-// A lightweight Poiyomi-style toon shader on the citrus standard pipeline, so it
+// A lightweight Poiyomi-style toon shader on the zestengine standard pipeline, so it
 // shares the scene's lights, shadows, probe GI (lightdata) and baked lightmaps.
 // Cel ramp + rim + toon specular over a PBR-ish base, all tunable in the
 // Inspector via the props above.
@@ -33,7 +33,7 @@ void main() {
     // Combine the key directional + all point/spot lights, then cel-band the
     // total intensity while preserving hue (classic toon look).
     vec3 lights = u_light_color * max(dot(N, -u_light_dir), 0.0)
-                + citrus_direct_diffuse(v_world_pos, N);
+                + zestengine_direct_diffuse(v_world_pos, N);
     float lum = max(max(lights.r, lights.g), lights.b);
     float ramp = toon_ramp(lum, ramp_steps, ramp_smooth);
     vec3 direct = lights * (ramp / max(lum, 1e-4));
@@ -44,7 +44,7 @@ void main() {
     spec = smoothstep(0.5, 0.52, spec) * spec_strength;
 
     // Baked / probe GI (matches the standard shader's indirect).
-    vec3 indirect = citrus_baked_gi(v_world_pos, N);
+    vec3 indirect = zestengine_baked_gi(v_world_pos, N);
 
     vec3 color = albedo.rgb * (direct + indirect) + spec * u_light_color;
 
@@ -54,6 +54,6 @@ void main() {
 
     color += texture(t_emission, v_uv).rgb * emission_strength;
 
-    color = citrus_postfx(color, gl_FragCoord.xy);
+    color = zestengine_postfx(color, gl_FragCoord.xy);
     o_color = vec4(color, albedo.a);
 }

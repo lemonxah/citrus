@@ -12,12 +12,12 @@ Each `source.json` records the upstream asset/version identifiers, author,
 license label, file sizes and SHA-256 hashes. Both GLBs contain one skinned mesh,
 400 joints and one animation, with no external buffer or image references.
 The exports retain Rigify's control/helper bones; they have not yet been
-integrated into Citrus's starter templates or visually tested in the engine.
+integrated into ZestEngine's starter templates or visually tested in the engine.
 
 ## License
 
 Both assets are labeled **Royalty Free**, not CC0. These downloads are for local
-evaluation. Before distributing the editable models as Citrus starter assets,
+evaluation. Before distributing the editable models as ZestEngine starter assets,
 obtain suitable redistribution permission from the creator or BlenderKit.
 See the [license](https://www.blenderkit.com/docs/licenses/) and
 [licensing FAQ](https://www.blenderkit.com/docs/licenses/licensing-faq/).

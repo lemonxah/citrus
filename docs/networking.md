@@ -1,23 +1,23 @@
 # Networking
 
-Citrus ships a built-in networking layer for multiplayer games: social VR
+ZestEngine ships a built-in networking layer for multiplayer games: social VR
 worlds where players grab and pass objects around, and shooters where the
 server has the final say. This page covers the model, the components, the
 `ComponentCtx` API and the editor tooling.
 
-Code: `crates/citrus-core/src/net.rs` (API types, components, ctx helpers),
-`crates/citrus-core/src/net_rewind.rs` (lag-compensation history),
-`crates/citrus-engine/src/net.rs` (transport, connections, session registry),
-`crates/citrus-engine/src/net_secure.rs` (key stretching, keys, encryption, replay window, loss),
-`crates/citrus-engine/src/net_identity.rs` (player identities, fingerprints, host pinning),
-`crates/citrus-engine/src/net_relay.rs` (relay client, hole punching, routes),
-`crates/citrus-engine/src/net_predict.rs` (prediction, reconciliation, adaptive delay),
-`crates/citrus-engine/src/net_sync.rs` (scene replication),
-`crates/citrus-core/src/motion.rs` (replayable movement: `Predictable`, `MoveHost`, `MotionState`),
-`crates/citrus-engine/src/play_net.rs` (play-session hooks, predicted-controller simulation),
-`crates/citrus-engine/src/net_window.rs` (editor window),
-`crates/citrus-editor/src/net_inspect.rs` (inspectors),
-`crates/citrus-relay` (the relay server).
+Code: `crates/zestengine-core/src/net.rs` (API types, components, ctx helpers),
+`crates/zestengine-core/src/net_rewind.rs` (lag-compensation history),
+`crates/zestengine-engine/src/net.rs` (transport, connections, session registry),
+`crates/zestengine-engine/src/net_secure.rs` (key stretching, keys, encryption, replay window, loss),
+`crates/zestengine-engine/src/net_identity.rs` (player identities, fingerprints, host pinning),
+`crates/zestengine-engine/src/net_relay.rs` (relay client, hole punching, routes),
+`crates/zestengine-engine/src/net_predict.rs` (prediction, reconciliation, adaptive delay),
+`crates/zestengine-engine/src/net_sync.rs` (scene replication),
+`crates/zestengine-core/src/motion.rs` (replayable movement: `Predictable`, `MoveHost`, `MotionState`),
+`crates/zestengine-engine/src/play_net.rs` (play-session hooks, predicted-controller simulation),
+`crates/zestengine-engine/src/net_window.rs` (editor window),
+`crates/zestengine-editor/src/net_inspect.rs` (inspectors),
+`crates/zestengine-relay` (the relay server).
 
 ## Model
 
@@ -113,15 +113,15 @@ injection by off-path attackers, but anyone who can reach it may join.
 `NetConfig::kdf` overrides the host's parameters.
 
 The join secret comes from the Network window, the Network Manager's Secret
-or `CITRUS_SECRET`.
+or `ZESTENGINE_SECRET`.
 
 ### Player identities
 
 Each install has a persistent Ed25519 key pair in `identity.key` in the
 user's config folder, next to the game's `input.ron` (`%APPDATA%\<title>`,
 `~/Library/Application Support/<title>`, `$XDG_CONFIG_HOME/<title>` or
-`~/.config/<title>`; `CITRUS_CONFIG_DIR` replaces the base; the editor uses
-`Citrus Editor`). The public key is the player id; its fingerprint is 128
+`~/.config/<title>`; `ZESTENGINE_CONFIG_DIR` replaces the base; the editor uses
+`ZestEngine Editor`). The public key is the player id; its fingerprint is 128
 bits of its SHA-256 written as 8 groups of 4 hex digits (`1a2b-3c4d-...`;
 the UI shows the first two groups, hover for the full one, click to copy).
 
@@ -153,37 +153,37 @@ a manual clock (`use_manual_clock` / `advance`).
   networked object with who simulates it. Connections stay alive while you edit;
   replication runs in Play mode, and stopping Play clears replicated state.
 - **Built games**: a Network Manager with Auto Start = Host / Join, or the
-  environment variables `CITRUS_HOST=<port>` / `CITRUS_JOIN=<host:port or
-  room code>`, `CITRUS_RELAY=<relay:port>`, `CITRUS_SECRET`, `CITRUS_NAME`,
-  `CITRUS_ACCOUNT`, `CITRUS_PASSWORD`,
-  `CITRUS_ACCOUNTS=name1:pass1,name2:pass2` (host-side account list; when set,
+  environment variables `ZESTENGINE_HOST=<port>` / `ZESTENGINE_JOIN=<host:port or
+  room code>`, `ZESTENGINE_RELAY=<relay:port>`, `ZESTENGINE_SECRET`, `ZESTENGINE_NAME`,
+  `ZESTENGINE_ACCOUNT`, `ZESTENGINE_PASSWORD`,
+  `ZESTENGINE_ACCOUNTS=name1:pass1,name2:pass2` (host-side account list; when set,
   joiners must present one of those account logins),
-  `CITRUS_RELAY_TOKEN` (relays that require an operator token)
-  (`CITRUS_NO_PUNCH` keeps relay peers on the relay).
+  `ZESTENGINE_RELAY_TOKEN` (relays that require an operator token)
+  (`ZESTENGINE_NO_PUNCH` keeps relay peers on the relay).
 - **From gameplay** (menus): `ctx.net_host(port)` (0 = the Network Manager's
   port; also opens a relay room when the manager names a relay),
   `ctx.net_join("1.2.3.4:9000")` or `ctx.net_join("ABC123")`,
   `ctx.net_disconnect()`.
 
 LAN discovery: a host answers broadcast queries on UDP port 47777
-(`LanBrowser` in `citrus_engine::net`).
+(`LanBrowser` in `zestengine_engine::net`).
 
 ## Internet play (relay + hole punching)
 
 No port forwarding needed: run a relay somewhere both sides can reach and
-set it as the Relay (Network window, Network Manager, or `CITRUS_RELAY`).
+set it as the Relay (Network window, Network Manager, or `ZESTENGINE_RELAY`).
 
 ```text
-cargo run --release -p citrus-relay -- --bind 0.0.0.0:47800
+cargo run --release -p zestengine-relay -- --bind 0.0.0.0:47800
 # options: --max-rooms 4096 --max-members 64 --idle 30
-#          --token SECRET          (or CITRUS_RELAY_TOKEN) hosts must know it to open rooms
+#          --token SECRET          (or ZESTENGINE_RELAY_TOKEN) hosts must know it to open rooms
 #          --rooms-per-ip 8        rooms one IP may hold
 #          --max-pending 16        joiners per room that haven't exchanged data yet
 #          --max-pending-total 1024
 #          --orphan-grace 30       seconds a room waits for a successor after its host left
 ```
 
-It's a small UDP server (`crates/citrus-relay`): open UDP 47800 on the
+It's a small UDP server (`crates/zestengine-relay`): open UDP 47800 on the
 machine it runs on and that's it.
 
 - **Hosting** with a relay set binds the host's port as usual (LAN clients
@@ -200,7 +200,7 @@ machine it runs on and that's it.
   firewalls) keeps the peer relayed; a direct route silent for 4 s falls back
   to the relay, and punching retries after 20 s. Relayed packets are always
   accepted, so switching paths never drops the connection.
-- **Relay protocol 3** (`citrus_relay::proto`): REGISTER (role, room code,
+- **Relay protocol 3** (`zestengine_relay::proto`): REGISTER (role, room code,
   nonce, LAN endpoints, cookie, proof; padded to 160 bytes) / COOKIE /
   REGISTERED (slot, own punch token, public endpoint, claim nonce) / PEER
   (introduction) / DATA (slot + payload: destination going in, source coming
@@ -375,9 +375,9 @@ Person Controller or VR Player, or the owner's predicted one on the host)
 ignores local input and leaves the camera and cursor alone; it takes them
 the first frame the local player drives it.
 
-The live frame and its replays run one step. `citrus_core::Predictable`
+The live frame and its replays run one step. `zestengine_core::Predictable`
 (`motion` / `set_motion`, `frame_extra`, `replay`) is the controller side;
-it moves through `citrus_core::MoveHost` (translation, rotation,
+it moves through `zestengine_core::MoveHost` (translation, rotation,
 `move_character`, ground contact, capsule resize, water surface, ray casts),
 which `ComponentCtx` implements for `update` and the play session
 implements for the host simulation and the owner's rewind + replay.
@@ -480,16 +480,16 @@ set, and a `Humanoid IK` (source Auto) on the avatar model poses it from the
 replicated `targets`.
 
 The owner's avatar fit rides along as the synced variables
-`citrus.avatar_scale` and `citrus.eye_height`; remote copies scale the avatar
+`zestengine.avatar_scale` and `zestengine.eye_height`; remote copies scale the avatar
 under the Network Avatar to match (see [vr-avatars.md](vr-avatars.md)).
 
 Face tracking rides along: the owner's face frame (non-zero Unified
 Expressions weights as bytes, plus eye gaze) goes out with the avatar poses and
 remote copies expose it as `face` for their Face Tracking.
 
-The worn avatar package travels too: when a player wears a `.citruspak`
+The worn avatar package travels too: when a player wears a `.zestenginepak`
 avatar, its Network Avatar's `wearing` (content id + download URL) replicates
-as the synced variable `citrus.avatar` (reliable, late joiners catch up), and
+as the synced variable `zestengine.avatar` (reliable, late joiners catch up), and
 each peer's content manager loads and wears the same package on that player.
 Peers download from the URL; a package worn from a local file only reaches
 peers that already have it cached.

@@ -3,7 +3,7 @@ name = "sample-game"
 version = "0.1.0"
 edition = "2024"
 
-# Detached from the citrus workspace: a bundled game is a standalone package
+# Detached from the zestengine workspace: a bundled game is a standalone package
 # that path-depends on the engine + its component crate (built without the
 # editor feature, so no editor/egui linkage).
 [workspace]
@@ -13,9 +13,9 @@ name = "sample-game"
 path = "src/main.rs"
 
 [dependencies]
-# Runtime only: no editor feature -> the game links neither citrus-editor nor egui_dock.
-citrus-engine = { path = "../../crates/citrus-engine", default-features = false }
-citrus-project-components = { path = "../../plugins/components" }
+# Runtime only: no editor feature -> the game links neither zestengine-editor nor egui_dock.
+zestengine-engine = { path = "../../crates/zestengine-engine", default-features = false }
+zestengine-project-components = { path = "../../plugins/components" }
 anyhow = "1"
 
 [profile.release]

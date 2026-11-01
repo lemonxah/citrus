@@ -1,4 +1,4 @@
-# citrus standard shader
+# zestengine standard shader
 
 The single default shader used by every world and avatar, on PC and mobile.
 Inspired by Poiyomi: one heavily configurable **uber-shader** instead of many
@@ -57,7 +57,7 @@ material; the publisher emits both variants and validates mobile budget.
 ## Material inspector GUI
 
 The shader is only as good as its inspector. Creators interact with the GUI,
-not the SPIR-V. The egui material inspector (citrus-editor) is a first-class
+not the SPIR-V. The egui material inspector (zestengine-editor) is a first-class
 part of the shader spec:
 
 - **Collapsible feature sections**, each with a master enable toggle in the
@@ -108,7 +108,7 @@ preamble, compiles via `glslc` at runtime and hot-reloads on save (about 2 s
 polling; property values are carried over by name). Compile errors show in
 the Inspector (with your own line numbers) and in the log; the material draws
 the error swirl until the file compiles again. Files > Create > New Shader
-writes a commented GLSL starter (`citrus_assets::SHADER_TEMPLATE`;
+writes a commented GLSL starter (`zestengine_assets::SHADER_TEMPLATE`;
 `HLSL_SHADER_TEMPLATE` is the HLSL equivalent).
 
 The file is the fragment stage only (standard vertex stage). Do not write a
@@ -171,7 +171,7 @@ kinds `float`, `toggle`, `color`, `color3`) still work unchanged: they pack into
 
 ### Data flow
 
-1. **Asset** (`citrus-assets/src/shader_props.rs`): the parser builds a
+1. **Asset** (`zestengine-assets/src/shader_props.rs`): the parser builds a
    `ShaderSource` with each property's storage: push lane (v1), std140 byte
    offset in the material block, keyword constant id, or texture binding.
 2. **Material**: values live in `MaterialModel::custom_values` (lanes 0..15 =
@@ -191,10 +191,10 @@ kinds `float`, `toggle`, `color`, `color3`) still work unchanged: they pack into
 |---|---|
 | set 0 | frame UBO (lights, shadows, probes, post), shadow atlas (1), probe SH (2), lightmaps (3), screen GI (4), environment cube (7) |
 | set 1, bindings 0-3 | fixed material slots `t_albedo`, `t_normal`, `t_orm`, `t_emission` (also editable in the custom shader Inspector) |
-| set 2, binding 0 | generated `CitrusMaterial` std140 block |
+| set 2, binding 0 | generated `ZestEngineMaterial` std140 block |
 | set 2, bindings 1..20 | `Texture2D` properties in declaration order |
 | push constants | `pc.model`, v1 props in `pc.d0..d3`, lightmap layer in `pc.d3.w` |
-| spec constants 0..31 | `@keyword` properties; id 63 = `citrus_alpha_mode` (0 opaque, 1 cutout, 2 blend) |
+| spec constants 0..31 | `@keyword` properties; id 63 = `zestengine_alpha_mode` (0 opaque, 1 cutout, 2 blend) |
 
 ### Provided by the preamble
 
@@ -202,24 +202,24 @@ kinds `float`, `toggle`, `color`, `color3`) still work unchanged: they pack into
 |---|---|
 | Varyings | `v_world_pos`, `v_normal`, `v_uv`, `v_uv1`, `v_color`, `v_tangent` |
 | Uniforms | `u_time`, `u_camera_pos`, `u_ambient`, `u_light_count`, the full `frame` UBO |
-| Lights | `citrus_light(i, pos, out L, out radiance)` (attenuation, spot cone, baked-light skip), `citrus_shadow(i, pos, n, L)` (cascades, cube faces, PCF), `citrus_direct_lambert(pos, n)` (shadowed), `citrus_direct_diffuse(pos, n)` (unshadowed) |
-| GI | `citrus_baked_gi(pos, n)` (lightmap + realtime probes, screen-space Flux GI, probe GI, ambient: the standard shader's priority), `citrus_gi(pos, n)`, `citrus_probe_irradiance(pos, n, out coverage)` |
-| Reflections | `citrus_env(pos, R, roughness)` (reflection probe, box-projected, or sky) |
-| Misc | `citrus_postfx(color, gl_FragCoord.xy)` (call before writing), `citrus_dither(fragcoord)`, `citrus_alpha_mode` |
+| Lights | `zestengine_light(i, pos, out L, out radiance)` (attenuation, spot cone, baked-light skip), `zestengine_shadow(i, pos, n, L)` (cascades, cube faces, PCF), `zestengine_direct_lambert(pos, n)` (shadowed), `zestengine_direct_diffuse(pos, n)` (unshadowed) |
+| GI | `zestengine_baked_gi(pos, n)` (lightmap + realtime probes, screen-space Flux GI, probe GI, ambient: the standard shader's priority), `zestengine_gi(pos, n)`, `zestengine_probe_irradiance(pos, n, out coverage)` |
+| Reflections | `zestengine_env(pos, R, roughness)` (reflection probe, box-projected, or sky) |
+| Misc | `zestengine_postfx(color, gl_FragCoord.xy)` (call before writing), `zestengine_dither(fragcoord)`, `zestengine_alpha_mode` |
 | Output | `o_color`; `o_gbuf` is zeroed (not an SSR reflector) before your `main` runs |
 
 Alpha mode and double-sided still come from the material's Transparency /
-Geometry sections (pipeline state); read `citrus_alpha_mode` to cut out.
+Geometry sections (pipeline state); read `zestengine_alpha_mode` to cut out.
 
 ### HLSL
 
 `.hlsl` files use the same directives and bindings. Implement
-`float4 citrus_frag(CitrusInput i)`; the engine adds the `main` entry point.
-`CitrusInput` has `world_pos`, `normal`, `uv`, `color`, `tangent`, `uv1`,
+`float4 zestengine_frag(ZestEngineInput i)`; the engine adds the `main` entry point.
+`ZestEngineInput` has `world_pos`, `normal`, `uv`, `color`, `tangent`, `uv1`,
 `frag_coord` (SV_Position) and `front_facing`. Every texture is a
 `Texture2D x` with a `SamplerState sampler_x` at the same binding (glslc's
 `-fauto-combined-image-sampler` merges them into the combined samplers the
-pipeline uses); `CITRUS_SAMPLE(x, uv)` expands to `x.Sample(sampler_x, uv)`.
+pipeline uses); `ZESTENGINE_SAMPLE(x, uv)` expands to `x.Sample(sampler_x, uv)`.
 The material block is a `cbuffer` with explicit `packoffset`s matching the
 std140 layout, keywords are `[[vk::constant_id(N)]] const` values, matrices
 are column-major as the engine writes them (use `mul(M, v)`). The helper
@@ -232,12 +232,12 @@ functions have the same names and signatures as in GLSL. Compiled with
 // @feature RIM "Rim"
 // @property rim_color "Rim Color" Color3(HDR) = (2, 2, 2)
 // @end
-float4 citrus_frag(CitrusInput i) {
-    float4 albedo = CITRUS_SAMPLE(t_albedo, i.uv) * tint;
+float4 zestengine_frag(ZestEngineInput i) {
+    float4 albedo = ZESTENGINE_SAMPLE(t_albedo, i.uv) * tint;
     float3 n = normalize(i.front_facing ? i.normal : -i.normal);
-    float3 c = albedo.rgb * (citrus_direct_lambert(i.world_pos, n) + citrus_baked_gi(i.world_pos, n));
+    float3 c = albedo.rgb * (zestengine_direct_lambert(i.world_pos, n) + zestengine_baked_gi(i.world_pos, n));
     if (RIM) c += rim_color * pow(1.0 - saturate(dot(n, normalize(u_camera_pos - i.world_pos))), 3.0);
-    return float4(citrus_postfx(c, i.frag_coord.xy), albedo.a);
+    return float4(zestengine_postfx(c, i.frag_coord.xy), albedo.a);
 }
 ```
 
@@ -265,19 +265,19 @@ decide which of them a material's GPU program contains.
   when one exists and otherwise falls back to specializing the shared module.
 - Cost model: variant count is bounded by the keyword combinations materials
   actually use (not 2^N); each costs one pipeline object. The test
-  `citrus_toon_variants_strip_disabled_features` checks that Citrus Toon's
+  `zestengine_toon_variants_strip_disabled_features` checks that ZestEngine Toon's
   Simple variant compiles to roughly half the SPIR-V of Heavy with a quarter
   of the texture samples, and that the heavy-only samplers (dissolve,
   glitter, decal, detail, parallax, second matcap, hair shift) are absent.
 
-### Citrus Toon (`shaders/citrus_toon.frag`)
+### ZestEngine Toon (`shaders/zestengine_toon.frag`)
 
 A Poiyomi-style toon shader written on this system. Presets: **Simple**
 (albedo, multilayer toon ramp, shadows, optional alpha), **Medium** (adds
 normal map, rim, matcap, toon specular, emission), **Heavy** (everything).
 Presets only set keywords; features can be toggled individually afterwards.
 
-| Poiyomi group | Citrus Toon |
+| Poiyomi group | ZestEngine Toon |
 |---|---|
 | Lighting modes | `lighting_mode`: Ramp (ramp texture), Multilayer (math toon, two layers with border/blur/colour), Realistic (GGX/Lambert with toon blend, metallic/roughness, ORM), Flat; min/max brightness, monochrome lighting, indirect strength, AO; all scene lights, shadows (`RECEIVE_SHADOWS`), lightmaps, probe and Flux GI |
 | Shadows | shadow colour, strength, shadow mask, ramp, second shadow layer |

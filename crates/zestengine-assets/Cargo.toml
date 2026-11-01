@@ -1,0 +1,31 @@
+[package]
+name = "zestengine-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zestengine-core.workspace = true
+zestengine-render.workspace = true
+bytemuck.workspace = true
+gltf.workspace = true
+ufbx.workspace = true
+image.workspace = true
+half.workspace = true
+intel_tex_2.workspace = true
+bcdec_rs.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ron.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# .zestenginepak content packages (zip; already in the tree via audionimbus-sys).
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# Independent ASTC decoder: tests check the encoder's output decodes back.
+texture2ddecoder = "0.1"
+
+[build-dependencies]
+cc = "1"

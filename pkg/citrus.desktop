@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Citrus
-Comment=Create and open Citrus game projects
-Exec=citrus-hub
-Icon=citrus
-Terminal=false
-Categories=Development;Graphics;3DGraphics;
-StartupWMClass=citrus

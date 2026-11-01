@@ -1,6 +1,6 @@
 # Feature UI Placement & Usage Guide
 
-Where each engine feature's UI lives in the Citrus editor, how to use it, and its
+Where each engine feature's UI lives in the ZestEngine editor, how to use it, and its
 status. Placement follows Unity/Godot/Unreal conventions (researched 2026-06-19):
 **object concerns → Inspector components; project-wide config → Settings;
 reusable data → Assets with their own editor; cross-cutting tools → dockable
@@ -64,7 +64,7 @@ Particles, navmesh/agents, anim graph, localization, streaming, runtime UI, shad
 graph all have tested runtime/logic modules but their authoring UI belongs in the
 homes above (components / settings / asset-editor windows), NOT a Tools dump. Each is
 a focused follow-up; the pattern is established by `LodComponent`:
-1. define the data struct in `citrus-core` (`impl TypedComponent`),
+1. define the data struct in `zestengine-core` (`impl TypedComponent`),
 2. register in both `ComponentRegistry::with_builtins` (core) and the editor's
    `EditorComponents` + an `impl Inspect`,
 3. consume it in the engine.
@@ -76,7 +76,7 @@ a focused follow-up; the pattern is established by `LodComponent`:
 Keep these **separate** (Unreal's canonical chain):
 `NavMeshBoundsVolume → RecastNavMesh → AIController → BehaviorTree → MoveTo`.
 
-- **Layer A — Navmesh data:** baked from collision geometry. Citrus target: a
+- **Layer A — Navmesh data:** baked from collision geometry. ZestEngine target: a
   **NavMeshSurface component** scoping a volume + a **Navigation Settings** panel
   (agent radius/height/slope/step, area types + costs) + a **Bake** button/window
   with an overlay toggle. The `navmesh.rs` A* + walkability grid is the runtime core.

@@ -1,8 +1,8 @@
-"""Convert BlenderKit prop exports to Citrus-ready GLBs.
+"""Convert BlenderKit prop exports to ZestEngine-ready GLBs.
 
 blender --background --factory-startup --disable-autoexec --python tools/prepare_template_props.py
 
-Re-encodes WebP textures to PNG (Citrus's gltf::import rejects EXT_texture_webp)
+Re-encodes WebP textures to PNG (ZestEngine's gltf::import rejects EXT_texture_webp)
 and exports plain glTF without Draco.
 """
 from pathlib import Path

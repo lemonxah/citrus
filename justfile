@@ -31,13 +31,13 @@ build:
 # Run the editor (build both executables so switching to the hub works).
 [positional-arguments]
 run *args:
-    cargo build -p citrus -p citrus-hub --locked
-    cargo run --bin citrus --locked -- "$@"
+    cargo build -p zestengine -p zestengine-hub --locked
+    cargo run --bin zestengine --locked -- "$@"
 
 # Open the Project Hub with its matching editor built.
 hub:
-    cargo build -p citrus -p citrus-hub --locked
-    cargo run --bin citrus-hub --locked
+    cargo build -p zestengine -p zestengine-hub --locked
+    cargo run --bin zestengine-hub --locked
 
 # Build and install on Linux; override with: just install "$HOME/.local" ""
 install prefix="/usr" sudo="sudo": build

@@ -1,6 +1,6 @@
 # Components & the in-game API
 
-How gameplay behaviour is written in citrus: the component model, the in-game
+How gameplay behaviour is written in zestengine: the component model, the in-game
 API a component talks to (`ComponentCtx`), object references, the editor-only
 inspector/gizmo traits, and how to ship a hot-reloadable Rust plugin.
 
@@ -13,11 +13,11 @@ A component has two halves that live in two crates:
 
 | Concern | Crate | Trait | Ships in a built game? |
 |---|---|---|---|
-| Behaviour (start/update) | `citrus-core` | `TypedComponent` | yes |
-| Inspector UI | `citrus-editor` | `Inspect` | no |
-| Viewport gizmo | `citrus-editor` | `Gizmo` | no |
+| Behaviour (start/update) | `zestengine-core` | `TypedComponent` | yes |
+| Inspector UI | `zestengine-editor` | `Inspect` | no |
+| Viewport gizmo | `zestengine-editor` | `Gizmo` | no |
 
-`citrus-core` is egui-free on purpose: a shipped game links the engine + core
+`zestengine-core` is egui-free on purpose: a shipped game links the engine + core
 and never pulls in the editor or egui. The editor halves are gated behind an
 `editor` cargo feature (see [Writing a plugin](#writing-a-plugin)), so they
 compile only when the editor builds the plugin.
@@ -33,7 +33,7 @@ Implement `TypedComponent`. The blanket impl turns it into the object-safe
 are all derived for you). It must be `Serialize + Deserialize + Default`.
 
 ```rust
-use citrus_core::{ComponentCtx, TypedComponent};
+use zestengine_core::{ComponentCtx, TypedComponent};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -84,7 +84,7 @@ moved this frame). Components on disabled objects (or under a disabled parent)
 don't run at all.
 
 The editor's Play mode and a shipped game run the exact same loop
-(`citrus-engine/src/play.rs`).
+(`zestengine-engine/src/play.rs`).
 
 Fields marked `#[serde(skip)]` are scratch state (not saved); initialize them in
 `Default`. Components that accumulate (`Bob`, `Orbit`) keep an `applied` offset
@@ -628,13 +628,13 @@ lightmaps aren't applied).
 
 ### User-generated content
 
-Load `.citruspak` worlds, avatars and props at runtime (path, URL or content id);
+Load `.zestenginepak` worlds, avatars and props at runtime (path, URL or content id);
 results arrive as `ContentEvent`s. Details: [user-content.md](user-content.md).
 
 ```rust
-let req = ctx.load_content("https://example.com/forest.citruspak");
-let (req, root) = ctx.spawn_content("chair.citruspak", pos, rot);
-ctx.spawn_avatar(self.player, "avatars/robot.citruspak");
+let req = ctx.load_content("https://example.com/forest.zestenginepak");
+let (req, root) = ctx.spawn_content("chair.zestenginepak", pos, rot);
+ctx.spawn_avatar(self.player, "avatars/robot.zestenginepak");
 ctx.enter_world(world_id);
 for e in ctx.content_events() { /* Progress / Loaded / Spawned / WorldEntered / Failed */ }
 ```
@@ -700,7 +700,7 @@ fn update(&mut self, ctx: &mut ComponentCtx) {
 ## Built-in components
 
 Registered automatically (`ComponentRegistry::with_builtins`). Their data lives
-in `citrus-core`; their inspectors/gizmos in `citrus-editor`.
+in `zestengine-core`; their inspectors/gizmos in `zestengine-editor`.
 
 | Name | Purpose |
 |---|---|
@@ -743,7 +743,7 @@ in `citrus-core`; their inspectors/gizmos in `citrus-editor`.
 | `VR Player`, `Grabbable`, `VR Avatar` | VR rig (head + hands from `ctx.screen.vr`, teleport arc, smooth move, snap turn, grab + trigger, desktop fallback), pick-up objects, a body that follows the head |
 
 The gameplay kit components (Health through VR Avatar above) live in
-`citrus-core/src/kit/` and are what the New Project templates are built from;
+`zestengine-core/src/kit/` and are what the New Project templates are built from;
 their pure helpers (`formation_offsets`, `screen_rect`, `rts_camera_pose`,
 `boom_position`, `teleport_arc`, `spread_direction`) are public for games that
 want the math without the component. Headset state reaches every component as
@@ -752,7 +752,7 @@ triggers; `active` is false without a running headset).
 
 ## Editor traits
 
-These live in `citrus-editor` and never link into a game. Implement them behind
+These live in `zestengine-editor` and never link into a game. Implement them behind
 `#[cfg(feature = "editor")]` in a plugin.
 
 ```rust
@@ -793,12 +793,12 @@ crate-type = ["cdylib"]
 [features]
 default = []
 # The editor builds with --features editor; a game builds without it, so
-# citrus-editor and egui never link into the shipped binary.
-editor = ["dep:citrus-editor", "dep:egui"]
+# zestengine-editor and egui never link into the shipped binary.
+editor = ["dep:zestengine-editor", "dep:egui"]
 
 [dependencies]
-citrus-core.workspace = true
-citrus-editor = { workspace = true, optional = true }
+zestengine-core.workspace = true
+zestengine-editor = { workspace = true, optional = true }
 egui = { workspace = true, optional = true }
 serde.workspace = true
 glam.workspace = true
@@ -808,20 +808,20 @@ glam.workspace = true
 editor one is feature-gated:
 
 ```rust
-use citrus_core::{ComponentRegistry, TypedComponent};
+use zestengine_core::{ComponentRegistry, TypedComponent};
 #[cfg(feature = "editor")]
-use citrus_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
+use zestengine_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
 
 // Runtime behaviour — called by the editor and by a shipped game.
 #[unsafe(no_mangle)]
-pub fn citrus_register(registry: &mut ComponentRegistry) {
+pub fn zestengine_register(registry: &mut ComponentRegistry) {
     registry.register::<Orbit>();
 }
 
 // Editor-only traits — compiled only with the editor feature; absent in a game.
 #[cfg(feature = "editor")]
 #[unsafe(no_mangle)]
-pub fn citrus_register_editor(editor: &mut EditorComponents) {
+pub fn zestengine_register_editor(editor: &mut EditorComponents) {
     editor.register::<Orbit>();
 }
 ```
@@ -847,5 +847,5 @@ Plain widgets (sliders, buttons, labels, painters) are fine.
 - [Features.md](../Features.md) — in-game API roadmap (object graph, components,
   physics queries, input, spawn/despawn) and the editor/gameplay component split.
 - [networking.md](networking.md) — multiplayer components and the `ctx` networking API.
-- `crates/citrus-core/src/lib.rs` — the authoritative API.
+- `crates/zestengine-core/src/lib.rs` — the authoritative API.
 - `plugins/components/src/lib.rs` — the `Orbit` example, end to end.

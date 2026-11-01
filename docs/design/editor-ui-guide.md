@@ -1,6 +1,6 @@
 # Editor UI guide
 
-How the Citrus editor implements the [Editor UI Design Spec](editor-ui-spec.md),
+How the ZestEngine editor implements the [Editor UI Design Spec](editor-ui-spec.md),
 how to build new UI that matches it, and the plan (with status) for converting every
 existing panel. The spec owns the values; this guide owns the code.
 
@@ -8,12 +8,12 @@ existing panel. The spec owns the values; this guide owns the code.
 
 | Module | What it holds |
 |---|---|
-| `crates/citrus-editor/src/theme.rs` | Every colour, radius, size and font from spec §2 as named tokens; the runtime accent; `theme::apply(ctx)` builds the egui style; `ObjectKind` (type family colour + icon) |
-| `crates/citrus-editor/src/icons.rs` | The spec §11 icon set, drawn from its SVG path data (stroke 1.4–1.5, round caps); the logo |
-| `crates/citrus-editor/src/widgets.rs` | The widget kit: buttons, troughs and segments, icon toggles, badges and chips, type tile, vector field, property rows, section headers, info notes, dashed add button, search field |
-| `crates/citrus-editor/assets/fonts/` | IBM Plex Sans 400/500/600 and Plex Mono 400/500 (SIL OFL, same files as ZestBay) |
+| `crates/zestengine-editor/src/theme.rs` | Every colour, radius, size and font from spec §2 as named tokens; the runtime accent; `theme::apply(ctx)` builds the egui style; `ObjectKind` (type family colour + icon) |
+| `crates/zestengine-editor/src/icons.rs` | The spec §11 icon set, drawn from its SVG path data (stroke 1.4–1.5, round caps); the logo |
+| `crates/zestengine-editor/src/widgets.rs` | The widget kit: buttons, troughs and segments, icon toggles, badges and chips, type tile, vector field, property rows, section headers, info notes, dashed add button, search field |
+| `crates/zestengine-editor/assets/fonts/` | IBM Plex Sans 400/500/600 and Plex Mono 400/500 (SIL OFL, same files as ZestBay) |
 
-`citrus_editor::install_editor_fonts(ctx)` and `theme::apply(ctx)` run once at
+`zestengine_editor::install_editor_fonts(ctx)` and `theme::apply(ctx)` run once at
 startup (`editor_app::start_load`). The Phosphor icon font stays installed behind
 Plex for icons the spec set doesn't cover.
 
@@ -55,7 +55,7 @@ Plex for icons the spec set doesn't cover.
 ## 3. Building a panel: an example
 
 ```rust
-use citrus_editor::{icons::Icon, theme, widgets};
+use zestengine_editor::{icons::Icon, theme, widgets};
 
 fn my_panel(ui: &mut egui::Ui, s: &mut MyState) {
     widgets::eyebrow(ui, "Sky");
@@ -89,7 +89,7 @@ builds on the previous; the shell (A–B) is what every later panel relies on.
   with 2 px accent underline, inactive text.muted, 1 px line.panel separators
 
 ### Phase B — shell
-- [x] Menu bar (§4): logo + "Citrus", menu buttons, centred transport trough (Play/Stop
+- [x] Menu bar (§4): logo + "ZestEngine", menu buttons, centred transport trough (Play/Stop
   primary, Pause, Step), breadcrumb `project / scene`, command search button (Ctrl K),
   preferences gear
 - [x] Status bar (§9): status dot + Ready/Playing, scene, object count, selection,
@@ -169,7 +169,7 @@ builds on the previous; the shell (A–B) is what every later panel relies on.
 - [x] New Project: template picker cards (icon tile, name, category, description; accent
   border when selected), All / Desktop / VR segmented filter, feature info note, location rows,
   primary Create & Open (`new_project_ui.rs`)
-- [x] Project Hub (`crates/citrus-hub`, separate executable): sidebar nav, project rows
+- [x] Project Hub (`crates/zestengine-hub`, separate executable): sidebar nav, project rows
   (thumbnail or initial, name + pin, mono path, last opened, version), template cards via
   `widgets::select_card`, in-theme folder picker, modals for initialise / creating
 - [ ] Project Settings, Open Project, Unsaved changes, Layers, Input
@@ -197,7 +197,7 @@ builds on the previous; the shell (A–B) is what every later panel relies on.
   view menu (Top / Front / Right snaps). Grid toggle, Wireframe / Overdraw shading and an orthographic
   projection need renderer support.
 - Accent presets + custom colour live in Project Settings > Appearance (saved as
-  `settings.accent` in project.citrus).
+  `settings.accent` in project.zestengine).
 - Environment: every row is on the themed row label and sections use eyebrows; the spec's regrouping
   into Sky / Ambient and fog / Post (and Tonemapper / Bloom / SSAO controls) is still to do.
 - FluxBaker: Quality as a segmented control and a Denoise checkbox are still to do (current settings

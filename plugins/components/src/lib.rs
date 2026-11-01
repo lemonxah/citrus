@@ -1,31 +1,31 @@
-//! Project components, compiled and hot-loaded by the citrus editor
+//! Project components, compiled and hot-loaded by the zestengine editor
 //! (Tools → Build & Reload Components).
 //!
-//! A component's *runtime* behaviour is `citrus_core::TypedComponent` (no UI);
-//! its *editor* inspector is `citrus_editor::Inspect` and its viewport gizmo is
-//! `citrus_editor::Gizmo`. Register the runtime in `citrus_register` and the
-//! editor traits in `citrus_register_editor`. A shipped game calls only the
+//! A component's *runtime* behaviour is `zestengine_core::TypedComponent` (no UI);
+//! its *editor* inspector is `zestengine_editor::Inspect` and its viewport gizmo is
+//! `zestengine_editor::Gizmo`. Register the runtime in `zestengine_register` and the
+//! editor traits in `zestengine_register_editor`. A shipped game calls only the
 //! former (no editor linkage).
 
-use citrus_core::{ComponentCtx, ComponentRegistry, ObjectRef, TypedComponent};
+use zestengine_core::{ComponentCtx, ComponentRegistry, ObjectRef, TypedComponent};
 #[cfg(feature = "editor")]
-use citrus_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
+use zestengine_editor::{EditorComponents, Gizmo, Inspect, InspectCtx};
 use serde::{Deserialize, Serialize};
 
 /// Register runtime behaviour (called by the editor and by a shipped game).
 #[unsafe(no_mangle)]
-pub fn citrus_register(registry: &mut ComponentRegistry) {
+pub fn zestengine_register(registry: &mut ComponentRegistry) {
     registry.register::<Orbit>();
-    // citrus: new components register here
+    // zestengine: new components register here
 }
 
 /// Register editor-only traits (inspector + gizmo). Compiled only with the
 /// `editor` feature (the editor builds plugins with it); absent in a game.
 #[cfg(feature = "editor")]
 #[unsafe(no_mangle)]
-pub fn citrus_register_editor(editor: &mut EditorComponents) {
+pub fn zestengine_register_editor(editor: &mut EditorComponents) {
     editor.register::<Orbit>();
-    // citrus: new components register their editor traits here
+    // zestengine: new components register their editor traits here
 }
 
 /// Orbits the owning object around a target object (or its own start point if

@@ -1,6 +1,6 @@
-# Citrus Engine — Review, Fixes & Roadmap (2026-06-17)
+# ZestEngine Engine — Review, Fixes & Roadmap (2026-06-17)
 
-A pass over the whole codebase comparing Citrus against how production engines
+A pass over the whole codebase comparing ZestEngine against how production engines
 (Unreal, Unity) solve the same problems. This documents **what was fixed**, **what
 was improved for performance**, **what new capability landed**, and an honest
 **gap analysis of what is still required to ship games**.
@@ -12,7 +12,7 @@ All code changes in this pass compile clean (`cargo check --workspace`).
 ## 1. Bugs fixed
 
 ### 1.1 Reflection probe captured geometry inside-out (the reported "offset / zoomed" reflection)
-**File:** `crates/citrus-render/src/lib.rs` (`step_refl_capture`, `record_scene_draws`)
+**File:** `crates/zestengine-render/src/lib.rs` (`step_refl_capture`, `record_scene_draws`)
 
 **Root cause.** The main scene passes render with a **negative-height Vulkan
 viewport** (`y = H, height = -H`) — the standard trick to keep glam's Y-up
@@ -40,7 +40,7 @@ the CPU `face_dir` cube convention used for skybox reflections, so it was left a
 > over-projects. Tighten the probe's Size to the room for 1:1 reflections.
 
 ### 1.2 EXR / HDR thumbnails rendered black or blown-out in the file browser
-**File:** `crates/citrus-editor/src/file_browser.rs` (`decode_thumb`)
+**File:** `crates/zestengine-editor/src/file_browser.rs` (`decode_thumb`)
 
 **Root cause.** EXR/`.hdr` images decode to **linear float** with values that
 routinely exceed 1.0. The thumbnail path did a raw `to_rgba8()` — a clamp from
@@ -61,7 +61,7 @@ transparent (some TGAs), now scoped correctly so it doesn't fight the HDR path.
 ## 2. New features
 
 ### 2.1 Material previews — material applied to a sphere (file browser)
-**File:** `crates/citrus-editor/src/file_browser.rs`
+**File:** `crates/zestengine-editor/src/file_browser.rs`
 
 `.material` tiles now show the material **rendered on a lit sphere** instead of a
 generic glyph — the Unity/Unreal content-browser behavior. Implementation is a
@@ -74,9 +74,9 @@ frame-budgeted exactly like image thumbnails, and **re-rendered when the materia
 file's mtime changes**, so editing a material refreshes its tile.
 
 ### 2.2 Frustum culling (performance / shipping essential)
-**Files:** `crates/citrus-render/src/{types.rs,lib.rs}`, `crates/citrus-engine/src/scene.rs`
+**Files:** `crates/zestengine-render/src/{types.rs,lib.rs}`, `crates/zestengine-engine/src/scene.rs`
 
-Citrus previously submitted **every** mesh every frame regardless of whether it was
+ZestEngine previously submitted **every** mesh every frame regardless of whether it was
 on screen — the single biggest CPU/GPU waste for any non-trivial level. Added
 **CPU frustum culling** for the main camera pass:
 
@@ -96,9 +96,9 @@ This is O(draws) per frame with no GPU round-trip and scales the engine from "de
 scene" to "real level" on the CPU-submission side.
 
 ### 2.3 Layer system — Unity-style layers + collision matrix (rendering **and** physics)
-**Files:** `crates/citrus-core/src/lib.rs`, `crates/citrus-engine/src/{scene.rs,physics.rs,
-runtime.rs,editor_app.rs}`, `crates/citrus-assets/src/scene_file.rs`,
-`crates/citrus-editor/src/components.rs`
+**Files:** `crates/zestengine-core/src/lib.rs`, `crates/zestengine-engine/src/{scene.rs,physics.rs,
+runtime.rs,editor_app.rs}`, `crates/zestengine-assets/src/scene_file.rs`,
+`crates/zestengine-editor/src/components.rs`
 
 **Which model, and why.** Two designs were on the table:
 
@@ -110,10 +110,10 @@ runtime.rs,editor_app.rs}`, `crates/citrus-assets/src/scene_file.rs`,
   to author; rendering visibility isn't layer-based at all (it uses show flags).
 
 The request ("set an object's layer; layers affect the renderer and collision
-physics; a layer matrix") *is* the Unity model, and Citrus already cites Unity as its
+physics; a layer matrix") *is* the Unity model, and ZestEngine already cites Unity as its
 UX reference — so **Unity-style layers** were implemented:
 
-- **Data** (`citrus-core`): `LayerSettings { names[32], collision[32] }` (the
+- **Data** (`zestengine-core`): `LayerSettings { names[32], collision[32] }` (the
   collision rows are bitmasks, kept symmetric via `set_collide`), plus a per-object
   `layer: u8` and a per-camera `culling_mask: u32`. Unit-tested (symmetry, defaults,
   short-vec repair).
@@ -141,7 +141,7 @@ This is a genuine shipping essential (view-model/FX layers, physics interaction
 filtering) that both Unity and Unreal consider table-stakes.
 
 ### 2.4 VR per-eye frustum culling (VR performance)
-**File:** `crates/citrus-render/src/lib.rs` (`render_xr_eye`)
+**File:** `crates/zestengine-render/src/lib.rs` (`render_xr_eye`)
 
 The stereo path renders the **whole scene once per eye** (`record_scene_draws` per
 eye), and previously submitted **every** draw to **both** eyes. The frustum culling
@@ -151,7 +151,7 @@ saving on the most submission-heavy path in the engine. (More VR wins in §8.)
 
 ---
 
-## 3. How production engines solve asset loading (and where Citrus already stands)
+## 3. How production engines solve asset loading (and where ZestEngine already stands)
 
 The brief asked specifically about Unreal's approach to **not locking the UI** during
 asset loads. Unreal's model is:
@@ -164,7 +164,7 @@ asset loads. Unreal's model is:
 3. **Placeholder-then-swap**: a default/!low-mip asset shows immediately; the real
    asset swaps in when ready.
 
-**Citrus already implements this pattern** (see `tasks.rs` + the background-task
+**ZestEngine already implements this pattern** (see `tasks.rs` + the background-task
 system, and `Features.md` §"Background-task system"):
 
 - Model import parses on a **worker thread**, GPU-applies on main.
@@ -243,43 +243,43 @@ Both are open-source and a fair yardstick for "what a modern small/indie engine 
 expected to have."
 
 ### vs. Godot (designer-facing, batteries-included)
-Godot's strengths are breadth of editor tooling. Gaps where Citrus trails:
+Godot's strengths are breadth of editor tooling. Gaps where ZestEngine trails:
 
 - **Runtime UI** — Godot's Control-node UI (anchors, containers, themes, signals) is a
-  flagship feature. Citrus has **none** (see §5 #1). Biggest single gap.
+  flagship feature. ZestEngine has **none** (see §5 #1). Biggest single gap.
 - **Animation system** — Godot's `AnimationPlayer`/`AnimationTree` (keyframe any
-  property, state machines, blend spaces). Citrus has rig/IK import but no runtime
+  property, state machines, blend spaces). ZestEngine has rig/IK import but no runtime
   animation graph.
-- **Tilemaps / 2D pipeline** — Godot is first-class 2D. Citrus is 3D-only. (Likely
+- **Tilemaps / 2D pipeline** — Godot is first-class 2D. ZestEngine is 3D-only. (Likely
   out of scope, but worth a deliberate "no" rather than an accidental gap.)
-- **Signals / event bus** — Godot's signal system is how nodes communicate. Citrus has
+- **Signals / event bus** — Godot's signal system is how nodes communicate. ZestEngine has
   no component-to-component event mechanism (listed `todo` in Features §2D).
-- **`NavigationServer` / navmesh pathfinding** — Citrus has no navmesh; AI/agents
+- **`NavigationServer` / navmesh pathfinding** — ZestEngine has no navmesh; AI/agents
   can't path. Godot ships baking + agents + avoidance.
 - **Resource hot-reload + `.import` pipeline** — Godot reimports assets on change with
-  per-asset import settings. Citrus has a texture cache + LSP-driven `.rs` reload but
+  per-asset import settings. ZestEngine has a texture cache + LSP-driven `.rs` reload but
   no general per-asset import-settings pipeline.
 - **Scene instancing / prefabs with overrides** — Godot's `PackedScene` instancing
-  with per-instance property overrides. Citrus has duplicate but no prefab/nested-scene
+  with per-instance property overrides. ZestEngine has duplicate but no prefab/nested-scene
   asset with override semantics.
 
 ### vs. Bevy (code-first, ECS, performance)
 Bevy's strengths are architecture and rendering scalability. Gaps:
 
-- **ECS / data-oriented core** — Bevy is archetypal ECS; Citrus uses `Vec<dyn Component>`
+- **ECS / data-oriented core** — Bevy is archetypal ECS; ZestEngine uses `Vec<dyn Component>`
   per object (per the architecture note, an intentional choice). Fine for the current
   scale, but **batching, parallel system scheduling, and cache locality** are weaker.
   If scenes grow large, an ECS or at least archetype-batched draw submission is the
   scaling path.
 - **Render graph** — Bevy has a declarative render graph with automatic resource
-  barriers. Citrus hand-codes passes + barriers in `lib.rs` (works, but every new pass
+  barriers. ZestEngine hand-codes passes + barriers in `lib.rs` (works, but every new pass
   is manual Vulkan sync — error-prone and a velocity tax).
 - **GPU-driven rendering / batching / instancing** — Bevy batches and (increasingly)
-  GPU-culls. Citrus issues one draw per slot with no instancing — fine post-frustum-cull
+  GPU-culls. ZestEngine issues one draw per slot with no instancing — fine post-frustum-cull
   for moderate scenes, but many identical props (foliage, crowds) need **instancing**.
 - **Asset server with typed handles** — Bevy's `AssetServer` + `Handle<T>` +
   hot-reloading is exactly the "unified asset registry" gap from §3.
-- **Plugin ecosystem / schedule** — Bevy's plugin + system-ordering model. Citrus has
+- **Plugin ecosystem / schedule** — Bevy's plugin + system-ordering model. ZestEngine has
   dylib plugins but no scheduled-system model.
 
 **Net:** the **critical, both-engines-have-it, we-don't** items are: **(1) runtime UI**,
