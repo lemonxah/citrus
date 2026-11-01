@@ -47,10 +47,10 @@ the zero-runtime-cost path for VR / low-end targets (mixed lighting).
 | Graphics | Vulkan 1.3 via [ash](https://crates.io/crates/ash) (dynamic rendering, sync2) |
 | Realtime GI | **Flux** — screen-space probes marching a global distance field (no bake, no RT cores) |
 | Lighting bake | Vulkan ray query (VK_KHR_ray_query / acceleration_structure) |
-| VR (planned) | OpenXR via the [openxr](https://crates.io/crates/openxr) crate (Monado / SteamVR runtimes) |
+| VR | OpenXR via the [openxr](https://crates.io/crates/openxr) crate (Monado / SteamVR runtimes) — desktop landed, Quest on-device validation pending |
 | Editor GUI | [egui](https://crates.io/crates/egui) + egui_dock, rendered in-engine |
 | Worlds/props | glTF 2.0, FBX (ufbx) |
-| Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones (planned); Bone Cloth for hair / skirts with auto-fitted body colliders |
+| Avatars | VRM (glTF extension): humanoid rig, expressions, spring bones; Bone Cloth for hair / skirts with auto-fitted body colliders |
 | Audio | [rodio](https://crates.io/crates/rodio) (.wav/.flac/.mp3) |
 | Default shader | zestengine standard uber-shader, Poiyomi-inspired — see [docs/shaders.md](docs/shaders.md) |
 | Windowing | winit |
@@ -87,7 +87,11 @@ four blended reflection probes per pixel (forward, SSR and ray-traced reflection
 render-to-texture cameras with nested screens and portals; deferred projected
 decals (depth + normal from the G-buffer); water with shore-calm waves and ripples
 across the raster, displaced and RT-reflection paths; per-instance material
-colour/parameters (`PerInstance`) without breaking instanced batches.
+colour/parameters (`PerInstance`) without breaking instanced batches; **AMD FSR 3**
+temporal upscaling with frame generation (frame interpolation) on HDR inputs;
+ray-traced reflections (Vulkan ray query) and screen-space reflections; bloom;
+volumetric fog; planar reflections; baked lightmaps + light probes; occlusion
+culling; GPU instancing and meshlet LOD generation; mobile/desktop render tiers.
 
 **Assets & formats** — glTF and FBX import; built-in primitives; `.material`,
 `.scene`, and `project.zestengine` files; `.wav`/`.flac`/`.mp3` audio; heightmap
@@ -132,8 +136,36 @@ runtime only (`zestengine-engine` with the editor cargo feature off), so no edit
 in the binary; the boot scene comes from `project.zestengine` and is overridable in the
 editable `src/main.rs`. Unsaved-changes prompt on exit.
 
+**Animation & avatars** — keyframe Animation tab with a curve/tangent editor;
+Animator Controller state machines with sub-state machines; GPU skinning; humanoid
+IK (11 tracker roles, procedural stepping), full-body tracking, and animation
+**retargeting** between skeletons; Bone/Mesh cloth with self-collision and
+auto-fitted colliders, VRM spring bones; face tracking (OpenXR + OSC), lip sync
+and voice-driven visemes; LOD generation via quadric-error decimation with meshlet
+clusters.
+
+**Water & simulation** — ocean / lake / river bodies with Gerstner waves and shore
+calm; buoyancy, drag and flow; interactive ripple fields; shallow-water simulation
+with beaches, run-up and fluid templates; underwater view and audio; waterfalls;
+carryable water; swimming (desktop + VR).
+
+**Networking** — UDP sessions with an authenticated relay, hole punching and host
+migration; client-side prediction with lag compensation (`ray_cast_rewound`)
+surviving migration; Argon2id passphrases and Ed25519 identities with allow / ban
+lists; world, avatar and voice sync.
+
+**VR** — OpenXR on desktop (multiview, controller input, in-headset world/avatar
+editing); VR templates; Android / Quest builds (Vulkan 1.1 fallback, ASTC;
+foveation pending on-device validation).
+
+**Content & templates** — UGC content packages with the sandboxed WASM `Script`;
+asset cooking into `assets.pak`; localization; the save API; the event bus
+(`ctx.emit`); seamless + additive multi-scene loading; project templates (FPS,
+TPS, top-down, strategy, card, novel, VR shooter, VR social).
+
 **Audio** — spatial / non-spatial `AudioSource` + `AudioListener` with distance
-attenuation, driven in play mode.
+attenuation, driven in play mode; Steam Audio spatialisation; the bus mixer; Opus
+voice chat with proximity.
 
 **Physics / collision** — Box / Sphere / Capsule / Mesh colliders with editable
 viewport widgets, a `RigidBody` component driving a rapier3d simulation (gravity,
